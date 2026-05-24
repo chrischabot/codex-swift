@@ -14,16 +14,30 @@ public struct SandboxPolicy: Sendable, Equatable {
     public var networkAllowed: Bool
     public var networkAllowedDomains: [String]
     public var networkDeniedDomains: [String]
+    /// Environment-scrubbing policy applied at every sandboxed spawn site
+    /// (ShellTool, UnifiedExec). Defaults to the restrictive allowlist that
+    /// strips API keys, SSH agent sockets, cloud creds, etc. — see
+    /// `SandboxEnvironmentPolicy.default`. Setting this to a custom value
+    /// is the supported extension point for project-specific allow/deny.
+    public var environmentPolicy: SandboxEnvironmentPolicy
+    /// Exec policy: today's only knob is "what absolute paths are
+    /// permitted"; bare names (no `/`) are always rejected at the spawn
+    /// site so PATH search cannot escape the kernel sandbox.
+    public var execPolicy: SandboxExecPolicy
     public init(mode: Mode = .workspaceWrite,
                 writableRoots: [String] = [],
                 networkAllowed: Bool = false,
                 networkAllowedDomains: [String] = [],
-                networkDeniedDomains: [String] = []) {
+                networkDeniedDomains: [String] = [],
+                environmentPolicy: SandboxEnvironmentPolicy = .default,
+                execPolicy: SandboxExecPolicy = .default) {
         self.mode = mode
         self.writableRoots = writableRoots
         self.networkAllowed = networkAllowed
         self.networkAllowedDomains = networkAllowedDomains
         self.networkDeniedDomains = networkDeniedDomains
+        self.environmentPolicy = environmentPolicy
+        self.execPolicy = execPolicy
     }
 }
 
@@ -101,6 +115,12 @@ public protocol Sandbox: Sendable {
     /// kernel sandbox where available, or denies when confinement cannot be
     /// enforced for a non-full-access policy.
     func sandboxedInvocation(argv: [String], cwd: String) -> SandboxInvocation
+    /// Environment-scrubbing policy used at the spawn site. Default
+    /// implementation returns the restrictive built-in allowlist so callers
+    /// that haven't been updated still get the secure default.
+    var spawnEnvironmentPolicy: SandboxEnvironmentPolicy { get }
+    /// Exec policy (absolute-path requirement, optional allowlist).
+    var spawnExecPolicy: SandboxExecPolicy { get }
 }
 
 public extension Sandbox {
@@ -110,6 +130,8 @@ public extension Sandbox {
     func evaluateNetworkDomainRule(host: String) -> SandboxDecision? {
         nil
     }
+    var spawnEnvironmentPolicy: SandboxEnvironmentPolicy { .default }
+    var spawnExecPolicy: SandboxExecPolicy { .default }
 }
 
 /// Portable, workspace-confined policy. This is the *decision* engine and is
@@ -128,6 +150,18 @@ public struct WorkspaceSandbox: Sandbox {
         self.policy = policy
         self.backendResolver = backendResolver
     }
+
+    public var spawnEnvironmentPolicy: SandboxEnvironmentPolicy {
+        // Full-access is the documented `/shell` escape hatch and behaves as
+        // an unfiltered exec — but the env scrubber still strips known
+        // secrets so the model can't read API keys via `env` even when the
+        // kernel sandbox is bypassed. Callers that genuinely need a raw env
+        // can pass an opt-in `SandboxEnvironmentPolicy` that empties the
+        // deny lists.
+        policy.environmentPolicy
+    }
+
+    public var spawnExecPolicy: SandboxExecPolicy { policy.execPolicy }
 
     static func canonicalPath(_ path: String) -> String {
         if let resolved = path.withCString({ realpath($0, nil) }) {
