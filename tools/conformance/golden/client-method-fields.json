@@ -1,0 +1,879 @@
+{
+  "account/login/cancel": {
+    "fields": [
+      "loginId"
+    ],
+    "paramsRef": "CancelLoginAccountParams",
+    "requestRequiresParams": true,
+    "required": [
+      "loginId"
+    ]
+  },
+  "account/login/start": {
+    "fields": [],
+    "paramsRef": "LoginAccountParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "account/logout": {
+    "fields": [],
+    "paramsRef": null,
+    "requestRequiresParams": false,
+    "required": []
+  },
+  "account/rateLimits/read": {
+    "fields": [],
+    "paramsRef": null,
+    "requestRequiresParams": false,
+    "required": []
+  },
+  "account/read": {
+    "fields": [
+      "refreshToken"
+    ],
+    "paramsRef": "GetAccountParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "account/sendAddCreditsNudgeEmail": {
+    "fields": [
+      "creditType"
+    ],
+    "paramsRef": "SendAddCreditsNudgeEmailParams",
+    "requestRequiresParams": true,
+    "required": [
+      "creditType"
+    ]
+  },
+  "app/list": {
+    "fields": [
+      "cursor",
+      "forceRefetch",
+      "limit",
+      "threadId"
+    ],
+    "paramsRef": "AppsListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "command/exec": {
+    "fields": [
+      "command",
+      "cwd",
+      "disableOutputCap",
+      "disableTimeout",
+      "env",
+      "outputBytesCap",
+      "processId",
+      "sandboxPolicy",
+      "size",
+      "streamStdin",
+      "streamStdoutStderr",
+      "timeoutMs",
+      "tty"
+    ],
+    "paramsRef": "CommandExecParams",
+    "requestRequiresParams": true,
+    "required": [
+      "command"
+    ]
+  },
+  "command/exec/resize": {
+    "fields": [
+      "processId",
+      "size"
+    ],
+    "paramsRef": "CommandExecResizeParams",
+    "requestRequiresParams": true,
+    "required": [
+      "processId",
+      "size"
+    ]
+  },
+  "command/exec/terminate": {
+    "fields": [
+      "processId"
+    ],
+    "paramsRef": "CommandExecTerminateParams",
+    "requestRequiresParams": true,
+    "required": [
+      "processId"
+    ]
+  },
+  "command/exec/write": {
+    "fields": [
+      "closeStdin",
+      "deltaBase64",
+      "processId"
+    ],
+    "paramsRef": "CommandExecWriteParams",
+    "requestRequiresParams": true,
+    "required": [
+      "processId"
+    ]
+  },
+  "config/batchWrite": {
+    "fields": [
+      "edits",
+      "expectedVersion",
+      "filePath",
+      "reloadUserConfig"
+    ],
+    "paramsRef": "ConfigBatchWriteParams",
+    "requestRequiresParams": true,
+    "required": [
+      "edits"
+    ]
+  },
+  "config/mcpServer/reload": {
+    "fields": [],
+    "paramsRef": null,
+    "requestRequiresParams": false,
+    "required": []
+  },
+  "config/read": {
+    "fields": [
+      "cwd",
+      "includeLayers"
+    ],
+    "paramsRef": "ConfigReadParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "config/value/write": {
+    "fields": [
+      "expectedVersion",
+      "filePath",
+      "keyPath",
+      "mergeStrategy",
+      "value"
+    ],
+    "paramsRef": "ConfigValueWriteParams",
+    "requestRequiresParams": true,
+    "required": [
+      "keyPath",
+      "mergeStrategy",
+      "value"
+    ]
+  },
+  "configRequirements/read": {
+    "fields": [],
+    "paramsRef": null,
+    "requestRequiresParams": false,
+    "required": []
+  },
+  "experimentalFeature/enablement/set": {
+    "fields": [
+      "enablement"
+    ],
+    "paramsRef": "ExperimentalFeatureEnablementSetParams",
+    "requestRequiresParams": true,
+    "required": [
+      "enablement"
+    ]
+  },
+  "experimentalFeature/list": {
+    "fields": [
+      "cursor",
+      "limit"
+    ],
+    "paramsRef": "ExperimentalFeatureListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "externalAgentConfig/detect": {
+    "fields": [
+      "cwds",
+      "includeHome"
+    ],
+    "paramsRef": "ExternalAgentConfigDetectParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "externalAgentConfig/import": {
+    "fields": [
+      "migrationItems"
+    ],
+    "paramsRef": "ExternalAgentConfigImportParams",
+    "requestRequiresParams": true,
+    "required": [
+      "migrationItems"
+    ]
+  },
+  "feedback/upload": {
+    "fields": [
+      "classification",
+      "extraLogFiles",
+      "includeLogs",
+      "reason",
+      "tags",
+      "threadId"
+    ],
+    "paramsRef": "FeedbackUploadParams",
+    "requestRequiresParams": true,
+    "required": [
+      "classification",
+      "includeLogs"
+    ]
+  },
+  "fs/copy": {
+    "fields": [
+      "destinationPath",
+      "recursive",
+      "sourcePath"
+    ],
+    "paramsRef": "FsCopyParams",
+    "requestRequiresParams": true,
+    "required": [
+      "destinationPath",
+      "sourcePath"
+    ]
+  },
+  "fs/createDirectory": {
+    "fields": [
+      "path",
+      "recursive"
+    ],
+    "paramsRef": "FsCreateDirectoryParams",
+    "requestRequiresParams": true,
+    "required": [
+      "path"
+    ]
+  },
+  "fs/getMetadata": {
+    "fields": [
+      "path"
+    ],
+    "paramsRef": "FsGetMetadataParams",
+    "requestRequiresParams": true,
+    "required": [
+      "path"
+    ]
+  },
+  "fs/readDirectory": {
+    "fields": [
+      "path"
+    ],
+    "paramsRef": "FsReadDirectoryParams",
+    "requestRequiresParams": true,
+    "required": [
+      "path"
+    ]
+  },
+  "fs/readFile": {
+    "fields": [
+      "path"
+    ],
+    "paramsRef": "FsReadFileParams",
+    "requestRequiresParams": true,
+    "required": [
+      "path"
+    ]
+  },
+  "fs/remove": {
+    "fields": [
+      "force",
+      "path",
+      "recursive"
+    ],
+    "paramsRef": "FsRemoveParams",
+    "requestRequiresParams": true,
+    "required": [
+      "path"
+    ]
+  },
+  "fs/unwatch": {
+    "fields": [
+      "watchId"
+    ],
+    "paramsRef": "FsUnwatchParams",
+    "requestRequiresParams": true,
+    "required": [
+      "watchId"
+    ]
+  },
+  "fs/watch": {
+    "fields": [
+      "path",
+      "watchId"
+    ],
+    "paramsRef": "FsWatchParams",
+    "requestRequiresParams": true,
+    "required": [
+      "path",
+      "watchId"
+    ]
+  },
+  "fs/writeFile": {
+    "fields": [
+      "dataBase64",
+      "path"
+    ],
+    "paramsRef": "FsWriteFileParams",
+    "requestRequiresParams": true,
+    "required": [
+      "dataBase64",
+      "path"
+    ]
+  },
+  "fuzzyFileSearch": {
+    "fields": [
+      "cancellationToken",
+      "query",
+      "roots"
+    ],
+    "paramsRef": "FuzzyFileSearchParams",
+    "requestRequiresParams": true,
+    "required": [
+      "query",
+      "roots"
+    ]
+  },
+  "hooks/list": {
+    "fields": [
+      "cwds"
+    ],
+    "paramsRef": "HooksListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "initialize": {
+    "fields": [
+      "capabilities",
+      "clientInfo"
+    ],
+    "paramsRef": "InitializeParams",
+    "requestRequiresParams": true,
+    "required": [
+      "clientInfo"
+    ]
+  },
+  "marketplace/add": {
+    "fields": [
+      "refName",
+      "source",
+      "sparsePaths"
+    ],
+    "paramsRef": "MarketplaceAddParams",
+    "requestRequiresParams": true,
+    "required": [
+      "source"
+    ]
+  },
+  "marketplace/remove": {
+    "fields": [
+      "marketplaceName"
+    ],
+    "paramsRef": "MarketplaceRemoveParams",
+    "requestRequiresParams": true,
+    "required": [
+      "marketplaceName"
+    ]
+  },
+  "marketplace/upgrade": {
+    "fields": [
+      "marketplaceName"
+    ],
+    "paramsRef": "MarketplaceUpgradeParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "mcpServer/oauth/login": {
+    "fields": [
+      "name",
+      "scopes",
+      "timeoutSecs"
+    ],
+    "paramsRef": "McpServerOauthLoginParams",
+    "requestRequiresParams": true,
+    "required": [
+      "name"
+    ]
+  },
+  "mcpServer/resource/read": {
+    "fields": [
+      "server",
+      "threadId",
+      "uri"
+    ],
+    "paramsRef": "McpResourceReadParams",
+    "requestRequiresParams": true,
+    "required": [
+      "server",
+      "uri"
+    ]
+  },
+  "mcpServer/tool/call": {
+    "fields": [
+      "_meta",
+      "arguments",
+      "server",
+      "threadId",
+      "tool"
+    ],
+    "paramsRef": "McpServerToolCallParams",
+    "requestRequiresParams": true,
+    "required": [
+      "server",
+      "threadId",
+      "tool"
+    ]
+  },
+  "mcpServerStatus/list": {
+    "fields": [
+      "cursor",
+      "detail",
+      "limit"
+    ],
+    "paramsRef": "ListMcpServerStatusParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "model/list": {
+    "fields": [
+      "cursor",
+      "includeHidden",
+      "limit"
+    ],
+    "paramsRef": "ModelListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "modelProvider/capabilities/read": {
+    "fields": [],
+    "paramsRef": "ModelProviderCapabilitiesReadParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "plugin/install": {
+    "fields": [
+      "marketplacePath",
+      "pluginName",
+      "remoteMarketplaceName"
+    ],
+    "paramsRef": "PluginInstallParams",
+    "requestRequiresParams": true,
+    "required": [
+      "pluginName"
+    ]
+  },
+  "plugin/installed": {
+    "fields": [
+      "cwds",
+      "installSuggestionPluginNames"
+    ],
+    "paramsRef": "PluginInstalledParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "plugin/list": {
+    "fields": [
+      "cwds",
+      "marketplaceKinds"
+    ],
+    "paramsRef": "PluginListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "plugin/read": {
+    "fields": [
+      "marketplacePath",
+      "pluginName",
+      "remoteMarketplaceName"
+    ],
+    "paramsRef": "PluginReadParams",
+    "requestRequiresParams": true,
+    "required": [
+      "pluginName"
+    ]
+  },
+  "plugin/share/checkout": {
+    "fields": [
+      "remotePluginId"
+    ],
+    "paramsRef": "PluginShareCheckoutParams",
+    "requestRequiresParams": true,
+    "required": [
+      "remotePluginId"
+    ]
+  },
+  "plugin/share/delete": {
+    "fields": [
+      "remotePluginId"
+    ],
+    "paramsRef": "PluginShareDeleteParams",
+    "requestRequiresParams": true,
+    "required": [
+      "remotePluginId"
+    ]
+  },
+  "plugin/share/list": {
+    "fields": [],
+    "paramsRef": "PluginShareListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "plugin/share/save": {
+    "fields": [
+      "discoverability",
+      "pluginPath",
+      "remotePluginId",
+      "shareTargets"
+    ],
+    "paramsRef": "PluginShareSaveParams",
+    "requestRequiresParams": true,
+    "required": [
+      "pluginPath"
+    ]
+  },
+  "plugin/share/updateTargets": {
+    "fields": [
+      "discoverability",
+      "remotePluginId",
+      "shareTargets"
+    ],
+    "paramsRef": "PluginShareUpdateTargetsParams",
+    "requestRequiresParams": true,
+    "required": [
+      "discoverability",
+      "remotePluginId",
+      "shareTargets"
+    ]
+  },
+  "plugin/skill/read": {
+    "fields": [
+      "remoteMarketplaceName",
+      "remotePluginId",
+      "skillName"
+    ],
+    "paramsRef": "PluginSkillReadParams",
+    "requestRequiresParams": true,
+    "required": [
+      "remoteMarketplaceName",
+      "remotePluginId",
+      "skillName"
+    ]
+  },
+  "plugin/uninstall": {
+    "fields": [
+      "pluginId"
+    ],
+    "paramsRef": "PluginUninstallParams",
+    "requestRequiresParams": true,
+    "required": [
+      "pluginId"
+    ]
+  },
+  "review/start": {
+    "fields": [
+      "delivery",
+      "target",
+      "threadId"
+    ],
+    "paramsRef": "ReviewStartParams",
+    "requestRequiresParams": true,
+    "required": [
+      "target",
+      "threadId"
+    ]
+  },
+  "skills/config/write": {
+    "fields": [
+      "enabled",
+      "name",
+      "path"
+    ],
+    "paramsRef": "SkillsConfigWriteParams",
+    "requestRequiresParams": true,
+    "required": [
+      "enabled"
+    ]
+  },
+  "skills/list": {
+    "fields": [
+      "cwds",
+      "forceReload"
+    ],
+    "paramsRef": "SkillsListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "thread/approveGuardianDeniedAction": {
+    "fields": [
+      "event",
+      "threadId"
+    ],
+    "paramsRef": "ThreadApproveGuardianDeniedActionParams",
+    "requestRequiresParams": true,
+    "required": [
+      "event",
+      "threadId"
+    ]
+  },
+  "thread/archive": {
+    "fields": [
+      "threadId"
+    ],
+    "paramsRef": "ThreadArchiveParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/compact/start": {
+    "fields": [
+      "threadId"
+    ],
+    "paramsRef": "ThreadCompactStartParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/fork": {
+    "fields": [
+      "approvalPolicy",
+      "approvalsReviewer",
+      "baseInstructions",
+      "config",
+      "cwd",
+      "developerInstructions",
+      "ephemeral",
+      "model",
+      "modelProvider",
+      "sandbox",
+      "serviceTier",
+      "threadId",
+      "threadSource"
+    ],
+    "paramsRef": "ThreadForkParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/inject_items": {
+    "fields": [
+      "items",
+      "threadId"
+    ],
+    "paramsRef": "ThreadInjectItemsParams",
+    "requestRequiresParams": true,
+    "required": [
+      "items",
+      "threadId"
+    ]
+  },
+  "thread/list": {
+    "fields": [
+      "archived",
+      "cursor",
+      "cwd",
+      "limit",
+      "modelProviders",
+      "searchTerm",
+      "sortDirection",
+      "sortKey",
+      "sourceKinds",
+      "useStateDbOnly"
+    ],
+    "paramsRef": "ThreadListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "thread/loaded/list": {
+    "fields": [
+      "cursor",
+      "limit"
+    ],
+    "paramsRef": "ThreadLoadedListParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "thread/metadata/update": {
+    "fields": [
+      "gitInfo",
+      "threadId"
+    ],
+    "paramsRef": "ThreadMetadataUpdateParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/name/set": {
+    "fields": [
+      "name",
+      "threadId"
+    ],
+    "paramsRef": "ThreadSetNameParams",
+    "requestRequiresParams": true,
+    "required": [
+      "name",
+      "threadId"
+    ]
+  },
+  "thread/read": {
+    "fields": [
+      "includeTurns",
+      "threadId"
+    ],
+    "paramsRef": "ThreadReadParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/resume": {
+    "fields": [
+      "approvalPolicy",
+      "approvalsReviewer",
+      "baseInstructions",
+      "config",
+      "cwd",
+      "developerInstructions",
+      "model",
+      "modelProvider",
+      "personality",
+      "sandbox",
+      "serviceTier",
+      "threadId"
+    ],
+    "paramsRef": "ThreadResumeParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/rollback": {
+    "fields": [
+      "numTurns",
+      "threadId"
+    ],
+    "paramsRef": "ThreadRollbackParams",
+    "requestRequiresParams": true,
+    "required": [
+      "numTurns",
+      "threadId"
+    ]
+  },
+  "thread/shellCommand": {
+    "fields": [
+      "command",
+      "threadId"
+    ],
+    "paramsRef": "ThreadShellCommandParams",
+    "requestRequiresParams": true,
+    "required": [
+      "command",
+      "threadId"
+    ]
+  },
+  "thread/start": {
+    "fields": [
+      "approvalPolicy",
+      "approvalsReviewer",
+      "baseInstructions",
+      "config",
+      "cwd",
+      "developerInstructions",
+      "ephemeral",
+      "model",
+      "modelProvider",
+      "personality",
+      "sandbox",
+      "serviceName",
+      "serviceTier",
+      "sessionStartSource",
+      "threadSource"
+    ],
+    "paramsRef": "ThreadStartParams",
+    "requestRequiresParams": true,
+    "required": []
+  },
+  "thread/unarchive": {
+    "fields": [
+      "threadId"
+    ],
+    "paramsRef": "ThreadUnarchiveParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "thread/unsubscribe": {
+    "fields": [
+      "threadId"
+    ],
+    "paramsRef": "ThreadUnsubscribeParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId"
+    ]
+  },
+  "turn/interrupt": {
+    "fields": [
+      "threadId",
+      "turnId"
+    ],
+    "paramsRef": "TurnInterruptParams",
+    "requestRequiresParams": true,
+    "required": [
+      "threadId",
+      "turnId"
+    ]
+  },
+  "turn/start": {
+    "fields": [
+      "approvalPolicy",
+      "approvalsReviewer",
+      "cwd",
+      "effort",
+      "input",
+      "model",
+      "outputSchema",
+      "personality",
+      "sandboxPolicy",
+      "serviceTier",
+      "summary",
+      "threadId"
+    ],
+    "paramsRef": "TurnStartParams",
+    "requestRequiresParams": true,
+    "required": [
+      "input",
+      "threadId"
+    ]
+  },
+  "turn/steer": {
+    "fields": [
+      "expectedTurnId",
+      "input",
+      "threadId"
+    ],
+    "paramsRef": "TurnSteerParams",
+    "requestRequiresParams": true,
+    "required": [
+      "expectedTurnId",
+      "input",
+      "threadId"
+    ]
+  },
+  "windowsSandbox/readiness": {
+    "fields": [],
+    "paramsRef": null,
+    "requestRequiresParams": false,
+    "required": []
+  },
+  "windowsSandbox/setupStart": {
+    "fields": [
+      "cwd",
+      "mode"
+    ],
+    "paramsRef": "WindowsSandboxSetupStartParams",
+    "requestRequiresParams": true,
+    "required": [
+      "mode"
+    ]
+  }
+}

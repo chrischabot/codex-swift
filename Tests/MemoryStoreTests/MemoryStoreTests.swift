@@ -1,0 +1,139 @@
+import XCTest
+import Foundation
+@testable import MemoryStore
+
+final class MemoryStoreTests: XCTestCase {
+    private func tmpDB() -> String {
+        NSTemporaryDirectory() + "codex-memory-\(UUID().uuidString).db"
+    }
+
+    func testSchemaBringUp() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try MemoryStore(MemoryStoreConfig(path: path))
+        let docs = try await store.documentCount()
+        let chunks = try await store.chunkCount()
+        let entities = try await store.entityCount()
+        XCTAssertEqual(docs, 0)
+        XCTAssertEqual(chunks, 0)
+        XCTAssertEqual(entities, 0)
+    }
+
+    func testUpsertAndDedupeDocument() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try MemoryStore(MemoryStoreConfig(path: path))
+        let sha = Data(repeating: 0xab, count: 32)
+        let docId = try await store.upsertDocument(DocumentRow(
+            source: .rss, sourceURI: "https://example.com/x",
+            bodyPath: "rollout:x", fetchedAt: 1, contentSHA: sha, rawBytes: 100))
+        XCTAssertGreaterThan(docId, 0)
+        let again = try await store.upsertDocument(DocumentRow(
+            source: .rss, sourceURI: "https://example.com/x",
+            bodyPath: "rollout:x", fetchedAt: 2, contentSHA: sha, rawBytes: 100))
+        XCTAssertEqual(again, docId)
+        let count = try await store.documentCount()
+        XCTAssertEqual(count, 1)
+    }
+
+    func testInsertChunkAndSearchVectors() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let cfg = MemoryStoreConfig(path: path, embeddingDimension: 8)
+        let store = try MemoryStore(cfg)
+        let sha = Data(repeating: 0x01, count: 32)
+        let docId = try await store.upsertDocument(DocumentRow(
+            source: .manual, sourceURI: "memo:1",
+            bodyPath: "rollout:1", fetchedAt: 1,
+            contentSHA: sha, rawBytes: 10))
+        let close1: [Float] = [1, 0, 0, 0, 0, 0, 0, 0]
+        let close2: [Float] = [0.98, 0.2, 0, 0, 0, 0, 0, 0]
+        let far:    [Float] = [0, 1, 0, 0, 0, 0, 0, 0]
+        _ = try await store.insertChunk(
+            ChunkRow(documentId: docId, idx: 0,
+                     text: "alpha", rawText: "alpha",
+                     tokenCount: 1, createdAt: 1),
+            embeddingValues: close1)
+        _ = try await store.insertChunk(
+            ChunkRow(documentId: docId, idx: 1,
+                     text: "beta", rawText: "beta",
+                     tokenCount: 1, createdAt: 1),
+            embeddingValues: close2)
+        _ = try await store.insertChunk(
+            ChunkRow(documentId: docId, idx: 2,
+                     text: "gamma", rawText: "gamma",
+                     tokenCount: 1, createdAt: 1),
+            embeddingValues: far)
+        let hits = try await store.searchVectorValues(close1, k: 3)
+        XCTAssertEqual(hits.count, 3)
+        XCTAssertEqual(hits[0].distance, 0, accuracy: 1e-4)
+        XCTAssertLessThan(hits[1].distance, hits[2].distance)
+    }
+
+    func testFTSReturnsMatchingChunk() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let cfg = MemoryStoreConfig(path: path, embeddingDimension: 4)
+        let store = try MemoryStore(cfg)
+        let sha = Data(count: 32)
+        let docId = try await store.upsertDocument(DocumentRow(
+            source: .manual, sourceURI: "doc:1",
+            bodyPath: "rollout:1", fetchedAt: 0,
+            contentSHA: sha, rawBytes: 1))
+        let emb: [Float] = [1, 0, 0, 0]
+        _ = try await store.insertChunk(
+            ChunkRow(documentId: docId, idx: 0,
+                     text: "the swift language is fast and safe",
+                     rawText: "raw", tokenCount: 7, createdAt: 0),
+            embeddingValues: emb)
+        let hits = try await store.searchLexical("swift safe", k: 5)
+        XCTAssertFalse(hits.isEmpty)
+        XCTAssertEqual(hits[0].chunkId, 1)
+    }
+
+    func testEntityEdgeAndTwoHop() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: 4))
+        let alice = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Alice", firstSeen: 0, lastSeen: 0))
+        let bob = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Bob", firstSeen: 0, lastSeen: 0))
+        let cara = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Cara", firstSeen: 0, lastSeen: 0))
+        _ = try await store.upsertEdge(EdgeRow(
+            src: alice, dst: bob, relation: "mentions",
+            firstSeen: 0, lastSeen: 0))
+        _ = try await store.upsertEdge(EdgeRow(
+            src: bob, dst: cara, relation: "mentions",
+            firstSeen: 0, lastSeen: 0))
+        let walk = try await store.twoHopNeighbours(seed: alice, depth: 2)
+        let ids = walk.map(\.0)
+        XCTAssertTrue(ids.contains(alice))
+        XCTAssertTrue(ids.contains(bob))
+        XCTAssertTrue(ids.contains(cara))
+    }
+
+    func testRoundTripScale() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let cfg = MemoryStoreConfig(path: path, embeddingDimension: 16)
+        let store = try MemoryStore(cfg)
+        let sha = Data(count: 32)
+        let docId = try await store.upsertDocument(DocumentRow(
+            source: .manual, sourceURI: "doc:scale",
+            bodyPath: "rollout:scale", fetchedAt: 0,
+            contentSHA: sha, rawBytes: 1))
+        let N = 500
+        for i in 0..<N {
+            var emb = [Float](repeating: 0, count: 16)
+            emb[i % 16] = 1
+            _ = try await store.insertChunk(
+                ChunkRow(documentId: docId, idx: i,
+                         text: "chunk \(i)", rawText: "raw \(i)",
+                         tokenCount: 1, createdAt: Int64(i)),
+                embeddingValues: emb)
+        }
+        let count = try await store.chunkCount()
+        XCTAssertEqual(count, N)
+        var probe = [Float](repeating: 0, count: 16)
+        probe[3] = 1
+        let hits = try await store.searchVectorValues(probe, k: 5)
+        XCTAssertEqual(hits.count, 5)
+        XCTAssertEqual(hits[0].distance, 0, accuracy: 1e-4)
+    }
+}

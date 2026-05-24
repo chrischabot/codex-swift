@@ -1,0 +1,6 @@
+{
+  "clientRequestSha256": "706075bcb53d118b9e2825705af987bd017e9400171ee53ede20c4f8fadafbf2",
+  "methodCount": 77,
+  "pin": "schema-sha256:706075bcb53d118b9e2825705af987bd017e9400171ee53ede20c4f8fadafbf2",
+  "schema": "codex-rs/app-server-protocol/schema/json/ClientRequest.json"
+}

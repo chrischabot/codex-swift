@@ -1,0 +1,58 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.pins
+# Note: Package.resolved IS committed (executable targets benefit from
+# deterministic dep resolution across CI / consumer checkouts).
+
+# Xcode
+*.xcodeproj
+DerivedData/
+xcuserdata/
+
+# Build artifacts
+*.o
+*.swiftmodule
+*.dylib
+*.so
+*.a
+build/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.iml
+
+# Test/runtime artifacts
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.rollout.jsonl
+*.log
+*.tmp
+*.bak
+codex-home-test/
+
+# Local Codex state (never commit user data)
+.codex/
+codex_home/
+
+# Local environment
+.env
+.env.local
+
+# Per-developer ephemeral
+calc_0.py
+scratch/
+tmp/
+
+# Code signing / notarization secrets
+*.p12
+*.cer
+*.provisionprofile
+AuthKey_*.p8
