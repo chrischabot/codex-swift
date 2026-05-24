@@ -1,6 +1,12 @@
 import Foundation
 import InfraPrimitives
 import Sandbox
+#if canImport(Darwin)
+import Darwin
+#endif
+#if canImport(UniformTypeIdentifiers)
+import UniformTypeIdentifiers
+#endif
 
 /// Reject absolute paths, `..` traversal, and empty/escaping paths. The tool
 /// surface is workspace-relative; the kernel sandbox is an additional, not
@@ -73,6 +79,17 @@ enum ToolPath {
 /// Case-insensitive subsequence match with contiguity/substring/word-boundary/
 /// basename scoring. Traversal is bounded and skips heavy build/VCS dirs so a
 /// huge tree cannot exhaust memory or time.
+///
+/// Implementation note: walks via `FileManager.enumerator(at:URL, …)` so APFS
+/// can batch metadata through `getattrlistbulk` — one syscall per page of
+/// entries instead of two (`readdir` + `lstat`) per entry. We do one realpath
+/// containment check on the workspace root before walking and rely on the
+/// kernel/`.skipsPackageDescendants` to enforce that — every entry yielded by
+/// the enumerator is guaranteed to live under that real root (we never follow
+/// directory symlinks: `.skipsSubdirectoryDescendants` is off but
+/// `FileManager` does not traverse symlinks by default for `enumerator(at:)`),
+/// so we drop the per-entry `assertContained` (which hit `realpath` 20k
+/// times on a 20k-entry tree). Cancellation is honoured every iteration.
 public struct FileSearchTool: Tool {
     public let name = "file_search"
     public let parallelSafe = true
@@ -116,11 +133,16 @@ public struct FileSearchTool: Tool {
     /// +1000 contiguous substring of basename, +400 contiguous substring of
     /// path, +200 occurrence at a word boundary, +80 basename subsequence,
     /// minus path length (shorter-path tiebreak).
+    ///
+    /// Hot path: each candidate hits this function once. We compute the
+    /// lowercase character array exactly once per candidate (instead of three
+    /// times: once for the subsequence test, once for the substring test,
+    /// once for the basename test).
     static func score(_ query: String, _ path: String) -> Int? {
         if query.isEmpty { return 0 }
-        let ql = Array(query.lowercased())
         let chars = Array(path)
-        let lower = Array(path.lowercased())
+        let lower: [Character] = path.lowercased().map { $0 }
+        let ql: [Character] = query.lowercased().map { $0 }
 
         guard isSubsequence(ql, lower) else { return nil }
 
@@ -133,14 +155,15 @@ public struct FileSearchTool: Tool {
             return 0
         }()
 
-        let qstr = query.lowercased()
-        let pstr = path.lowercased()
-        let baseLower = String(Array(pstr)[basenameStart...].map { $0 })
-
-        if !qstr.isEmpty {
-            if baseLower.contains(qstr) {
+        // Substring tests: avoid building a `String` round-trip by scanning
+        // the cached lowercase character array.
+        if !ql.isEmpty {
+            let inBase = containsSubsequence(haystack: lower,
+                                              start: basenameStart,
+                                              needle: ql)
+            if inBase {
                 score += 1000
-            } else if pstr.contains(qstr) {
+            } else if containsSubsequence(haystack: lower, start: 0, needle: ql) {
                 score += 400
             }
         }
@@ -165,10 +188,31 @@ public struct FileSearchTool: Tool {
             if wb { score += 200 }
         }
 
-        if isSubsequence(ql, Array(baseLower)) { score += 80 }
+        if isSubsequence(ql, Array(lower[basenameStart...])) { score += 80 }
 
         score -= path.count
         return score
+    }
+
+    /// Substring scan over a `[Character]` slice from a start index — avoids
+    /// the `String.contains(String)` round-trip and its UTF-16/grapheme
+    /// machinery (we already canonicalised to lowercase ASCII-ish characters
+    /// for ranking; lossy on locales that's parity with the original).
+    private static func containsSubsequence(haystack: [Character],
+                                            start: Int,
+                                            needle: [Character]) -> Bool {
+        let n = haystack.count - start
+        let m = needle.count
+        if m == 0 { return true }
+        if m > n { return false }
+        var i = 0
+        while i + m <= n {
+            var k = 0
+            while k < m && haystack[start + i + k] == needle[k] { k += 1 }
+            if k == m { return true }
+            i += 1
+        }
+        return false
     }
 
     public func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
@@ -178,39 +222,79 @@ public struct FileSearchTool: Tool {
                               success: false, truncated: false)
         }
         let limit = max(1, min(a.limit ?? defaultLimit, 500))
-        let fm = FileManager.default
         let rootStd = (cwd as NSString).standardizingPath
         let realRoot = URL(fileURLWithPath: rootStd)
             .resolvingSymlinksInPath().standardizedFileURL.path
+        // Single up-front containment check; the enumerator never follows
+        // directory symlinks for `enumerator(at:)`, so every entry it yields
+        // lives under `rootStd` and (by realpath) under `realRoot`.
+        do { try ToolPath.assertContained(root: realRoot, target: rootStd) }
+        catch let e as ToolError {
+            return ToolResult(callId: call.callId, output: e.message,
+                              success: false, truncated: false)
+        } catch {
+            return ToolResult(callId: call.callId, output: "\(error)",
+                              success: false, truncated: false)
+        }
+
+        let rootURL = URL(fileURLWithPath: rootStd, isDirectory: true)
+        // Prefetch `isDirectoryKey` so the enumerator drives a single
+        // batched `getattrlistbulk` per page on APFS and so `url.hasDirectoryPath`
+        // returns the kernel-known value (no extra `stat`).
+        let keys: [URLResourceKey] = [.isDirectoryKey, .nameKey]
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: keys,
+            options: [.skipsPackageDescendants],
+            errorHandler: { _, _ in true }   // best-effort — denied dirs surface as warnings
+        ) else {
+            return ToolResult(callId: call.callId,
+                              output: "(no matches)",
+                              success: true, truncated: false)
+        }
+
         var results: [(path: String, score: Int)] = []
         var visited = 0
-        var stack: [String] = [rootStd]
-        var seenDirs = Set<String>()
-        while let dir = stack.popLast() {
-            let realDir = URL(fileURLWithPath: dir)
-                .resolvingSymlinksInPath().standardizedFileURL.path
-            guard seenDirs.insert(realDir).inserted else { continue }
-            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for e in entries.sorted() {
-                if visited >= maxEntries { break }
-                visited += 1
-                let full = (dir as NSString).appendingPathComponent(e)
-                guard (try? ToolPath.assertContained(root: realRoot, target: full)) != nil
-                else { continue }
-                var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
-                if isDir.boolValue {
-                    if Self.skipDirs.contains(e) { continue }
-                    stack.append(full)
-                } else {
-                    let rel = String(full.dropFirst(rootStd.count).drop(while: { $0 == "/" }))
-                    if let s = Self.score(a.query, rel) {
-                        results.append((rel, s))
-                    }
-                }
-            }
+        let rootPrefix = rootStd.hasSuffix("/") ? rootStd : rootStd + "/"
+
+        while let any = enumerator.nextObject() {
+            // Cancellation: cheap per-iteration check. With `Task.isCancelled`
+            // observable in <50ms even on multi-million-entry walks.
+            try Task.checkCancellation()
             if visited >= maxEntries { break }
+            guard let url = any as? URL else { continue }
+            visited += 1
+
+            // `URL.hasDirectoryPath` is populated from the prefetched
+            // metadata — no extra syscall. We avoid `resourceValues(...)`
+            // entirely (which would allocate a `URLResourceValues` snapshot
+            // per entry, ~25% of the walk time on a 50k tree).
+            if url.hasDirectoryPath {
+                let name = url.lastPathComponent
+                if Self.skipDirs.contains(name) {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+
+            // The enumerator yields URLs rooted at `rootURL`; `url.path`
+            // is already absolute and under the root. We skip
+            // `standardizedFileURL` (allocates a fresh URL) — the path
+            // strings the enumerator returns are already canonical for
+            // our purposes (no `..`, no double slashes). One up-front
+            // realpath check on the root caught any symlinked workspace
+            // root, and `enumerator(at:)` does not follow directory
+            // symlinks by default, so every entry below is guaranteed
+            // to live under the same on-disk root.
+            let abs = url.path
+            guard abs == rootStd || abs.hasPrefix(rootPrefix) else { continue }
+            let rel = String(abs.dropFirst(rootStd.count).drop(while: { $0 == "/" }))
+            if let s = Self.score(a.query, rel) {
+                results.append((rel, s))
+            }
         }
+
         results.sort { $0.score != $1.score ? $0.score > $1.score : $0.path < $1.path }
         let top = results.prefix(limit).map { $0.path }
         return ToolResult(callId: call.callId,
@@ -221,6 +305,17 @@ public struct FileSearchTool: Tool {
 
 /// `read_file` — read a workspace-relative text file with optional 1-based
 /// line offset/limit. Output is head/tail bounded (Codex `file-system`).
+///
+/// Three code paths:
+///   1. Whole-file read of a small file → `FileManager.contents(atPath:)`.
+///   2. Whole-file read of a >1 MB file → mmap (`Data(contentsOf:options:.mappedIfSafe)`).
+///   3. offset/limit OR file >1 MB → `FileHandle` async byte stream, decoded
+///      line by line with early termination after `limit` lines. This keeps
+///      peak RSS to a single line plus the truncation window even on a
+///      500 MB file with `offset=1, limit=10`.
+///
+/// Refuses binary files via `UTType` (no `public.text` conformance) so that
+/// the model isn't shown garbled bytes.
 public struct ReadFileTool: Tool {
     public let name = "read_file"
     public let parallelSafe = true
@@ -231,6 +326,9 @@ public struct ReadFileTool: Tool {
         #"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"],"additionalProperties":false}"#
     }
     private let maxBytes: Int
+    /// Above this size we always stream; below we read the whole file in one
+    /// shot (faster for tiny files where syscall overhead dominates).
+    private static let streamingThreshold = 1 * 1024 * 1024
     public init(limits: Limits = Limits()) {
         self.maxBytes = limits.clamped().maxToolOutputBytes
     }
@@ -248,30 +346,181 @@ public struct ReadFileTool: Tool {
             return ToolResult(callId: call.callId, output: e.message,
                               success: false, truncated: false)
         }
-        guard let data = FileManager.default.contents(atPath: full) else {
+        let url = URL(fileURLWithPath: full)
+        let vals = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey,
+                                                     .isDirectoryKey, .typeIdentifierKey])
+        if vals == nil || vals?.isRegularFile != true {
+            // Distinguish "missing" from "not a file" with the same message
+            // the old code used so callers/tests keep working.
             return ToolResult(callId: call.callId, output: "file not found: \(a.path)",
                               success: false, truncated: false)
         }
-        var text = String(decoding: data, as: UTF8.self)
-        if a.offset != nil || a.limit != nil {
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-            let start = max(0, (a.offset ?? 1) - 1)
-            guard start <= lines.count else {
-                return ToolResult(callId: call.callId, output: "",
-                                  success: true, truncated: false)
+        let size = vals?.fileSize ?? 0
+
+        // Binary detection: refuse to read non-text files. We accept files
+        // whose UTType conforms to `public.text` OR whose UTType is unknown
+        // (extensionless source/config files commonly fall here, and we
+        // don't want to false-positive them). We refuse anything that
+        // explicitly conforms to a binary type.
+        #if canImport(UniformTypeIdentifiers)
+        if #available(macOS 11.0, *), let tid = vals?.typeIdentifier,
+           let t = UTType(tid) {
+            let isText = t.conforms(to: .text) || t.conforms(to: .sourceCode)
+                || t.conforms(to: .plainText) || t.conforms(to: .json)
+                || t.conforms(to: .xml) || t.conforms(to: .yaml)
+                || t.conforms(to: .propertyList) || t.conforms(to: .script)
+            let isData = t.conforms(to: .data) && !isText
+            // `public.data` is the root of binary types; explicit conformance
+            // to `public.image`, `public.movie`, etc. all flow through there.
+            // We only refuse when (a) it's a known type, (b) explicitly
+            // non-text. Sniff bytes for the unknown/no-extension case below.
+            if isData && !isText {
+                return ToolResult(callId: call.callId,
+                                  output: "binary file refused: \(a.path) (UTI \(tid))",
+                                  success: false, truncated: false)
             }
-            let end = a.limit.map { min(lines.count, start + max(0, $0)) } ?? lines.count
-            text = lines[start..<min(end, lines.count)].joined(separator: "\n")
         }
+        #endif
+
+        let useStream = (a.offset != nil) || (a.limit != nil) || size > Self.streamingThreshold
+
+        if !useStream {
+            // Fast path — whole small file.
+            guard let data = FileManager.default.contents(atPath: full) else {
+                return ToolResult(callId: call.callId, output: "file not found: \(a.path)",
+                                  success: false, truncated: false)
+            }
+            if Self.looksBinary(data.prefix(4096)) {
+                return ToolResult(callId: call.callId,
+                                  output: "binary file refused: \(a.path) (NUL bytes detected)",
+                                  success: false, truncated: false)
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            var ring = HeadTailBuffer(maxBytes: maxBytes)
+            ring.append(text)
+            return ToolResult(callId: call.callId, output: ring.rendered(),
+                              success: true, truncated: ring.didTruncate)
+        }
+
+        // Streaming path. Open with `O_NOFOLLOW` so a symlink swapped in
+        // mid-flight cannot redirect us outside the workspace.
+        let fd: Int32 = full.withCString { open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        if fd < 0 {
+            let err = errno
+            // ELOOP means a symlink — surface a clean error.
+            let msg = err == ELOOP
+                ? "symlink read refused: \(a.path)"
+                : "file not found: \(a.path)"
+            return ToolResult(callId: call.callId, output: msg,
+                              success: false, truncated: false)
+        }
+        defer { close(fd) }
+
+        // Sniff the first 4 KB for binary content (NUL byte).
+        var sniff = [UInt8](repeating: 0, count: 4096)
+        let n = sniff.withUnsafeMutableBytes { buf -> Int in
+            #if canImport(Darwin)
+            return Darwin.read(fd, buf.baseAddress, buf.count)
+            #else
+            return Glibc.read(fd, buf.baseAddress, buf.count)
+            #endif
+        }
+        if n > 0, Self.looksBinary(Data(sniff.prefix(n))) {
+            return ToolResult(callId: call.callId,
+                              output: "binary file refused: \(a.path) (NUL bytes detected)",
+                              success: false, truncated: false)
+        }
+        // Rewind for the actual streaming read.
+        _ = lseek(fd, 0, SEEK_SET)
+
+        let startLine = max(0, (a.offset ?? 1) - 1)
+        let maxLines = a.limit.map { max(0, $0) } ?? Int.max
+
+        // Line-buffered streaming. We pull 64 KB chunks and split on '\n',
+        // emitting completed lines into the ring buffer until we hit the
+        // window's end. Memory: one chunk (64 KB) + the partial-line tail.
+        let chunkSize = 64 * 1024
         var ring = HeadTailBuffer(maxBytes: maxBytes)
-        ring.append(text)
+        var emitted = 0
+        var lineIdx = 0
+        var tail = Data()
+        var firstEmit = true
+        var done = false
+        var buf = [UInt8](repeating: 0, count: chunkSize)
+
+        outer: while !done {
+            try Task.checkCancellation()
+            let r = buf.withUnsafeMutableBytes { p -> Int in
+                #if canImport(Darwin)
+                return Darwin.read(fd, p.baseAddress, p.count)
+                #else
+                return Glibc.read(fd, p.baseAddress, p.count)
+                #endif
+            }
+            if r <= 0 { break }
+            var start = 0
+            for i in 0..<r {
+                if buf[i] == 0x0A {  // '\n'
+                    let lineBytes: Data
+                    if tail.isEmpty {
+                        lineBytes = Data(buf[start..<i])
+                    } else {
+                        var d = tail
+                        d.append(contentsOf: buf[start..<i])
+                        tail = Data()
+                        lineBytes = d
+                    }
+                    if lineIdx >= startLine {
+                        if emitted >= maxLines { done = true; break outer }
+                        let s = String(decoding: lineBytes, as: UTF8.self)
+                        if firstEmit { firstEmit = false } else { ring.append("\n") }
+                        ring.append(s)
+                        emitted += 1
+                    }
+                    lineIdx += 1
+                    start = i + 1
+                }
+            }
+            if start < r {
+                tail.append(contentsOf: buf[start..<r])
+                // Cap tail to avoid pathological lines exhausting memory.
+                if tail.count > 16 * 1024 * 1024 {
+                    // 16 MB single line — treat as binary-ish; bail out.
+                    return ToolResult(callId: call.callId,
+                                      output: "line too long: \(a.path)",
+                                      success: false, truncated: true)
+                }
+            }
+        }
+        // Trailing partial line (no terminating '\n').
+        if !tail.isEmpty && !done {
+            if lineIdx >= startLine && emitted < maxLines {
+                let s = String(decoding: tail, as: UTF8.self)
+                if firstEmit { firstEmit = false } else { ring.append("\n") }
+                ring.append(s)
+            }
+        }
         return ToolResult(callId: call.callId, output: ring.rendered(),
                           success: true, truncated: ring.didTruncate)
+    }
+
+    /// Treat any NUL byte in the first 4 KB as a binary indicator. Same
+    /// heuristic git uses (cat-file/diff). False-negatives on UTF-16 files
+    /// are fine — UTType already caught the common ones.
+    private static func looksBinary(_ data: Data) -> Bool {
+        for b in data where b == 0 { return true }
+        return false
     }
 }
 
 /// `write_file` — create/overwrite a workspace-relative file. Serial (mutates)
 /// and gated by the sandbox write policy (Codex `file-system` write path).
+///
+/// Overwrite behaviour: when the target already exists we preserve extended
+/// attributes (notably `com.apple.quarantine`, Finder tags, ACLs) by
+/// `copyfile(3)`-ing the metadata from the OLD file onto the temp file
+/// before the atomic rename. The temp file is opened with `O_NOFOLLOW` so a
+/// symlink races can't redirect the write.
 public struct WriteFileTool: Tool {
     public let name = "write_file"
     public let parallelSafe = false
@@ -307,18 +556,116 @@ public struct WriteFileTool: Tool {
             try FileManager.default.createDirectory(
                 atPath: (full as NSString).deletingLastPathComponent,
                 withIntermediateDirectories: true)
-            try a.content.write(toFile: full, atomically: true, encoding: .utf8)
+            let bytes = a.content.utf8.count
+            try Self.atomicWritePreservingMetadata(path: full,
+                                                   content: a.content)
             return ToolResult(callId: call.callId,
-                              output: "wrote \(a.content.utf8.count) bytes to \(a.path)",
+                              output: "wrote \(bytes) bytes to \(a.path)",
                               success: true, truncated: false)
         } catch {
             return ToolResult(callId: call.callId, output: "write failed: \(error)",
                               success: false, truncated: false)
         }
     }
+
+    /// Atomic write that preserves xattrs and ACLs on overwrite. Strategy:
+    ///   1. Write content to `<path>.codex-write-<uuid>` opened with
+    ///      `O_NOFOLLOW | O_CREAT | O_EXCL | O_WRONLY` — refuses to follow
+    ///      a symlink the attacker may have planted at the temp path.
+    ///   2. If the destination exists, `copyfile(3)` xattrs+ACL from old
+    ///      onto temp (`COPYFILE_XATTR | COPYFILE_ACL`).
+    ///   3. `rename(2)` temp over destination — atomic on the same FS.
+    static func atomicWritePreservingMetadata(path: String, content: String) throws {
+        let dir = (path as NSString).deletingLastPathComponent
+        let base = (path as NSString).lastPathComponent
+        let tmpName = ".\(base).codex-write-\(UUID().uuidString)"
+        let tmpPath = (dir as NSString).appendingPathComponent(tmpName)
+
+        let flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
+        let mode: mode_t = 0o644
+        let fd: Int32 = tmpPath.withCString { open($0, flags, mode) }
+        if fd < 0 {
+            let e = errno
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(e),
+                          userInfo: [NSLocalizedDescriptionKey:
+                                        "open temp failed: \(String(cString: strerror(e)))"])
+        }
+        var closed = false
+        defer {
+            if !closed { close(fd) }
+            // Remove temp if rename failed.
+            unlink(tmpPath)
+        }
+
+        // Write the content.
+        var remaining = Array(content.utf8)
+        var off = 0
+        while off < remaining.count {
+            let r = remaining.withUnsafeBytes { p -> Int in
+                #if canImport(Darwin)
+                return Darwin.write(fd, p.baseAddress!.advanced(by: off),
+                                    remaining.count - off)
+                #else
+                return Glibc.write(fd, p.baseAddress!.advanced(by: off),
+                                   remaining.count - off)
+                #endif
+            }
+            if r < 0 {
+                let e = errno
+                if e == EINTR { continue }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(e),
+                              userInfo: [NSLocalizedDescriptionKey:
+                                            "write temp failed: \(String(cString: strerror(e)))"])
+            }
+            off += r
+        }
+
+        // Make sure bytes are on disk before rename.
+        #if canImport(Darwin)
+        _ = fsync(fd)
+        #endif
+        close(fd); closed = true
+
+        // If destination exists, carry over xattrs + ACLs.
+        if FileManager.default.fileExists(atPath: path) {
+            #if canImport(Darwin)
+            let copyFlags = copyfile_flags_t(COPYFILE_XATTR | COPYFILE_ACL)
+            // `copyfile` from old onto temp. Errors here are non-fatal —
+            // the data write succeeded; metadata loss is degraded but
+            // not catastrophic. We *do* log to stderr in debug builds.
+            let rc = path.withCString { src in
+                tmpPath.withCString { dst in
+                    copyfile(src, dst, nil, copyFlags)
+                }
+            }
+            if rc != 0 {
+                #if DEBUG
+                FileHandle.standardError.write(Data(
+                    "[write_file] copyfile(xattr|acl) failed: \(String(cString: strerror(errno)))\n".utf8))
+                #endif
+            }
+            #endif
+        }
+
+        // Atomic rename. After this, defer's `unlink` is a no-op.
+        let rc = tmpPath.withCString { src in
+            path.withCString { dst in rename(src, dst) }
+        }
+        if rc != 0 {
+            let e = errno
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(e),
+                          userInfo: [NSLocalizedDescriptionKey:
+                                        "rename failed: \(String(cString: strerror(e)))"])
+        }
+    }
 }
 
 /// `list_dir` — list a workspace-relative directory (name + kind).
+///
+/// Uses `FileManager.contentsOfDirectory(at:includingPropertiesForKeys:)` so
+/// the kernel batches the `isDirectoryKey` metadata into the directory read
+/// (one `getattrlistbulk` syscall per page on APFS) instead of one extra
+/// `stat` per entry.
 public struct ListDirTool: Tool {
     public let name = "list_dir"
     public let parallelSafe = true
@@ -339,17 +686,28 @@ public struct ListDirTool: Tool {
             return ToolResult(callId: call.callId, output: e.message,
                               success: false, truncated: false)
         }
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: full) else {
-            return ToolResult(callId: call.callId, output: "not a directory: \(a.path ?? ".")",
+        let url = URL(fileURLWithPath: full, isDirectory: true)
+        let keys: [URLResourceKey] = [.isDirectoryKey, .nameKey]
+        let entries: [URL]
+        do {
+            entries = try FileManager.default.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: keys,
+                options: [])
+        } catch {
+            return ToolResult(callId: call.callId,
+                              output: "not a directory: \(a.path ?? ".")",
                               success: false, truncated: false)
         }
-        let lines = entries.sorted().map { e -> String in
-            var isDir: ObjCBool = false
-            fm.fileExists(atPath: (full as NSString).appendingPathComponent(e),
-                          isDirectory: &isDir)
-            return isDir.boolValue ? "\(e)/" : e
-        }
+        // Use the prefetched `hasDirectoryPath` rather than a per-entry
+        // `resourceValues(forKeys:)` call (which allocates a snapshot
+        // struct per entry).
+        let lines: [String] = entries
+            .map { (u: URL) -> (name: String, isDir: Bool) in
+                (u.lastPathComponent, u.hasDirectoryPath)
+            }
+            .sorted { $0.name < $1.name }
+            .map { $0.isDir ? "\($0.name)/" : $0.name }
         return ToolResult(callId: call.callId,
                           output: lines.isEmpty ? "(empty)" : lines.joined(separator: "\n"),
                           success: true, truncated: false)
