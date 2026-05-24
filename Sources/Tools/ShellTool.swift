@@ -278,7 +278,18 @@ public struct ShellTool: Tool {
 
         let launch: [String]
         if fullAccess {
-            launch = inner   // Codex /shell: explicit full-access escape hatch.
+            // Codex /shell: explicit full-access escape hatch. There is no
+            // sandbox to escape from in this mode, so PATH lookup is fine;
+            // we still wrap bare names through `/usr/bin/env` so PATH
+            // resolution happens in a well-known binary rather than relying
+            // on `posix_spawn`'s implicit PATH search (which Darwin does
+            // NOT perform — it requires an absolute exe). Without this
+            // wrapper a bare `python3` would fail with ENOENT.
+            if let exe = inner.first, !exe.hasPrefix("/") {
+                launch = ["/usr/bin/env"] + inner
+            } else {
+                launch = inner
+            }
         } else {
             switch sandbox.sandboxedInvocation(argv: inner, cwd: workDir) {
             case .run(let wrapped):
