@@ -3,6 +3,10 @@ import CSQLite
 import CSQLiteVec
 import InfraPrimitives
 
+#if canImport(Accelerate)
+import Accelerate
+#endif
+
 public enum MemoryStoreError: Error, Sendable, CustomStringConvertible {
     case open(String), exec(String), prepare(String), step(String), invalid(String)
     public var description: String {
@@ -90,6 +94,60 @@ public actor MemoryStore {
     private let config: MemoryStoreConfig
     /// True when sqlite-vec's vec0 virtual table is available on this build.
     nonisolated public let vecAvailable: Bool
+
+    // MARK: - batched cosine (vDSP_mmul fast path)
+
+    /// Compute `matrix · query` for `rowCount` row-major rows of `dim`-wide
+    /// vectors. The result is an array of length `rowCount` where entry `r`
+    /// is the dot product of row `r` and `query`. Used by the Swift-fallback
+    /// branch of `searchVectors` to score every chunk in a single
+    /// Accelerate matmul instead of one Swift loop per row.
+    ///
+    /// Pre-conditions: `query.count == dim`, `matrix.count == rowCount * dim`.
+    /// On Accelerate-capable platforms this is a single `vDSP_mmul` call. On
+    /// Linux / Windows we fall back to a tiled scalar loop that's still
+    /// considerably faster than the per-row `cosineDistance` path because
+    /// it avoids per-row `[Float]` allocation.
+    nonisolated public static func batchedDot(query: [Float],
+                                              matrix: [Float],
+                                              rowCount: Int,
+                                              dim: Int) -> [Float] {
+        precondition(query.count == dim,
+                     "batchedDot: query.count=\(query.count) dim=\(dim)")
+        precondition(matrix.count == rowCount * dim,
+                     "batchedDot: matrix.count=\(matrix.count) rowCount*dim=\(rowCount * dim)")
+        if rowCount == 0 { return [] }
+        var result = [Float](repeating: 0, count: rowCount)
+        #if canImport(Accelerate)
+        // matrix (rowCount × dim) · query (dim × 1) = result (rowCount × 1)
+        matrix.withUnsafeBufferPointer { mp in
+            query.withUnsafeBufferPointer { qp in
+                result.withUnsafeMutableBufferPointer { rp in
+                    vDSP_mmul(mp.baseAddress!, 1,
+                              qp.baseAddress!, 1,
+                              rp.baseAddress!, 1,
+                              vDSP_Length(rowCount),
+                              vDSP_Length(1),
+                              vDSP_Length(dim))
+                }
+            }
+        }
+        #else
+        matrix.withUnsafeBufferPointer { mp in
+            query.withUnsafeBufferPointer { qp in
+                for r in 0..<rowCount {
+                    var s: Float = 0
+                    let row = mp.baseAddress!.advanced(by: r * dim)
+                    for d in 0..<dim {
+                        s += row[d] * qp[d]
+                    }
+                    result[r] = s
+                }
+            }
+        }
+        #endif
+        return result
+    }
 
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 

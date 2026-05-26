@@ -141,8 +141,13 @@ struct CodexDaemon {
             exit(1)
         }
 
+        // codexd is a long-running, multi-session daemon. Env overlay
+        // is intentionally NOT applied here for the same reason as
+        // codex-broker — see comment there.
         let authManager = AuthManager(
-            store: TokenStoreFactory.production(codexHome: codexHome))
+            store: TokenStoreFactory.production(codexHome: codexHome),
+            apiKeyExchanger: CurlAPIKeyExchanger(),
+            revoker: CurlTokenRevoker())
         let useMock = ProcessInfo.processInfo.environment["CODEXKIT_MOCK"] == "1"
         let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
         let model: any ModelClient

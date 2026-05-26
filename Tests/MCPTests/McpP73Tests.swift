@@ -39,6 +39,15 @@ final class McpP73Tests: XCTestCase {
         // implicitly through Foundation in Swift).
         setenv("CODEX_API_KEY", "supersecret-MUST-NOT-LEAK", 1)
         defer { unsetenv("CODEX_API_KEY") }
+        // Mutating the process-wide PATH leaks across tests; restore
+        // whatever we inherited on the way out so later tests
+        // (e.g. ShellToolTests' `sleep`-based timeout test, SpawnWorkerTests)
+        // can still resolve `/bin/sleep` etc.
+        let originalPATH = ProcessInfo.processInfo.environment["PATH"]
+        defer {
+            if let p = originalPATH { setenv("PATH", p, 1) }
+            else { unsetenv("PATH") }
+        }
         setenv("PATH", "/usr/bin:/bin", 1)
 
         let cfg = McpServerConfig(name: "x", command: "echo", args: [])
@@ -79,6 +88,15 @@ final class McpP73Tests: XCTestCase {
     /// Literal `env = { K = "v" }` overrides must win over the
     /// allowlist (upstream `.envs(envs)` is chained after the allowlist).
     func testBuildStdioEnvironmentLiteralOverrideWins() {
+        // Mutating the process-wide PATH leaks across tests. Restore
+        // afterwards — without this, later tests inherit a PATH of
+        // just `/usr/bin` and `sleep` (which lives at `/bin/sleep` on
+        // macOS) becomes unresolvable.
+        let originalPATH = ProcessInfo.processInfo.environment["PATH"]
+        defer {
+            if let p = originalPATH { setenv("PATH", p, 1) }
+            else { unsetenv("PATH") }
+        }
         setenv("PATH", "/usr/bin", 1)
         var cfg = McpServerConfig(name: "x", command: "echo")
         cfg.env = ["PATH": "/custom/path", "EXTRA": "ok"]

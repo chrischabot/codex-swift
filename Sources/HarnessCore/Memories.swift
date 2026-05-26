@@ -21,6 +21,10 @@ public actor MemoryStore {
     /// Model name used for consolidation calls. Defaults to the upstream
     /// memories model id. Overridable for tests.
     public var consolidationModel: String
+    /// FTS5-backed prefilter for `searchStructured`. Lazily constructed on
+    /// first call so we don't open a SQLite handle in stores that never
+    /// search. Falls back to the legacy full scan on any I/O error.
+    private var ftsIndex: MemoriesFTSIndex?
 
     public init(codexHome: String,
                 modelClient: (any ModelClient)? = nil,
@@ -156,11 +160,44 @@ public actor MemoryStore {
         }
         // Collect candidate files (sorted), optionally scoped under scopePath.
         let scopeRel = scopePath?.trimmingCharacters(in: .init(charactersIn: "/"))
-        let candidates: [String]
+        let baseList: [String]
         if let s = scopeRel, !s.isEmpty {
-            candidates = list().filter { $0.hasPrefix(s + "/") || $0 == s }
+            baseList = list().filter { $0.hasPrefix(s + "/") || $0 == s }
         } else {
-            candidates = list()
+            baseList = list()
+        }
+        // FTS5 prefilter: feed the bag of query terms to the index and use
+        // its candidate set as the search list when available. The
+        // prefilter only narrows; we still apply the exact line-level
+        // match logic on its output. If the index can't be opened (read-
+        // only fs, etc.) `candidates` returns nil and we fall back to the
+        // full scan below.
+        //
+        // CRITICAL: FTS5's `unicode61` tokenizer treats `-` / `.` / `:` as
+        // separators (so `magic-foo` indexes as `magic` + `foo`). When the
+        // caller asks for `normalized` matching (strip non-alphanumerics
+        // before comparison), the line scan can match queries that the
+        // FTS5 tokenizer's bag-of-words cannot — so the prefilter would
+        // drop true matches. Same caveat for the within-token negative
+        // queries the FTS5 tokenizer might split differently. Bypass the
+        // prefilter entirely in those cases and fall through to the full
+        // scan rather than silently shrinking the candidate set.
+        let canUsePrefilter = !normalized
+        let candidates: [String]
+        if canUsePrefilter {
+            if ftsIndex == nil { ftsIndex = MemoriesFTSIndex(memDir: dir) }
+            let prefiltered = ftsIndex?
+                .candidates(forTerms: queries, scopePath: scopeRel)
+            if let prefiltered {
+                // Intersect with the lexical scope list to preserve scope
+                // semantics — the FTS index doesn't know about scope filters.
+                let baseSet = Set(baseList)
+                candidates = prefiltered.filter { baseSet.contains($0) }.sorted()
+            } else {
+                candidates = baseList
+            }
+        } else {
+            candidates = baseList
         }
         var allMatches: [StructuredMatch] = []
         for name in candidates {

@@ -375,6 +375,76 @@ final class FileToolsSevereTests: XCTestCase {
 
     // MARK: - write_file xattr preservation
 
+    // MARK: - F1: fast-path read_file refuses symlinks
+
+    func testReadFileFastPathRefusesSymlink() async throws {
+        let root = tmpRoot("nofollow-fast")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        // Real file outside workspace.
+        let outside = NSTemporaryDirectory() + "secret-\(UUID().uuidString)"
+        try "stolen".write(toFile: outside, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(atPath: outside) }
+        // Symlink inside workspace → outside file. (Within the workspace
+        // the symlink itself is allowed by ToolPath.assertContained when
+        // the LINK target is also under root — but here it's outside, so
+        // the lexical check already rejects this case. We additionally
+        // assert the fast-path open(2) layer refuses to follow even when
+        // a symlink slips past the lexical guard via a race or a
+        // mistaken root resolution.)
+        let linkPath = root + "/leak.txt"
+        try FileManager.default.createSymbolicLink(
+            atPath: linkPath, withDestinationPath: outside)
+        let tool = ReadFileTool(limits: Limits())
+        let r = try await tool.run(
+            ToolCall(callId: "1", name: "read_file",
+                     argumentsJSON: #"{"path":"leak.txt"}"#),
+            cwd: root)
+        XCTAssertFalse(r.success,
+                       "read_file must refuse a symlink that points outside the workspace")
+        // Either the lexical check or O_NOFOLLOW catches it; we only
+        // assert the read did NOT return the outside file's contents.
+        XCTAssertFalse(r.output.contains("stolen"),
+                       "fast path leaked the symlink target's contents")
+    }
+
+    func testReadFileFastPathStillReadsRegularFile() async throws {
+        let root = tmpRoot("nofollow-regular")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        // Regression: the F1 fast-path change must not break ordinary
+        // small-file reads. Without offset/limit and below 1 MiB this
+        // path now uses open(O_NOFOLLOW) instead of FileManager.contents.
+        let path = root + "/hello.txt"
+        try "hello world".write(toFile: path, atomically: true, encoding: .utf8)
+        let r = try await ReadFileTool(limits: Limits()).run(
+            ToolCall(callId: "1", name: "read_file",
+                     argumentsJSON: #"{"path":"hello.txt"}"#),
+            cwd: root)
+        XCTAssertTrue(r.success, "fast-path read regressed: \(r.output)")
+        XCTAssertEqual(r.output, "hello world")
+    }
+
+    // MARK: - F2: write_file surfaces metadata-loss outcome
+
+    func testWriteFileReportsMetadataPreservationOnOverwrite() throws {
+        let root = tmpRoot("xattr-msg")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let path = "\(root)/doc.txt"
+        try "v1".write(toFile: path, atomically: true, encoding: .utf8)
+        let outcome = try WriteFileTool.atomicWritePreservingMetadata(
+            path: path, content: "v2")
+        XCTAssertEqual(outcome, .metadataPreserved,
+                       "overwrite of an existing file with no xattrs should report metadataPreserved")
+    }
+
+    func testWriteFileReportsFreshFileWhenNoPriorTarget() throws {
+        let root = tmpRoot("xattr-fresh")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let outcome = try WriteFileTool.atomicWritePreservingMetadata(
+            path: "\(root)/new.txt", content: "fresh")
+        XCTAssertEqual(outcome, .freshFile,
+                       "new file creation has nothing to preserve")
+    }
+
     func testWriteFilePreservesQuarantineXattrOnOverwrite() throws {
         let root = tmpRoot("xattr")
         defer { try? FileManager.default.removeItem(atPath: root) }

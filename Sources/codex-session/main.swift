@@ -130,7 +130,10 @@ struct SessionWorkerMain {
                                   tokenType: "BearerExternal",
                                   expiresAtUnix: 4_102_444_800,
                                   accountId: accountId)
-            })
+            },
+            apiKeyExchanger: CurlAPIKeyExchanger(),
+            revoker: CurlTokenRevoker(),
+            env: ProcessInfo.processInfo.environment)
         let useMock = env["CODEXKIT_MOCK"] == "1"
         let apiKey = env["OPENAI_API_KEY"]
         let model: any ModelClient

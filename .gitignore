@@ -28,10 +28,17 @@ build/
 *.swp
 *.iml
 
+# Python/tool caches
+__pycache__/
+*.py[cod]
+
 # Test/runtime artifacts
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
 *.rollout.jsonl
 *.log
 *.tmp
@@ -41,6 +48,9 @@ codex-home-test/
 # Local Codex state (never commit user data)
 .codex/
 codex_home/
+.claude/
+.maestro/
+.playwright-mcp/
 
 # Local environment
 .env
@@ -50,6 +60,12 @@ codex_home/
 calc_0.py
 scratch/
 tmp/
+catscan-output/
+crm-build/
+flightdeck/
+crm-turn-*.png
+crm-build.tar.gz
+flightdeck.tar.gz
 
 # Code signing / notarization secrets
 *.p12

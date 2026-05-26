@@ -546,4 +546,54 @@ final class MemoryToolsTests: XCTestCase {
         XCTAssertEqual(parsed.rolloutSummary, "sum")
         XCTAssertEqual(parsed.rolloutSlug, "slug")
     }
+
+    // MARK: - FTS5 prefilter
+
+    /// Prove the FTS5 prefilter narrows the candidate set rather than
+    /// silently degrading to the full scan. We seed two files; only one
+    /// contains the query term. The prefilter must return just that one
+    /// candidate.
+    func testMemoriesFTSIndexNarrowsCandidateSet() throws {
+        let home = NSTemporaryDirectory() + "memfts-" + UUID().uuidString
+        try FileManager.default.createDirectory(
+            atPath: home + "/memories", withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try "alpha bravo charlie".write(
+            toFile: home + "/memories/a.md", atomically: true, encoding: .utf8)
+        try "delta echo foxtrot".write(
+            toFile: home + "/memories/b.md", atomically: true, encoding: .utf8)
+
+        let idx = MemoriesFTSIndex(memDir: home + "/memories")
+        let cands = idx.candidates(forTerms: ["bravo"], scopePath: nil)
+        XCTAssertNotNil(cands, "FTS index must engage (not degrade to full-scan nil)")
+        XCTAssertEqual(cands, ["a.md"],
+                       "prefilter must return only files containing the term")
+
+        let noMatch = idx.candidates(forTerms: ["zzznomatch"], scopePath: nil)
+        XCTAssertEqual(noMatch, [],
+                       "empty match set must be `[]`, not nil (nil means 'fall back to full scan')")
+    }
+
+    /// End-to-end: with the prefilter wired into searchStructured, a search
+    /// for a term that exists in only one file must return that file (and
+    /// the prefilter must not have hidden the match by mistake).
+    func testMemoriesSearchUsesFTSPrefilterEndToEnd() async throws {
+        let (mem, home) = try makeMemoryStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try "alpha bravo charlie".write(
+            toFile: home + "/memories/a.md", atomically: true, encoding: .utf8)
+        try "delta echo foxtrot".write(
+            toFile: home + "/memories/b.md", atomically: true, encoding: .utf8)
+        let tool = MemoriesSearchTool(store: mem)
+        let r = try await tool.run(
+            ToolCall(callId: "c", name: "memories_search",
+                     argumentsJSON: #"{"queries":["bravo"]}"#),
+            cwd: "/")
+        guard let d = r.output.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let items = obj["items"] as? [String] else {
+            return XCTFail("expected items[] in result")
+        }
+        XCTAssertEqual(items, ["a.md"])
+    }
 }

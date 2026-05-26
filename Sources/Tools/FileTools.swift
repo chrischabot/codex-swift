@@ -12,6 +12,23 @@ import UniformTypeIdentifiers
 /// surface is workspace-relative; the kernel sandbox is an additional, not
 /// the only, boundary (defense in depth, Codex parity).
 enum ToolPath {
+    /// `realpath(3)` wrapper. On macOS this is the only reliable way to
+    /// canonicalize a path: Foundation's URL APIs
+    /// (`resolvingSymlinksInPath`, `standardizedFileURL`,
+    /// `NSString.standardizingPath`) do NOT follow the `/var ↔ /private/var`
+    /// firmlink, but the kernel-emitted paths from
+    /// `FileManager.enumerator(at:)` and friends do — every workspace
+    /// rooted under `NSTemporaryDirectory()` (which is `/var/folders/...`)
+    /// would mismatch otherwise. Returns `nil` for paths that don't
+    /// resolve (typically: don't exist yet).
+    static func canonicalize(_ path: String) -> String? {
+        path.withCString { cstr -> String? in
+            guard let resolved = realpath(cstr, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+    }
+
     static func resolve(_ rel: String, under root: String) throws -> String {
         if rel.hasPrefix("/") { throw ToolError(message: "absolute path not allowed: \(rel)") }
         let comps = rel.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
@@ -158,12 +175,12 @@ public struct FileSearchTool: Tool {
         // Substring tests: avoid building a `String` round-trip by scanning
         // the cached lowercase character array.
         if !ql.isEmpty {
-            let inBase = containsSubsequence(haystack: lower,
+            let inBase = containsSubstring(haystack: lower,
                                               start: basenameStart,
                                               needle: ql)
             if inBase {
                 score += 1000
-            } else if containsSubsequence(haystack: lower, start: 0, needle: ql) {
+            } else if containsSubstring(haystack: lower, start: 0, needle: ql) {
                 score += 400
             }
         }
@@ -194,11 +211,12 @@ public struct FileSearchTool: Tool {
         return score
     }
 
-    /// Substring scan over a `[Character]` slice from a start index — avoids
-    /// the `String.contains(String)` round-trip and its UTF-16/grapheme
-    /// machinery (we already canonicalised to lowercase ASCII-ish characters
-    /// for ranking; lossy on locales that's parity with the original).
-    private static func containsSubsequence(haystack: [Character],
+    /// Contiguous substring scan over a `[Character]` slice from a start
+    /// index — avoids the `String.contains(String)` round-trip and its
+    /// UTF-16/grapheme machinery (we already canonicalised to lowercase
+    /// ASCII-ish characters for ranking; lossy on locales is parity with
+    /// the original).
+    private static func containsSubstring(haystack: [Character],
                                             start: Int,
                                             needle: [Character]) -> Bool {
         let n = haystack.count - start
@@ -223,11 +241,19 @@ public struct FileSearchTool: Tool {
         }
         let limit = max(1, min(a.limit ?? defaultLimit, 500))
         let rootStd = (cwd as NSString).standardizingPath
-        let realRoot = URL(fileURLWithPath: rootStd)
-            .resolvingSymlinksInPath().standardizedFileURL.path
+        // Canonicalize the workspace root using realpath(3). Foundation's
+        // URL canonicalization (`resolvingSymlinksInPath` /
+        // `standardizedFileURL`) does NOT follow the `/var → /private/var`
+        // firmlink on macOS, but the kernel-emitted URLs from
+        // `FileManager.enumerator(at:)` do. The mismatch made every
+        // file_search hit fail the prefix check below — so we use the
+        // canonical form everywhere from here on. (`realpath` resolves
+        // every symlink, the firmlink, and any `..` components in one
+        // syscall.)
+        let realRoot = ToolPath.canonicalize(rootStd) ?? rootStd
         // Single up-front containment check; the enumerator never follows
         // directory symlinks for `enumerator(at:)`, so every entry it yields
-        // lives under `rootStd` and (by realpath) under `realRoot`.
+        // lives under the canonical root.
         do { try ToolPath.assertContained(root: realRoot, target: rootStd) }
         catch let e as ToolError {
             return ToolResult(callId: call.callId, output: e.message,
@@ -237,7 +263,9 @@ public struct FileSearchTool: Tool {
                               success: false, truncated: false)
         }
 
-        let rootURL = URL(fileURLWithPath: rootStd, isDirectory: true)
+        // Use the canonical form for the enumerator so its URLs and our
+        // prefix checks agree.
+        let rootURL = URL(fileURLWithPath: realRoot, isDirectory: true)
         // Prefetch `isDirectoryKey` so the enumerator drives a single
         // batched `getattrlistbulk` per page on APFS and so `url.hasDirectoryPath`
         // returns the kernel-known value (no extra `stat`).
@@ -256,7 +284,7 @@ public struct FileSearchTool: Tool {
 
         var results: [(path: String, score: Int)] = []
         var visited = 0
-        let rootPrefix = rootStd.hasSuffix("/") ? rootStd : rootStd + "/"
+        let rootPrefix = realRoot.hasSuffix("/") ? realRoot : realRoot + "/"
 
         while let any = enumerator.nextObject() {
             // Cancellation: cheap per-iteration check. With `Task.isCancelled`
@@ -266,11 +294,19 @@ public struct FileSearchTool: Tool {
             guard let url = any as? URL else { continue }
             visited += 1
 
-            // `URL.hasDirectoryPath` is populated from the prefetched
-            // metadata — no extra syscall. We avoid `resourceValues(...)`
-            // entirely (which would allocate a `URLResourceValues` snapshot
-            // per entry, ~25% of the walk time on a 50k tree).
-            if url.hasDirectoryPath {
+            // Pull just `isDirectory` — `resourceValues(forKeys:)` reads
+            // from the URL's cache (populated by the enumerator's
+            // prefetch) so this is O(1) and does not syscall. We don't
+            // rely on `url.hasDirectoryPath` because Foundation's
+            // `FileManager.enumerator(at:)` does not consistently set
+            // the trailing slash on yielded URLs across SDK versions
+            // (some return `file:///root/sub` without a trailing slash
+            // for directories, which broke `hasDirectoryPath`-based
+            // routing in practice — testFileSearchRanksAndSkipsHeavyDirs
+            // would then treat `src/` as a file and never descend into it).
+            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?
+                .isDirectory ?? false
+            if isDir {
                 let name = url.lastPathComponent
                 if Self.skipDirs.contains(name) {
                     enumerator.skipDescendants()
@@ -288,8 +324,8 @@ public struct FileSearchTool: Tool {
             // symlinks by default, so every entry below is guaranteed
             // to live under the same on-disk root.
             let abs = url.path
-            guard abs == rootStd || abs.hasPrefix(rootPrefix) else { continue }
-            let rel = String(abs.dropFirst(rootStd.count).drop(while: { $0 == "/" }))
+            guard abs == realRoot || abs.hasPrefix(rootPrefix) else { continue }
+            let rel = String(abs.dropFirst(realRoot.count).drop(while: { $0 == "/" }))
             if let s = Self.score(a.query, rel) {
                 results.append((rel, s))
             }
@@ -385,10 +421,39 @@ public struct ReadFileTool: Tool {
         let useStream = (a.offset != nil) || (a.limit != nil) || size > Self.streamingThreshold
 
         if !useStream {
-            // Fast path — whole small file.
-            guard let data = FileManager.default.contents(atPath: full) else {
-                return ToolResult(callId: call.callId, output: "file not found: \(a.path)",
+            // Fast path — whole small file. Use `O_NOFOLLOW` so a symlink
+            // swapped in mid-flight (or a within-workspace symlink that
+            // points outside but somehow eluded `assertContained`) cannot
+            // be read. Brings the fast path into parity with the
+            // streaming path below.
+            let fd: Int32 = full.withCString { open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+            if fd < 0 {
+                let err = errno
+                let msg = err == ELOOP
+                    ? "symlink read refused: \(a.path)"
+                    : "file not found: \(a.path)"
+                return ToolResult(callId: call.callId, output: msg,
                                   success: false, truncated: false)
+            }
+            defer { close(fd) }
+            var data = Data()
+            data.reserveCapacity(max(size, 0))
+            var buf = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                let r = buf.withUnsafeMutableBytes { p -> Int in
+                    #if canImport(Darwin)
+                    return Darwin.read(fd, p.baseAddress, p.count)
+                    #else
+                    return Glibc.read(fd, p.baseAddress, p.count)
+                    #endif
+                }
+                if r == 0 { break }
+                if r < 0 {
+                    return ToolResult(callId: call.callId,
+                                      output: "file not found: \(a.path)",
+                                      success: false, truncated: false)
+                }
+                data.append(buf, count: r)
             }
             if Self.looksBinary(data.prefix(4096)) {
                 return ToolResult(callId: call.callId,
@@ -557,15 +622,34 @@ public struct WriteFileTool: Tool {
                 atPath: (full as NSString).deletingLastPathComponent,
                 withIntermediateDirectories: true)
             let bytes = a.content.utf8.count
-            try Self.atomicWritePreservingMetadata(path: full,
-                                                   content: a.content)
-            return ToolResult(callId: call.callId,
-                              output: "wrote \(bytes) bytes to \(a.path)",
+            let outcome = try Self.atomicWritePreservingMetadata(
+                path: full, content: a.content)
+            // F2: surface metadata-preservation outcome to the caller so
+            // a release-build user doesn't silently lose xattrs/ACLs.
+            var msg = "wrote \(bytes) bytes to \(a.path)"
+            switch outcome {
+            case .freshFile:
+                break
+            case .metadataPreserved:
+                break
+            case .metadataLost(let reason):
+                msg += " (metadata loss: \(reason))"
+            }
+            return ToolResult(callId: call.callId, output: msg,
                               success: true, truncated: false)
         } catch {
             return ToolResult(callId: call.callId, output: "write failed: \(error)",
                               success: false, truncated: false)
         }
+    }
+
+    /// Outcome of `atomicWritePreservingMetadata`. The data write always
+    /// succeeded by the time this is returned; the cases distinguish
+    /// whether (and how) the on-disk xattr/ACL inheritance behaved.
+    enum WriteOutcome: Equatable {
+        case freshFile                       // no prior file to inherit from
+        case metadataPreserved               // copyfile succeeded
+        case metadataLost(reason: String)    // copyfile returned non-zero
     }
 
     /// Atomic write that preserves xattrs and ACLs on overwrite. Strategy:
@@ -575,7 +659,10 @@ public struct WriteFileTool: Tool {
     ///   2. If the destination exists, `copyfile(3)` xattrs+ACL from old
     ///      onto temp (`COPYFILE_XATTR | COPYFILE_ACL`).
     ///   3. `rename(2)` temp over destination — atomic on the same FS.
-    static func atomicWritePreservingMetadata(path: String, content: String) throws {
+    @discardableResult
+    static func atomicWritePreservingMetadata(path: String,
+                                              content: String) throws
+        -> WriteOutcome {
         let dir = (path as NSString).deletingLastPathComponent
         let base = (path as NSString).lastPathComponent
         let tmpName = ".\(base).codex-write-\(UUID().uuidString)"
@@ -627,23 +714,34 @@ public struct WriteFileTool: Tool {
         close(fd); closed = true
 
         // If destination exists, carry over xattrs + ACLs.
+        var outcome: WriteOutcome = .freshFile
         if FileManager.default.fileExists(atPath: path) {
             #if canImport(Darwin)
             let copyFlags = copyfile_flags_t(COPYFILE_XATTR | COPYFILE_ACL)
             // `copyfile` from old onto temp. Errors here are non-fatal —
             // the data write succeeded; metadata loss is degraded but
-            // not catastrophic. We *do* log to stderr in debug builds.
+            // not catastrophic. We surface the failure to the caller so
+            // the user sees it in the write_file output (F2 fix).
             let rc = path.withCString { src in
                 tmpPath.withCString { dst in
                     copyfile(src, dst, nil, copyFlags)
                 }
             }
             if rc != 0 {
+                let reason = String(cString: strerror(errno))
+                outcome = .metadataLost(reason: reason)
                 #if DEBUG
                 FileHandle.standardError.write(Data(
-                    "[write_file] copyfile(xattr|acl) failed: \(String(cString: strerror(errno)))\n".utf8))
+                    "[write_file] copyfile(xattr|acl) failed: \(reason)\n".utf8))
                 #endif
+            } else {
+                outcome = .metadataPreserved
             }
+            #else
+            // No copyfile on Linux. We don't claim to preserve metadata
+            // on non-Darwin; surface that to avoid quiet "did it work?"
+            // questions on Linux test runs.
+            outcome = .metadataLost(reason: "xattr/ACL preservation not supported on this platform")
             #endif
         }
 
@@ -657,6 +755,7 @@ public struct WriteFileTool: Tool {
                           userInfo: [NSLocalizedDescriptionKey:
                                         "rename failed: \(String(cString: strerror(e)))"])
         }
+        return outcome
     }
 }
 
@@ -699,12 +798,17 @@ public struct ListDirTool: Tool {
                               output: "not a directory: \(a.path ?? ".")",
                               success: false, truncated: false)
         }
-        // Use the prefetched `hasDirectoryPath` rather than a per-entry
-        // `resourceValues(forKeys:)` call (which allocates a snapshot
-        // struct per entry).
+        // `resourceValues(forKeys:)` returns from the URL's cache because
+        // we prefetched `.isDirectoryKey` via `includingPropertiesForKeys`
+        // — O(1) per entry, no syscall. We don't use `URL.hasDirectoryPath`
+        // because Foundation's `contentsOfDirectory(at:…)` does not
+        // reliably set the trailing slash on the returned URLs across SDK
+        // versions.
         let lines: [String] = entries
             .map { (u: URL) -> (name: String, isDir: Bool) in
-                (u.lastPathComponent, u.hasDirectoryPath)
+                let isDir = (try? u.resourceValues(forKeys: [.isDirectoryKey]))?
+                    .isDirectory ?? false
+                return (u.lastPathComponent, isDir)
             }
             .sorted { $0.name < $1.name }
             .map { $0.isDir ? "\($0.name)/" : $0.name }

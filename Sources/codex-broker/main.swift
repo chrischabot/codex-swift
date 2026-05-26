@@ -55,8 +55,14 @@ struct BrokerMain {
         let service = BrokerService(
             catalogTTL: .seconds(60),
             durableAuthPath: ProcessInfo.processInfo.environment["CODEX_BROKER_AUTH_STORE"])
+        // codex-broker is a long-running, multi-session daemon. Env
+        // overlay (OPENAI_API_KEY / CODEX_API_KEY) is intentionally NOT
+        // applied here — it would let one client's invocation env
+        // shadow stored credentials for every other connected session.
         let auth = AuthManager(
-            store: TokenStoreFactory.production(codexHome: codexHome))
+            store: TokenStoreFactory.production(codexHome: codexHome),
+            apiKeyExchanger: CurlAPIKeyExchanger(),
+            revoker: CurlTokenRevoker())
         if let listen = listenURL() {
             do {
                 let path = try unixPath(from: listen)

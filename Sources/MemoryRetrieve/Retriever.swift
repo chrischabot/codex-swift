@@ -61,14 +61,25 @@ public actor MemoryRetriever {
     private let store: MemoryStore
     private let inference: any LocalInferenceProvider
     private let config: Config
+    private let embedCache: QueryEmbeddingCache
 
     public init(store: MemoryStore,
                 inference: any LocalInferenceProvider,
-                config: Config = Config()) {
+                config: Config = Config(),
+                embedCacheCapacity: Int = 128,
+                embedCacheModelId: String = "default") {
         self.store = store
         self.inference = inference
         self.config = config
+        self.embedCache = QueryEmbeddingCache(capacity: embedCacheCapacity,
+                                              modelId: embedCacheModelId)
     }
+
+    // MARK: - embed-cache surface (used by tests; also exposed to callers
+    //         that want to invalidate after a model swap)
+    public nonisolated var embedCacheHitCount: Int { embedCache.hitCount }
+    public nonisolated var embedCacheMissCount: Int { embedCache.missCount }
+    public nonisolated func invalidateEmbedCache() { embedCache.invalidateAll() }
 
     /// Run the full pipeline. `rerank` defaults to true; tests and the
     /// `ask_local_brain` MCP tool can flip it off to skip the cross-encoder.
@@ -135,10 +146,17 @@ public actor MemoryRetriever {
     }
 
     func vecTopHits(_ query: String) async throws -> [VectorHit] {
-        let embeddings = try await inference.embed(
-            [query], deadline: .fromNow(config.embedDeadline))
-        guard let q = embeddings.first else { return [] }
-        return try await store.searchVectorValues(q.values, k: config.vecTopK)
+        let values: [Float]
+        if let cached = embedCache.get(query) {
+            values = cached
+        } else {
+            let embeddings = try await inference.embed(
+                [query], deadline: .fromNow(config.embedDeadline))
+            guard let q = embeddings.first else { return [] }
+            values = q.values
+            embedCache.put(query, values)
+        }
+        return try await store.searchVectorValues(values, k: config.vecTopK)
     }
 
     static func snippet(from text: String, query: String, max: Int = 280) -> String {

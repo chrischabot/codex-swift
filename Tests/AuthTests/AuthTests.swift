@@ -387,4 +387,332 @@ final class AuthTests: XCTestCase {
         XCTAssertEqual("\(AuthError.notAuthenticated)", "auth: not authenticated")
         XCTAssertTrue("\(AuthError.transport("x"))".contains("transport"))
     }
+
+    // MARK: - A1: loginFinish mints OPENAI_API_KEY from id_token
+
+    func testLoginFinishMintsAPIKeyFromIdTokenWhenExchangerWired() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        let ex = MockExchanger(
+            exchange: { _, _ in .success(AuthTokens(
+                accessToken: "AT", refreshToken: "RT",
+                idToken: "header.payload.sig",
+                expiresAtUnix: 9_999_999_999,
+                accountId: "acct_42")) },
+            refresh: { _ in .failure(.server("unused")) })
+        let key = MockAPIKeyExchanger(result: .success("sk-minted-from-id-token"))
+        let mgr = AuthManager(store: store, exchanger: ex,
+                              apiKeyExchanger: key, now: { 1000 })
+        let start = await mgr.loginStart(rng: { n in (0..<n).map { UInt8($0 % 256) } })
+        let r = await mgr.loginFinish(code: "abc", state: start.state)
+        guard case .success = r else { return XCTFail("login failed: \(r)") }
+        let count = await key.count
+        XCTAssertEqual(count, 1,
+                       "loginFinish must invoke exchangeForAPIKey when id_token present")
+        let lastID = await key.lastIDToken
+        XCTAssertEqual(lastID, "header.payload.sig")
+    }
+
+    func testLoginFinishSkipsAPIKeyExchangeWhenNoIdToken() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let ex = MockExchanger(
+            exchange: { _, _ in .success(AuthTokens(
+                accessToken: "AT", refreshToken: "RT", idToken: nil,
+                expiresAtUnix: 9_999_999_999, accountId: "acct_42")) },
+            refresh: { _ in .failure(.server("unused")) })
+        let key = MockAPIKeyExchanger(result: .success("sk-should-not-fire"))
+        let mgr = AuthManager(store: FileTokenStore(codexHome: home),
+                              exchanger: ex, apiKeyExchanger: key)
+        let start = await mgr.loginStart()
+        _ = await mgr.loginFinish(code: "abc", state: start.state)
+        let count = await key.count
+        XCTAssertEqual(count, 0,
+                       "no id_token → no token-exchange call")
+    }
+
+    func testLoginFinishTreatsAPIKeyExchangeFailureAsNonFatal() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        let ex = MockExchanger(
+            exchange: { _, _ in .success(AuthTokens(
+                accessToken: "AT", refreshToken: "RT", idToken: "id.tok.en",
+                expiresAtUnix: 9_999_999_999, accountId: "acct_42")) },
+            refresh: { _ in .failure(.server("unused")) })
+        let key = MockAPIKeyExchanger(result: .failure(.server("plan tier lacks API access")))
+        let mgr = AuthManager(store: store, exchanger: ex, apiKeyExchanger: key)
+        let start = await mgr.loginStart()
+        let r = await mgr.loginFinish(code: "abc", state: start.state)
+        guard case .success(let info) = r else {
+            return XCTFail("ChatGPT login must still succeed when API-key mint fails: \(r)")
+        }
+        XCTAssertTrue(info.authenticated)
+        XCTAssertEqual(store.load()?.accessToken, "AT",
+                       "ChatGPT bearer is still persisted")
+    }
+
+    // MARK: - A2: revoke on logout / re-login
+
+    func testLogoutRevokesPreviousRefreshTokenWhenWired() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "ax", refreshToken: "rx",
+                                  expiresAtUnix: 9_999_999_999,
+                                  accountId: "acct"))
+        let rev = MockRevoker()
+        let mgr = AuthManager(store: store, revoker: rev)
+        try await mgr.logout()
+        let calls = await rev.calls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.token, "rx")
+        XCTAssertEqual(calls.first?.hint, .refreshToken)
+        XCTAssertNil(store.load(), "local clear still happens after revoke")
+    }
+
+    func testLogoutWithNoRevokerWiredIsSilent() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "ax", refreshToken: "rx",
+                                  expiresAtUnix: 9_999_999_999,
+                                  accountId: "acct"))
+        let mgr = AuthManager(store: store, revoker: nil)
+        try await mgr.logout()
+        XCTAssertNil(store.load())
+    }
+
+    func testReloginRevokesSupersededCredential() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "OLD", refreshToken: "OLD-RT",
+                                  expiresAtUnix: 9_999_999_999,
+                                  accountId: "acct"))
+        let rev = MockRevoker()
+        let mgr = AuthManager(store: store, revoker: rev)
+        try await mgr.loginWithAPIKey("sk-replacement")
+        let calls = await rev.calls
+        XCTAssertEqual(calls.count, 1, "old refresh token revoked")
+        XCTAssertEqual(calls.first?.token, "OLD-RT")
+        XCTAssertEqual(store.load()?.accessToken, "sk-replacement")
+    }
+
+    func testRevocationFailureDoesNotBreakLogout() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "a", refreshToken: "r",
+                                  expiresAtUnix: 9_999_999_999, accountId: "x"))
+        let rev = MockRevoker(throwing: AuthError.transport("network down"))
+        let mgr = AuthManager(store: store, revoker: rev)
+        try await mgr.logout()  // must not throw
+        XCTAssertNil(store.load(),
+                     "logout proceeds with local clear even if revoke fails")
+    }
+
+    // MARK: - A3 / A4: refresh failure classification + always-mark
+
+    func testValidAccessTokenRecordsClassifiedReasonOn401() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        let stored = AuthTokens(accessToken: "OLD", refreshToken: "RT0",
+                                expiresAtUnix: 1000, accountId: "acct_x")
+        try store.save(stored)
+        let ex = MockExchanger(
+            exchange: { _, _ in .failure(.server("unused")) },
+            refresh: { _ in .failure(.refreshFailed(
+                reason: .expired,
+                underlying: #"{"error":{"code":"refresh_token_expired"}}"#)) })
+        let mgr = AuthManager(store: store, exchanger: ex, now: { 2000 })
+        let tok = await mgr.validAccessToken()
+        XCTAssertEqual(tok, "OLD",
+                       "validAccessToken falls back to stored on transient/permanent failure")
+        let reason = await mgr.refreshFailureReason(for: stored)
+        XCTAssertEqual(reason, .expired,
+                       "permanent failure reason is recorded for supervisor surface")
+        let marked = await mgr.hasRefreshFailure(for: stored)
+        XCTAssertTrue(marked,
+                      "validAccessToken must mark refresh failures so a follow-up call short-circuits")
+    }
+
+    func testSecondValidAccessTokenCallShortCircuitsAfterPermanentFailure() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "OLD", refreshToken: "RT0",
+                                  expiresAtUnix: 1000, accountId: "acct_x"))
+        let ex = MockExchanger(
+            exchange: { _, _ in .failure(.server("unused")) },
+            refresh: { _ in .failure(.refreshFailed(
+                reason: .exhausted, underlying: "{}")) })
+        let mgr = AuthManager(store: store, exchanger: ex, now: { 2000 })
+        _ = await mgr.validAccessToken()
+        _ = await mgr.validAccessToken()
+        let rc = await ex.refreshCount()
+        // The single-flight broker collapses concurrent calls, but
+        // sequential calls past a recorded refresh failure should NOT
+        // burn additional refresh attempts.
+        XCTAssertEqual(rc, 1,
+                       "known-rejected refresh tokens must not be retried")
+    }
+
+    func testTransientFailureDoesNotPoisonReasonButMarksOnForceRefresh() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        let stored = AuthTokens(accessToken: "OLD", refreshToken: "RT0",
+                                expiresAtUnix: 9_999_999_999,
+                                accountId: "acct_x")
+        try store.save(stored)
+        let ex = MockExchanger(
+            exchange: { _, _ in .failure(.server("unused")) },
+            refresh: { _ in .failure(.transport("DNS error")) })
+        let mgr = AuthManager(store: store, exchanger: ex, now: { 1000 })
+        _ = await mgr.refreshAccessToken()
+        let reason = await mgr.refreshFailureReason(for: stored)
+        XCTAssertNil(reason, "transient failure must NOT be classified")
+        let marked = await mgr.hasRefreshFailure(for: stored)
+        XCTAssertTrue(marked,
+                      "force-refresh marks the failure so the caller stops retrying")
+    }
+
+    // MARK: - A5: env-overlay shadowing
+
+    func testLoginWithAPIKeyThrowsShadowedByEnvWhenOverlayActive() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        let mgr = AuthManager(store: store,
+                              env: ["CODEX_API_KEY": "env-key"])
+        do {
+            try await mgr.loginWithAPIKey("sk-user")
+            XCTFail("expected LoginShadowedByEnvError")
+        } catch let e as LoginShadowedByEnvError {
+            XCTAssertEqual(e.operation, .loginWithAPIKey)
+            XCTAssertEqual(e.shadowingVar, "CODEX_API_KEY")
+        }
+        XCTAssertEqual(store.load()?.accessToken, "sk-user",
+                       "persistent store still updated; shadow is a warning, not a refusal")
+        let visible = await mgr.storedTokens()?.accessToken
+        XCTAssertEqual(visible, "env-key",
+                       "but the running process keeps reading the env overlay")
+    }
+
+    func testLogoutThrowsShadowedByEnvWhenOverlayActive() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "ax", expiresAtUnix: 9_999_999_999,
+                                  accountId: "acct"))
+        let mgr = AuthManager(store: store,
+                              env: ["OPENAI_API_KEY": "env-key"])
+        do {
+            try await mgr.logout()
+            XCTFail("expected LoginShadowedByEnvError")
+        } catch let e as LoginShadowedByEnvError {
+            XCTAssertEqual(e.operation, .logout)
+            XCTAssertEqual(e.shadowingVar, "OPENAI_API_KEY")
+        }
+        XCTAssertNil(store.load(), "local clear still completed before the throw")
+    }
+
+    func testNoShadowingErrorWhenEnvUnset() async throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let mgr = AuthManager(store: FileTokenStore(codexHome: home),
+                              env: [:])
+        // Must not throw.
+        try await mgr.loginWithAPIKey("sk")
+        try await mgr.logout()
+    }
+
+    // MARK: - AuthSupport spot checks
+
+    func testEnvAuthPrecedenceCodexAPIKeyWinsOverOpenAI() {
+        let a = EnvAuth.loadFromEnv(env: [
+            "CODEX_API_KEY": "codex",
+            "OPENAI_API_KEY": "openai",
+            "CODEX_ACCESS_TOKEN": "bearer",
+        ])
+        XCTAssertEqual(a?.openaiAPIKey, "codex")
+        XCTAssertNil(a?.tokens, "API key path doesn't populate tokens section")
+    }
+
+    func testEnvAuthCodexAccessTokenPopulatesTokensSection() {
+        let a = EnvAuth.loadFromEnv(env: ["CODEX_ACCESS_TOKEN": "bearer"])
+        XCTAssertNil(a?.openaiAPIKey)
+        XCTAssertEqual(a?.tokens?.accessToken, "bearer")
+    }
+
+    func testEnvAuthEmptyStringIsTreatedAsUnset() {
+        let a = EnvAuth.loadFromEnv(env: ["CODEX_API_KEY": ""])
+        XCTAssertNil(a, "empty env values must not produce an overlay")
+    }
+
+    func testAuthDotJsonRoundTripsViaAuthTokensProjection() throws {
+        let original = AuthTokens(accessToken: "AT", refreshToken: "RT",
+                                  idToken: "ID", tokenType: "Bearer",
+                                  expiresAtUnix: AuthTokens.neverExpires,
+                                  accountId: "acct_x")
+        let dotJson = original.toAuthDotJson()
+        let back = AuthTokens.fromAuthDotJson(dotJson)
+        XCTAssertEqual(back?.accessToken, "AT")
+        XCTAssertEqual(back?.refreshToken, "RT")
+        XCTAssertEqual(back?.idToken, "ID")
+        XCTAssertEqual(back?.accountId, "acct_x")
+    }
+
+    func testAuthDotJsonDecodeAcceptsUpstreamSnakeCase() throws {
+        let payload = #"""
+        {
+          "OPENAI_API_KEY": null,
+          "tokens": {
+            "access_token": "AT",
+            "refresh_token": "RT",
+            "id_token": "IDT",
+            "account_id": "acct_42"
+          },
+          "last_refresh": "2026-01-01T00:00:00Z"
+        }
+        """#
+        let a = try AuthDotJson.decode(Data(payload.utf8))
+        XCTAssertEqual(a.tokens?.accessToken, "AT")
+        XCTAssertEqual(a.tokens?.refreshToken, "RT")
+        XCTAssertEqual(a.tokens?.idToken, "IDT")
+        XCTAssertEqual(a.tokens?.accountId, "acct_42")
+        XCTAssertEqual(a.lastRefresh, "2026-01-01T00:00:00Z")
+    }
+
+    func testAuthFileLockReadsExistingFileAndReturnsNilForMissing() throws {
+        let dir = atTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let path = dir + "/auth.json"
+        let payload = #"{"OPENAI_API_KEY":"sk"}"#
+        try payload.write(toFile: path, atomically: true, encoding: .utf8)
+        let data = AuthFileLock.readContentsLocked(path: path)
+        XCTAssertEqual(data, Data(payload.utf8))
+        XCTAssertNil(AuthFileLock.readContentsLocked(path: dir + "/missing.json"))
+    }
+}
+
+// MARK: - Test doubles for severe-testing coverage
+
+private actor MockAPIKeyExchanger: APIKeyExchanger {
+    private(set) var count = 0
+    private(set) var lastIDToken: String?
+    private let result: Result<String, AuthError>
+    init(result: Result<String, AuthError>) { self.result = result }
+    func exchangeForAPIKey(idToken: String, cfg: OAuthConfig) async throws -> String {
+        count += 1
+        lastIDToken = idToken
+        switch result {
+        case .success(let s): return s
+        case .failure(let e): throw e
+        }
+    }
+}
+
+private actor MockRevoker: TokenRevoker {
+    struct Call: Sendable, Equatable {
+        let token: String
+        let hint: TokenTypeHint
+    }
+    private(set) var calls: [Call] = []
+    private let throwing: AuthError?
+    init(throwing: AuthError? = nil) { self.throwing = throwing }
+    func revoke(token: String, tokenTypeHint: TokenTypeHint,
+                cfg: OAuthConfig) async throws {
+        calls.append(Call(token: token, hint: tokenTypeHint))
+        if let throwing { throw throwing }
+    }
 }

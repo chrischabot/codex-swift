@@ -21,31 +21,88 @@ public actor AuthManager {
 
     private let cfg: OAuthConfig
     private let store: any TokenStore
+    /// Optional ephemeral (in-memory, host-app-scoped) store. When set,
+    /// `loginWithExternalChatGPTTokens` writes here instead of `store`
+    /// so host-app-injected ChatGPT tokens never touch disk or the
+    /// keychain. All other login modes continue to route through `store`.
+    private let ephemeralStore: EphemeralTokenStore?
     private let exchanger: any TokenExchanger
     private let deviceCodeClient: any DeviceCodeClient
     private let refreshBroker: AuthRefreshBroker
     private let nowProvider: @Sendable () -> Int64
     private let externalTokenRefresh: ExternalTokenRefresh?
+    /// OAuth 2.0 Token Exchange client used to mint an OpenAI API key from
+    /// the id_token after a successful ChatGPT login (B1). Optional so
+    /// tests / offline harnesses can disable the post-login exchange.
+    private let apiKeyExchanger: (any APIKeyExchanger)?
+    /// Revocation client used on logout / re-login. Best-effort; never
+    /// blocks the surrounding operation. Optional so tests can disable.
+    private let revoker: (any TokenRevoker)?
 
     private var pending: (pkce: PKCE, state: String, redirectURI: String)?
     private var refreshFailures = Set<String>()
+    /// Most-recent classified refresh failure, keyed by `refreshFailureKey`.
+    /// Mirrors upstream's `refresh_failure_for_auth` lookup
+    /// (manager.rs:1398) so the supervisor can surface a re-login prompt
+    /// without re-attempting the refresh.
+    private var refreshFailureReasons: [String: RefreshTokenFailedReason] = [:]
+    /// OpenAI API key minted from the ChatGPT id_token via OAuth 2.0 token
+    /// exchange (B1). Held in memory so the same login can serve both
+    /// API-key and ChatGPT-managed code paths. Mirrors the
+    /// `OPENAI_API_KEY` field in upstream's auth.json.
+    private var mintedAPIKey: String?
+    /// D1: env-precedence overlay (CODEX_API_KEY > OPENAI_API_KEY >
+    /// CODEX_ACCESS_TOKEN), snapshotted at construction. When set,
+    /// this beats the persistent store for the lifetime of the process.
+    /// Mirrors upstream `load_auth` (manager.rs:731).
+    private let envOverlay: AuthDotJson?
+    /// Snapshot of the env vars used to detect overlay shadow on writes.
+    /// Held separately from `envOverlay` so we can report the *specific*
+    /// shadowing var to callers ("CODEX_API_KEY" vs "OPENAI_API_KEY").
+    private let envSnapshot: [String: String]
+    /// D2: optional auth.json path for guarded-reload codepath. nil =
+    /// single-process mode (keychain etc.); reload is a no-op.
+    private let authJsonPath: String?
 
     public init(config: OAuthConfig = OAuthConfig(),
                 store: any TokenStore,
+                ephemeralStore: EphemeralTokenStore? = nil,
                 exchanger: any TokenExchanger = CurlTokenExchanger(),
                 deviceCodeClient: any DeviceCodeClient = CurlDeviceCodeClient(),
                 refreshBroker: AuthRefreshBroker = AuthRefreshBroker(),
                 externalTokenRefresh: ExternalTokenRefresh? = nil,
+                apiKeyExchanger: (any APIKeyExchanger)? = nil,
+                revoker: (any TokenRevoker)? = nil,
+                env: [String: String] = [:],
+                authJsonPath: String? = nil,
                 now: @escaping @Sendable () -> Int64 = {
                     Int64(Date().timeIntervalSince1970)
                 }) {
         self.cfg = config
         self.store = store
+        self.ephemeralStore = ephemeralStore
         self.exchanger = exchanger
         self.deviceCodeClient = deviceCodeClient
         self.refreshBroker = refreshBroker
         self.externalTokenRefresh = externalTokenRefresh
+        self.apiKeyExchanger = apiKeyExchanger
+        self.revoker = revoker
         self.nowProvider = now
+        self.envOverlay = EnvAuth.loadFromEnv(env: env)
+        self.envSnapshot = env
+        if let authJsonPath {
+            self.authJsonPath = authJsonPath
+        } else if let fs = store as? FileTokenStore {
+            self.authJsonPath = fs.path
+        } else if let mig = store as? MigratingTokenStore,
+                  let fs = mig.primary as? FileTokenStore {
+            self.authJsonPath = fs.path
+        } else if let mig = store as? MigratingTokenStore,
+                  let fs = mig.legacy as? FileTokenStore {
+            self.authJsonPath = fs.path
+        } else {
+            self.authJsonPath = nil
+        }
     }
 
     /// Begin a login: returns the authorize URL + opaque state, stashing the
@@ -89,25 +146,46 @@ public actor AuthManager {
         }
     }
 
-    public func loginWithAPIKey(_ apiKey: String) throws {
+    public func loginWithAPIKey(_ apiKey: String) async throws {
         pending = nil
         refreshFailures.removeAll()
-        try store.save(AuthTokens(accessToken: apiKey,
-                                  refreshToken: nil,
-                                  tokenType: "APIKey",
-                                  expiresAtUnix: 4_102_444_800,
-                                  accountId: nil))
+        refreshFailureReasons.removeAll()
+        let new = AuthTokens(accessToken: apiKey,
+                             refreshToken: nil,
+                             tokenType: "APIKey",
+                             expiresAtUnix: AuthTokens.neverExpires,
+                             accountId: nil)
+        let prev = store.load()
+        try store.save(new)
+        await revokeIfNeeded(previous: prev, replacement: new)
+        try throwIfEnvShadowed(.loginWithAPIKey)
     }
 
     public func loginWithExternalChatGPTTokens(accessToken: String,
-                                               accountId: String) throws {
+                                               accountId: String) async throws {
         pending = nil
         refreshFailures.removeAll()
-        try store.save(AuthTokens(accessToken: accessToken,
-                                  refreshToken: nil,
-                                  tokenType: "BearerExternal",
-                                  expiresAtUnix: 4_102_444_800,
-                                  accountId: accountId))
+        refreshFailureReasons.removeAll()
+        let tokens = AuthTokens(accessToken: accessToken,
+                                refreshToken: nil,
+                                tokenType: "BearerExternal",
+                                expiresAtUnix: AuthTokens.neverExpires,
+                                accountId: accountId)
+        // Host-app-injected ChatGPT tokens are in-memory only. They
+        // live and die with the host-app session, so we must never
+        // persist them to disk or to the keychain. Upstream parity:
+        // `EphemeralAuthStorage` (codex-rs/login/src/auth/storage.rs:293-334).
+        if let ephemeralStore {
+            let prev = ephemeralStore.load()
+            try ephemeralStore.save(tokens)
+            await revokeIfNeeded(previous: prev, replacement: tokens)
+            try throwIfEnvShadowed(.loginWithExternalChatGPTTokens)
+            return
+        }
+        let prev = store.load()
+        try store.save(tokens)
+        await revokeIfNeeded(previous: prev, replacement: tokens)
+        try throwIfEnvShadowed(.loginWithExternalChatGPTTokens)
     }
 
     /// Complete a login by exchanging the redirect `code`. `state` must match
@@ -123,11 +201,31 @@ public actor AuthManager {
         switch await exchanger.exchange(code: code, verifier: p.pkce.verifier,
                                         cfg: loginConfig) {
         case .success(let t):
+            // A1: best-effort OAuth 2.0 Token Exchange (RFC 8693) to mint
+            // an OpenAI API key from the id_token. Mirrors upstream
+            // `obtain_api_key`. Failure is non-fatal — the ChatGPT login
+            // still succeeds; the user just doesn't get the API-key path.
+            if let idToken = t.idToken, !idToken.isEmpty,
+               let apiKeyExchanger {
+                do {
+                    let key = try await apiKeyExchanger.exchangeForAPIKey(
+                        idToken: idToken, cfg: loginConfig)
+                    mintedAPIKey = key
+                } catch {
+                    mintedAPIKey = nil
+                }
+            } else {
+                mintedAPIKey = nil
+            }
+            let prev = store.load()
             do { try store.save(t) } catch {
                 return .failure(.transport("persist: \(error)"))
             }
             refreshFailures.removeAll()
+            refreshFailureReasons.removeAll()
             pending = nil
+            // A2: revoke prior credential when superseded. Best-effort.
+            await revokeIfNeeded(previous: prev, replacement: t)
             return .success(AccountInfo(accountId: t.accountId,
                                         authenticated: true,
                                         expiresAtUnix: t.expiresAtUnix))
@@ -136,14 +234,62 @@ public actor AuthManager {
         }
     }
 
-    public func logout() throws {
+    public func logout() async throws {
         pending = nil
         refreshFailures.removeAll()
-        try store.clear()
+        refreshFailureReasons.removeAll()
+        // A2: best-effort revoke previous credentials at the issuer
+        // BEFORE we clear local state. If revocation fails we still
+        // proceed with the local clear (best-effort by contract).
+        let ephemeralPrev = ephemeralStore?.load()
+        let persistedPrev = store.load()
+        await revokeIfNeeded(previous: ephemeralPrev, replacement: nil)
+        await revokeIfNeeded(previous: persistedPrev, replacement: nil)
+        // Clear both ephemeral (host-app-injected) and persistent
+        // (managed-CLI) credentials. Either side throwing does not
+        // prevent the other from being attempted; the first error is
+        // rethrown so callers learn something failed.
+        var firstError: (any Error)?
+        if let ephemeralStore {
+            do { try ephemeralStore.clear() } catch { firstError = error }
+        }
+        do { try store.clear() } catch {
+            if firstError == nil { firstError = error }
+        }
+        mintedAPIKey = nil
+        if let firstError { throw firstError }
+        // A5: even though local state was cleared, an env overlay still
+        // wins on read. Surface that so the caller can warn the user.
+        try throwIfEnvShadowed(.logout)
+    }
+
+    // MARK: - A2 / A5 helpers
+
+    /// Best-effort revocation of `previous` when it differs from
+    /// `replacement`. Never blocks the caller on error — failures are
+    /// swallowed by `Revocation.revokeIfPossible`. Skipped when no
+    /// `revoker` is wired (the default).
+    private func revokeIfNeeded(previous: AuthTokens?,
+                                replacement: AuthTokens?) async {
+        guard let revoker else { return }
+        guard Revocation.shouldRevoke(previous: previous,
+                                      replacement: replacement) else { return }
+        await Revocation.revokeIfPossible(previous, cfg: cfg, revoker: revoker)
+    }
+
+    /// Throws `LoginShadowedByEnvError` if any env-overlay variable is
+    /// currently set. Used at the END of write-side operations so the
+    /// persistent store update still happens — the throw is purely
+    /// diagnostic ("your change won't be visible to this process").
+    private func throwIfEnvShadowed(
+        _ op: LoginShadowedByEnvError.Operation) throws {
+        if let varname = LoginShadowedByEnvError.shadowingVar(env: envSnapshot) {
+            throw LoginShadowedByEnvError(operation: op, shadowingVar: varname)
+        }
     }
 
     public func account() -> AccountInfo {
-        guard let t = store.load() else {
+        guard let t = effectiveTokens() else {
             return AccountInfo(accountId: nil, authenticated: false,
                                expiresAtUnix: nil)
         }
@@ -152,19 +298,115 @@ public actor AuthManager {
                            expiresAtUnix: t.expiresAtUnix)
     }
 
-    public func storedTokens() -> AuthTokens? { store.load() }
+    public func storedTokens() -> AuthTokens? { effectiveTokens() }
+
+    /// Effective tokens after applying overlays. Precedence (mirrors
+    /// upstream `load_auth`, manager.rs:731):
+    ///   1. env overlay (CODEX_API_KEY > OPENAI_API_KEY > CODEX_ACCESS_TOKEN)
+    ///   2. ephemeral host-app-injected ChatGPT tokens
+    ///   3. persistent token store (file / keychain)
+    private func effectiveTokens() -> AuthTokens? {
+        if let envOverlay,
+           let tokens = AuthTokens.fromAuthDotJson(envOverlay) {
+            return tokens
+        }
+        if let ephemeralStore, let t = ephemeralStore.load() { return t }
+        return store.load()
+    }
+
+    /// D1: return the effective on-disk auth record after applying env
+    /// precedence. Used by callers that need the raw `AuthDotJson`
+    /// shape (e.g. supervisor reads) rather than the runtime
+    /// `AuthTokens` projection.
+    public func effectiveAuthDotJson() -> AuthDotJson? {
+        if let envOverlay { return envOverlay }
+        if let ephemeralStore, let t = ephemeralStore.load() {
+            return t.toAuthDotJson()
+        }
+        if let path = authJsonPath,
+           let data = AuthFileLock.readContentsLocked(path: path),
+           let auth = try? AuthDotJson.decode(data) {
+            return auth
+        }
+        if let t = store.load() { return t.toAuthDotJson() }
+        return nil
+    }
+
+    // MARK: - D2: account-id-matched guarded reload
+
+    /// Outcome of `reloadIfAccountIdMatches`. Mirrors upstream
+    /// `ReloadOutcome` (manager.rs:~1430).
+    public enum ReloadOutcome: Sendable, Equatable {
+        /// On-disk account+token match in-memory; continue with refresh.
+        case matched
+        /// Sibling process refreshed; adopt the on-disk tokens and skip
+        /// the network call.
+        case adoptedOnDisk(AuthTokens)
+        /// On-disk record is missing/empty/stale (continue with refresh).
+        case staleOnDisk
+        /// Store doesn't expose an auth.json path (single-process mode).
+        case skipped
+    }
+
+    /// Before issuing a network refresh, re-read auth.json under a
+    /// shared flock and compare account ids. If a sibling process has
+    /// already refreshed the tokens out from under us, adopt those
+    /// tokens and skip the network call (prevents two processes burning
+    /// the same refresh_token in parallel). Mirrors upstream
+    /// `reload_if_account_id_matches` (manager.rs:1434).
+    public func reloadIfAccountIdMatches() -> ReloadOutcome {
+        guard let path = authJsonPath else { return .skipped }
+        guard let inMemory = store.load() else { return .skipped }
+        guard let data = AuthFileLock.readContentsLocked(path: path) else {
+            return .staleOnDisk
+        }
+        guard let onDisk = try? AuthDotJson.decode(data),
+              let onDiskTokens = AuthTokens.fromAuthDotJson(onDisk) else {
+            return .staleOnDisk
+        }
+        if inMemory.accountId == onDiskTokens.accountId
+            && inMemory.accessToken == onDiskTokens.accessToken {
+            return .matched
+        }
+        if onDisk.lastRefresh != nil {
+            try? store.save(onDiskTokens)
+            refreshFailures.remove(refreshFailureKey(inMemory))
+            return .adoptedOnDisk(onDiskTokens)
+        }
+        return .staleOnDisk
+    }
 
     public func hasRefreshFailure(for tokens: AuthTokens) -> Bool {
         refreshFailures.contains(refreshFailureKey(tokens))
     }
 
-    public func isAuthenticated() -> Bool { store.load() != nil }
+    /// Classified reason for the last refresh failure on `tokens`, or `nil`
+    /// when no failure has been recorded. Surfaces upstream's
+    /// `RefreshTokenFailedReason` (expired / reused / revoked / other) so
+    /// the supervisor can decide between "show re-login prompt" and "retry
+    /// transparently". Mirrors `refresh_failure_for_auth` (manager.rs:1398).
+    public func refreshFailureReason(for tokens: AuthTokens)
+        -> RefreshTokenFailedReason? {
+        refreshFailureReasons[refreshFailureKey(tokens)]
+    }
+
+    public func isAuthenticated() -> Bool { effectiveTokens() != nil }
 
     /// A currently-valid access token, refreshing through the single-flight
     /// broker when expiring. Returns nil when not authenticated / unrefreshable.
+    ///
+    /// A4: if a *permanent* refresh failure (`expired` / `exhausted` /
+    /// `revoked`) has already been recorded for `t`, we short-circuit and
+    /// return nil rather than burning another refresh call on a known-
+    /// rejected token. Transient failures still fall through to the
+    /// refresh path so retries can recover.
     public func validAccessToken() async -> String? {
-        guard let t = store.load() else { return nil }
+        guard let t = effectiveTokens() else { return nil }
         if !t.isExpiring(now: nowProvider()) { return t.accessToken }
+        if let reason = refreshFailureReasons[refreshFailureKey(t)],
+           reason.isPermanent {
+            return nil
+        }
         return await refreshAccessTokenFrom(t, fallbackToStored: true)
     }
 
@@ -173,7 +415,7 @@ public actor AuthManager {
     /// refresh fails; retrying a known-rejected bearer would mask the real
     /// authentication failure.
     public func refreshAccessToken() async -> String? {
-        guard let t = store.load() else { return nil }
+        guard let t = effectiveTokens() else { return nil }
         return await refreshAccessTokenFrom(t, fallbackToStored: false)
     }
 
@@ -194,23 +436,42 @@ public actor AuthManager {
         let exchanger = self.exchanger
         let store = self.store
         let account = t.accountId ?? "default"
-        let refreshed = try? await refreshBroker.token(account: account) {
-            switch await exchanger.refresh(refreshToken: rt, cfg: cfg) {
-            case .success(let nt):
-                try? store.save(nt)
-                return nt.accessToken
-            case .failure(let e):
-                throw e
+        // Wrap the refresh in a typed-throwing closure so the broker
+        // preserves the AuthError (in particular `.refreshFailed`) all
+        // the way back here. The previous `try?` collapse was the
+        // root cause of A3 — the classified reason was silently
+        // discarded before we could record it.
+        let key = refreshFailureKey(t)
+        do {
+            let refreshed = try await refreshBroker.token(account: account) {
+                switch await exchanger.refresh(refreshToken: rt, cfg: cfg) {
+                case .success(let nt):
+                    try? store.save(nt)
+                    return nt.accessToken
+                case .failure(let e):
+                    throw e
+                }
             }
-        }
-        if let refreshed {
-            refreshFailures.remove(refreshFailureKey(t))
+            refreshFailures.remove(key)
+            refreshFailureReasons.removeValue(forKey: key)
             return refreshed
+        } catch let AuthError.refreshFailed(reason, _) {
+            // A3 + A4: record classified reason AND mark the failure on
+            // both paths so subsequent `validAccessToken` callers don't
+            // burn another refresh attempt on a known-rejected token.
+            refreshFailures.insert(key)
+            refreshFailureReasons[key] = reason
+            return fallbackToStored ? store.load()?.accessToken : nil
+        } catch {
+            // Transient failures (timeouts, 5xx, parser errors). Mark the
+            // failure on the force-refresh path so the next call short-
+            // circuits, but don't classify a reason — a retry might
+            // succeed. Mirrors upstream's transient/permanent split.
+            if !fallbackToStored {
+                refreshFailures.insert(key)
+            }
+            return fallbackToStored ? store.load()?.accessToken : nil
         }
-        if !fallbackToStored {
-            refreshFailures.insert(refreshFailureKey(t))
-        }
-        return fallbackToStored ? store.load()?.accessToken : nil
     }
 
     private func refreshFailureKey(_ tokens: AuthTokens) -> String {

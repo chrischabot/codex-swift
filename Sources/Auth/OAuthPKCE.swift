@@ -56,6 +56,12 @@ public enum AuthError: Error, Sendable, Equatable, CustomStringConvertible {
     case invalidState
     case notAuthenticated
     case malformed(String)
+    /// Refresh request was rejected by the issuer (HTTP 401 / equivalent
+    /// permanent-failure signal). `reason` is the classified cause;
+    /// `underlying` preserves the raw body for diagnostics. Mirrors upstream
+    /// `RefreshTokenError::Permanent` + `RefreshTokenFailedError`
+    /// (codex-rs/login/src/auth/manager.rs:843).
+    case refreshFailed(reason: RefreshTokenFailedReason, underlying: String)
     public var description: String {
         switch self {
         case .transport(let s): return "auth transport: \(s)"
@@ -63,6 +69,7 @@ public enum AuthError: Error, Sendable, Equatable, CustomStringConvertible {
         case .invalidState: return "auth: state mismatch (possible CSRF)"
         case .notAuthenticated: return "auth: not authenticated"
         case .malformed(let s): return "auth: malformed (\(s))"
+        case .refreshFailed(let r, _): return r.userFacingMessage
         }
     }
 }
@@ -145,8 +152,17 @@ private final class ProcBox2: @unchecked Sendable { let p = Process() }
 public struct CurlTokenExchanger: TokenExchanger {
     public init() {}
 
+    /// Outcome of a token-endpoint POST. We carry the HTTP status so refresh
+    /// callers can classify 401s as permanent failures (mirrors upstream's
+    /// `RefreshTokenError::{Permanent,Transient}` split at manager.rs:843).
+    struct TokenEndpointResult {
+        var status: Int
+        var body: String
+        var json: [String: Any]?
+    }
+
     private func post(_ url: String, form: [String: String])
-    async -> Result<[String: Any], AuthError> {
+    async -> Result<TokenEndpointResult, AuthError> {
         let body = form.map { k, v in
             let enc = { (s: String) in
                 s.addingPercentEncoding(
@@ -160,6 +176,7 @@ public struct CurlTokenExchanger: TokenExchanger {
         p.arguments = ["curl", "-sS", "-X", "POST", url,
                        "-H", "Content-Type: application/x-www-form-urlencoded",
                        "-H", "Accept: application/json",
+                       "-w", "\n%{http_code}",
                        "--data-binary", "@-"]
         let inPipe = Pipe(); let outPipe = Pipe(); let errPipe = Pipe()
         p.standardInput = inPipe
@@ -176,15 +193,17 @@ public struct CurlTokenExchanger: TokenExchanger {
             return .failure(.transport("curl exit \(p.terminationStatus): "
                 + String(decoding: e.prefix(300), as: UTF8.self)))
         }
-        guard let obj = (try? JSONSerialization.jsonObject(with: out))
-            as? [String: Any] else {
-            return .failure(.malformed("non-JSON token response"))
+        let raw = String(decoding: out, as: UTF8.self)
+        let parts = raw.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let statusText = parts.last, let status = Int(statusText) else {
+            return .failure(.malformed("missing HTTP status"))
         }
-        if let err = obj["error"] {
-            let desc = (obj["error_description"] as? String) ?? "\(err)"
-            return .failure(.server(desc))
-        }
-        return .success(obj)
+        let bodyText = parts.dropLast().joined(separator: "\n")
+        let bodyData = bodyText.data(using: .utf8) ?? Data()
+        let json = (try? JSONSerialization.jsonObject(with: bodyData))
+            as? [String: Any]
+        return .success(TokenEndpointResult(
+            status: status, body: bodyText, json: json))
     }
 
     public func tokensFromPublicObject(_ obj: [String: Any]) -> Result<AuthTokens, AuthError> {
@@ -212,7 +231,17 @@ public struct CurlTokenExchanger: TokenExchanger {
             "redirect_uri": cfg.redirectURI, "client_id": cfg.clientId,
             "code_verifier": verifier,
         ]) {
-        case .success(let o): return tokensFromPublicObject(o)
+        case .success(let r):
+            if (200..<300).contains(r.status), let obj = r.json {
+                return tokensFromPublicObject(obj)
+            }
+            if let obj = r.json, let err = obj["error"] {
+                let desc = (obj["error_description"] as? String) ?? "\(err)"
+                return .failure(.server(desc))
+            }
+            return .failure(.server(
+                "token endpoint status \(r.status): "
+                + String(r.body.prefix(300))))
         case .failure(let e): return .failure(e)
         }
     }
@@ -223,14 +252,31 @@ public struct CurlTokenExchanger: TokenExchanger {
             "grant_type": "refresh_token", "refresh_token": refreshToken,
             "client_id": cfg.clientId,
         ]) {
-        case .success(let o):
-            // Some issuers omit a rotated refresh_token; keep the old one.
-            switch tokensFromPublicObject(o) {
-            case .success(var t):
-                if t.refreshToken == nil { t.refreshToken = refreshToken }
-                return .success(t)
-            case .failure(let e): return .failure(e)
+        case .success(let r):
+            if (200..<300).contains(r.status), let obj = r.json {
+                // Some issuers omit a rotated refresh_token; keep the old one.
+                switch tokensFromPublicObject(obj) {
+                case .success(var t):
+                    if t.refreshToken == nil { t.refreshToken = refreshToken }
+                    return .success(t)
+                case .failure(let e): return .failure(e)
+                }
             }
+            // 401 → typed permanent failure with a user-facing message.
+            // Mirrors upstream `classify_refresh_token_failure`
+            // (codex-rs/login/src/auth/manager.rs:858).
+            if r.status == 401 {
+                let reason = RefreshFailureClassifier.classify(body: r.body)
+                return .failure(.refreshFailed(
+                    reason: reason, underlying: r.body))
+            }
+            if let obj = r.json, let err = obj["error"] {
+                let desc = (obj["error_description"] as? String) ?? "\(err)"
+                return .failure(.server(desc))
+            }
+            return .failure(.server(
+                "token endpoint status \(r.status): "
+                + String(r.body.prefix(300))))
         case .failure(let e): return .failure(e)
         }
     }
