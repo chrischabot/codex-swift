@@ -1,5 +1,12 @@
 import Foundation
+import CryptoKit
 import InfraPrimitives
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// Errors surfaced by the git plumbing layer. Callers generally degrade
 /// gracefully (nil/empty) rather than propagate these.
@@ -21,8 +28,8 @@ public struct GitResult: Sendable, Equatable {
     }
 }
 
-/// Holds the Process + its three pipes across the dedicated reader thread and
-/// the timeout Task without tripping Swift 6 Sendable checks (the underlying
+/// Holds the Process + its three pipes across the timeout Task and the
+/// async drain logic without tripping Swift 6 Sendable checks (the underlying
 /// Foundation types are not Sendable but our access is disciplined).
 private final class GitProcBox: @unchecked Sendable {
     let process: Process
@@ -34,9 +41,9 @@ private final class GitProcBox: @unchecked Sendable {
     }
 }
 
-/// Single-resume bridge between the blocking reader thread / timeout Task and
-/// the awaiting continuation. NSLock-guarded so the first resume wins and a
-/// late second resume is a no-op (never traps).
+/// Single-resume bridge between async drains, the timeout Task, and the
+/// awaiting continuation. NSLock-guarded so the first resume wins; later
+/// resumes are no-ops (never trap).
 private final class GitResumer: @unchecked Sendable {
     private let lock = NSLock()
     private var cont: CheckedContinuation<GitResult, Never>?
@@ -55,18 +62,86 @@ private final class GitResumer: @unchecked Sendable {
     }
 }
 
-/// Spawns `git` via `/usr/bin/env`, captures stdout+stderr fully on a
-/// dedicated thread (so no cooperative thread blocks), and arms a timeout
+/// Thread-safe accumulator for `DispatchIO`-streamed pipe data. Bounded to
+/// `maxBytes`; extra bytes are dropped at the tail.
+private final class BoundedSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private let maxBytes: Int
+    init(maxBytes: Int) { self.maxBytes = maxBytes }
+    func append(_ chunk: DispatchData) {
+        lock.lock(); defer { lock.unlock() }
+        let remaining = maxBytes - data.count
+        if remaining <= 0 { return }
+        if chunk.count <= remaining {
+            chunk.enumerateBytes { region, _, _ in
+                data.append(contentsOf: region)
+            }
+        } else {
+            // Truncate.
+            let prefix = chunk.subdata(in: 0..<remaining)
+            prefix.enumerateBytes { region, _, _ in
+                data.append(contentsOf: region)
+            }
+        }
+    }
+    func snapshot() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+/// Spawns `git` via `/usr/bin/env`, drains stdout+stderr concurrently via
+/// `DispatchIO` so neither pipe can deadlock the other, and arms a timeout
 /// Task that force-reaps the descendant tree on overrun. Output is bound to
 /// 1 MiB per stream. Never traps on hostile output.
 public enum GitRunner {
+
+    /// Read-only git invocations that should be insulated from a concurrent
+    /// IDE's index/lock activity. The flags here go BEFORE the subcommand
+    /// (they're `git`-level, not subcommand-level).
+    private static let readOnlyPrefix: [String] = [
+        "-c", "core.fsmonitor=false",
+        "--no-optional-locks",
+    ]
+
+    private static let readOnlyVerbs: Set<String> = [
+        "diff", "ls-files", "ls-tree", "show", "rev-parse", "status",
+        "merge-base", "symbolic-ref", "remote", "cat-file",
+    ]
+
+    /// Inject read-only safety flags (`--no-optional-locks` and
+    /// `core.fsmonitor=false`) for read-only verbs so a parallel IDE's git
+    /// activity doesn't race our index reads. We only apply them when the
+    /// first non-`-c` argument is a recognised read-only verb (so write paths
+    /// like `add`/`commit-tree` are untouched, and a caller-supplied `-c`
+    /// already at the front is preserved).
+    private static func decorate(_ args: [String]) -> [String] {
+        guard let verb = firstSubcommand(args), readOnlyVerbs.contains(verb) else {
+            return args
+        }
+        return readOnlyPrefix + args
+    }
+
+    private static func firstSubcommand(_ args: [String]) -> String? {
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if a == "-c" { i += 2; continue }
+            if a.hasPrefix("-") { i += 1; continue }
+            return a
+        }
+        return nil
+    }
+
     static func run(_ args: [String],
                     cwd: String,
                     env extra: [String: String] = [:],
                     timeout: Duration = .seconds(30)) async -> GitResult {
+        let decorated = decorate(args)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["git"] + args
+        proc.arguments = ["git"] + decorated
         proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
         var environment = ProcessInfo.processInfo.environment
         for (k, v) in extra { environment[k] = v }
@@ -94,6 +169,67 @@ public enum GitRunner {
         return await withCheckedContinuation { (cont: CheckedContinuation<GitResult, Never>) in
             resumer.set(cont)
 
+            let maxBytes = 1024 * 1024
+            let outSink = BoundedSink(maxBytes: maxBytes)
+            let errSink = BoundedSink(maxBytes: maxBytes)
+
+            let queue = DispatchQueue(label: "git-runner.io",
+                                      qos: .userInitiated,
+                                      attributes: .concurrent)
+
+            // We need to wait for BOTH pipes to hit EOF AND the process to
+            // exit before resuming. `pending` starts at 3 (out, err, exit);
+            // each completion decrements and the last one resumes.
+            let pendingLock = NSLock()
+            nonisolated(unsafe) var pending = 3
+            let decrementAndMaybeResume: @Sendable () -> Void = {
+                pendingLock.lock()
+                pending -= 1
+                let done = pending == 0
+                pendingLock.unlock()
+                if done {
+                    let code = box.process.terminationStatus
+                    resumer.resume(GitResult(stdout: outSink.snapshot(),
+                                             stderr: errSink.snapshot(),
+                                             exitCode: code,
+                                             timedOut: false))
+                }
+            }
+
+            // Drain stdout via DispatchIO.
+            let outFD = dup(box.out.fileHandleForReading.fileDescriptor)
+            let outIO = DispatchIO(type: .stream, fileDescriptor: outFD,
+                                   queue: queue) { _ in
+                close(outFD)
+            }
+            outIO.setLimit(lowWater: 1)
+            outIO.read(offset: 0, length: .max, queue: queue) { done, data, _ in
+                if let data, !data.isEmpty { outSink.append(data) }
+                if done { outIO.close(); decrementAndMaybeResume() }
+            }
+
+            // Drain stderr via DispatchIO.
+            let errFD = dup(box.err.fileHandleForReading.fileDescriptor)
+            let errIO = DispatchIO(type: .stream, fileDescriptor: errFD,
+                                   queue: queue) { _ in
+                close(errFD)
+            }
+            errIO.setLimit(lowWater: 1)
+            errIO.read(offset: 0, length: .max, queue: queue) { done, data, _ in
+                if let data, !data.isEmpty { errSink.append(data) }
+                if done { errIO.close(); decrementAndMaybeResume() }
+            }
+
+            // Wait for the process to exit on a background queue.
+            box.process.terminationHandler = { _ in
+                // Close our copies of the pipe read-ends so the DispatchIO
+                // readers see EOF if they haven't already.
+                try? box.out.fileHandleForReading.close()
+                try? box.err.fileHandleForReading.close()
+                decrementAndMaybeResume()
+            }
+
+            // Timeout: reap, then let the DispatchIO/termination path finish.
             let timeoutTask = Task {
                 try? await Task.sleep(for: timeout)
                 if Task.isCancelled { return }
@@ -101,29 +237,14 @@ public enum GitRunner {
                     reapProcessTree(box.process.processIdentifier)
                     box.process.terminate()
                 }
+                // Resume early with a synthetic timeout result — the
+                // DispatchIO/termination handlers will still fire but
+                // resumer.resume is idempotent.
                 resumer.resume(GitResult(stdout: "",
                                          stderr: "git timed out",
                                          exitCode: -1, timedOut: true))
             }
-
-            let reader = Thread {
-                let maxBytes = 1024 * 1024
-                let outData = (try? box.out.fileHandleForReading.readToEnd()) ?? Data()
-                let errData = (try? box.err.fileHandleForReading.readToEnd()) ?? Data()
-                box.process.waitUntilExit()
-                let code = box.process.terminationStatus
-                func bound(_ d: Data) -> String {
-                    let slice = d.count > maxBytes ? d.prefix(maxBytes) : d[...]
-                    return String(decoding: slice, as: UTF8.self)
-                }
-                timeoutTask.cancel()
-                resumer.resume(GitResult(stdout: bound(outData),
-                                         stderr: bound(errData),
-                                         exitCode: code,
-                                         timedOut: false))
-            }
-            reader.stackSize = 1 << 20
-            reader.start()
+            _ = timeoutTask  // keep alive until parent continuation resumes
         }
     }
 }
@@ -186,12 +307,17 @@ public actor GitUtils {
         return ordered
     }
 
+    /// `^[^@/]+@([^:/]+):(.+)$`. Compiled once, reused across calls.
+    private static let scpRegex: NSRegularExpression = {
+        // The literal is well-formed; force-try is fine here.
+        // swiftlint:disable:next force_try
+        return try! NSRegularExpression(pattern: "^[^@/]+@([^:/]+):(.+)$")
+    }()
+
     private static func matchSCP(_ s: String) -> (host: String, path: String)? {
-        // ^[^@/]+@([^:/]+):(.+)$
-        guard let re = try? NSRegularExpression(pattern: "^[^@/]+@([^:/]+):(.+)$")
-        else { return nil }
         let r = NSRange(s.startIndex..., in: s)
-        guard let m = re.firstMatch(in: s, range: r), m.numberOfRanges == 3,
+        guard let m = scpRegex.firstMatch(in: s, range: r),
+              m.numberOfRanges == 3,
               let hr = Range(m.range(at: 1), in: s),
               let pr = Range(m.range(at: 2), in: s) else { return nil }
         return (String(s[hr]), String(s[pr]))
@@ -265,21 +391,304 @@ public actor GitUtils {
     }
 
     /// Best-effort new-file patches for untracked, non-ignored files.
+    ///
+    /// We don't shell out one git-per-file; instead we synthesize the diff in
+    /// process so it matches `git diff --no-index /dev/null <path>` byte-for-
+    /// byte. This collapses N spawns into a single `ls-files` plus a parallel
+    /// in-process diff fan-out (bounded to 8 concurrent file reads).
     private func untrackedDiffs() async -> String {
         let ls = await GitRunner.run(
             ["ls-files", "--others", "--exclude-standard"], cwd: cwd)
         guard ls.exitCode == 0 else { return "" }
+
+        let paths = ls.stdout
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+        if paths.isEmpty { return "" }
+
+        let root = cwd
+        // Indexed fan-out with bounded concurrency, preserving `ls-files`
+        // order in the concatenated output.
+        let concurrency = min(8, paths.count)
+        let parts: [String] = await withTaskGroup(of: (Int, String).self) { group in
+            var out = Array(repeating: "", count: paths.count)
+            var next = 0
+            var inflight = 0
+            let total = paths.count
+
+            // Prime up to `concurrency` workers.
+            while next < total && inflight < concurrency {
+                let i = next; let p = paths[i]
+                group.addTask { (i, GitUtils.synthUntrackedDiff(repoRoot: root, relPath: p)) }
+                next += 1; inflight += 1
+            }
+            // As each completes, schedule the next.
+            while let (i, s) = await group.next() {
+                out[i] = s
+                inflight -= 1
+                if next < total {
+                    let j = next; let p = paths[j]
+                    group.addTask { (j, GitUtils.synthUntrackedDiff(repoRoot: root, relPath: p)) }
+                    next += 1; inflight += 1
+                }
+            }
+            return out
+        }
+        return parts.joined()
+    }
+
+    // MARK: - Synthetic `git diff --no-index /dev/null <file>`
+
+    /// Encodes a path the way `git diff` does in its header lines.
+    ///
+    /// Match `git`'s behaviour with `core.quotePath=true` (the default):
+    ///   * If the path contains ANY byte that needs escaping (control chars,
+    ///     `"`, `\`, or high-bit non-ASCII), git wraps the whole thing in
+    ///     double quotes and C-escapes the contents: control bytes become
+    ///     `\a \b \t \n \v \f \r`, `"` becomes `\"`, `\\` stays as `\\`, and
+    ///     any other byte with value < 0x20 or >= 0x80 becomes `\NNN` (3-
+    ///     digit octal).
+    ///   * Otherwise the path is rendered verbatim.
+    ///
+    /// Returns `(rendered, wasQuoted)`. The caller needs `wasQuoted` because
+    /// the `+++ b/path` line's "trailing tab to disambiguate spaces" trick is
+    /// only applied when the path is NOT quoted (when quoted the trailing
+    /// `"` already terminates the path).
+    nonisolated static func gitQuotePath(_ path: String) -> (rendered: String, quoted: Bool) {
+        let bytes = Array(path.utf8)
+        var needsQuote = false
+        for b in bytes {
+            if b < 0x20 || b >= 0x80 || b == 0x22 /* " */ || b == 0x5C /* \ */ {
+                needsQuote = true; break
+            }
+        }
+        if !needsQuote { return (path, false) }
+
         var out = ""
-        for line in ls.stdout.split(separator: "\n", omittingEmptySubsequences: true) {
-            let f = String(line)
-            let d = await GitRunner.run(
-                ["diff", "--no-index", "/dev/null", f], cwd: cwd)
-            // `git diff --no-index` exits 1 when there ARE differences.
-            if d.exitCode == 0 || d.exitCode == 1 {
-                out += d.stdout
+        out.reserveCapacity(bytes.count + 4)
+        out.append("\"")
+        for b in bytes {
+            switch b {
+            case 0x07: out.append("\\a")
+            case 0x08: out.append("\\b")
+            case 0x09: out.append("\\t")
+            case 0x0A: out.append("\\n")
+            case 0x0B: out.append("\\v")
+            case 0x0C: out.append("\\f")
+            case 0x0D: out.append("\\r")
+            case 0x22: out.append("\\\"")
+            case 0x5C: out.append("\\\\")
+            case 0x20...0x7E:
+                // Printable ASCII (other than " and \) — emit as-is.
+                out.append(Character(UnicodeScalar(b)))
+            default:
+                // Control char or high-bit byte → \NNN three-digit octal.
+                out.append(String(format: "\\%03o", b))
+            }
+        }
+        out.append("\"")
+        return (out, true)
+    }
+
+    /// Render the `--- a/<path>` / `+++ b/<path>` / `diff --git a/p b/p`
+    /// header lines exactly as `git diff` would.
+    ///
+    /// Rules:
+    ///   * `diff --git ...` line uses the (possibly-quoted) form on both
+    ///     sides.
+    ///   * The `--- /dev/null` line is fixed (we're synthesising a new file).
+    ///   * The `+++ b/<path>` line gets a trailing `\t` IF the rendered path
+    ///     contains a space AND the path was NOT quoted. (When quoted, the
+    ///     closing `"` already terminates the path; when there's no space,
+    ///     no disambiguator is needed.)
+    private nonisolated static func renderDiffGitLine(_ relPath: String) -> String {
+        let (q, _) = gitQuotePath(relPath)
+        // The `a/` and `b/` prefixes go INSIDE the quotes when the path is
+        // quoted; git renders `"a/<escaped>"` not `a/"<escaped>"`.
+        let (qa, _) = gitQuotePath("a/" + relPath)
+        let (qb, _) = gitQuotePath("b/" + relPath)
+        _ = q
+        return "diff --git \(qa) \(qb)\n"
+    }
+
+    private nonisolated static func renderPlusPlusLine(_ relPath: String) -> String {
+        let (qb, wasQuoted) = gitQuotePath("b/" + relPath)
+        // Trailing tab only when path has a space AND we did not quote.
+        if !wasQuoted && relPath.contains(" ") {
+            return "+++ \(qb)\t\n"
+        }
+        return "+++ \(qb)\n"
+    }
+
+    /// Pure helper (nonisolated) so the TaskGroup workers can call it
+    /// concurrently without bouncing back into the actor.
+    nonisolated static func synthUntrackedDiff(repoRoot: String, relPath: String) -> String {
+        let absPath = (relPath as NSString).isAbsolutePath
+            ? relPath
+            : (repoRoot as NSString).appendingPathComponent(relPath)
+
+        // Stat with lstat so we see the symlink itself rather than its target.
+        var st = stat()
+        guard lstat(absPath, &st) == 0 else {
+            // File vanished between ls-files and read — race. Surface a
+            // best-effort marker that mirrors what `git diff --no-index`
+            // would emit ("error: ...") and move on.
+            return diffHeaderOnly(path: relPath, mode: "100644",
+                                  sha: "0000000")
+                + "error: open(\"\(relPath)\"): No such file or directory\n"
+        }
+
+        let mode = st.st_mode
+        let isReg = (mode & S_IFMT) == S_IFREG
+        let isLink = (mode & S_IFMT) == S_IFLNK
+
+        if isLink {
+            // Symlink: content is the link target string (no trailing \n),
+            // mode is 120000. git hashes the target text.
+            let target = readlinkText(absPath) ?? ""
+            let bytes = Array(target.utf8)
+            let sha = blobSHA1(bytes)
+            let shortSha = String(sha.prefix(7))
+            var out = ""
+            out += renderDiffGitLine(relPath)
+            out += "new file mode 120000\n"
+            out += "index 0000000..\(shortSha)\n"
+            out += "--- /dev/null\n"
+            out += renderPlusPlusLine(relPath)
+            // Symlink target is never empty in practice; emit as single line
+            // without trailing newline.
+            if !bytes.isEmpty {
+                out += "@@ -0,0 +1 @@\n"
+                out += "+\(target)\n"
+                out += "\\ No newline at end of file\n"
+            }
+            return out
+        }
+
+        guard isReg else {
+            // FIFO, socket, device, etc. `git ls-files` already filters these
+            // out, but defend in depth: skip with no diff text.
+            return ""
+        }
+
+        // Regular file: read fully. Files can be huge — but `git diff --no-
+        // index` reads them fully too, so behaviour is preserved. The caller
+        // (HeadTailBuffer) bounds the *output*, not the input.
+        let exec = (mode & S_IXUSR) != 0
+        let fileMode = exec ? "100755" : "100644"
+
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: absPath),
+                                   options: [.mappedIfSafe]) else {
+            return diffHeaderOnly(path: relPath, mode: fileMode, sha: "0000000")
+                + "error: open(\"\(relPath)\"): cannot read\n"
+        }
+        let bytes = [UInt8](data)
+        let sha = blobSHA1(bytes)
+        let shortSha = String(sha.prefix(7))
+
+        // Empty file: header through index line only, no `---`/`+++`/hunk.
+        if bytes.isEmpty {
+            var out = ""
+            out += renderDiffGitLine(relPath)
+            out += "new file mode \(fileMode)\n"
+            out += "index 0000000..\(shortSha)\n"
+            return out
+        }
+
+        // Binary detection: NUL in first 8000 bytes — same heuristic as git's
+        // `buffer_is_binary`.
+        let scanLen = min(bytes.count, 8000)
+        let isBinary = bytes.prefix(scanLen).contains(0)
+        if isBinary {
+            // Binary files line uses the QUOTED path inside the message too
+            // (e.g. `Binary files /dev/null and "b/résumé.txt" differ`).
+            let (qb, _) = gitQuotePath("b/" + relPath)
+            var out = ""
+            out += renderDiffGitLine(relPath)
+            out += "new file mode \(fileMode)\n"
+            out += "index 0000000..\(shortSha)\n"
+            out += "Binary files /dev/null and \(qb) differ\n"
+            return out
+        }
+
+        // Text: emit `--- /dev/null`, `+++ b/path`, single all-additions hunk.
+        // Line count = number of '\n' OR (lines without trailing newline = 1
+        // extra). Match git's hunk-count semantics:
+        //   - if file ends with \n: hunk count = number of newlines
+        //   - else: hunk count = number of newlines + 1
+        let endsWithNL = bytes.last == 0x0A
+        var newlines = 0
+        for b in bytes where b == 0x0A { newlines += 1 }
+        let lineCount = endsWithNL ? newlines : (newlines + 1)
+
+        var out = ""
+        out += renderDiffGitLine(relPath)
+        out += "new file mode \(fileMode)\n"
+        out += "index 0000000..\(shortSha)\n"
+        out += "--- /dev/null\n"
+        out += renderPlusPlusLine(relPath)
+        // git emits "@@ -0,0 +1 @@" for single-line files, "@@ -0,0 +1,N @@"
+        // for N>=2.
+        if lineCount == 1 {
+            out += "@@ -0,0 +1 @@\n"
+        } else {
+            out += "@@ -0,0 +1,\(lineCount) @@\n"
+        }
+        // Emit each line prefixed with '+'. We preserve original byte
+        // sequence (incl. CRLF) by splitting on '\n' only.
+        var i = 0
+        while i < bytes.count {
+            var j = i
+            while j < bytes.count && bytes[j] != 0x0A { j += 1 }
+            // [i..<j) is the line content, bytes[j] (if in range) is '\n'.
+            let lineSlice = bytes[i..<j]
+            // The content might be invalid UTF-8 for some text-ish files
+            // (e.g. Latin-1). git emits raw bytes; we decode lossy.
+            let lineStr = String(decoding: lineSlice, as: UTF8.self)
+            out += "+"
+            out += lineStr
+            out += "\n"
+            if j < bytes.count {
+                i = j + 1
+            } else {
+                // No trailing newline at EOF — emit git's marker.
+                out += "\\ No newline at end of file\n"
+                break
             }
         }
         return out
+    }
+
+    /// Header-only diff (used for I/O errors).
+    private nonisolated static func diffHeaderOnly(path: String,
+                                                   mode: String,
+                                                   sha: String) -> String {
+        var out = ""
+        out += renderDiffGitLine(path)
+        out += "new file mode \(mode)\n"
+        out += "index 0000000..\(sha)\n"
+        return out
+    }
+
+    /// Git blob hash: SHA1("blob <size>\0<content>").
+    private nonisolated static func blobSHA1(_ bytes: [UInt8]) -> String {
+        var h = Insecure.SHA1()
+        let header = "blob \(bytes.count)\0"
+        h.update(data: Data(header.utf8))
+        h.update(data: Data(bytes))
+        let digest = h.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Read a symlink's target. Returns nil on failure.
+    private nonisolated static func readlinkText(_ path: String) -> String? {
+        var buf = [CChar](repeating: 0, count: 4096)
+        let n = path.withCString { cpath in
+            readlink(cpath, &buf, buf.count - 1)
+        }
+        if n < 0 { return nil }
+        buf[n] = 0
+        return String(cString: buf)
     }
 
     public func workingDiff() async -> String {
