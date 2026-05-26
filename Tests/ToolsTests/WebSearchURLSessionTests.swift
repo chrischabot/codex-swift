@@ -460,7 +460,15 @@ final class WebSearchURLSessionTests: XCTestCase {
 
         let selfPID = ProcessInfo.processInfo.processIdentifier
 
-        // Snapshot child count immediately, in-flight, after.
+        // Measure the DELTA introduced by the WebHTTP call, not the
+        // absolute count. Other suites in the same test bundle (curl-
+        // backed token exchangers, MCP stdio probes, ShellTool tests)
+        // may leave subprocesses lingering; an absolute assertion would
+        // race them. The actual claim is "the URLSession code path
+        // forks nothing", so we compare in-flight vs pre-flight on
+        // this PID.
+        let baseline = countChildren(of: selfPID)
+
         async let result = WebHTTP.postJSON(
             "https://example.invalid/x",
             headers: mockedHeaders(["Authorization": "Bearer K"], mockID: id),
@@ -468,10 +476,12 @@ final class WebSearchURLSessionTests: XCTestCase {
             session: session)
 
         try? await Task.sleep(nanoseconds: 200_000_000) // 200ms — mid-flight
-        let childCount = countChildren(of: selfPID)
+        let inFlight = countChildren(of: selfPID)
         _ = await result
-        XCTAssertEqual(childCount, 0,
-                       "URLSession path must spawn zero child processes (got \(childCount))")
+        let delta = inFlight - baseline
+        XCTAssertLessThanOrEqual(delta, 0,
+            "URLSession path must spawn zero child processes "
+            + "(baseline=\(baseline) in-flight=\(inFlight) delta=\(delta))")
     }
 
     // MARK: Cancellation latency
