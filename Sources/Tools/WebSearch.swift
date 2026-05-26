@@ -1,49 +1,131 @@
 import Foundation
 
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
+#if canImport(FoundationNetworking)
+import FoundationNetworking
 #endif
 
-/// `@unchecked Sendable` Process box so the non-Sendable `Process` can be used
-/// from the async `WebSearchBackend.search` (same pattern as the model/auth
-/// HTTP clients).
-private final class WSProc: @unchecked Sendable { let p = Process() }
-
-/// Portable curl-backed JSON POST used by the web-search backends. Works on
-/// Linux + macOS without URLSession; mirrors `CurlTokenExchanger` /
-/// `OpenAIResponsesClient`.
+/// JSON POST used by the web-search backends. Uses `URLSession` so the
+/// Authorization bearer never appears on a child-process argv (the previous
+/// curl-spawn implementation leaked the key via `ps auxe`).
+///
+/// Connection reuse: a single module-private `sharedSession` (ephemeral
+/// configuration — no on-disk cookies/cache/global-storage bleed) gives us
+/// HTTP/2 (and HTTP/3 where the server negotiates it) connection coalescing
+/// across calls without us doing anything explicit.
+///
+/// Cancellation: we drive `URLSession.dataTask` via a continuation +
+/// `withTaskCancellationHandler`. `URLSession.data(for:)` does propagate
+/// `Task.cancel()` on Apple platforms, but only via cooperative cancellation
+/// at suspension points; wiring the task object up to the cancel handler
+/// gives us deterministic, sub-100ms abort of in-flight I/O on Linux as well.
+///
+/// Retries: none (matches the curl implementation we are replacing). The
+/// caller (`CompositeWebSearch`) handles primary→fallback failover.
 enum WebHTTP {
+    /// Per-process shared session. Ephemeral config means cookies / URL cache
+    /// / credential storage live only in memory for this session's lifetime
+    /// and never bleed across users of `URLSession.shared`.
+    static let sharedSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.httpShouldUsePipelining = true
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForRequest = 60
+        cfg.timeoutIntervalForResource = 60
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        cfg.urlCache = nil
+        cfg.httpCookieStorage = nil
+        cfg.urlCredentialStorage = nil
+        return URLSession(configuration: cfg)
+    }()
+
     static func postJSON(_ url: String,
                          headers: [String: String],
                          body: Data) async -> Result<Data, ToolError> {
-        let box = WSProc()
-        let p = box.p
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        var args = ["curl", "-sS", "--max-time", "60", "-X", "POST", url,
-                    "-H", "Content-Type: application/json",
-                    "-H", "Accept: application/json",
-                    "--data-binary", "@-"]
-        for (k, v) in headers { args += ["-H", "\(k): \(v)"] }
-        p.arguments = args
-        let inPipe = Pipe(); let outPipe = Pipe(); let errPipe = Pipe()
-        p.standardInput = inPipe
-        p.standardOutput = outPipe
-        p.standardError = errPipe
-        do { try p.run() }
-        catch { return .failure(ToolError(message: "web_search: failed to spawn curl: \(error)")) }
-        inPipe.fileHandleForWriting.write(body)
-        try? inPipe.fileHandleForWriting.close()
-        let out = outPipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            let e = errPipe.fileHandleForReading.readDataToEndOfFile()
-            return .failure(ToolError(message:
-                "web_search: curl exit \(p.terminationStatus): "
-                + String(decoding: e.prefix(300), as: UTF8.self)))
+        await postJSON(url, headers: headers, body: body, session: sharedSession)
+    }
+
+    /// Test-injectable variant — production callers use the no-`session`
+    /// overload above; tests can pass a per-test `URLSession` whose
+    /// configuration's `protocolClasses` mocks the network.
+    static func postJSON(_ url: String,
+                         headers: [String: String],
+                         body: Data,
+                         session: URLSession) async -> Result<Data, ToolError> {
+        guard let u = URL(string: url) else {
+            return .failure(ToolError(message: "web_search: invalid url: \(url)"))
         }
-        return .success(out)
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.httpBody = body
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        // CRITICAL: bearer/Authorization travels on the HTTP header. It is
+        // NEVER materialized into a child-process argv, so `ps -E ww -A`
+        // cannot leak it (see WebSearchURLSessionTests.testKeyNeverOnArgv).
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        req.timeoutInterval = 60
+
+        let box = TaskBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Result<Data, ToolError>, Never>) in
+                if Task.isCancelled {
+                    cont.resume(returning: .failure(
+                        ToolError(message: "web_search: cancelled before start")))
+                    return
+                }
+                let task = session.dataTask(with: req) { data, resp, err in
+                    if let err = err {
+                        let ns = err as NSError
+                        if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled {
+                            cont.resume(returning: .failure(
+                                ToolError(message: "web_search: cancelled")))
+                            return
+                        }
+                        cont.resume(returning: .failure(
+                            ToolError(message: "web_search: transport error: \(err.localizedDescription)")))
+                        return
+                    }
+                    guard let data = data else {
+                        cont.resume(returning: .failure(
+                            ToolError(message: "web_search: empty response body")))
+                        return
+                    }
+                    if let http = resp as? HTTPURLResponse,
+                       !(200..<300).contains(http.statusCode) {
+                        let snippet = String(decoding: data.prefix(300), as: UTF8.self)
+                        cont.resume(returning: .failure(
+                            ToolError(message: "web_search: HTTP \(http.statusCode): \(snippet)")))
+                        return
+                    }
+                    cont.resume(returning: .success(data))
+                }
+                box.set(task)
+                task.resume()
+            }
+        } onCancel: {
+            // Propagate Task.cancel() into URLSession within ~tens of ms;
+            // the dataTask completion fires with NSURLErrorCancelled, which
+            // we translate into a Result.failure above.
+            box.cancel()
+        }
+    }
+
+    /// Sendable box so the non-Sendable `URLSessionDataTask` can be referenced
+    /// from the cancellation handler without tripping Swift 6 isolation.
+    private final class TaskBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: URLSessionDataTask?
+        private var cancelled = false
+        func set(_ t: URLSessionDataTask) {
+            lock.lock(); defer { lock.unlock() }
+            if cancelled { t.cancel() } else { task = t }
+        }
+        func cancel() {
+            lock.lock(); defer { lock.unlock() }
+            cancelled = true
+            task?.cancel()
+        }
     }
 }
 
