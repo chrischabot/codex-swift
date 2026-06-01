@@ -20,10 +20,16 @@ final class MediaTokenTests: XCTestCase {
         let signer = MediaToken.Signer.random()
         XCTAssertNil(signer.verify("garbage"))
         XCTAssertNil(signer.verify("AAAA.BBBB"))
-        // Tamper a valid token.
+        // Tamper a valid token. Flip the FIRST char (start of the payload's
+        // base64url): every bit there is a DATA bit, so the decoded payload
+        // changes and the HMAC no longer matches → rejected. (Do NOT flip the
+        // LAST char: for a 32-byte HMAC the final base64url char carries 4 data +
+        // 2 *padding* bits that the decoder discards, so an A↔B flip there leaves
+        // the decoded signature unchanged and verify legitimately succeeds — that
+        // made this assertion flaky.)
         let token = signer.sign(relPath: "x/y.png")!
         var chars = Array(token)
-        chars[chars.count - 1] = chars.last == "A" ? "B" : "A"
+        chars[0] = (chars[0] == "A") ? "B" : "A"
         XCTAssertNil(signer.verify(String(chars)))
     }
 

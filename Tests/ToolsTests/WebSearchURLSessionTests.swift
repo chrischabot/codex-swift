@@ -440,12 +440,14 @@ final class WebSearchURLSessionTests: XCTestCase {
         XCTAssertLessThan(fdAfter - fdBefore, 50,
                           "FD delta must be <50, got before=\(fdBefore) after=\(fdAfter)")
 
-        // No zombie children: nothing should be reaped (we don't spawn).
-        // ps confirms no curl child of this process.
-        let psOut = runPS()
+        // No zombie children: nothing should be reaped (we don't spawn). Assert
+        // there is no `curl` CHILD of THIS process — parse the ppid column rather
+        // than a naive system-wide `psOut.contains("curl ")`, which trips on ANY
+        // unrelated process anywhere on the machine whose command mentions curl
+        // (a sibling test's curl, a `libcurl` load, another session's healthcheck).
         let selfPID = ProcessInfo.processInfo.processIdentifier
-        XCTAssertFalse(psOut.contains(" \(selfPID) ") && psOut.contains("curl "),
-                       "no curl child of our PID may exist")
+        let curlKids = curlChildCount(of: selfPID)
+        XCTAssertEqual(curlKids, 0, "no curl child of our PID may exist (found \(curlKids))")
     }
 
     /// CLAIM: postJSON never spawns a `curl` child during a real call.
@@ -683,6 +685,21 @@ private func countChildren(of pid: Int32) -> Int {
         let cmd = parts[2...].joined(separator: " ")
         if cmd.contains("/bin/ps") || cmd.hasSuffix("ps") { continue }
         n += 1
+    }
+    return n
+}
+
+/// Count `curl` processes that are DIRECT CHILDREN of `pid`. Matches the child's
+/// executable (basename `curl`) — never a system-wide command-line substring —
+/// so unrelated processes that merely mention curl cannot trip the caller.
+private func curlChildCount(of pid: Int32) -> Int {
+    let ps = runPS()
+    var n = 0
+    for line in ps.split(separator: "\n") {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 3, let ppid = Int32(parts[0]), ppid == pid else { continue }
+        let exe = String(parts[2])   // first command token = the executable
+        if exe == "curl" || exe.hasSuffix("/curl") { n += 1 }
     }
     return n
 }
