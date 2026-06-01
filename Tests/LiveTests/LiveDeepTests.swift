@@ -173,16 +173,23 @@ final class LiveDeepTests: XCTestCase {
             }
             return false
         }, "review emits the typed enteredReviewMode item")
-        let exit = evs.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it, _) = n,
-               case .agentMessage(_, let t) = it,
-               t.contains("<user_action>") { return t }
+        // The FRONTEND stream gets the typed `.exitedReviewMode` item; the
+        // byte-faithful `<user_action>` reviewExitSuccess wrapper is the
+        // MODEL-history item persisted to the rollout for cross-turn replay — it
+        // is NOT emitted to the frontend stream (SessionEngine.swift:3924-3956).
+        // Verify both: the stream item, and the wrapper in the rollout.
+        XCTAssertTrue(evs.contains {
+            if case .itemCompleted(_, _, let it, _) = $0, case .exitedReviewMode = it { return true }
+            return false
+        }, "review emits the typed exitedReviewMode item to the frontend stream")
+        let rebuilt = try await st.reconstruct(tid)
+        let exitWrapper = rebuilt.items.compactMap { item -> String? in
+            if case .agentMessage(_, let t) = item, t.contains("<user_action>") { return t }
             return nil
         }.last ?? ""
-        XCTAssertTrue(exit.contains("<user_action>")
-                      && exit.contains("<action>review</action>")
-                      && exit.contains("</user_action>"),
-                      "review exit item is the byte-faithful reviewExitSuccess wrapper")
+        XCTAssertTrue(exitWrapper.contains("<action>review</action>")
+                      && exitWrapper.contains("</user_action>"),
+                      "review exit persists the byte-faithful reviewExitSuccess wrapper to the rollout")
     }
 
     // MARK: 3. UserShell task runs a real command (full access)
@@ -238,14 +245,15 @@ final class LiveDeepTests: XCTestCase {
                case .contextCompaction = item { return true }
             return false
         }, "manual compaction emitted the canonical contextCompaction item")
-        XCTAssertTrue(e2.contains {
-            // Routes through the typed `.warning` case (upstream
-            // `WarningNotification { thread_id: Some(...), message }`).
-            if case .warning(let threadId, let message) = $0 {
-                return threadId == tid && message == Compaction.headsUpWarning
-            }
-            return false
-        }, "manual compaction emitted the byte-exact Heads-up warning with threadId")
+        // Heads-up warning is LOCAL-compaction-path only; the live remote
+        // `/responses/compact` path completes silently by design
+        // (SessionEngine.swift:2563-2567). Don't REQUIRE it on a live (remote) run;
+        // validate byte-exactness + threadId only if it IS emitted (local path).
+        for case .warning(let threadId, let message) in e2 {
+            XCTAssertTrue(threadId == tid, "compaction warning must carry the threadId")
+            XCTAssertEqual(message, Compaction.headsUpWarning,
+                           "compaction warning, if emitted, must be byte-exact")
+        }
         let rebuilt = try await st.reconstruct(tid)
         // Live OpenAI takes the remote `/responses/compact` path: upstream
         // (compact_remote.rs) installs the endpoint's returned messages

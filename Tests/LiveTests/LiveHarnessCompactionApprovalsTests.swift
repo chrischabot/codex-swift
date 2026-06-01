@@ -127,15 +127,16 @@ final class LiveHarnessCompactionApprovalsTests: XCTestCase {
             return false
         }, "manual .compactNow emitted the canonical contextCompaction item")
 
-        // The warning message must be byte-exact via the source symbol, and
-        // (upstream `WarningNotification { thread_id: Some(...), message }`)
-        // carries the thread association via the typed `.warning` case.
-        let warningMatched = compactEvs.contains { n -> Bool in
-            guard case .warning(let threadId, let msg) = n else { return false }
-            return threadId == tid && msg == Compaction.headsUpWarning
+        // The heads-up warning is emitted ONLY on the LOCAL (model-streamed)
+        // compaction path; the live remote `/responses/compact` path completes
+        // SILENTLY by design (SessionEngine.swift:2563-2567 / upstream
+        // compact_remote.rs). A live run takes the remote path, so do NOT REQUIRE
+        // a warning — but if one IS emitted (local path), it must be byte-exact
+        // and carry the threadId (upstream `WarningNotification { thread_id, message }`).
+        for case .warning(let t, let m) in compactEvs {
+            XCTAssertTrue(t == tid, "compaction warning must carry the threadId")
+            XCTAssertEqual(m, Compaction.headsUpWarning, "compaction warning must be byte-exact")
         }
-        XCTAssertTrue(warningMatched,
-                      "warning carried byte-exact Compaction.headsUpWarning with threadId")
 
         let rebuilt = try await store.reconstruct(tid)
         // Live OpenAI uses the remote `/responses/compact` path: upstream
