@@ -473,8 +473,14 @@ final class LiveDeepTests: XCTestCase {
         let driver = Task { _ = await dCollect(engine, untilCompletions: 3,
                                                timeout: .seconds(90)) }
         defer { driver.cancel() }
+        // PREASSIGN the turn id so the steer's `expectedTurnId` matches the active
+        // turn. `steer` validation rejects a mismatched id ("expected active turn
+        // id X but found Y", SessionEngine.submit(.steer)), so with a nil (random)
+        // start id the steered input would be rejected and never reach the prompt
+        // or rollout — which is exactly what made both assertions below fail.
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "Count from one to five, one number per line.")], model: nil, turnId: nil))
+            text: "Count from one to five, one number per line.")], model: nil,
+            turnId: TurnId("x")))
         await engine.submit(.steer(input: [TurnInput(
             text: "STEER_ZEBRA_88: also mention zebra in your final reply.")],
             expectedTurnId: TurnId("x")))
