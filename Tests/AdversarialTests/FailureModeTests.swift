@@ -60,7 +60,7 @@ private func fmBlob(_ items: [PromptInput]) -> String {
     items.map { i in
         switch i {
         case .userText(let t), .developerText(let t), .assistantText(let t): return t
-        case .toolOutput(_, let o): return o
+        case .toolOutput(_, _, _, let o): return o
         case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
         }
     }.joined(separator: "\n")

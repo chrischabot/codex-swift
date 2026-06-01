@@ -114,7 +114,7 @@ public actor ChatCompletionsClient: ModelClient {
                 messages.append(["role": "system", "content": t])
             case .assistantText(let t):
                 messages.append(["role": "assistant", "content": t])
-            case .toolOutput(_, let output):
+            case .toolOutput(_, _, _, let output):
                 messages.append(["role": "user", "content": output])
             case .reasoning(let summary, let content, _):
                 // Chat-completions has no encrypted-reasoning replay slot; fold

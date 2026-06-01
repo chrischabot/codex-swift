@@ -386,13 +386,21 @@ public struct ContextManager: Sendable {
             case .agentMessage(_, let t):
                 if !t.isEmpty { out.append(.assistantText(t)) }
             case .commandExecution(let id, let command, _, _, _, let o, _, _, _, _):
-                // Prefix the tool/command name so the model can see WHICH call
-                // produced this output across iterations (the replay layer
-                // otherwise labels every call a generic "tool"). Mirrors codex-rs
-                // replaying the real FunctionCall name.
+                // Replay the REAL tool name on the synthesized function_call so
+                // the model sees WHICH call produced this output across
+                // iterations (mirrors codex-rs replaying the verbatim
+                // `ResponseItem::FunctionCall` name; previously every call was a
+                // generic "tool"). The name lives on the structured
+                // `function_call` item, NOT prefixed into the output text — so
+                // the output text stays clean (parity with upstream's separate
+                // FunctionCall / FunctionCallOutput items). The Swift unified
+                // `.commandExecution` item does not retain the original
+                // arguments string (see Rollout.swift:843-880), so `"{}"` is
+                // passed for `argumentsJSON`.
                 if let o {
-                    let name = command.first.map { "[\($0)]\n" } ?? ""
-                    out.append(.toolOutput(callId: id.raw, output: name + o))
+                    let name = command.first ?? "tool"
+                    out.append(.toolOutput(callId: id.raw, name: name,
+                                           argumentsJSON: "{}", output: o))
                 }
             case .contextMessage(_, let role, let sections):
                 for s in sections where !s.isEmpty {
@@ -433,7 +441,13 @@ public struct ContextManager: Sendable {
                         }
                         return "[apply_patch] \(verb) \(ch.path)\n\(ch.diff)"
                     }.joined(separator: "\n")
-                    out.append(.toolOutput(callId: id.raw, output: rendered))
+                    // The apply_patch edits are replayed as the `apply_patch`
+                    // tool's function_call_output so the model remembers what it
+                    // changed. The real tool name is `apply_patch`; the unified
+                    // `.fileChange` item does not retain the original arguments
+                    // string, so `"{}"` is passed for `argumentsJSON`.
+                    out.append(.toolOutput(callId: id.raw, name: "apply_patch",
+                                           argumentsJSON: "{}", output: rendered))
                 }
             case .collabAgentToolCall, .contextCompaction,
                  .enteredReviewMode, .exitedReviewMode, .unknown:

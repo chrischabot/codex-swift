@@ -171,7 +171,8 @@ final class ModelClientAuditV11Tests: XCTestCase {
                 type: "grammar", syntax: "lark", definition: "x"))
         let prompt = Prompt(
             instructions: "i",
-            input: [.toolOutput(callId: "c1", output: envelope)],
+            input: [.toolOutput(callId: "c1", name: "shell",
+                                argumentsJSON: "{}", output: envelope)],
             tools: [freeform])
         let body = OpenAIResponsesClient.buildRequestBody(
             prompt, ModelSettings(model: "gpt", threadId: "t"),
@@ -188,7 +189,8 @@ final class ModelClientAuditV11Tests: XCTestCase {
         """
         let prompt = Prompt(
             instructions: "i",
-            input: [.toolOutput(callId: "c1", output: envelope)])
+            input: [.toolOutput(callId: "c1", name: "shell",
+                                argumentsJSON: "{}", output: envelope)])
         let body = OpenAIResponsesClient.buildRequestBody(
             prompt, ModelSettings(model: "gpt", threadId: "t"),
             maxOutputTokens: nil)

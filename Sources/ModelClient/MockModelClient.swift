@@ -118,7 +118,7 @@ public actor MockModelClient: ModelClient {
                 switch inp {
                 case .userText(let t), .developerText(let t), .assistantText(let t):
                     return t
-                case .toolOutput(_, let o):
+                case .toolOutput(_, _, _, let o):
                     return o
                 case .reasoning:
                     return nil

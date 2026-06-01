@@ -67,7 +67,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
-            case .toolOutput(_, let s): return s
+            case .toolOutput(_, _, _, let s): return s
         case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
@@ -107,7 +107,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
-            case .toolOutput(_, let s): return s
+            case .toolOutput(_, _, _, let s): return s
         case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
@@ -147,7 +147,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
-            case .toolOutput(_, let s): return s
+            case .toolOutput(_, _, _, let s): return s
             case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
@@ -183,7 +183,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
-            case .toolOutput(_, let s): return s
+            case .toolOutput(_, _, _, let s): return s
             case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
@@ -227,7 +227,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
-            case .toolOutput(_, let s): return s
+            case .toolOutput(_, _, _, let s): return s
         case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
@@ -289,7 +289,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
-            case .toolOutput(_, let s): return s
+            case .toolOutput(_, _, _, let s): return s
         case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")

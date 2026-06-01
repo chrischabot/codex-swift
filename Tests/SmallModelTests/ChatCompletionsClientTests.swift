@@ -57,7 +57,9 @@ final class ChatCompletionsClientTests: XCTestCase {
         let prompt = Prompt(instructions: "   ",
                             input: [.developerText("ctx"),
                                     .assistantText("prior"),
-                                    .toolOutput(callId: "c1", output: "tool said hi")])
+                                    .toolOutput(callId: "c1", name: "shell",
+                                                argumentsJSON: "{}",
+                                                output: "tool said hi")])
         // Empty settings.model → fall back to the construction model id.
         let settings = ModelSettings(model: "", threadId: "t", store: false)
         let body = ChatCompletionsClient.buildRequestBody(

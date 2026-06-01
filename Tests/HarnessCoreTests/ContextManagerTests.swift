@@ -379,7 +379,7 @@ final class ContextManagerTests: XCTestCase {
         XCTAssertEqual(proj, [
             .userText("u1"),
             .assistantText("a1"),
-            .toolOutput(callId: "c1", output: "out1"),
+            .toolOutput(callId: "c1", name: "echo", argumentsJSON: "{}", output: "out1"),
             .userText("u2"),
             .userText("EXTRA"),
         ], "for_prompt sends the full chronological transcript incl. assistant turns")

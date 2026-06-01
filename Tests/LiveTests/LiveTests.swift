@@ -128,7 +128,8 @@ final class LiveTests: XCTestCase {
             instructions: "SYSTEM",
             input: [.developerText("DEV"), .userText("hello"),
                     .assistantText("prior reply"),
-                    .toolOutput(callId: "c1", output: "OUT")],
+                    .toolOutput(callId: "c1", name: "echo",
+                                argumentsJSON: "{}", output: "OUT")],
             tools: [ToolSpec(name: "echo",
                              description: "echoes",
                              parametersJSON: #"{"type":"object","properties":{"text":{"type":"string"}}}"#)])
@@ -447,7 +448,7 @@ final class LiveTests: XCTestCase {
             items.map { i in
                 switch i {
                 case .userText(let t), .developerText(let t), .assistantText(let t): return t
-                case .toolOutput(_, let o): return o
+                case .toolOutput(_, _, _, let o): return o
                 case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
                 }
             }.joined(separator: "\n")

@@ -10,7 +10,26 @@ public enum PromptInput: Sendable, Equatable {
     case userText(String)
     case developerText(String)
     case assistantText(String)
-    case toolOutput(callId: String, output: String)
+    /// A tool result replayed back into the next request's input. Mirrors
+    /// upstream replaying the originating `ResponseItem::FunctionCall` (real
+    /// `name` + `arguments`) immediately followed by its
+    /// `ResponseItem::FunctionCallOutput` (`client_common.rs:65-82`,
+    /// `protocol/src/models.rs:787-800`). The request builder serializes this
+    /// as a `function_call` (`{type,name,arguments,call_id}`) + a
+    /// `function_call_output` (`{type,call_id,output}`) pair so the API accepts
+    /// the output (it requires a matching preceding call) AND the model sees
+    /// WHICH tool produced the result across iterations.
+    ///
+    /// `name` is the REAL tool name (e.g. `shell`, `apply_patch`, `read_file`),
+    /// not the prior fake `"tool"`. `argumentsJSON` is the call's arguments
+    /// string; the Swift `ThreadItem` model unifies a tool call and its output
+    /// into one `.commandExecution` / `.fileChange` entry that does NOT retain
+    /// the original arguments string (a documented consequence of the unified
+    /// item model — see `Rollout.swift:843-880`), so callers projecting from
+    /// history pass `"{}"`. Callers that have the live arguments may pass them
+    /// verbatim.
+    case toolOutput(callId: String, name: String, argumentsJSON: String,
+                    output: String)
     /// A reasoning item replayed back into the model input so encrypted
     /// chain-of-thought survives across turns (Codex `ResponseItem::Reasoning`,
     /// `protocol/src/models.rs:766-775`). `summary` is the list of

@@ -151,11 +151,18 @@ public actor OpenAIResponsesClient: ModelClient {
             case .assistantText(let t):
                 input.append(["role": "assistant",
                               "content": [["type": "output_text", "text": t]]])
-            case .toolOutput(let callId, let output):
-                // Replay a minimal preceding function_call so the API accepts
-                // the function_call_output (it requires a matching call).
+            case .toolOutput(let callId, let name, let argumentsJSON, let output):
+                // Replay the originating function_call so the API accepts the
+                // function_call_output (it requires a matching preceding call)
+                // AND the model sees the REAL tool name + arguments it invoked
+                // (upstream replays the verbatim `ResponseItem::FunctionCall`,
+                // `protocol/src/models.rs:787-800`). `name` is the actual tool
+                // name; `argumentsJSON` is the call's arguments string. The
+                // upstream `function_call` shape is
+                // `{type,name,arguments,call_id}` (`namespace` omitted when
+                // absent, `id` is `#[serde(skip_serializing)]`).
                 input.append(["type": "function_call", "call_id": callId,
-                              "name": "tool", "arguments": "{}"])
+                              "name": name, "arguments": argumentsJSON])
                 let formattedOutput = reserializeFreeformShellOutputs
                     ? (FreeformApplyPatchFormatting
                         .reserializeShellOutput(output) ?? output)
