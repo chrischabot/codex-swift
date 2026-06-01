@@ -50,8 +50,19 @@ enum CodexSwiftSession {
         guard let store = try? ThreadStore(codexHome: codexHome, limits: Limits()) else {
             log("[\(task.id)] failed to open ThreadStore"); return info
         }
-        var limits = Limits()                 // real defaults (incl. maxSamplingIterationsPerTurn)
+        var limits = Limits()
         limits.turnDeadline = timeout
+        // BUG FIX: the default `maxSamplingIterationsPerTurn` LoopGuard is 100, which
+        // force-FAILS a turn ("sampling loop guard fired") after 100 sample->tool
+        // iterations. Deep-swe tasks are long-horizon and meant to be bounded by the
+        // TIME budget (agent.timeout_sec, default 5400s ≈ 90min) — but at ~8s/iter the
+        // 100-cap fires after only ~13min, truncating the agent mid-task (observed:
+        // both tasks stopped at EXACTLY 100 iters well before the deadline). The turn
+        // deadline + `maxIdenticalToolRepeats` (64) already bound true runaway loops,
+        // so raise the iteration cap to its safe ceiling (1000) and let the deadline
+        // be the binding constraint. Override via CODEX_BENCH_MAX_ITERS.
+        limits.maxSamplingIterationsPerTurn =
+            ProcessInfo.processInfo.environment["CODEX_BENCH_MAX_ITERS"].flatMap(Int.init) ?? 1000
         // Model-facing exec-output budget: codex uses a per-model TruncationPolicy
         // (~10KB head+tail for gpt-5.x, keeping the failing assertion visible); the
         // port's flat 1 MiB default lets one test/grep flood the window and trigger
