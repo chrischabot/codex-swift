@@ -233,6 +233,11 @@ struct SessionWorkerMain {
                 rawValue: ModelsCatalog.entry(for: c.model)?.shellType)
             await DefaultTools.register(on: router, sandbox: sb, limits: limits,
                                         shellType: shellType,
+                                        // computer_use drives THIS host's desktop —
+                                        // only meaningful for a local (non-remote)
+                                        // session, never one bound to a remote
+                                        // exec container.
+                                        computerUseEnabled: c.remoteEnvironment == nil,
                                         spawnAgentOptions: spawnAgentOptions)
             // Dynamic workflows: enabled gate (the orchestrator is wired after
             // the engine exists, so progress can be pushed over its stream).

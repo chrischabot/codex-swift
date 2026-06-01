@@ -893,6 +893,7 @@ public enum DefaultTools {
                                 allowLoginShell: Bool = true,
                                 requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled,
                                 toolSearchEnabled: Bool = defaultToolSearchEnabled,
+                                computerUseEnabled: Bool = false,
                                 spawnAgentOptions: SpawnAgentToolOptions = SpawnAgentToolOptions()) async {
         let uem = UnifiedExecManager()
         // Under `dangerFullAccess` the model's exec tools must skip the
@@ -1063,6 +1064,19 @@ public enum DefaultTools {
         await router.register(WebSearchTool(
             backend: webSearch ?? ResolvedWebSearch.fromEnvironment(),
             sandbox: sandbox))
+        // PORT EXTENSION (computer-use): `computer_use` lets the agent drive the
+        // real macOS desktop (mouse/keyboard/screen) via the native OpenAI
+        // `computer` action loop for GUI tasks the shell/file/code tools cannot
+        // do. Opt-in (default OFF so the upstream-parity tool list + tests are
+        // unchanged) and macOS-only; the real session runtimes enable it for
+        // LOCAL (non-remote) sessions only — a remote-exec session controls a
+        // container, not this host's desktop. See ComputerUseTool / the
+        // ComputerUse module.
+        #if canImport(AppKit)
+        if computerUseEnabled {
+            await router.register(ComputerUseTool())
+        }
+        #endif
         // tool_search discovery (audit tools-router finding 2). Upstream
         // `spec_plan.rs:117 append_tool_search_executor` appends the model-visible
         // `tool_search` tool AFTER all other executors (and before code-mode is

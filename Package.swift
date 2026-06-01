@@ -119,12 +119,14 @@ let package = Package(
         .library(name: "MemoryRetrieve", targets: ["MemoryRetrieve"]),
         .library(name: "MemoryMCP", targets: ["MemoryMCP"]),
         .library(name: "BenchKit", targets: ["BenchKit"]),
+        .library(name: "ComputerUse", targets: ["ComputerUse"]),
         .executable(name: "codexd", targets: ["codexd"]),
         .executable(name: "codex-broker", targets: ["codex-broker"]),
         .executable(name: "codex-session", targets: ["codex-session"]),
         .executable(name: "codex-memory", targets: ["codex-memory"]),
         .executable(name: "mock-responses", targets: ["mock-responses"]),
         .executable(name: "codex-bench", targets: ["codex-bench"]),
+        .executable(name: "codex-computer", targets: ["codex-computer"]),
     ],
     dependencies: mlxDependencies + webDependencies,
     targets: [
@@ -146,6 +148,9 @@ let package = Package(
         .target(name: "CPTY"),
 
         .target(name: "InfraPrimitives", swiftSettings: strict),
+        // Computer-use (OpenAI `computer` tool): macOS desktop control executor.
+        // System frameworks only (AppKit/CoreGraphics/ApplicationServices/ImageIO).
+        .target(name: "ComputerUse", swiftSettings: strict),
         .target(name: "Observability", dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "WireProtocol", dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "ProtocolModel", dependencies: ["WireProtocol", "InfraPrimitives"], swiftSettings: strict),
@@ -161,7 +166,7 @@ let package = Package(
         .target(name: "Sandbox",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "Tools",
-                dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY"], swiftSettings: strict),
+                dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
         .target(name: "MCP",
                 dependencies: ["Tools", "InfraPrimitives", "ProtocolModel", "Config"], swiftSettings: strict),
         .target(name: "Skills", swiftSettings: strict),
@@ -287,6 +292,9 @@ let package = Package(
                 swiftSettings: strict),
         .executableTarget(name: "codex-bench",
                 dependencies: ["BenchKit", "InfraPrimitives", "Observability"],
+                swiftSettings: strict),
+        .executableTarget(name: "codex-computer",
+                dependencies: ["ComputerUse"],
                 swiftSettings: strict),
 
         .testTarget(name: "WorkflowsTests",

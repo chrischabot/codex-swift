@@ -297,6 +297,10 @@ struct CodexDaemon {
                         rawValue: ModelsCatalog.entry(for: c.model)?.shellType)
                     await DefaultTools.register(on: router, sandbox: sb, limits: limits,
                                                 shellType: shellType,
+                                                // computer_use drives THIS host's
+                                                // desktop — local (non-remote)
+                                                // sessions only.
+                                                computerUseEnabled: c.remoteEnvironment == nil,
                                                 spawnAgentOptions: spawnAgentOptions)
                     // Dynamic workflows: enabled gate (the orchestrator is
                     // wired after the engine exists, so progress can be pushed
