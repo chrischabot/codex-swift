@@ -54,7 +54,7 @@ final class InfraAdversarialTests: XCTestCase {
         XCTAssertLessThanOrEqual(c.ledgerSoftCPUFraction, 1.0)
         XCTAssertGreaterThanOrEqual(c.ledgerHardMemoryBytes, 64 * 1024 * 1024)
         XCTAssertGreaterThanOrEqual(c.turnDeadline, .seconds(1))
-        XCTAssertLessThanOrEqual(c.turnDeadline, .seconds(24 * 3600))
+        XCTAssertLessThanOrEqual(c.turnDeadline, .seconds(365 * 24 * 3600))
         XCTAssertGreaterThanOrEqual(c.retryMaxDelay, c.retryBaseDelay,
                                     "inverted retry window is corrected")
         XCTAssertGreaterThanOrEqual(c.heartbeatInterval, .milliseconds(1))

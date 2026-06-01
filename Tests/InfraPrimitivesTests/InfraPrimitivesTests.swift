@@ -112,7 +112,7 @@ final class InfraPrimitivesTests: XCTestCase {
         l.streamMaxRetries = 9999
         l.ledgerSoftCPUFraction = 99
         l.retryTokensPerSecond = -5
-        l.turnDeadline = .seconds(10 * 24 * 3600)
+        l.turnDeadline = .seconds(400 * 24 * 3600)   // above the 365-day ceiling
         l.retryBaseDelay = .seconds(999)
         l.retryMaxDelay = .milliseconds(1)        // inverted on purpose
         l.heartbeatInterval = .nanoseconds(1)     // below min tick
@@ -122,7 +122,7 @@ final class InfraPrimitivesTests: XCTestCase {
         XCTAssertLessThanOrEqual(c.ledgerSoftCPUFraction, 1.0)
         XCTAssertGreaterThanOrEqual(c.ledgerSoftCPUFraction, 0.05)
         XCTAssertGreaterThanOrEqual(c.retryTokensPerSecond, 0)
-        XCTAssertLessThanOrEqual(c.turnDeadline, .seconds(24 * 3600))
+        XCTAssertLessThanOrEqual(c.turnDeadline, .seconds(365 * 24 * 3600))
         XCTAssertGreaterThanOrEqual(c.retryMaxDelay, c.retryBaseDelay)
         XCTAssertGreaterThanOrEqual(c.heartbeatInterval, .milliseconds(1))
         XCTAssertGreaterThanOrEqual(c.effectiveMaxActiveWorkers(), 1)

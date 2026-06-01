@@ -31,9 +31,15 @@ public struct Limits: Sendable, Codable, Equatable {
     /// Wall-clock deadline for a single turn. Override with
     /// `turn_deadline_secs = <N>` in `$CODEX_HOME/config.toml` (F1).
     public var turnDeadline: Duration = .seconds(900)
-    /// Hard cap on sample->tool->sample iterations within one turn. Override
-    /// with `max_sampling_iterations_per_turn = <N>` in `config.toml`.
-    public var maxSamplingIterationsPerTurn: Int = 100
+    /// Backstop on sample->tool->sample iterations within one turn. A turn is
+    /// meant to be bounded by the TIME deadline (`turnDeadline`), not an arbitrary
+    /// iteration count — multi-day long-horizon turns can legitimately run tens of
+    /// thousands of iterations. So this defaults HIGH (the deadline binds first in
+    /// every realistic run) and only guards against literal non-terminating loops.
+    /// Override with `max_sampling_iterations_per_turn = <N>` in `config.toml`.
+    /// (Was 100 — which fired after ~13min on a long-deadline turn and force-FAILED
+    /// it with "sampling loop guard fired", truncating long agentic/bench runs.)
+    public var maxSamplingIterationsPerTurn: Int = 1_000_000
     /// Hard cap on *non-progressing* consecutive auto-compactions within one
     /// turn. Upstream (`core/src/session/turn.rs:497-517`) has NO per-turn
     /// compaction counter: "as long as compaction works well in getting us way
@@ -112,8 +118,17 @@ public struct Limits: Sendable, Codable, Equatable {
         l.maxInboundMessageBytes = 64 * 1024 * 1024
         l.maxToolOutputBytes = 16 * 1024 * 1024
         l.maxInFlightPerConnection = 256
-        l.maxSamplingIterationsPerTurn = 1000
-        l.maxCompactionsPerTurn = 16
+        // Multi-day runs are a first-class goal: a single long-horizon turn can
+        // legitimately run for days (tens of thousands of sample->tool
+        // iterations), bounded by the TIME deadline — NOT an arbitrary iteration
+        // count. Keep a finite backstop against literal infinity, but high enough
+        // that no realistic run reaches it (10M iters ≈ years at seconds/iter).
+        l.maxSamplingIterationsPerTurn = 10_000_000
+        // Was 16 — LOWER than the default (100), so `clamped()` silently capped
+        // the "intended-unreachable" default down to 16. The mid-turn counter is
+        // non-progress-based (a productive compaction never advances it), so this
+        // ceiling only needs to clear a genuine non-terminating compaction loop.
+        l.maxCompactionsPerTurn = 1000
         l.maxIdenticalToolRepeats = 64
         l.maxConcurrentTools = 64
         l.streamMaxRetries = 12
@@ -131,7 +146,11 @@ public struct Limits: Sendable, Codable, Equatable {
 
     // Duration hard bounds.
     private static let minTick: Duration = .milliseconds(1)
-    private static let maxTurnDeadline: Duration = .seconds(24 * 3600)
+    // Multi-day turns are a goal, so the per-turn deadline ceiling must allow
+    // far more than a day — config could not previously express a >24h turn at
+    // all (the clamp capped it). 365 days is effectively unbounded for any real
+    // run while still rejecting absurd/overflow values.
+    private static let maxTurnDeadline: Duration = .seconds(365 * 24 * 3600)
     private static let maxInterval: Duration = .seconds(3600)
     private static let maxIdleUnload: Duration = .seconds(24 * 3600)
 
