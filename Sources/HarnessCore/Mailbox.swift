@@ -59,6 +59,17 @@ public struct InterAgentCommunication: Sendable, Equatable, Codable {
     }
 }
 
+/// Faithful port of `codex_core::state::MailboxDeliveryPhase`
+/// (codex-rs/core/src/state/turn.rs:47-53). Gates whether queued inter-agent
+/// mail is consumed by the *current* turn or held back for the next one.
+public enum MailboxDeliveryPhase: Sendable, Equatable {
+    /// Incoming mailbox messages can still be consumed by the current turn.
+    case currentTurn
+    /// The current turn already emitted visible final-answer text; mailbox
+    /// messages should remain queued for a later turn.
+    case nextTurn
+}
+
 public actor Mailbox {
     private var queue: [InterAgentCommunication] = []
     private var nextSeq: UInt64 = 0

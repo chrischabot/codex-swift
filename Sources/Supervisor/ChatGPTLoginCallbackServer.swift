@@ -15,6 +15,20 @@ struct ChatGPTLoginCallbackResponse: Sendable {
         status: 200,
         body: "Sign-in complete. You can return to Codex.")
 
+    /// Mirrors upstream `login/src/server.rs` `compose_success_url` +
+    /// `/success` page selection: the post-callback success page reflects the
+    /// `codex_streamlined_login` flag. Upstream redirects the browser to
+    /// `/success?...&codex_streamlined_login=true` and serves the streamlined
+    /// `success.html` body, versus the legacy `success_legacy.html` body when
+    /// the flag is absent/false. The Swift callback server collapses the
+    /// redirect into a single response, so the flag selects the body here.
+    static func success(streamlined: Bool) -> ChatGPTLoginCallbackResponse {
+        guard streamlined else { return .success }
+        return ChatGPTLoginCallbackResponse(
+            status: 200,
+            body: "Signed in to Codex. You can return to Codex.")
+    }
+
     static func failure(_ message: String, status: Int = 400) -> ChatGPTLoginCallbackResponse {
         ChatGPTLoginCallbackResponse(status: status, body: message)
     }
@@ -24,6 +38,10 @@ final class ChatGPTLoginCallbackServer: @unchecked Sendable {
     typealias Handler = @Sendable ([String: String]) async -> ChatGPTLoginCallbackResponse
 
     let port: UInt16
+    /// When true, the post-callback success page uses the streamlined variant,
+    /// mirroring upstream `codex_streamlined_login` (login/src/server.rs:887-889,
+    /// 407-410). Threaded from `account/login/start` `codexStreamlinedLogin`.
+    let codexStreamlinedLogin: Bool
     private let fd: Int32
     private let handler: Handler
     private var acceptThread: Thread?
@@ -31,6 +49,7 @@ final class ChatGPTLoginCallbackServer: @unchecked Sendable {
     private var isStopped = false
 
     init(preferredPort: UInt16 = 1455, fallbackPort: UInt16 = 1457,
+         codexStreamlinedLogin: Bool = false,
          handler: @escaping Handler) throws {
         do {
             self.fd = try PosixSocket.listenLoopback(port: preferredPort)
@@ -38,6 +57,7 @@ final class ChatGPTLoginCallbackServer: @unchecked Sendable {
             self.fd = try PosixSocket.listenLoopback(port: fallbackPort)
         }
         self.port = PosixSocket.boundPort(fd)
+        self.codexStreamlinedLogin = codexStreamlinedLogin
         self.handler = handler
         start()
     }

@@ -302,7 +302,7 @@ final class SupervisorResourceTests: XCTestCase {
         XCTAssertEqual(terminationCount, 0)
 
         await supervisor.submit(cfg.threadId, .startTurn(input: [TurnInput(text: "should be rejected")],
-                                                         model: nil))
+                                                         model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(100))
 
         let opCount = await probe.ops()
@@ -317,7 +317,7 @@ final class SupervisorResourceTests: XCTestCase {
         XCTAssertTrue(seen.contains {
             if case .error(let threadId, _, let willRetry, let body) = $0 {
                 return threadId == cfg.threadId
-                    && body.codexErrorInfo == "Overloaded"
+                    && body.reason == "Overloaded"
                     && willRetry == false
             }
             return false
@@ -508,7 +508,7 @@ final class SupervisorResourceTests: XCTestCase {
         XCTAssertTrue(seen.contains {
             if case .error(let threadId, _, let willRetry, let body) = $0 {
                 return threadId == hotThread
-                    && body.codexErrorInfo == "ResourceGovernorTerminal"
+                    && body.reason == "ResourceGovernorTerminal"
                     && willRetry == false
             }
             return false
@@ -550,7 +550,7 @@ final class SupervisorResourceTests: XCTestCase {
         XCTAssertTrue(seen.contains {
             if case .error(let threadId, _, let willRetry, let body) = $0 {
                 return threadId == thread
-                    && body.codexErrorInfo == "ResourceGovernorTerminal"
+                    && body.reason == "ResourceGovernorTerminal"
                     && willRetry == false
             }
             return false

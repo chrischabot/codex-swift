@@ -81,6 +81,21 @@ public struct OAuthMetadata: Sendable, Equatable {
 }
 
 public enum McpOAuth {
+    /// INTENTIONAL PORT DIVERGENCE (audit "mcp" Finding 6, minor):
+    ///
+    /// Upstream (`rmcp-client/src/perform_oauth_login.rs`) binds an *ephemeral*
+    /// loopback port and appends a per-server callback-id (SHA256 of the
+    /// normalized server URL, base64url) to the redirect path, and sources
+    /// `client_id` from dynamic registration / `oauth.client_id` config. This
+    /// Swift implementation is a *simplified, CLI-only* `codex mcp login` flow
+    /// (out of band from the JSON-RPC protocol surface): it uses a fixed
+    /// loopback port + static path and a literal `client_id=Codex` in the token
+    /// exchange. Because this is not part of the wire protocol that real MCP
+    /// servers exercise during a session, the fidelity impact is low; it is
+    /// retained as a documented divergence rather than reproducing the
+    /// ephemeral-port + callback-id machinery for a local CLI helper. If full
+    /// OAuth login parity is later required, see the finding's
+    /// `fixRecommendation` for the exact derivation.
     public static let redirectURI = "http://127.0.0.1:1455/mcp/oauth/callback"
 
     public static func discoverMetadata(serverURL: String,

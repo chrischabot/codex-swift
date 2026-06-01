@@ -95,9 +95,9 @@ final class AdversarialTests: XCTestCase {
             }
             return out
         }
-        await engine.submit(.startTurn(input: [TurnInput(text: "first")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "first")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(200))
-        await engine.submit(.startTurn(input: [TurnInput(text: "second")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "second")], model: nil, turnId: nil))
         let evs = await collector.value
 
         let completions = evs.compactMap { n -> TurnStatus? in
@@ -107,7 +107,7 @@ final class AdversarialTests: XCTestCase {
         XCTAssertEqual(completions[0], .failed, "failed turn is isolated")
         XCTAssertEqual(completions[1], .completed, "session recovers and serves the next turn")
         XCTAssertTrue(evs.contains {
-            if case .itemCompleted(_, _, let i) = $0, case .agentMessage(_, let t) = i {
+            if case .itemCompleted(_, _, let i, _) = $0, case .agentMessage(_, let t) = i {
                 return t == "recovered after failure"
             }; return false
         })

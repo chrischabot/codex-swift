@@ -125,10 +125,49 @@ final class WireProtocolTests: XCTestCase {
         XCTAssertEqual(g.rejectionDescriptor(method: "thread/start",
                                              presentFields: ["runtimeWorkspaceRoots"], caps: noCaps),
                        "thread/start.runtimeWorkspaceRoots")
+        // Enum-variant gates carry the fixed, method-independent reason from the
+        // upstream `#[experimental("askForApproval.granular")]` annotation on the
+        // `AskForApproval::Granular` variant — NOT a method-qualified descriptor
+        // (shared.rs:168, tests.rs:1481-1745).
         XCTAssertEqual(g.rejectionDescriptor(method: "turn/start",
+                                             presentFields: ["askForApproval=granular"], caps: noCaps),
+                       "askForApproval.granular")
+        XCTAssertEqual(g.rejectionDescriptor(method: "thread/start",
                                              presentFields: ["approvalPolicy=granular"], caps: noCaps),
-                       "turn/start.approvalPolicy=granular")
+                       "askForApproval.granular")
+        XCTAssertNil(g.rejectionDescriptor(method: "thread/start",
+                                           presentFields: ["askForApproval=granular"], caps: caps))
         XCTAssertNil(g.rejectionDescriptor(method: "thread/start",
                                            presentFields: ["cwd"], caps: noCaps))
+    }
+
+    /// Audit app-server-registry/finding-1: whole-method `#[experimental(...)]`
+    /// markers from upstream common.rs (goal/*, realtime/*, remoteControl/*,
+    /// collaborationMode/list, fuzzyFileSearch/session*) must be gated by the
+    /// ExperimentalGate so a non-experimental client is rejected with
+    /// `<method> requires experimentalApi capability` (-32600).
+    func testExperimentalGateCoversWholeMethodMarkers() {
+        let g = ExperimentalGate()
+        let noCaps = ClientCapabilities(experimentalApi: false)
+        let caps = ClientCapabilities(experimentalApi: true)
+        let gatedMethods = [
+            "thread/goal/set", "thread/goal/get", "thread/goal/clear",
+            "thread/realtime/start", "thread/realtime/appendAudio",
+            "thread/realtime/appendText", "thread/realtime/stop",
+            "thread/realtime/listVoices",
+            "remoteControl/enable", "remoteControl/disable",
+            "remoteControl/status/read",
+            "collaborationMode/list",
+            "fuzzyFileSearch/sessionStart", "fuzzyFileSearch/sessionUpdate",
+            "fuzzyFileSearch/sessionStop",
+        ]
+        for m in gatedMethods {
+            XCTAssertTrue(g.isExperimentalMethod(m),
+                          "\(m) must be a whole-method experimental marker")
+            XCTAssertEqual(g.rejectionDescriptor(method: m, presentFields: [], caps: noCaps),
+                           m, "\(m) must be rejected without experimentalApi")
+            XCTAssertNil(g.rejectionDescriptor(method: m, presentFields: [], caps: caps),
+                         "\(m) must be allowed once experimentalApi is negotiated")
+        }
     }
 }

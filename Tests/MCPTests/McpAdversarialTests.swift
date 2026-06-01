@@ -98,7 +98,7 @@ final class McpAdversarialTests: XCTestCase {
         XCTAssertTrue(r.truncated, "a 3 MB MCP result is truncated downstream")
         XCTAssertLessThan(r.output.utf8.count, 200_000,
                           "the model is not flooded by a huge MCP result")
-        XCTAssertTrue(r.output.contains("bytes elided"))
+        XCTAssertTrue(r.output.contains("tokens truncated"))
         await mgr.stopAll()
     }
 

@@ -34,8 +34,19 @@ public struct Limits: Sendable, Codable, Equatable {
     /// Hard cap on sample->tool->sample iterations within one turn. Override
     /// with `max_sampling_iterations_per_turn = <N>` in `config.toml`.
     public var maxSamplingIterationsPerTurn: Int = 100
-    /// Hard cap on consecutive auto-compactions within one turn.
-    public var maxCompactionsPerTurn: Int = 4
+    /// Hard cap on *non-progressing* consecutive auto-compactions within one
+    /// turn. Upstream (`core/src/session/turn.rs:497-517`) has NO per-turn
+    /// compaction counter: "as long as compaction works well in getting us way
+    /// below the token limit, we shouldn't worry about being in an infinite
+    /// loop", so it simply `continue`s after each `run_auto_compact`. To match
+    /// that behaviour while still retaining a safety net against a genuine
+    /// non-terminating loop, the Swift backstop now (a) defaults high enough to
+    /// be unreachable in normal operation and (b) only counts compactions that
+    /// fail to reduce the token usage below the auto-compact limit (a
+    /// no-progress condition). A productive compaction never advances the
+    /// counter, so a long turn that legitimately needs many mid-turn
+    /// compactions is not failed the way upstream would not fail it.
+    public var maxCompactionsPerTurn: Int = 100
     /// Identical-tool-call repetition cap before the loop guard fires.
     public var maxIdenticalToolRepeats: Int = 8
     /// Tool fan-out semaphore: max concurrent tool tasks per turn.

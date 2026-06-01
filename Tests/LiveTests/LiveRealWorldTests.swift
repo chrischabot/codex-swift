@@ -54,6 +54,7 @@ private func rwBlob(_ items: [PromptInput]) -> String {
         switch i {
         case .userText(let t), .developerText(let t), .assistantText(let t): return t
         case .toolOutput(_, let o): return o
+                case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
         }
     }.joined(separator: "\n")
 }
@@ -81,8 +82,8 @@ private func rwWriteExecutablePythonScript(path: String,
 /// (status, output) for every completed/failed `shell` command-execution item.
 private func rwShellItems(_ evs: [ServerNotification]) -> [(ItemStatus, String)] {
     evs.compactMap { n in
-        if case .itemCompleted(_, _, let it) = n,
-           case .commandExecution(_, let cmd, _, let s, let out, _) = it,
+        if case .itemCompleted(_, _, let it, _) = n,
+           case .commandExecution(_, let cmd, _, let s, _, let out, _, _, _, _) = it,
            cmd.first == "shell_command" {
             return (s, out ?? "")
         }
@@ -204,7 +205,7 @@ final class LiveRealWorldTests: XCTestCase {
             "Use the shell tool. Create a file factorial.py in the current "
             + "directory that prints factorial(10), then run it with "
             + "`python3 factorial.py`. Use the shell tool for every step, "
-            + "then give a one-line final answer.")], model: nil))
+            + "then give a one-line final answer.")], model: nil, turnId: nil))
         let evs = await collector.value
 
         XCTAssertNotNil(rwLast(evs), "the bounded real-world turn terminated")
@@ -250,7 +251,7 @@ final class LiveRealWorldTests: XCTestCase {
         await engine.submit(.startTurn(input: [TurnInput(text:
             "Use the shell tool to explore this project: list files, then "
             + "`cat README.md` and `cat src/calc.py`. Then summarize in one "
-            + "sentence what the project does.")], model: nil))
+            + "sentence what the project does.")], model: nil, turnId: nil))
         let evs = await collector.value
 
         XCTAssertNotNil(rwLast(evs), "the bounded exploration turn terminated")
@@ -296,7 +297,7 @@ final class LiveRealWorldTests: XCTestCase {
             "Use the shell tool to create math2.py with a function "
             + "mul(a,b) returning a*b, and a script check.py that asserts "
             + "mul(4,5)==20 and prints CHECK_OK, then run `python3 check.py`. "
-            + "Use the shell tool for every step.")], model: nil))
+            + "Use the shell tool for every step.")], model: nil, turnId: nil))
         let evs = await collector.value
 
         XCTAssertNotNil(rwLast(evs), "the bounded build+test turn terminated")
@@ -335,7 +336,7 @@ final class LiveRealWorldTests: XCTestCase {
             "Use the shell tool to run exactly: cat /nonexistent_codexkit_zzz_42 "
             + "Observe that it fails, then run exactly: echo RECOVERED_OK . "
             + "Use the shell tool for both commands, then summarize.")],
-            model: nil))
+            model: nil, turnId: nil))
         let evs = await collector.value
 
         XCTAssertNotNil(rwLast(evs), "the bounded error-handling turn terminated")
@@ -419,7 +420,7 @@ final class LiveRealWorldTests: XCTestCase {
                         + "Use this exact single-line shell command as the shell tool's "
                         + "command argument, with no edits:\n\(script)\n"
                         + "After the tool returns, give a concise final answer.")],
-                        model: nil))
+                        model: nil, turnId: nil))
                     let events = await task.value
                     lastEvents = events
                     XCTAssertNotNil(rwLast(events),

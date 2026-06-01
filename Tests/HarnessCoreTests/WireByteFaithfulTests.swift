@@ -15,6 +15,7 @@ private func projectedBlob(_ items: [PromptInput]) -> String {
         switch i {
         case .userText(let t), .developerText(let t), .assistantText(let t): return t
         case .toolOutput(_, let o): return o
+        case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
         }
     }.joined(separator: "\n")
 }
@@ -38,9 +39,9 @@ private func wbCollect(_ engine: SessionEngine,
     return r
 }
 
-/// P2.1 / C3: terminal-event collector — counts both `turnCompleted` and
-/// `turnAborted` toward the target. An interrupted turn now emits the latter
-/// (not the former) so callers driving an interrupt flow must wait on either.
+/// Terminal-event collector — counts `turnCompleted` toward the target. An
+/// interrupted turn is delivered as `turn/completed` with status interrupted
+/// (upstream fidelity), so a single terminal method covers both cases.
 private func wbCollect(_ engine: SessionEngine,
                        untilTerminals n: Int,
                        timeout: Duration = .seconds(30)) async -> [ServerNotification] {
@@ -51,11 +52,33 @@ private func wbCollect(_ engine: SessionEngine,
         for await ev in stream {
             out.append(ev)
             switch ev {
-            case .turnCompleted, .turnAborted:
+            case .turnCompleted:
                 c += 1
                 if c == n { return out }
             default: continue
             }
+        }
+        return out
+    }
+    let timer = Task { try? await Task.sleep(for: timeout); collector.cancel() }
+    let r = await collector.value
+    timer.cancel()
+    return r
+}
+
+/// Completion-counting collector that also records the first `turn/started`
+/// id into `box` (the value a client echoes back as `expectedTurnId`).
+private func wbCollectCapturingTurnId(_ engine: SessionEngine, into box: TurnIdBox,
+                                      untilCompletions n: Int,
+                                      timeout: Duration = .seconds(30)) async -> [ServerNotification] {
+    let stream = await engine.events()
+    let collector = Task { () -> [ServerNotification] in
+        var out: [ServerNotification] = []
+        var c = 0
+        for await ev in stream {
+            out.append(ev)
+            if case .turnStarted(_, let t) = ev { await box.set(t.id) }
+            if case .turnCompleted = ev { c += 1; if c == n { break } }
         }
         return out
     }
@@ -92,10 +115,10 @@ final class WireByteFaithfulTests: XCTestCase {
     // next turn's wire prompt carries it byte-for-byte.
 
     func testInterruptedTurnAbortedGuidanceIsByteFaithfulInNextPrompt() async throws {
-        // P2.1 / C3: the interrupted turn now ends with a `turn/aborted`
-        // notification (not `turn/completed`). The next turn's prompt must
-        // still carry the byte-exact `<turn_aborted>` guidance (parity with
-        // Codex `INTERRUPTED_GUIDANCE`).
+        // The interrupted turn ends with a `turn/completed` notification whose
+        // status is interrupted (upstream fidelity). The next turn's prompt
+        // must still carry the byte-exact `<turn_aborted>` guidance (parity
+        // with Codex `INTERRUPTED_GUIDANCE`).
         let (store, home) = try makeStore()
         defer { try? FileManager.default.removeItem(atPath: home) }
         let tid = ThreadId.generate()
@@ -111,25 +134,24 @@ final class WireByteFaithfulTests: XCTestCase {
                                    router: ToolRouter(limits: Limits()), limits: Limits())
         await engine.start()
         let collector = Task { await wbCollect(engine, untilTerminals: 2) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "long task")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "long task")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(80))
         await engine.submit(.interrupt(turnId: TurnId("x")))
         try await Task.sleep(for: .milliseconds(120))
-        await engine.submit(.startTurn(input: [TurnInput(text: "next")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "next")], model: nil, turnId: nil))
         let evs = await collector.value
 
-        // The first terminal event for the interrupted turn must be
-        // `turnAborted`, NOT `turnCompleted`.
+        // The first terminal event for the interrupted turn is `turnCompleted`
+        // with status interrupted.
         let firstTerminal = evs.first { ev in
             if case .turnCompleted = ev { return true }
-            if case .turnAborted = ev { return true }
             return false
         }
-        guard case .turnAborted(_, _, let reason, _, _, _)? = firstTerminal else {
-            return XCTFail("first terminal event must be turnAborted, got: \(String(describing: firstTerminal))")
+        guard case .turnCompleted(_, let turn)? = firstTerminal else {
+            return XCTFail("first terminal event must be turnCompleted, got: \(String(describing: firstTerminal))")
         }
-        XCTAssertEqual(reason, "interrupted",
-                       "user-initiated interrupt maps to canonical reason `interrupted`")
+        XCTAssertEqual(turn.status, .interrupted,
+                       "user-initiated interrupt maps to turn.status interrupted")
 
         let expectedFragment = TurnAborted(TurnAborted.interruptedGuidance).render()
         XCTAssertEqual(expectedFragment,
@@ -157,7 +179,7 @@ final class WireByteFaithfulTests: XCTestCase {
                                    router: ToolRouter(limits: Limits()), limits: Limits())
         await engine.start()
         let collector = Task { await wbCollect(engine, untilCompletions: 1) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await collector.value
 
         let expected = GoalPrompts.goalContextItem(
@@ -202,7 +224,7 @@ final class WireByteFaithfulTests: XCTestCase {
                                    skills: skills)
         await engine.start()
         let collector = Task { await wbCollect(engine, untilCompletions: 1) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
         _ = await collector.value
 
         let caps = await model.capturedRequests()
@@ -243,11 +265,16 @@ final class WireByteFaithfulTests: XCTestCase {
                                    model: model, store: store,
                                    router: ToolRouter(limits: Limits()), limits: Limits())
         await engine.start()
-        let collector = Task { await wbCollect(engine, untilCompletions: 1) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "please do X")], model: nil))
+        let turnIdBox = TurnIdBox()
+        let collector = Task {
+            await wbCollectCapturingTurnId(engine, into: turnIdBox, untilCompletions: 1)
+        }
+        await engine.submit(.startTurn(input: [TurnInput(text: "please do X")], model: nil, turnId: nil))
+        // Steer must echo the active turn id (upstream `turn/steer` contract).
+        let activeTurnId = await turnIdBox.waitForId() ?? TurnId("t")
         try await Task.sleep(for: .milliseconds(80))
         await engine.submit(.steer(input: [TurnInput(text: "STEER_EXTRA_42")],
-                                   expectedTurnId: TurnId("t")))
+                                   expectedTurnId: activeTurnId))
         _ = await collector.value
 
         let caps = await model.capturedRequests()
@@ -269,6 +296,10 @@ final class WireByteFaithfulTests: XCTestCase {
     // MARK: Model-backed behavioral replay: prompt/tool/compaction/memory/durability.
 
     func testModelBackedToolCompactionMemoryPersistenceReplay() async throws {
+        // Exercises the opt-in `previous_response_id` chaining path (default is
+        // prompt-prefix replay + prompt_cache_key affinity).
+        setenv("CODEXKIT_USE_PREV_RESPONSE_ID", "1", 1)
+        defer { unsetenv("CODEXKIT_USE_PREV_RESPONSE_ID") }
         let (store, home) = try makeStore()
         defer { try? FileManager.default.removeItem(atPath: home) }
         let work = NSTemporaryDirectory() + "wbf-replay-" + UUID().uuidString
@@ -306,12 +337,12 @@ final class WireByteFaithfulTests: XCTestCase {
 
         let first = Task { await wbCollect(engine, untilCompletions: 1) }
         await engine.submit(.startTurn(input: [TurnInput(text: "Build with TOOL_REPLAY_MARKER")],
-                                       model: nil))
+                                       model: nil, turnId: nil))
         let firstEvents = await first.value
 
         XCTAssertTrue(firstEvents.contains {
-            if case .itemCompleted(_, _, let item) = $0,
-               case .commandExecution(let id, _, _, let status, let output, _) = item {
+            if case .itemCompleted(_, _, let item, _) = $0,
+               case .commandExecution(let id, _, _, let status, _, let output, _, _, _, _) = item {
                 return id.raw == "replay_tool"
                     && status == .completed
                     && (output ?? "").contains("TOOL_REPLAY_OK")
@@ -319,18 +350,23 @@ final class WireByteFaithfulTests: XCTestCase {
             return false
         }, "tool execution event is completed with model-requested output")
         XCTAssertTrue(firstEvents.contains {
-            if case .raw(let method, _) = $0 { return method == "thread/compacted" }
+            if case .itemCompleted(_, _, let item, _) = $0,
+               case .contextCompaction = item { return true }
             return false
         }, "high-token tool follow-up triggers model-backed compaction")
         XCTAssertTrue(firstEvents.contains {
-            if case .raw(let method, let params) = $0 {
-                return method == "warning"
-                    && params["message"]?.stringValue == Compaction.headsUpWarning
+            // Upstream `bespoke_event_handling.rs:220-227` maps the warning to
+            // `WarningNotification { thread_id: Some(conversation_id), message }`,
+            // so the warning routes through the typed `.warning` encoder
+            // (method "warning", payload {threadId, message}) and carries the
+            // thread association — NOT a message-only `.raw` hand-roll.
+            if case .warning(let threadId, let message) = $0 {
+                return threadId == tid && message == Compaction.headsUpWarning
             }
             return false
-        }, "compaction emits the byte-exact warning event")
+        }, "compaction emits the byte-exact warning event with threadId")
         XCTAssertTrue(firstEvents.contains {
-            if case .itemCompleted(_, _, let item) = $0,
+            if case .itemCompleted(_, _, let item, _) = $0,
                case .agentMessage(_, let text) = item {
                 return text == "FINAL_REPLAY_OK after compaction"
             }
@@ -370,8 +406,12 @@ final class WireByteFaithfulTests: XCTestCase {
 
         let rebuilt = try await store.reconstruct(tid)
         XCTAssertEqual(rebuilt.lastTurnStatus, .completed)
+        // P1.1 / F2: replace-then-replay reconstruction surfaces the compaction
+        // summary as the `.userMessage` bridge from the replayed
+        // replacement_history (faithful to upstream), not an `.agentMessage`.
         XCTAssertTrue(rebuilt.items.contains {
-            if case .agentMessage(_, let text) = $0 {
+            if case .userMessage(_, let content) = $0 {
+                let text = content.first?.text ?? ""
                 return text.hasPrefix(Compaction.summaryPrefix)
                     && text.contains("MODEL_REPLAY_SUMMARY includes TOOL_REPLAY_OK")
             }
@@ -386,7 +426,7 @@ final class WireByteFaithfulTests: XCTestCase {
 
         let second = Task { await wbCollect(engine, untilCompletions: 1) }
         await engine.submit(.startTurn(input: [TurnInput(text: "Continue after replay")],
-                                       model: nil))
+                                       model: nil, turnId: nil))
         _ = await second.value
         let allCaps = await model.capturedRequests()
         XCTAssertEqual(allCaps.count, 4)

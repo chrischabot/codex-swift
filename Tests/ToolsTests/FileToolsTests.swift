@@ -229,10 +229,29 @@ final class FileToolsTests: XCTestCase {
         await DefaultTools.register(on: router,
                                     sandbox: WorkspaceSandbox(SandboxPolicy(mode: .readOnly)))
         let names = Set((await router.specs()).map { $0.name })
-        for expected in ["apply_patch", "shell_command", "unified_exec", "file_search",
-                         "read_file", "write_file", "list_dir", "web_search", "exec", "wait"] {
+        // Default registration uses `shell_type: shell_command` (the value every
+        // shipped model declares), which upstream `spec_plan.rs` resolves to a
+        // model-visible `shell_command` ONLY. The `exec_command`/`write_stdin`
+        // PTY pair is reserved for `ConfigShellToolType::UnifiedExec` and must
+        // NOT be advertised simultaneously (see ExecCommandWriteStdinTests).
+        for expected in ["apply_patch", "shell_command",
+                         "file_search", "read_file", "write_file", "list_dir",
+                         "web_search", "exec", "wait"] {
             XCTAssertTrue(names.contains(expected),
                           "DefaultTools must register \(expected)")
         }
+        XCTAssertFalse(names.contains("exec_command"),
+                       "ShellCommand mode must NOT expose `exec_command` alongside `shell_command`")
+        XCTAssertFalse(names.contains("write_stdin"),
+                       "ShellCommand mode must NOT expose `write_stdin` alongside `shell_command`")
+        // `unified_exec` has no model-visible ToolSpec upstream — it must be
+        // CALLABLE (hidden registry) but absent from specs().
+        XCTAssertFalse(names.contains("unified_exec"),
+                       "unified_exec must NOT be model-visible (upstream parity)")
+        let ux = await router.dispatch(
+            ToolCall(callId: "ux-hidden", name: "unified_exec", argumentsJSON: "{}"),
+            cwd: NSTemporaryDirectory(), deadline: .fromNow(.seconds(5)))
+        XCTAssertFalse(ux.output.hasPrefix("unsupported call:"),
+                       "unified_exec stays callable via the hidden registry: \(ux.output)")
     }
 }

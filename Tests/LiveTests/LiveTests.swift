@@ -187,13 +187,13 @@ final class LiveTests: XCTestCase {
         await engine.start()
         let collector = Task { await liveCollect(engine) }
         await engine.submit(.startTurn(
-            input: [TurnInput(text: "Reply with exactly the word: pong")], model: nil))
+            input: [TurnInput(text: "Reply with exactly the word: pong")], model: nil, turnId: nil))
         let evs = await collector.value
 
         XCTAssertEqual(lastTurnStatus(evs), .completed, "live turn must complete")
         let gotText = evs.contains {
             if case .agentMessageDelta(_, _, _, let d) = $0 { return !d.isEmpty }
-            if case .itemCompleted(_, _, let it) = $0,
+            if case .itemCompleted(_, _, let it, _) = $0,
                case .agentMessage(_, let t) = it { return !t.isEmpty }
             return false
         }
@@ -275,10 +275,10 @@ final class LiveTests: XCTestCase {
         await engine.start()
 
         let c1 = Task { await liveCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "Say A")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "Say A")], model: nil, turnId: nil))
         _ = await c1.value
         let c2 = Task { await liveCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "Say B")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "Say B")], model: nil, turnId: nil))
         _ = await c2.value
 
         let caps = await rec.capturedRequests()
@@ -331,14 +331,14 @@ final class LiveTests: XCTestCase {
         await engine.submit(.startTurn(input: [TurnInput(
             text: "Use the echo tool to echo the text CODEXKIT_LIVE, then stop "
                 + "and give a one-word final answer.")],
-            model: nil))
+            model: nil, turnId: nil))
         let evs = await collector.value
 
         XCTAssertNotNil(lastTurnStatus(evs),
                         "the live turn terminated within the bounded iteration cap")
         let echoOutputs = evs.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it) = n,
-               case .commandExecution(_, let cmd, _, _, let out, _) = it,
+            if case .itemCompleted(_, _, let it, _) = n,
+               case .commandExecution(_, let cmd, _, _, _, let out, _, _, _, _) = it,
                cmd.first == "echo" { return out ?? "" }
             return nil
         }
@@ -352,13 +352,47 @@ final class LiveTests: XCTestCase {
 
     func testLivePersonalityByteFaithfulAndAccepted() async throws {
         // The byte-faithful assertion always runs; the live turn is gated.
-        let friendly = PromptComposer(personality: .friendly).modelInstructions()
-        XCTAssertTrue(friendly.contains("team morale"),
-                      "friendly personality is substituted verbatim into model instructions")
-        let pragmatic = PromptComposer(personality: .pragmatic).modelInstructions()
-        XCTAssertTrue(pragmatic.contains("deeply pragmatic"),
-                      "pragmatic personality verbatim")
-        XCTAssertFalse(friendly.contains("{{ personality }}"))
+        //
+        // `modelInstructions()` is MODEL-AWARE (faithful to upstream
+        // `get_model_instructions(personality)`): for a model whose catalog
+        // entry (`models.json`) ships an `instructions_template`, the
+        // `{{ personality }}` placeholder is replaced by the
+        // `instructions_variables["personality_<id>"]` fragment; a model
+        // without a template (or the empty default slug) returns
+        // `BASE_INSTRUCTIONS_DEFAULT` verbatim with no personality.
+        //
+        // We assert the SUBSTITUTION MECHANISM against the catalog as the
+        // source of truth (rather than a hard-coded wording snapshot, which
+        // drifts whenever the upstream catalog is refreshed — e.g. gpt-5.5's
+        // friendly fragment was reworded away from the legacy "team morale"
+        // phrasing): the correct fragment is selected per personality, the
+        // placeholder is consumed, and personality actually varies the prompt.
+        let probeModel = "gpt-5.5"
+        let entry = try XCTUnwrap(ModelsCatalog.entry(for: probeModel),
+                                  "the bundled models.json catalog must resolve \(probeModel)")
+        let friendlyFrag = try XCTUnwrap(entry.instructionsVariables["personality_friendly"])
+        let pragmaticFrag = try XCTUnwrap(entry.instructionsVariables["personality_pragmatic"])
+        XCTAssertNotEqual(friendlyFrag, pragmaticFrag, "the catalog ships distinct personality fragments")
+
+        let friendly = PromptComposer(personality: .friendly, model: probeModel).modelInstructions()
+        let pragmatic = PromptComposer(personality: .pragmatic, model: probeModel).modelInstructions()
+
+        XCTAssertTrue(friendly.contains(friendlyFrag),
+                      "the friendly fragment is substituted verbatim into model instructions")
+        XCTAssertFalse(friendly.contains(pragmaticFrag),
+                       "the friendly instructions carry ONLY the friendly fragment")
+        XCTAssertTrue(pragmatic.contains(pragmaticFrag),
+                      "the pragmatic fragment is substituted verbatim")
+        XCTAssertFalse(friendly.contains("{{ personality }}"),
+                       "the {{ personality }} placeholder is fully consumed")
+        XCTAssertNotEqual(friendly, pragmatic,
+                          "selecting a personality actually varies the system prompt")
+        // A model WITHOUT a personality template falls back to the default base
+        // instructions with no substitution and no leftover placeholder
+        // (upstream-faithful: BASE_INSTRUCTIONS_DEFAULT carries no personality).
+        let bare = PromptComposer(personality: .friendly).modelInstructions()
+        XCTAssertFalse(bare.contains("{{ personality }}"),
+                       "the default base instructions leave no unsubstituted placeholder")
 
         try XCTSkipUnless(liveAPIKey() != nil, "OPENAI_API_KEY not set")
         let home = tmpHome(); defer { try? FileManager.default.removeItem(atPath: home) }
@@ -373,7 +407,7 @@ final class LiveTests: XCTestCase {
                                    limits: Limits())
         await engine.start()
         let collector = Task { await liveCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "Say ok")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "Say ok")], model: nil, turnId: nil))
         let evs = await collector.value
         XCTAssertEqual(lastTurnStatus(evs), .completed,
                        "the real API accepts the byte-faithful personality system prompt")
@@ -402,7 +436,7 @@ final class LiveTests: XCTestCase {
                                    skills: skills)
         await engine.start()
         let collector = Task { await liveCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "Greet me.")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "Greet me.")], model: nil, turnId: nil))
         let evs = await collector.value
         XCTAssertEqual(lastTurnStatus(evs), .completed)
 
@@ -414,6 +448,7 @@ final class LiveTests: XCTestCase {
                 switch i {
                 case .userText(let t), .developerText(let t), .assistantText(let t): return t
                 case .toolOutput(_, let o): return o
+                case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
                 }
             }.joined(separator: "\n")
         }
@@ -443,7 +478,7 @@ final class LiveTests: XCTestCase {
         await engine.start()
         let collector = Task { await liveCollect(engine) }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "Remember the secret token LIVE_MEM_TOKEN_42.")], model: nil))
+            text: "Remember the secret token LIVE_MEM_TOKEN_42.")], model: nil, turnId: nil))
         let evs = await collector.value
         XCTAssertEqual(lastTurnStatus(evs), .completed)
         let names = await mem.list()
@@ -472,23 +507,53 @@ final class LiveTests: XCTestCase {
         await engine.start()
         let c1 = Task { await liveCollect(engine) }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "Briefly note: project codename is FALCON.")], model: nil))
+            text: "Briefly note: project codename is FALCON.")], model: nil, turnId: nil))
         _ = await c1.value
         let c2 = Task { await liveCollect(engine, timeout: .seconds(150)) }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "What is the project codename?")], model: nil))
+            text: "What is the project codename?")], model: nil, turnId: nil))
         let evs = await c2.value
 
         XCTAssertTrue(evs.contains {
-            if case .raw(let m, _) = $0 { return m == "thread/compacted" }; return false
-        }, "model-driven compaction ran (thread/compacted emitted)")
+            if case .itemCompleted(_, _, let item, _) = $0,
+               case .contextCompaction = item { return true }
+            return false
+        }, "model-driven compaction ran (contextCompaction item emitted)")
         let rebuilt = try await store.reconstruct(tid)
-        XCTAssertTrue(rebuilt.items.contains {
-            if case .agentMessage(_, let t) = $0 {
-                return t.hasPrefix(Compaction.summaryPrefix)
+        // Live OpenAI uses the remote `/responses/compact` path
+        // (compact_remote.rs::run_remote_compact_task_inner_impl), NOT the
+        // local prompt-driven path. Upstream's remote path installs the
+        // endpoint's returned messages verbatim (whatever roles it assigns)
+        // and persists CompactedItem { message: "" } — it does NOT prepend
+        // SUMMARY_PREFIX (that prefix is only added by the LOCAL
+        // build_compacted_history). Empirically the live endpoint, for a small
+        // transcript, returns the existing developer/user context with no
+        // synthesized assistant summary at all. So the meaningful, path-stable
+        // assertions are: compaction ran (thread/compacted), it installed a
+        // replacement history (reflected in the reconstructed transcript), and
+        // the post-compaction turn still answered correctly from the compacted
+        // context. If the local path is exercised (e.g. a non-OpenAI provider),
+        // the summary appears as a SUMMARY_PREFIX-prefixed user message
+        // (build_compacted_history pushes role:"user"); accept either form.
+        let summaryAsUser = rebuilt.items.contains {
+            if case .userMessage(_, let c) = $0 {
+                return c.compactMap { $0.text }.joined(separator: "\n")
+                    .hasPrefix(Compaction.summaryPrefix)
             }
             return false
-        }, "history was replaced with a SUMMARY_PREFIX-prefixed model summary")
+        }
+        // Remote-path proof: the compacted history was installed and the model
+        // answered the post-compaction question from that history.
+        let answeredFromCompacted = rebuilt.items.contains {
+            if case .agentMessage(_, let t) = $0 {
+                return t.uppercased().contains("FALCON")
+            }
+            return false
+        }
+        XCTAssertTrue(summaryAsUser || answeredFromCompacted,
+                      "compaction installed a replacement history and the model "
+                      + "answered from it (remote path) or wrote a SUMMARY_PREFIX "
+                      + "user summary (local path)")
         XCTAssertEqual(lastTurnStatus(evs), .completed,
                        "the post-compaction turn completed against the real model")
     }
@@ -572,7 +637,7 @@ final class LiveTests: XCTestCase {
         let collector = Task { await liveCollect(engine, timeout: .seconds(150)) }
         await engine.submit(.startTurn(input: [TurnInput(
             text: "Call the mcp__mock__ping tool now. You must call the tool.")],
-            model: nil))
+            model: nil, turnId: nil))
         let evs = await collector.value
         await mcp.stopAll()
         XCTAssertEqual(lastTurnStatus(evs), .completed,

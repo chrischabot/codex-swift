@@ -45,6 +45,33 @@ let mlxSwiftSettings: [SwiftSetting] = mlxEnabled
     ? [.define("CODEXKIT_MLX")]
     : []
 
+// WebGateway — the user-facing web server / WebSocket gateway (docs/webgateway/).
+// Hummingbird 2.x + SwiftNIO is the repo's first networking dependency (the
+// portable core and existing transports are hand-rolled POSIX/Network.framework).
+// `traits: []` on hummingbird drops the default ConfigurationSupport trait so we
+// don't pull apple/swift-configuration transitively. Pins are point-in-time —
+// re-reconcile against Swift Package Index on bump. See docs/webgateway/.
+let webDependencies: [Package.Dependency] = [
+    .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.25.0"),
+    .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", from: "2.7.0"),
+    .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", from: "2.0.0"),
+    // Already in the graph transitively (NIO/Hummingbird); declared so
+    // WebGateway can `import Crypto` (HMAC media-token signing) on macOS+Linux.
+    .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0" ..< "5.0.0"),
+]
+
+let webGatewayDeps: [Target.Dependency] = [
+    .product(name: "Hummingbird", package: "hummingbird"),
+    .product(name: "HummingbirdCore", package: "hummingbird"),
+    .product(name: "HummingbirdTLS", package: "hummingbird"),
+    .product(name: "HummingbirdHTTP2", package: "hummingbird"),
+    .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
+    .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+    .product(name: "Crypto", package: "swift-crypto"),
+    "Supervisor", "Persistence", "Auth", "Config",
+    "WireProtocol", "ProtocolModel", "InfraPrimitives", "Observability",
+]
+
 // Precompute MemoryInfer dependencies and settings so the big Package(...)
 // expression below stays inside the compiler's type-checking budget. (Swift
 // 6.1's manifest checker chokes on a too-rich nested expression otherwise.)
@@ -74,6 +101,8 @@ let package = Package(
         .library(name: "Connectors", targets: ["Connectors"]),
         .library(name: "ExtensionAPI", targets: ["ExtensionAPI"]),
         .library(name: "HarnessCore", targets: ["HarnessCore"]),
+        .library(name: "Workflows", targets: ["Workflows"]),
+        .library(name: "WebGateway", targets: ["WebGateway"]),
         .library(name: "IPC", targets: ["IPC"]),
         .library(name: "Transport", targets: ["Transport"]),
         .library(name: "Supervisor", targets: ["Supervisor"]),
@@ -89,13 +118,15 @@ let package = Package(
         .library(name: "MemoryScore", targets: ["MemoryScore"]),
         .library(name: "MemoryRetrieve", targets: ["MemoryRetrieve"]),
         .library(name: "MemoryMCP", targets: ["MemoryMCP"]),
+        .library(name: "BenchKit", targets: ["BenchKit"]),
         .executable(name: "codexd", targets: ["codexd"]),
         .executable(name: "codex-broker", targets: ["codex-broker"]),
         .executable(name: "codex-session", targets: ["codex-session"]),
         .executable(name: "codex-memory", targets: ["codex-memory"]),
         .executable(name: "mock-responses", targets: ["mock-responses"]),
+        .executable(name: "codex-bench", targets: ["codex-bench"]),
     ],
-    dependencies: mlxDependencies,
+    dependencies: mlxDependencies + webDependencies,
     targets: [
         .systemLibrary(name: "CSQLite", path: "Sources/CSQLite"),
         .target(
@@ -119,12 +150,14 @@ let package = Package(
         .target(name: "WireProtocol", dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "ProtocolModel", dependencies: ["WireProtocol", "InfraPrimitives"], swiftSettings: strict),
 
-        .target(name: "Prompts", swiftSettings: strict),
+        .target(name: "Prompts",
+                resources: [.copy("Resources/models.json")],
+                swiftSettings: strict),
 
         .target(name: "Persistence",
                 dependencies: ["ProtocolModel", "WireProtocol", "InfraPrimitives", "CSQLite"], swiftSettings: strict),
         .target(name: "ModelClient",
-                dependencies: ["InfraPrimitives"], swiftSettings: strict),
+                dependencies: ["InfraPrimitives", "WireProtocol"], swiftSettings: strict),
         .target(name: "Sandbox",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "Tools",
@@ -135,7 +168,21 @@ let package = Package(
         .target(name: "Connectors", swiftSettings: strict),
         .target(name: "ExtensionAPI", swiftSettings: strict),
         .target(name: "HarnessCore",
-                dependencies: ["ProtocolModel", "WireProtocol", "ModelClient", "Persistence", "Tools", "InfraPrimitives", "Observability", "Prompts", "Sandbox", "Skills", "Connectors", "Config", "Tokenizer"],
+                dependencies: ["ProtocolModel", "WireProtocol", "ModelClient", "Persistence", "Tools", "InfraPrimitives", "Observability", "Prompts", "Sandbox", "Skills", "Connectors", "Config", "Tokenizer", "ExtensionAPI"],
+                swiftSettings: strict),
+
+        // Dynamic Workflows — JS-scripted multi-agent orchestration engine.
+        // See docs/workflows/PORT_DESIGN.md.
+        .target(name: "Workflows",
+                dependencies: ["HarnessCore", "Tools", "ModelClient", "Persistence", "ProtocolModel", "WireProtocol", "Prompts", "InfraPrimitives", "Sandbox", "Config"],
+                swiftSettings: strict),
+
+        // WebGateway — Hummingbird/NIO web server + WebSocket gateway that
+        // serves the compiled shadcn UI (www/dist) over TLS and bridges browser
+        // WebSocket sessions into per-connection RequestRouters over the shared
+        // SessionSupervisor, in-process (no external RPC). See docs/webgateway/.
+        .target(name: "WebGateway",
+                dependencies: webGatewayDeps,
                 swiftSettings: strict),
 
         .target(name: "IPC", dependencies: ["ProtocolModel"], swiftSettings: strict),
@@ -145,7 +192,7 @@ let package = Package(
         .target(name: "SessionWorkerCore",
                 dependencies: ["HarnessCore", "IPC", "ProtocolModel"], swiftSettings: strict),
         .target(name: "Supervisor",
-                dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools"],
+                dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools", "Prompts"],
                 swiftSettings: strict),
         .target(name: "Broker",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
@@ -160,7 +207,8 @@ let package = Package(
                 dependencies: ["InfraPrimitives", "WireProtocol", "ProtocolModel", "Persistence",
                                "ModelClient", "Tools", "Sandbox", "Prompts", "MCP", "Skills",
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
-                               "Supervisor", "Transport", "Observability", "Auth", "Tokenizer", "Config"],
+                               "Supervisor", "Transport", "Observability", "Auth", "Tokenizer", "Config", "Workflows",
+                               "MemoryExtension", "WebGateway"],
                 swiftSettings: strict),
         .executableTarget(name: "codex-broker",
                 dependencies: ["Broker", "Auth", "Observability"], swiftSettings: strict),
@@ -168,7 +216,8 @@ let package = Package(
                 dependencies: ["InfraPrimitives", "WireProtocol", "ProtocolModel", "Persistence",
                                "ModelClient", "Tools", "Sandbox", "Prompts", "MCP", "Skills",
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
-                               "Observability", "Auth", "Tokenizer"], swiftSettings: strict),
+                               "Observability", "Auth", "Tokenizer", "Config", "Workflows",
+                               "MemoryExtension"], swiftSettings: strict),
         .executableTarget(name: "mock-responses",
                 dependencies: ["ModelClient", "InfraPrimitives"], swiftSettings: strict),
 
@@ -198,6 +247,24 @@ let package = Package(
                 dependencies: ["MCP", "Tools", "MemoryRetrieve", "MemoryScore", "MemoryStore", "MemoryInfer",
                                "ModelClient", "ProtocolModel", "Config"],
                 swiftSettings: strict),
+        // Phase 1 extension: the Memory Wiki as a MemoryProvider (impl #1).
+        // The composition factory (`makeWikiMemoryProvider`) builds the full
+        // read stack (store + inference + retriever + gate + toolset), so it
+        // pulls the Memory* read modules + ModelClient/Config — but NOT the
+        // curation modules (Ingest/Process), which live in `codex-memory`.
+        .target(name: "MemoryExtension",
+                dependencies: ["HarnessCore", "MemoryRetrieve", "MemoryStore",
+                               "MemoryInfer", "MemoryScore", "MemoryMCP",
+                               "ModelClient", "Config", "Tools"],
+                swiftSettings: strict),
+        // Phase 3 extension: the local-LLM SmallModel utility (addon-only).
+        .target(name: "SmallModel",
+                dependencies: ["ModelClient", "InfraPrimitives"],
+                swiftSettings: strict),
+        // Phase 4 extension: the Channel contract + engine-backed host.
+        .target(name: "Channels",
+                dependencies: ["HarnessCore", "ProtocolModel", "ExtensionAPI"],
+                swiftSettings: strict),
 
         .executableTarget(name: "codex-memory",
                 dependencies: ["MemoryStore", "MemoryInfer", "MemoryIngest", "MemoryProcess",
@@ -205,6 +272,25 @@ let package = Package(
                                "Config", "Observability", "InfraPrimitives", "ModelClient"],
                 swiftSettings: strict),
 
+        // -----------------------------------------------------------------
+        // DeepSWE benchmark runner — see docs/benchmarks/DEEP_SWE_RUNNER.md
+        // Runs the vendored deep-swe suite with codex-swift as the agent,
+        // isolating each task in an apple/container arm64 VM and scoring a
+        // Pass@1 comparable to deepswe.datacurve.ai.
+        // -----------------------------------------------------------------
+        .target(name: "BenchKit",
+                dependencies: ["InfraPrimitives", "Observability", "ProtocolModel",
+                               "WireProtocol", "ModelClient", "Persistence", "Tools",
+                               "Sandbox", "Prompts", "HarnessCore", "Config", "Tokenizer",
+                               "MCP", "Skills", "Connectors", "ExtensionAPI",
+                               "Supervisor", "SessionWorkerCore", "IPC"],
+                swiftSettings: strict),
+        .executableTarget(name: "codex-bench",
+                dependencies: ["BenchKit", "InfraPrimitives", "Observability"],
+                swiftSettings: strict),
+
+        .testTarget(name: "WorkflowsTests",
+                dependencies: ["Workflows", "Tools", "ModelClient", "Persistence", "InfraPrimitives", "HarnessCore"], swiftSettings: strict),
         .testTarget(name: "MemoryStoreTests",
                 dependencies: ["MemoryStore", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "MemoryInferTests",
@@ -238,12 +324,21 @@ let package = Package(
         .testTarget(name: "PromptsTests",
                 dependencies: ["Prompts"], swiftSettings: strict),
         .testTarget(name: "PersistenceTests",
-                dependencies: ["Persistence", "ProtocolModel", "InfraPrimitives"], swiftSettings: strict),
+                dependencies: ["Persistence", "ProtocolModel", "InfraPrimitives", "WireProtocol"], swiftSettings: strict),
         .testTarget(name: "ModelClientTests",
-                dependencies: ["ModelClient", "InfraPrimitives"], swiftSettings: strict),
+                dependencies: ["ModelClient", "InfraPrimitives", "Prompts"], swiftSettings: strict),
         .testTarget(name: "HarnessCoreTests",
                 dependencies: ["HarnessCore", "ModelClient", "Persistence", "Tools",
-                               "Sandbox", "ProtocolModel", "WireProtocol", "InfraPrimitives", "Prompts", "Config"], swiftSettings: strict),
+                               "Sandbox", "ProtocolModel", "WireProtocol", "InfraPrimitives", "Prompts", "Config", "Tokenizer", "ExtensionAPI"], swiftSettings: strict),
+        .testTarget(name: "MemoryExtensionTests",
+                dependencies: ["MemoryExtension", "MemoryRetrieve", "MemoryStore", "MemoryInfer",
+                               "HarnessCore", "Tools", "InfraPrimitives", "ModelClient", "Config"],
+                swiftSettings: strict),
+        .testTarget(name: "SmallModelTests",
+                dependencies: ["SmallModel", "ModelClient", "InfraPrimitives"], swiftSettings: strict),
+        .testTarget(name: "ChannelsTests",
+                dependencies: ["Channels", "HarnessCore", "ModelClient", "Persistence",
+                               "Tools", "ProtocolModel", "InfraPrimitives", "ExtensionAPI"], swiftSettings: strict),
         .testTarget(name: "ToolsTests",
                 dependencies: ["Tools", "Sandbox", "ProtocolModel", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "SandboxTests",
@@ -269,7 +364,7 @@ let package = Package(
         .testTarget(name: "AdversarialTests",
                 dependencies: ["InfraPrimitives", "WireProtocol", "ProtocolModel",
                                "ModelClient", "Tools", "Persistence", "HarnessCore",
-                               "Sandbox", "Prompts"],
+                               "Sandbox", "Prompts", "MCP"],
                 swiftSettings: strict),
         .testTarget(name: "IntegrationTests",
                 dependencies: ["Supervisor", "SessionWorkerCore", "HarnessCore", "ModelClient",
@@ -279,7 +374,16 @@ let package = Package(
         .testTarget(name: "LiveTests",
                 dependencies: ["HarnessCore", "ModelClient", "Persistence", "Tools",
                                "Sandbox", "ProtocolModel", "InfraPrimitives", "Prompts", "MCP",
-                               "Supervisor", "SessionWorkerCore", "IPC", "WireProtocol"],
+                               "Supervisor", "SessionWorkerCore", "IPC", "WireProtocol",
+                               "Workflows", "Config", "Connectors", "Skills",
+                               "ExtensionAPI", "MemoryExtension", "SmallModel", "Channels"],
+                swiftSettings: strict),
+        .testTarget(name: "BenchKitTests",
+                dependencies: ["BenchKit", "InfraPrimitives", "ProtocolModel",
+                               "ModelClient", "Tools", "HarnessCore"],
+                swiftSettings: strict),
+        .testTarget(name: "WebGatewayTests",
+                dependencies: ["WebGateway"],
                 swiftSettings: strict),
     ],
     swiftLanguageModes: [.v6]

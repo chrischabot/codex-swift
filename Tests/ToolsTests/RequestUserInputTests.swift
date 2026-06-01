@@ -23,6 +23,46 @@ final class RequestUserInputTests: XCTestCase {
                       "DefaultTools must register request_user_input (P3.4 / H-18); got \(names)")
     }
 
+    // Port of upstream `request_user_input_tool_description_mentions_available_modes`
+    // (core/src/tools/handlers/request_user_input_spec_tests.rs): the
+    // model-facing description ALWAYS appends a sentence naming the modes the
+    // tool is available in. The default (no DefaultModeRequestUserInput feature)
+    // resolves to `[Plan]`.
+    func testToolDescriptionMentionsDefaultAvailableMode() {
+        let tool = RequestUserInputTool()
+        XCTAssertEqual(
+            tool.toolDescription,
+            "Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode.")
+    }
+
+    func testToolDescriptionTwoModesUpstreamPhrasing() {
+        // Mirrors upstream `default_mode_enabled_available_modes` → [Default, Plan].
+        let tool = RequestUserInputTool(availableModes: [.default, .plan])
+        XCTAssertEqual(
+            tool.toolDescription,
+            "Request user input for one to three short questions and wait for the response. This tool is only available in Default or Plan mode.")
+    }
+
+    // Port of upstream `format_allowed_modes` branches.
+    func testFormatAllowedModesBranches() {
+        XCTAssertEqual(RequestUserInputTool.formatAllowedModes([]), "no modes")
+        XCTAssertEqual(RequestUserInputTool.formatAllowedModes([.plan]), "Plan mode")
+        XCTAssertEqual(RequestUserInputTool.formatAllowedModes([.default, .plan]),
+                       "Default or Plan mode")
+        // Three-or-more: comma-joined with NO spaces, prefixed "modes: ".
+        XCTAssertEqual(
+            RequestUserInputTool.formatAllowedModes([.default, .plan, .pairProgramming]),
+            "modes: Default,Plan,Pair Programming")
+    }
+
+    // Port of `ModeKind::display_name` (protocol/src/config_types.rs:580).
+    func testModeDisplayNamesMatchUpstream() {
+        XCTAssertEqual(RequestUserInputMode.plan.displayName, "Plan")
+        XCTAssertEqual(RequestUserInputMode.default.displayName, "Default")
+        XCTAssertEqual(RequestUserInputMode.pairProgramming.displayName, "Pair Programming")
+        XCTAssertEqual(RequestUserInputMode.execute.displayName, "Execute")
+    }
+
     func testRequestUserInputSchemaMatchesUpstream() {
         let tool = RequestUserInputTool()
         XCTAssertEqual(tool.name, "request_user_input")

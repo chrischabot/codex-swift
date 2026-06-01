@@ -32,6 +32,40 @@ private func saCollect(_ e: SessionEngine, untilCompletions n: Int = 1,
     return r
 }
 
+/// Sendable sink for the active turn id (the value a client echoes back as
+/// `expectedTurnId` on `turn/steer`).
+private actor SaTurnIdBox {
+    private(set) var id: TurnId?
+    func set(_ v: TurnId) { if id == nil { id = v } }
+    func waitForId(timeout: Duration = .seconds(5)) async -> TurnId? {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while id == nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return id
+    }
+}
+
+private func saCollectCapturingTurnId(_ e: SessionEngine, into box: SaTurnIdBox,
+                                      untilCompletions n: Int = 1,
+                                      timeout: Duration = .seconds(30)) async -> [ServerNotification] {
+    let s = await e.events()
+    let c = Task { () -> [ServerNotification] in
+        var o: [ServerNotification] = []
+        var k = 0
+        for await ev in s {
+            o.append(ev)
+            if case .turnStarted(_, let t) = ev { await box.set(t.id) }
+            if case .turnCompleted = ev { k += 1; if k == n { break } }
+        }
+        return o
+    }
+    let t = Task { try? await Task.sleep(for: timeout); c.cancel() }
+    let r = await c.value
+    t.cancel()
+    return r
+}
+
 final class SecurityAdversarialTests: XCTestCase {
 
     // MARK: ThreadId well-formedness matrix (CWE-22/CWE-23 defense)
@@ -183,17 +217,23 @@ final class SecurityAdversarialTests: XCTestCase {
                                    model: model, store: store,
                                    router: ToolRouter(limits: lim), limits: lim)
         await engine.start()
-        let collector = Task { await saCollect(engine, untilCompletions: 1,
-                                               timeout: .seconds(20)) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        let turnIdBox = SaTurnIdBox()
+        let collector = Task { await saCollectCapturingTurnId(engine, into: turnIdBox,
+                                                              untilCompletions: 1,
+                                                              timeout: .seconds(20)) }
+        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
+        // Flood with VALID steers (correct expectedTurnId) so they pass the
+        // turn-state validation and exercise the pending-input cap shedding;
+        // an invalid id would be rejected before reaching the cap.
+        let activeTurnId = await turnIdBox.waitForId() ?? TurnId("x")
         try await Task.sleep(for: .milliseconds(50))
         for i in 0..<5000 {
             await engine.submit(.steer(input: [TurnInput(text: "steer-\(i)")],
-                                       expectedTurnId: TurnId("x")))
+                                       expectedTurnId: activeTurnId))
         }
         let evs = await collector.value
         let overloaded = evs.contains {
-            if case .error(_, _, _, let b) = $0 { return b.codexErrorInfo == "Overloaded" }
+            if case .error(_, _, _, let b) = $0 { return b.reason == "Overloaded" }
             return false
         }
         XCTAssertTrue(overloaded,
@@ -277,7 +317,7 @@ final class SecurityAdversarialTests: XCTestCase {
         let applied = try ap.apply(legit, root: root)
         XCTAssertEqual(applied.first?.kind, .add)
         XCTAssertEqual(try String(contentsOfFile: root + "/sub/dir/ok.txt",
-                                  encoding: .utf8), "fine",
+                                  encoding: .utf8), "fine\n",
                        "containment must not break legitimate in-workspace writes")
     }
 

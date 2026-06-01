@@ -7,7 +7,9 @@ import ModelClient
 ///
 /// Mirrors `core/src/context_manager/history.rs`:
 /// - per-item token estimate = ceil(model-visible bytes / 4) where
-///   model-visible bytes is the JSON-serialized item length
+///   model-visible bytes is the JSON-serialized item length for ordinary
+///   items, or `estimate_reasoning_length(encrypted_content.len())` for an
+///   encrypted reasoning/compaction item
 ///   (`estimate_response_item_model_visible_bytes` +
 ///   `approx_tokens_from_byte_count`); plus base-instruction tokens.
 /// - `totalTokenUsage()` = last server-reported total tokens + estimate of
@@ -32,26 +34,127 @@ public struct ContextManager: Sendable {
     // ceil(bytes / 4) — `approx_tokens_from_byte_count_i64`.
     static func tokensFromBytes(_ bytes: Int) -> Int { (max(0, bytes) + 3) / 4 }
 
-    /// JSON-serialized byte length — `estimate_response_item_model_visible_bytes`
-    /// (our item model has no encrypted reasoning/image-data-URL cases, so the
-    /// raw serialized size is the model-visible size).
+    /// Port of `estimate_reasoning_length`
+    /// (`core/src/context_manager/history.rs:499-505`):
+    /// `encoded_len * 3 / 4 - 650`, saturating at 0. The server already
+    /// accounted for the encrypted reasoning tokens and the base64 blob is not
+    /// re-ingested verbatim by the model, so the model-visible byte cost of an
+    /// encrypted reasoning/compaction item is the decoded payload size minus a
+    /// fixed offset, NOT the serialized JSON length.
+    static func estimateReasoningLength(_ encodedLen: Int) -> Int {
+        let scaled = max(0, encodedLen) * 3 / 4
+        return max(0, scaled - 650)
+    }
+
+    /// `estimate_response_item_model_visible_bytes`
+    /// (`core/src/context_manager/history.rs:534-545`): a Reasoning item with
+    /// `encrypted_content: Some(_)` (and likewise Compaction / ContextCompaction
+    /// carrying encrypted content) is costed as
+    /// `estimate_reasoning_length(content.len())` model-visible bytes; every
+    /// other item is its raw serialized JSON byte length. (Our `ThreadItem`
+    /// model has no image-data-URL case, so no image discounting applies; and
+    /// `.contextCompaction` carries no encrypted content in the Swift model.)
     static func modelVisibleBytes(of item: ThreadItem) -> Int {
-        (try? JSONEncoder().encode(item))?.count ?? 0
+        if case let .reasoning(_, _, _, encryptedContent) = item,
+           let encrypted = encryptedContent {
+            return estimateReasoningLength(encrypted.utf8.count)
+        }
+        return (try? JSONEncoder().encode(item))?.count ?? 0
     }
     static func estimateItemTokens(_ item: ThreadItem) -> Int {
         tokensFromBytes(modelVisibleBytes(of: item))
     }
 
-    /// Codex `is_model_generated_item`: assistant message or reasoning.
-    /// `.contextCompaction` is a structural marker (not model-generated
-    /// content) so it does not gate `itemsAfterLastModelGenerated`.
+    /// Codex `is_model_generated_item`
+    /// (`core/src/context_manager/history.rs:681-699`).
+    ///
+    /// Upstream returns `true` for assistant messages, reasoning, the
+    /// model-emitted CALL side of every tool (`FunctionCall`, `ToolSearchCall`,
+    /// `WebSearchCall`, `ImageGenerationCall`, `CustomToolCall`,
+    /// `LocalShellCall`), and for both compaction markers
+    /// (`Compaction => true`, `ContextCompaction => true`). It returns `false`
+    /// for user messages, the tool OUTPUT side (`FunctionCallOutput`, …),
+    /// `CompactionTrigger`, and `Other`.
+    ///
+    /// `.contextCompaction` is treated as model-generated here so that after a
+    /// remote compaction — whose installed history ends with a
+    /// `.contextCompaction` marker (see SessionEngine appending
+    /// `.contextCompaction`) — `itemsAfterLastModelGenerated()` returns an
+    /// empty slice and `totalTokenUsage()` re-baselines to the last server
+    /// total rather than re-counting the synthesized summary/user items on top
+    /// of a stale `lastServerTotalTokens`.
+    ///
+    /// `.commandExecution` is an INTENTIONAL port divergence and stays in the
+    /// `false` arm: the Swift `ThreadItem` model unifies a tool call and its
+    /// output into a single `.commandExecution` variant (see Items.swift), so
+    /// there is no separate call-side boundary item to mark `true`. Upstream's
+    /// `FunctionCall => true` / `FunctionCallOutput => false` split has no
+    /// 1:1 mapping here; collapsing both into one non-model-generated item
+    /// counts the whole unified entry as "after the boundary", which is the
+    /// closest faithful behaviour for the unified model. Do NOT "fix" this to
+    /// return `true` — it is a deliberate consequence of the unified item
+    /// model, not a bug.
     private static func isModelGenerated(_ item: ThreadItem) -> Bool {
         switch item {
-        case .agentMessage, .reasoning: return true
-        case .userMessage, .commandExecution, .fileChange, .contextMessage,
-             .contextCompaction, .unknown: return false
+        case .agentMessage, .reasoning, .contextCompaction: return true
+        case .userMessage, .commandExecution, .fileChange, .collabAgentToolCall,
+             .contextMessage, .enteredReviewMode, .exitedReviewMode, .unknown: return false
         }
     }
+    /// Codex `is_codex_generated_item`
+    /// (`core/src/context_manager/history.rs:701-708`): returns `true` ONLY for
+    /// the tool-OUTPUT side of a tool call (`FunctionCallOutput`,
+    /// `ToolSearchOutput`, `CustomToolCallOutput`) and for `developer`-role
+    /// messages. This is the predicate the remote-compaction pre-request trim
+    /// (`trim_function_call_history_to_fit_context_window`, compact_remote.rs:361-388)
+    /// uses to decide which trailing items may be dropped so the compact request
+    /// fits the model context window.
+    ///
+    /// INTENTIONAL PORT DIVERGENCE (matching `isModelGenerated`'s treatment of
+    /// the unified item model): the Swift `ThreadItem` model unifies a tool call
+    /// and its output into a single `.commandExecution` entry, so there is no
+    /// standalone tool-OUTPUT item to mark `true`. `.commandExecution` therefore
+    /// returns `false` here — it is NOT trimmable as a codex-generated item —
+    /// preserving the same unified-item semantics as `isModelGenerated`. Do NOT
+    /// "fix" this to return `true` for outputs; it is a deliberate consequence of
+    /// the unified item model. The remaining codex-generated case the Swift model
+    /// can express is a `developer`-role `.contextMessage`.
+    static func isCodexGeneratedItem(_ item: ThreadItem) -> Bool {
+        if case let .contextMessage(_, role, _) = item, role == "developer" {
+            return true
+        }
+        return false
+    }
+
+    /// Port of `trim_function_call_history_to_fit_context_window`
+    /// (`core/src/compact_remote.rs:361-388`): before issuing a remote compaction
+    /// request, trim trailing codex-generated items (developer messages — see
+    /// `isCodexGeneratedItem`) while the whole-history estimate exceeds the model
+    /// context window, so the compact request itself fits. Stops as soon as the
+    /// estimate fits, the last item is NOT codex-generated, or history is empty.
+    ///
+    /// `contextWindow == nil` mirrors upstream's `let Some(context_window) = …
+    /// else { return 0 }`: with no declared window the trim is a no-op (limit
+    /// effectively disabled). A safety counter (bounded by the initial history
+    /// count) guards against an unproductive loop where an item's token cost is
+    /// zero, so a broken estimate can never spin forever. Returns the number of
+    /// items removed.
+    @discardableResult
+    public mutating func trimToFitContextWindow(contextWindow: Int?) -> Int {
+        guard let contextWindow else { return 0 }
+        var deleted = 0
+        var attemptsRemaining = history.count
+        while estimatedTokens > contextWindow {
+            guard attemptsRemaining > 0 else { break }
+            attemptsRemaining -= 1
+            guard let last = history.last else { break }
+            guard Self.isCodexGeneratedItem(last) else { break }
+            guard removeLastItem() else { break }
+            deleted += 1
+        }
+        return deleted
+    }
+
     /// Codex `is_user_turn_boundary`: a (non-contextual) user message.
     private static func isUserTurnBoundary(_ item: ThreadItem) -> Bool {
         if case .userMessage = item { return true }
@@ -132,11 +235,15 @@ public struct ContextManager: Sendable {
     /// policy*1.2. `maxOutputBytes == nil` records verbatim (non-output items).
     public mutating func appendItem(_ item: ThreadItem, maxOutputBytes: Int? = nil) {
         switch (item, maxOutputBytes) {
-        case (.commandExecution(let id, let cmd, let cwd, let st, let out, let ec), .some(let cap)):
+        case (.commandExecution(let id, let cmd, let cwd, let st, let actions, let out, let ec,
+                                let pid, let source, let durationMs), .some(let cap)):
             let budget = Int(Double(cap) * 1.2)
             let truncated = out.map { Self.truncate($0, maxBytes: budget) }
             history.append(.commandExecution(id: id, command: cmd, cwd: cwd, status: st,
-                                             aggregatedOutput: truncated, exitCode: ec))
+                                             commandActions: actions,
+                                             aggregatedOutput: truncated, exitCode: ec,
+                                             processId: pid, source: source,
+                                             durationMs: durationMs))
         default:
             history.append(item)
         }
@@ -146,6 +253,10 @@ public struct ContextManager: Sendable {
         let content = input.map { i -> UserMessageContent in
             var c = UserMessageContent(text: i.text ?? "")
             c.type = i.type; c.url = i.url; c.path = i.path
+            // Thread image detail + text-span metadata through to history so
+            // they round-trip and reach the model input builder instead of
+            // being silently dropped (upstream `UserInput` → `CoreUserInput`).
+            c.detail = i.detail; c.textElements = i.textElements
             return c
         }
         history.append(.userMessage(id: ItemId.generate("u"), content: content))
@@ -153,6 +264,17 @@ public struct ContextManager: Sendable {
 
     public mutating func appendAssistant(_ text: String, id: ItemId) {
         history.append(.agentMessage(id: id, text: text))
+    }
+
+    /// Records a reasoning item (encrypted chain-of-thought + flattened
+    /// summary/content) so it is replayed into the next request's input and
+    /// persisted in the rollout — parity with upstream feeding
+    /// `ResponseItem::Reasoning` back via `get_formatted_input`.
+    public mutating func appendReasoning(id: ItemId, summary: [String],
+                                         content: [String],
+                                         encryptedContent: String?) {
+        history.append(.reasoning(id: id, summary: summary, content: content,
+                                  encryptedContent: encryptedContent))
     }
 
     /// Codex `replace`: wholesale history rewrite (compaction / rollback);
@@ -263,8 +385,15 @@ public struct ContextManager: Sendable {
                 if !t.isEmpty { out.append(.userText(t)) }
             case .agentMessage(_, let t):
                 if !t.isEmpty { out.append(.assistantText(t)) }
-            case .commandExecution(let id, _, _, _, let o, _):
-                if let o { out.append(.toolOutput(callId: id.raw, output: o)) }
+            case .commandExecution(let id, let command, _, _, _, let o, _, _, _, _):
+                // Prefix the tool/command name so the model can see WHICH call
+                // produced this output across iterations (the replay layer
+                // otherwise labels every call a generic "tool"). Mirrors codex-rs
+                // replaying the real FunctionCall name.
+                if let o {
+                    let name = command.first.map { "[\($0)]\n" } ?? ""
+                    out.append(.toolOutput(callId: id.raw, output: name + o))
+                }
             case .contextMessage(_, let role, let sections):
                 for s in sections where !s.isEmpty {
                     switch role {
@@ -273,11 +402,49 @@ public struct ContextManager: Sendable {
                     default: out.append(.userText(s))
                     }
                 }
-            case .reasoning, .fileChange, .contextCompaction, .unknown:
+            case .reasoning(_, let summary, let content, let encryptedContent):
+                // Replay reasoning items into the model input so encrypted
+                // chain-of-thought survives across turns (Codex
+                // `attach_item_ids` / `get_formatted_input` feeds Reasoning
+                // items back; client.rs requests `reasoning.encrypted_content`).
+                // Only replay items that carry encrypted content OR some
+                // summary/content text — an empty reasoning item contributes
+                // nothing and is skipped to keep the input array clean.
+                if encryptedContent != nil || !summary.isEmpty || !content.isEmpty {
+                    out.append(.reasoning(summary: summary, content: content,
+                                          encryptedContent: encryptedContent))
+                }
+            case .fileChange(let id, let changes, _):
+                // FAITHFUL CONTEXT FIX: codex-rs replays the agent's apply_patch
+                // edits into the next prompt so it remembers what it changed;
+                // codex-swift had been SKIPPING .fileChange entirely, so on every
+                // follow-up iteration the model could not see it had edited any
+                // file via its primary editing tool — the dominant cause of
+                // "re-discovers and only implements 30-50% of the spec". Emit the
+                // applied patch (path + kind + diff) as the apply_patch output so
+                // the edit stays visible across iterations.
+                if !changes.isEmpty {
+                    let rendered = changes.map { ch -> String in
+                        let verb: String
+                        switch ch.kind {
+                        case .add: verb = "added"
+                        case .delete: verb = "deleted"
+                        case .update: verb = "updated"
+                        }
+                        return "[apply_patch] \(verb) \(ch.path)\n\(ch.diff)"
+                    }.joined(separator: "\n")
+                    out.append(.toolOutput(callId: id.raw, output: rendered))
+                }
+            case .collabAgentToolCall, .contextCompaction,
+                 .enteredReviewMode, .exitedReviewMode, .unknown:
                 // `.unknown` items are upstream ThreadItem variants Swift has
                 // not modeled (mcpToolCall, webSearch, etc.). They are
                 // captured for round-trip but contribute nothing to the
-                // model prompt.
+                // model prompt. `collabAgentToolCall` is a wire-surface item
+                // with no model-input projection. `enteredReviewMode` /
+                // `exitedReviewMode` are frontend thread-history markers only —
+                // the review-exit guidance is replayed via a separate
+                // agentMessage, so these contribute nothing to the model input.
                 continue
             }
         }
@@ -290,14 +457,20 @@ public struct ContextManager: Sendable {
             switch item {
             case .userMessage(_, let c): return "user: " + c.compactMap { $0.text }.joined(separator: " ")
             case .agentMessage(_, let t): return "assistant: " + t
-            case .reasoning(_, let s): return "reasoning: " + s
-            case .commandExecution(_, let cmd, _, _, let o, _):
+            case .reasoning(_, let s, _, _): return "reasoning: " + s.joined(separator: "\n")
+            case .commandExecution(_, let cmd, _, _, _, let o, _, _, _, _):
                 return "tool \(cmd.joined(separator: " ")): " + (o ?? "")
             case .fileChange(_, let ch, _): return "filechange: " + ch.map(\.path).joined(separator: ",")
             case .contextMessage(_, let role, let sections):
                 return "\(role): " + sections.joined(separator: "\n")
+            case .collabAgentToolCall(_, let tool, _, _, _, _, _, _, _):
+                return "collabAgentToolCall: \(tool.rawValue)"
             case .contextCompaction:
                 return "context_compaction"
+            case .enteredReviewMode(_, let review):
+                return "entered_review_mode: " + review
+            case .exitedReviewMode(_, let review):
+                return "exited_review_mode: " + review
             case .unknown(_, let typeName, _):
                 return "unknown(\(typeName))"
             }

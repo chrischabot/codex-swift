@@ -21,7 +21,7 @@ final class ContextManagerTests: XCTestCase {
         // Items after the last model-generated item (the assistant message):
         c.appendItem(.commandExecution(id: ItemId("c1"), command: ["echo"], cwd: "/w",
                                        status: .completed,
-                                       aggregatedOutput: String(repeating: "Z", count: 80),
+                                       commandActions: [], aggregatedOutput: String(repeating: "Z", count: 80),
                                        exitCode: 0))
         let total = c.totalTokenUsage()
         XCTAssertGreaterThan(total, 1000, "server last total + post-model-generated estimate")
@@ -35,13 +35,13 @@ final class ContextManagerTests: XCTestCase {
         var c = ContextManager()
         c.appendItem(.commandExecution(id: ItemId("c1"), command: ["x"], cwd: "/w",
                                        status: .completed,
-                                       aggregatedOutput: String(repeating: "A", count: 100_000),
+                                       commandActions: [], aggregatedOutput: String(repeating: "A", count: 100_000),
                                        exitCode: 0),
                      maxOutputBytes: 64)
-        guard case .commandExecution(_, _, _, _, let out, _) = c.history[0] else {
+        guard case .commandExecution(_, _, _, _, _, let out, _, _, _, _) = c.history[0] else {
             return XCTFail("expected commandExecution")
         }
-        XCTAssertTrue((out ?? "").contains("bytes elided"),
+        XCTAssertTrue((out ?? "").contains("tokens truncated"),
                       "tool output is truncated on record (policy*1.2 head/tail ring)")
         XCTAssertLessThan((out ?? "").utf8.count, 100_000)
     }
@@ -93,18 +93,18 @@ final class ContextManagerTests: XCTestCase {
         // toolCall(id=A) — in-progress, no output yet
         c.appendItem(.commandExecution(id: ItemId("A"), command: ["echo", "A"],
                                        cwd: "/w", status: .inProgress,
-                                       aggregatedOutput: nil, exitCode: nil))
+                                       commandActions: [], aggregatedOutput: nil, exitCode: nil))
         // toolOutput(id=A) — completed half of the same call
         c.appendItem(.commandExecution(id: ItemId("A"), command: ["echo", "A"],
                                        cwd: "/w", status: .completed,
-                                       aggregatedOutput: "outA", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "outA", exitCode: 0))
         c.appendItem(.agentMessage(id: ItemId("m"), text: "ack"))
         c.appendItem(.commandExecution(id: ItemId("B"), command: ["echo", "B"],
                                        cwd: "/w", status: .inProgress,
-                                       aggregatedOutput: nil, exitCode: nil))
+                                       commandActions: [], aggregatedOutput: nil, exitCode: nil))
         c.appendItem(.commandExecution(id: ItemId("B"), command: ["echo", "B"],
                                        cwd: "/w", status: .completed,
-                                       aggregatedOutput: "outB", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "outB", exitCode: 0))
 
         let removed = c.removeFirstItem()
         XCTAssertEqual(removed, 2,
@@ -119,13 +119,13 @@ final class ContextManagerTests: XCTestCase {
             return XCTFail("expected agentMessage at [0]")
         }
         XCTAssertEqual(t, "ack")
-        guard case .commandExecution(let id1, _, _, let st1, let out1, _) = c.history[1] else {
+        guard case .commandExecution(let id1, _, _, let st1, _, let out1, _, _, _, _) = c.history[1] else {
             return XCTFail("expected commandExecution at [1]")
         }
         XCTAssertEqual(id1.raw, "B")
         XCTAssertEqual(st1, .inProgress)
         XCTAssertNil(out1)
-        guard case .commandExecution(let id2, _, _, let st2, let out2, _) = c.history[2] else {
+        guard case .commandExecution(let id2, _, _, let st2, _, let out2, _, _, _, _) = c.history[2] else {
             return XCTFail("expected commandExecution at [2]")
         }
         XCTAssertEqual(id2.raw, "B")
@@ -138,21 +138,21 @@ final class ContextManagerTests: XCTestCase {
         c.appendItem(.agentMessage(id: ItemId("m"), text: "hello"))
         c.appendItem(.commandExecution(id: ItemId("c1"), command: ["echo"], cwd: "/w",
                                        status: .completed,
-                                       aggregatedOutput: "out", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "out", exitCode: 0))
         c.appendItem(.commandExecution(id: ItemId("c2"), command: ["echo"], cwd: "/w",
                                        status: .completed,
-                                       aggregatedOutput: "out2", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "out2", exitCode: 0))
 
         let removed = c.removeFirstItem()
         XCTAssertEqual(removed, 1,
                        "agentMessage has no call/output pair → only the message is removed")
         XCTAssertEqual(c.history.count, 2)
         // Surviving items are the two commandExecutions, in order.
-        guard case .commandExecution(let id1, _, _, _, _, _) = c.history[0] else {
+        guard case .commandExecution(let id1, _, _, _, _, _, _, _, _, _) = c.history[0] else {
             return XCTFail("expected commandExecution at [0]")
         }
         XCTAssertEqual(id1.raw, "c1")
-        guard case .commandExecution(let id2, _, _, _, _, _) = c.history[1] else {
+        guard case .commandExecution(let id2, _, _, _, _, _, _, _, _, _) = c.history[1] else {
             return XCTFail("expected commandExecution at [1]")
         }
         XCTAssertEqual(id2.raw, "c2")
@@ -163,7 +163,7 @@ final class ContextManagerTests: XCTestCase {
         // Single tool-call with no output anywhere in history.
         c.appendItem(.commandExecution(id: ItemId("X"), command: ["echo"], cwd: "/w",
                                        status: .inProgress,
-                                       aggregatedOutput: nil, exitCode: nil))
+                                       commandActions: [], aggregatedOutput: nil, exitCode: nil))
 
         let removed = c.removeFirstItem()
         XCTAssertEqual(removed, 1,
@@ -184,10 +184,10 @@ final class ContextManagerTests: XCTestCase {
         // Split pair sharing id "Z": call first, then output.
         c.appendItem(.commandExecution(id: ItemId("Z"), command: ["echo", "Z"],
                                        cwd: "/w", status: .inProgress,
-                                       aggregatedOutput: nil, exitCode: nil))
+                                       commandActions: [], aggregatedOutput: nil, exitCode: nil))
         c.appendItem(.commandExecution(id: ItemId("Z"), command: ["echo", "Z"],
                                        cwd: "/w", status: .completed,
-                                       aggregatedOutput: "outZ", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "outZ", exitCode: 0))
 
         let v0 = c.historyVersion
         let removed = c.removeLastItem()
@@ -210,7 +210,7 @@ final class ContextManagerTests: XCTestCase {
         var c = ContextManager()
         c.appendItem(.commandExecution(id: ItemId("c1"), command: ["echo"], cwd: "/w",
                                        status: .completed,
-                                       aggregatedOutput: "out", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "out", exitCode: 0))
         c.appendItem(.agentMessage(id: ItemId("m"), text: "bye"))
 
         let v0 = c.historyVersion
@@ -220,7 +220,7 @@ final class ContextManagerTests: XCTestCase {
                        "removeLastItem on a non-paired tail bumps historyVersion exactly once")
         XCTAssertEqual(c.history.count, 1,
                        "agentMessage has no pair → unrelated commandExecution survives")
-        guard case .commandExecution(let id, _, _, _, _, _) = c.history[0] else {
+        guard case .commandExecution(let id, _, _, _, _, _, _, _, _, _) = c.history[0] else {
             return XCTFail("expected commandExecution to survive")
         }
         XCTAssertEqual(id.raw, "c1")
@@ -238,7 +238,7 @@ final class ContextManagerTests: XCTestCase {
         // Single tool-call with no paired output anywhere in history.
         c.appendItem(.commandExecution(id: ItemId("X"), command: ["echo"], cwd: "/w",
                                        status: .inProgress,
-                                       aggregatedOutput: nil, exitCode: nil))
+                                       commandActions: [], aggregatedOutput: nil, exitCode: nil))
 
         let v0 = c.historyVersion
         let removed = c.removeLastItem()
@@ -266,7 +266,7 @@ final class ContextManagerTests: XCTestCase {
         c.appendUser([TurnInput(text: "u2")])
         c.appendItem(.commandExecution(id: ItemId("c1"), command: ["echo"], cwd: "/w",
                                        status: .completed,
-                                       aggregatedOutput: "out", exitCode: 0))
+                                       commandActions: [], aggregatedOutput: "out", exitCode: 0))
         // No assistant / reasoning anywhere → tail must be empty.
         XCTAssertTrue(c.itemsAfterLastModelGenerated().isEmpty,
                       "no model-generated item → upstream returns items[len..], i.e. empty")
@@ -313,12 +313,67 @@ final class ContextManagerTests: XCTestCase {
                        "post-recompute, totalTokenUsage tracks the new baseline (no double-counting)")
     }
 
+    // MARK: - context-compaction Finding 1 — .contextCompaction is a
+    // model-generated boundary (upstream `ContextCompaction => true`,
+    // core/src/context_manager/history.rs:681-699).
+    //
+    // After a remote compaction the installed history ends with a
+    // `.contextCompaction` marker. Because that marker is now model-generated,
+    // `itemsAfterLastModelGenerated()` returns an EMPTY slice and
+    // `totalTokenUsage()` re-baselines to the last server total instead of
+    // re-counting the synthesized summary/user items appended after it.
+    func testContextCompactionIsModelGeneratedBoundary() {
+        var c = ContextManager()
+        // A freshly compacted history: synthesized summary user message(s)
+        // followed by the canonical `.contextCompaction` marker, then a few
+        // post-compaction user turns layered on top.
+        c.replace([
+            .userMessage(id: ItemId("summary"),
+                         content: [UserMessageContent(text: "compacted summary")]),
+            .contextCompaction(id: ItemId("cmp")),
+            .userMessage(id: ItemId("u-after"),
+                         content: [UserMessageContent(text: "new question after compaction")]),
+        ])
+        c.setLastServerTotalTokens(40_000)
+        // The boundary is the .contextCompaction marker; only the trailing
+        // post-compaction user message is "after" it.
+        let after = c.itemsAfterLastModelGenerated()
+        XCTAssertEqual(after.count, 1,
+                       ".contextCompaction is the model-generated boundary; only post-marker items follow")
+        guard case .userMessage(_, let content)? = after.first,
+              content.first?.text == "new question after compaction" else {
+            return XCTFail("the single trailing item should be the post-compaction user message")
+        }
+        let tailTokens = ContextManager.estimateItemTokens(
+            .userMessage(id: ItemId("u-after"),
+                         content: [UserMessageContent(text: "new question after compaction")]))
+        XCTAssertEqual(c.totalTokenUsage(), 40_000 + tailTokens,
+                       "totalTokenUsage = lastServerTotal + only the items recorded after the compaction marker; the summary before the marker is NOT re-counted")
+    }
+
+    // A trailing `.contextCompaction` marker (no items after it) yields an
+    // empty tail, so totalTokenUsage == lastServerTotalTokens exactly — the
+    // load-bearing post-compaction re-baseline case.
+    func testTrailingContextCompactionYieldsEmptyTail() {
+        var c = ContextManager()
+        c.replace([
+            .userMessage(id: ItemId("summary"),
+                         content: [UserMessageContent(text: "compacted summary")]),
+            .contextCompaction(id: ItemId("cmp")),
+        ])
+        c.setLastServerTotalTokens(40_000)
+        XCTAssertTrue(c.itemsAfterLastModelGenerated().isEmpty,
+                      "history ending in .contextCompaction has no items after the boundary")
+        XCTAssertEqual(c.totalTokenUsage(), 40_000,
+                       "no tail → totalTokenUsage is exactly the server-reported total (no double-count of the summary)")
+    }
+
     func testForPromptSendsFullTranscriptInOrder() {
         var c = ContextManager()
         c.appendUser([TurnInput(text: "u1")])
         c.appendAssistant("a1", id: ItemId("a1"))
         c.appendItem(.commandExecution(id: ItemId("c1"), command: ["echo"], cwd: "/w",
-                                       status: .completed, aggregatedOutput: "out1", exitCode: 0))
+                                       status: .completed, commandActions: [], aggregatedOutput: "out1", exitCode: 0))
         c.appendUser([TurnInput(text: "u2")])
         let proj = c.forPrompt(extra: [.userText("EXTRA")])
         XCTAssertEqual(proj, [
@@ -328,5 +383,221 @@ final class ContextManagerTests: XCTestCase {
             .userText("u2"),
             .userText("EXTRA"),
         ], "for_prompt sends the full chronological transcript incl. assistant turns")
+    }
+
+    func testForPromptReplaysReasoningWithEncryptedContent() {
+        var c = ContextManager()
+        c.appendUser([TurnInput(text: "u1")])
+        c.appendReasoning(id: ItemId("r1"), summary: ["s"], content: ["cot"],
+                          encryptedContent: "ENC")
+        c.appendAssistant("a1", id: ItemId("a1"))
+        let proj = c.forPrompt()
+        XCTAssertEqual(proj, [
+            .userText("u1"),
+            .reasoning(summary: ["s"], content: ["cot"], encryptedContent: "ENC"),
+            .assistantText("a1"),
+        ], "reasoning items must replay into the model input for cross-turn continuity")
+    }
+
+    func testForPromptSkipsEmptyReasoningItem() {
+        var c = ContextManager()
+        c.appendUser([TurnInput(text: "u1")])
+        c.appendReasoning(id: ItemId("r1"), summary: [], content: [],
+                          encryptedContent: nil)
+        let proj = c.forPrompt()
+        XCTAssertEqual(proj, [.userText("u1")],
+                       "an empty reasoning item contributes nothing to the input")
+    }
+
+    // MARK: Finding 1 — encrypted reasoning token estimation
+    // Port of upstream `estimate_reasoning_length`
+    // (core/src/context_manager/history.rs:499-505): model-visible bytes for an
+    // encrypted reasoning item are `len*3/4 - 650` (saturating), NOT the
+    // serialized-JSON byte length, then converted to tokens via ceil(bytes/4).
+
+    func testEstimateReasoningLengthMatchesUpstreamFormula() {
+        // len*3/4 - 650 saturating at 0.
+        XCTAssertEqual(ContextManager.estimateReasoningLength(0), 0)
+        XCTAssertEqual(ContextManager.estimateReasoningLength(800), 0,
+                       "800*3/4=600, 600-650 saturates to 0")
+        XCTAssertEqual(ContextManager.estimateReasoningLength(1000), 100,
+                       "1000*3/4=750, 750-650=100")
+        XCTAssertEqual(ContextManager.estimateReasoningLength(4000), 2350,
+                       "4000*3/4=3000, 3000-650=2350")
+    }
+
+    func testEncryptedReasoningCostedByDecodedSizeNotJSONBytes() {
+        // Upstream `estimate_response_item_model_visible_bytes` special-cases an
+        // encrypted Reasoning item to `estimate_reasoning_length(content.len())`
+        // model-visible bytes, then `estimate_item_token_count` converts via
+        // ceil(bytes/4). For a 4000-byte encrypted blob:
+        //   model-visible bytes = estimate_reasoning_length(4000) = 2350
+        //   tokens              = ceil(2350/4) = 588
+        let blob = String(repeating: "A", count: 4000)  // 4000 bytes encrypted
+        var c = ContextManager()
+        c.appendReasoning(id: ItemId("r1"), summary: [], content: [],
+                          encryptedContent: blob)
+        let item = c.history[0]
+        XCTAssertEqual(ContextManager.modelVisibleBytes(of: item), 2350,
+                       "encrypted reasoning is costed by estimate_reasoning_length, not JSON bytes")
+        XCTAssertEqual(ContextManager.estimateItemTokens(item), (2350 + 3) / 4)
+
+        // The special-cased estimate is independent of (and differs from) the
+        // serialized-JSON byte path used for ordinary items: it is driven by the
+        // encrypted-content length, not the serialized item.
+        let jsonBytes = (try? JSONEncoder().encode(item))?.count ?? 0
+        XCTAssertNotEqual(ContextManager.modelVisibleBytes(of: item), jsonBytes,
+                          "the encrypted-reasoning estimate must diverge from the raw JSON-byte path")
+
+        // The discounted size scales with the encrypted blob length: a larger
+        // blob yields a strictly larger estimate.
+        var c2 = ContextManager()
+        c2.appendReasoning(id: ItemId("r2"), summary: [], content: [],
+                           encryptedContent: String(repeating: "A", count: 8000))
+        XCTAssertGreaterThan(ContextManager.modelVisibleBytes(of: c2.history[0]),
+                             ContextManager.modelVisibleBytes(of: item),
+                             "a larger encrypted blob costs more model-visible bytes")
+    }
+
+    func testReasoningWithoutEncryptedContentStillUsesJSONBytes() {
+        // No encrypted content → falls back to the JSON-byte path (unchanged).
+        var c = ContextManager()
+        c.appendReasoning(id: ItemId("r1"), summary: ["short summary"],
+                          content: ["chain"], encryptedContent: nil)
+        let item = c.history[0]
+        let jsonBytes = (try? JSONEncoder().encode(item))?.count ?? 0
+        XCTAssertEqual(ContextManager.modelVisibleBytes(of: item), jsonBytes,
+                       "non-encrypted reasoning is costed by serialized JSON size")
+        XCTAssertEqual(ContextManager.estimateItemTokens(item), (jsonBytes + 3) / 4)
+    }
+
+    func testTotalTokenUsageDiscountsTrailingEncryptedReasoning() {
+        // An encrypted reasoning item recorded after the last model-generated
+        // item is counted into `totalTokenUsage()` via the discounted estimate,
+        // not the inflated JSON-byte count — driving the auto-compact ladder.
+        var c = ContextManager()
+        c.appendUser([TurnInput(text: "q")])
+        c.setLastServerTotalTokens(1000)
+        let blob = String(repeating: "B", count: 4000)
+        c.appendReasoning(id: ItemId("r1"), summary: [], content: [],
+                          encryptedContent: blob)
+        // userMessage is not model-generated; reasoning IS model-generated, so
+        // it is the boundary and the window after it is empty → total == server.
+        XCTAssertEqual(c.totalTokenUsage(), 1000,
+                       "reasoning is the last model-generated item; window after is empty")
+        // But the whole-history estimate uses the discounted reasoning size.
+        let discountedTokens = (ContextManager.estimateReasoningLength(4000) + 3) / 4
+        let userTokens = ContextManager.estimateItemTokens(c.history[0])
+        XCTAssertEqual(c.estimatedTokens, userTokens + discountedTokens)
+    }
+
+    // MARK: - context-compaction Finding (major) — trim_function_call_history_to_fit_context_window
+    //
+    // Port of upstream `trim_function_call_history_to_fit_context_window`
+    // (core/src/compact_remote.rs:361-388) + `is_codex_generated_item`
+    // (core/src/context_manager/history.rs:701-708). Before the remote compact
+    // request, while the whole-history estimate exceeds the model context
+    // window, pop trailing CODEX-GENERATED items (developer messages / tool
+    // outputs) until it fits or the tail is not codex-generated.
+
+    func testTrimToFitDropsTrailingDeveloperMessagesUntilFits() {
+        var c = ContextManager()
+        // A big user message sets the baseline; then several large developer
+        // (codex-generated) context messages push the estimate over the window.
+        c.appendUser([TurnInput(text: String(repeating: "U", count: 4000))])
+        for i in 0..<5 {
+            c.appendItem(.contextMessage(id: ItemId("dev\(i)"), role: "developer",
+                                         sections: [String(repeating: "D", count: 4000)]))
+        }
+        let window = ContextManager.estimateItemTokens(c.history[0]) + 50
+        XCTAssertGreaterThan(c.estimatedTokens, window,
+                             "test invariant: history starts over the window")
+        let deleted = c.trimToFitContextWindow(contextWindow: window)
+        XCTAssertGreaterThan(deleted, 0, "trailing developer messages are trimmed")
+        XCTAssertLessThanOrEqual(c.estimatedTokens, window,
+                                 "after trimming, the history fits the context window")
+        // The user message is NEVER trimmed (not codex-generated).
+        XCTAssertFalse(c.history.isEmpty)
+        guard case .userMessage = c.history[0] else {
+            return XCTFail("the leading user message must survive the trim")
+        }
+    }
+
+    func testTrimToFitStopsAtNonCodexGeneratedTail() {
+        var c = ContextManager()
+        // user (not codex-gen), developer (codex-gen), then a trailing assistant
+        // message which is NOT codex-generated — the loop must stop at it even
+        // though we are still over the window, leaving everything intact.
+        c.appendUser([TurnInput(text: String(repeating: "U", count: 4000))])
+        c.appendItem(.contextMessage(id: ItemId("dev"), role: "developer",
+                                     sections: [String(repeating: "D", count: 4000)]))
+        c.appendAssistant(String(repeating: "A", count: 4000), id: ItemId("a1"))
+        let before = c.history.count
+        // Pick a window far below the current estimate so the loop wants to trim.
+        let deleted = c.trimToFitContextWindow(contextWindow: 1)
+        XCTAssertEqual(deleted, 0,
+                       "tail is an assistant message (not codex-generated) → no trimming")
+        XCTAssertEqual(c.history.count, before, "history is untouched")
+    }
+
+    func testTrimToFitDoesNotTouchUserOrAssistantOrCommandExecution() {
+        var c = ContextManager()
+        // Per the unified-item port divergence, .commandExecution is NOT
+        // codex-generated, so a trailing tool output is never trimmed.
+        c.appendItem(.commandExecution(id: ItemId("c1"), command: ["echo"], cwd: "/w",
+                                       status: .completed, commandActions: [],
+                                       aggregatedOutput: String(repeating: "Z", count: 4000),
+                                       exitCode: 0))
+        let before = c.history.count
+        let deleted = c.trimToFitContextWindow(contextWindow: 1)
+        XCTAssertEqual(deleted, 0,
+                       ".commandExecution is not codex-generated under the unified item model")
+        XCTAssertEqual(c.history.count, before)
+    }
+
+    func testTrimToFitNilWindowIsNoOp() {
+        var c = ContextManager()
+        c.appendItem(.contextMessage(id: ItemId("dev"), role: "developer",
+                                     sections: [String(repeating: "D", count: 4000)]))
+        let before = c.history.count
+        XCTAssertEqual(c.trimToFitContextWindow(contextWindow: nil), 0,
+                       "no declared context window → trim disabled (upstream returns 0)")
+        XCTAssertEqual(c.history.count, before)
+    }
+
+    func testTrimToFitEmptyHistoryIsNoOp() {
+        var c = ContextManager()
+        XCTAssertEqual(c.trimToFitContextWindow(contextWindow: 1), 0,
+                       "empty history → nothing to trim, no crash")
+        XCTAssertTrue(c.history.isEmpty)
+    }
+
+    func testTrimToFitFitsAlreadyIsNoOp() {
+        var c = ContextManager()
+        c.appendItem(.contextMessage(id: ItemId("dev"), role: "developer",
+                                     sections: ["small"]))
+        let before = c.history.count
+        XCTAssertEqual(c.trimToFitContextWindow(contextWindow: 1_000_000), 0,
+                       "history already fits → no trimming")
+        XCTAssertEqual(c.history.count, before)
+    }
+
+    func testIsCodexGeneratedItemMatchesUpstreamPredicate() {
+        // developer-role context message → true (codex-generated).
+        XCTAssertTrue(ContextManager.isCodexGeneratedItem(
+            .contextMessage(id: ItemId("d"), role: "developer", sections: ["x"])))
+        // user-role context message → false.
+        XCTAssertFalse(ContextManager.isCodexGeneratedItem(
+            .contextMessage(id: ItemId("u"), role: "user", sections: ["x"])))
+        // user / assistant / reasoning → false.
+        XCTAssertFalse(ContextManager.isCodexGeneratedItem(
+            .userMessage(id: ItemId("u"), content: [UserMessageContent(text: "hi")])))
+        XCTAssertFalse(ContextManager.isCodexGeneratedItem(
+            .agentMessage(id: ItemId("a"), text: "hi")))
+        // .commandExecution → false (intentional unified-item divergence).
+        XCTAssertFalse(ContextManager.isCodexGeneratedItem(
+            .commandExecution(id: ItemId("c"), command: ["echo"], cwd: "/w",
+                              status: .completed, commandActions: [],
+                              aggregatedOutput: "out", exitCode: 0)))
     }
 }

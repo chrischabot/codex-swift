@@ -51,7 +51,7 @@ final class McpP73Tests: XCTestCase {
         setenv("PATH", "/usr/bin:/bin", 1)
 
         let cfg = McpServerConfig(name: "x", command: "echo", args: [])
-        let env = McpClient.buildStdioEnvironment(config: cfg)
+        let env = try! McpClient.buildStdioEnvironment(config: cfg)
         XCTAssertNil(env["CODEX_API_KEY"],
                      "F6: parent secrets must NOT leak into stdio child env")
         XCTAssertNotNil(env["PATH"],
@@ -67,22 +67,29 @@ final class McpP73Tests: XCTestCase {
         defer { unsetenv("MY_UNREQUESTED_SECRET") }
         var cfg = McpServerConfig(name: "x", command: "echo")
         cfg.envVars = [McpServerEnvVar(name: "MY_EXPLICIT_OPT_IN")]
-        let env = McpClient.buildStdioEnvironment(config: cfg)
+        let env = try! McpClient.buildStdioEnvironment(config: cfg)
         XCTAssertEqual(env["MY_EXPLICIT_OPT_IN"], "opted-in-value")
         XCTAssertNil(env["MY_UNREQUESTED_SECRET"])
     }
 
-    /// `source: "remote"` env_vars are an upstream remote-executor
-    /// concept; locally they must be dropped, never resolved from the
-    /// parent env (otherwise they'd silently widen the leak surface).
-    func testBuildStdioEnvironmentDropsRemoteSourceEnvVars() {
+    /// `source: "remote"` env_vars are an upstream remote-executor concept.
+    /// On a LOCAL stdio launch upstream `local_stdio_env_var_names`
+    /// (`rmcp-client/src/utils.rs:50-58`) treats this as a hard configuration
+    /// error and refuses to start the server, rather than silently dropping
+    /// the entry. We mirror that: `buildStdioEnvironment` throws
+    /// `McpError.spawn` with the upstream message.
+    func testBuildStdioEnvironmentRemoteSourceEnvVarThrows() {
         setenv("REMOTE_ONLY_TOKEN", "remote-secret", 1)
         defer { unsetenv("REMOTE_ONLY_TOKEN") }
         var cfg = McpServerConfig(name: "x", command: "echo")
         cfg.envVars = [McpServerEnvVar(name: "REMOTE_ONLY_TOKEN",
                                        source: "remote")]
-        let env = McpClient.buildStdioEnvironment(config: cfg)
-        XCTAssertNil(env["REMOTE_ONLY_TOKEN"])
+        XCTAssertThrowsError(try McpClient.buildStdioEnvironment(config: cfg)) { err in
+            let msg = "\(err)"
+            XCTAssertTrue(msg.contains("uses source `remote`"), msg)
+            XCTAssertTrue(msg.contains("REMOTE_ONLY_TOKEN"), msg)
+            XCTAssertTrue(msg.contains("requires remote MCP stdio"), msg)
+        }
     }
 
     /// Literal `env = { K = "v" }` overrides must win over the
@@ -100,7 +107,7 @@ final class McpP73Tests: XCTestCase {
         setenv("PATH", "/usr/bin", 1)
         var cfg = McpServerConfig(name: "x", command: "echo")
         cfg.env = ["PATH": "/custom/path", "EXTRA": "ok"]
-        let env = McpClient.buildStdioEnvironment(config: cfg)
+        let env = try! McpClient.buildStdioEnvironment(config: cfg)
         XCTAssertEqual(env["PATH"], "/custom/path")
         XCTAssertEqual(env["EXTRA"], "ok")
     }

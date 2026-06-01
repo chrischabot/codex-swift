@@ -7,6 +7,178 @@ import WireProtocol
 public typealias McpElicitationHandler =
     @Sendable (_ requestId: RequestId, _ serverName: String, _ params: JSONValue) async -> JSONValue?
 
+/// Upstream `Implementation` identity sent in the MCP `initialize` request
+/// (`codex-rs/codex-mcp/src/rmcp_client.rs:483-490`): `name =
+/// "codex-mcp-client"`, `title = Some("Codex")`, `version =
+/// env!("CARGO_PKG_VERSION")`. The upstream workspace version is `0.0.0`
+/// (`codex-rs/Cargo.toml`), so we mirror that here as the build version.
+public enum McpClientInfo {
+    public static let name = "codex-mcp-client"
+    public static let title = "Codex"
+    /// Build version. Mirrors upstream `CARGO_PKG_VERSION` (workspace `0.0.0`).
+    public static let version = "0.0.0"
+
+    /// The `clientInfo` object for the `initialize` request, in the order
+    /// upstream emits its `Implementation` struct (name, title, version).
+    public static var initializeClientInfo: [String: Any] {
+        ["name": name, "title": title, "version": version]
+    }
+
+    /// Whether the `AuthElicitation` feature is enabled. Upstream
+    /// `Feature::AuthElicitation.default_enabled() == false` (stage
+    /// `UnderDevelopment`, `features/src/tests.rs:297-298`), so this is `false`
+    /// and the advertised capability is the empty object `{}`.
+    public static let authElicitationEnabled = false
+
+    /// The client `elicitation` capability advertised in `initialize`. Upstream
+    /// `client_elicitation_capability` (`core/src/session/session.rs:1027-1031`)
+    /// is `ElicitationCapability { form: Some(..), url: Some(..) }` (wire
+    /// `{"form":{},"url":{}}`) ONLY when `Feature::AuthElicitation` is enabled;
+    /// otherwise it is `ElicitationCapability::default()`, which — because both
+    /// `form` and `url` are `skip_serializing_if = "Option::is_none"`
+    /// (`rmcp-0.15.0/src/model.rs:209-216`) — serializes to the empty object
+    /// `{}`. `initialize` always sets `elicitation: Some(..)`
+    /// (`codex-mcp/src/rmcp_client.rs:480`), so the key is always present.
+    public static var elicitationCapability: [String: Any] {
+        capability(authElicitationEnabled: authElicitationEnabled)
+    }
+
+    /// Pure mapping from the AuthElicitation feature flag to the wire-shape of
+    /// the `elicitation` capability. Exposed so both branches are testable
+    /// without a mutable global.
+    public static func capability(authElicitationEnabled: Bool) -> [String: Any] {
+        if authElicitationEnabled {
+            return ["form": [String: Any](), "url": [String: Any]()]
+        }
+        return [String: Any]()
+    }
+}
+
+/// Wire-faithful reproduction of upstream `codex_mcp::SandboxState`
+/// (`codex-mcp/src/runtime.rs:18-29`), serialized into the `tools/call`
+/// request `_meta` under the key `codex/sandbox-state-meta` for servers that
+/// advertise the matching experimental capability
+/// (`core/src/mcp_tool_call.rs:705-751`).
+///
+/// Field-for-field serde parity (struct is `#[serde(rename_all = "camelCase")]`):
+///  - `permissionProfile`: `Option`, `skip_serializing_if = "Option::is_none"`
+///    → the key is OMITTED when nil.
+///  - `sandboxPolicy`: the **core** `SandboxPolicy`
+///    (`protocol/src/protocol.rs:991-994`), an internally-tagged enum
+///    `#[serde(tag = "type", rename_all = "kebab-case")]` →
+///    `{"type":"danger-full-access"}` / `{"type":"read-only", ...}` /
+///    `{"type":"workspace-write", ...}` / `{"type":"external-sandbox", ...}`.
+///    NOTE: this is the kebab-case core wire shape, NOT the v2 app-server
+///    camelCase `ProtocolModel.SandboxPolicy`.
+///  - `codexLinuxSandboxExe`: `Option<PathBuf>` with NO skip attribute →
+///    the key is ALWAYS present, emitting JSON `null` when absent.
+///  - `sandboxCwd`: always present string.
+///  - `useLegacyLandlock`: `#[serde(default)]` bool, always present.
+public struct SandboxStateMeta: Sendable, Equatable {
+    /// Upstream `codex/sandbox-state-meta` capability + `_meta` key.
+    public static let metaKey = "codex/sandbox-state-meta"
+
+    /// Core `SandboxPolicy` wire shape. The kebab-case `type` tag mirrors
+    /// `protocol/src/protocol.rs` (`danger-full-access` / `read-only` /
+    /// `workspace-write` / `external-sandbox`).
+    public enum Policy: Sendable, Equatable {
+        case dangerFullAccess
+        case readOnly(networkAccess: Bool)
+        case workspaceWrite(writableRoots: [String], networkAccess: Bool,
+                            excludeTmpdirEnvVar: Bool, excludeSlashTmp: Bool)
+        case externalSandbox(networkAccess: NetworkAccess)
+    }
+
+    /// Optional permission profile. When `nil`, the `permissionProfile` key
+    /// is omitted (upstream `skip_serializing_if = "Option::is_none"`). The
+    /// value, when present, is the verbatim serialized `PermissionProfile`
+    /// JSON object as passed by the caller.
+    public var permissionProfile: JSONLite?
+    public var sandboxPolicy: Policy
+    /// `Option<PathBuf>` with no skip — emits `null` when nil.
+    public var codexLinuxSandboxExe: String?
+    public var sandboxCwd: String
+    public var useLegacyLandlock: Bool
+
+    public init(permissionProfile: JSONLite? = nil,
+                sandboxPolicy: Policy,
+                codexLinuxSandboxExe: String? = nil,
+                sandboxCwd: String,
+                useLegacyLandlock: Bool = false) {
+        self.permissionProfile = permissionProfile
+        self.sandboxPolicy = sandboxPolicy
+        self.codexLinuxSandboxExe = codexLinuxSandboxExe
+        self.sandboxCwd = sandboxCwd
+        self.useLegacyLandlock = useLegacyLandlock
+    }
+
+    /// Build a `SandboxStateMeta.Policy` from the session's sandbox mode +
+    /// writable roots + network flag. Mirrors how upstream derives the core
+    /// `SandboxPolicy` for a turn: `read-only` carries `network_access`,
+    /// `workspace-write` carries the writable roots + network flag (and the
+    /// two tmp-exclusion booleans, which the port does not surface and so
+    /// default to `false`), and `danger-full-access` carries nothing.
+    public static func policy(mode: SandboxModeKind,
+                              writableRoots: [String],
+                              networkAccess: Bool) -> Policy {
+        switch mode {
+        case .dangerFullAccess:
+            return .dangerFullAccess
+        case .readOnly:
+            return .readOnly(networkAccess: networkAccess)
+        case .workspaceWrite:
+            return .workspaceWrite(writableRoots: writableRoots,
+                                   networkAccess: networkAccess,
+                                   excludeTmpdirEnvVar: false,
+                                   excludeSlashTmp: false)
+        }
+    }
+
+    /// Serialize the core `SandboxPolicy` to its internally-tagged
+    /// kebab-case wire object. `skip_serializing_if` rules are reproduced:
+    ///  - `read-only.network_access`: `skip_serializing_if = Not::not` → omit
+    ///    when `false`.
+    ///  - `workspace-write.writable_roots`: `skip_serializing_if = Vec::is_empty`
+    ///    → omit when empty; the other three booleans use `#[serde(default)]`
+    ///    only (always emitted).
+    ///  - `external-sandbox.network_access`: `#[serde(default)]` (always emitted)
+    ///    serialized as the lowercase `NetworkAccess` string.
+    private func policyJSON() -> [String: Any] {
+        switch sandboxPolicy {
+        case .dangerFullAccess:
+            return ["type": "danger-full-access"]
+        case .readOnly(let net):
+            var o: [String: Any] = ["type": "read-only"]
+            if net { o["network_access"] = true }   // skip when false
+            return o
+        case .workspaceWrite(let roots, let net, let exTmp, let exSlash):
+            var o: [String: Any] = ["type": "workspace-write"]
+            if !roots.isEmpty { o["writable_roots"] = roots }   // skip when empty
+            o["network_access"] = net
+            o["exclude_tmpdir_env_var"] = exTmp
+            o["exclude_slash_tmp"] = exSlash
+            return o
+        case .externalSandbox(let net):
+            return ["type": "external-sandbox", "network_access": net.rawValue]
+        }
+    }
+
+    /// Build the `JSONSerialization`-compatible object for this state, suitable
+    /// to insert into the `tools/call` `_meta` map. `permissionProfile` is
+    /// omitted entirely when nil; `codexLinuxSandboxExe` emits `NSNull` when nil.
+    public func metaObject() -> [String: Any] {
+        var o: [String: Any] = [:]
+        if let pp = permissionProfile {
+            o["permissionProfile"] = McpClient.jsonLiteToAny(pp)
+        }
+        o["sandboxPolicy"] = policyJSON()
+        o["codexLinuxSandboxExe"] = codexLinuxSandboxExe ?? NSNull()
+        o["sandboxCwd"] = sandboxCwd
+        o["useLegacyLandlock"] = useLegacyLandlock
+        return o
+    }
+}
+
 /// Upstream parity: `[mcp_servers.NAME] env_vars` accepts either a bare
 /// string (the variable name, sourced locally) or an inline-table with
 /// `name` + optional `source = "local" | "remote"`. The `remote` form lets
@@ -179,6 +351,22 @@ public struct McpServerConfig: Sendable, Codable, Equatable {
         return out
     }
 
+    /// Whether `toolName` is allowed by this server's enabled/disabled filter.
+    /// Mirrors upstream `ToolFilter::allows` (codex-mcp/src/tools.rs:103-112):
+    /// a tool is allowed iff (no allowlist is set OR the tool is in the
+    /// allowlist) AND the tool is not in the denylist. Enforced at the
+    /// `tools/call` boundary as defense-in-depth, independent of how the call
+    /// arrived (connection_manager.rs:582-594).
+    public func toolAllowed(_ toolName: String) -> Bool {
+        if let allow = enabledTools, !allow.isEmpty, !allow.contains(toolName) {
+            return false
+        }
+        if let deny = disabledTools, deny.contains(toolName) {
+            return false
+        }
+        return true
+    }
+
     private enum CodingKeys: String, CodingKey {
         case name, command, args, env, url
         case bearerTokenEnvVar
@@ -313,11 +501,171 @@ public struct McpToolSpec: Sendable, Equatable, Codable {
     public var name: String
     public var description: String
     public var inputSchemaJSON: String
+    /// The tool object's `_meta` map, preserved verbatim (upstream
+    /// `rmcp::model::Tool.meta`). Carries connector identity
+    /// (`connector_id` / `connector_name` / `connector_display_name` /
+    /// `connector_description` / `connectorDescription`) and the
+    /// `openai/fileParams` input-schema-masking hint. `nil` when the tool
+    /// declared no `_meta`. (Finding 3 — required by the `openai/fileParams`
+    /// masking in Finding 4 and by codex-apps connector gating upstream.)
+    public var meta: JSONLite?
+
+    public init(name: String, description: String,
+                inputSchemaJSON: String, meta: JSONLite? = nil) {
+        self.name = name
+        self.description = description
+        self.inputSchemaJSON = inputSchemaJSON
+        self.meta = meta
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, description, inputSchemaJSON, meta
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        description = (try c.decodeIfPresent(String.self, forKey: .description)) ?? ""
+        inputSchemaJSON = (try c.decodeIfPresent(String.self,
+                                                 forKey: .inputSchemaJSON)) ?? "{}"
+        meta = try c.decodeIfPresent(JSONLite.self, forKey: .meta)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encode(description, forKey: .description)
+        try c.encode(inputSchemaJSON, forKey: .inputSchemaJSON)
+        try c.encodeIfPresent(meta, forKey: .meta)
+    }
+
+    // MARK: - Connector identity (Finding 3)
+
+    /// Mirror of upstream `meta_string` (rmcp_client.rs:489-495): read the
+    /// string value of `key` from `_meta`, trimmed; `nil` if absent, not a
+    /// string, or empty after trimming.
+    private func metaString(_ key: String) -> String? {
+        guard case .object(let o)? = meta, case .string(let s)? = o[key] else {
+            return nil
+        }
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// `_meta["connector_id"]` (rmcp_client.rs:467).
+    public var connectorId: String? { metaString("connector_id") }
+    /// `_meta["connector_name"]` falling back to `_meta["connector_display_name"]`
+    /// (rmcp_client.rs:468-469).
+    public var connectorName: String? {
+        metaString("connector_name") ?? metaString("connector_display_name")
+    }
+    /// `_meta["connector_description"]` falling back to
+    /// `_meta["connectorDescription"]` (rmcp_client.rs:470-471).
+    public var connectorDescription: String? {
+        metaString("connector_description") ?? metaString("connectorDescription")
+    }
+
+    /// Upstream `declared_openai_file_input_param_names` (tools.rs:62-78):
+    /// the non-empty string entries of `_meta["openai/fileParams"]`. Empty
+    /// when the key is absent or not an array of strings.
+    public var openaiFileParams: [String] {
+        guard case .object(let o)? = meta,
+              case .array(let arr)? = o[McpToolSpec.metaOpenAIFileParamsKey]
+        else { return [] }
+        return arr.compactMap { v in
+            guard case .string(let s) = v, !s.isEmpty else { return nil }
+            return s
+        }
+    }
+
+    /// Upstream `META_OPENAI_FILE_PARAMS` (tools.rs:249).
+    static let metaOpenAIFileParamsKey = "openai/fileParams"
 }
 
 public struct McpCallResult: Sendable, Equatable {
+    /// Concatenated `text` of all text content blocks — the primary
+    /// model-visible output for simple consumers (back-compat).
     public var text: String
     public var isError: Bool
+    /// Full content block array, preserved verbatim from the MCP result
+    /// (upstream `CallToolResult.content`). Image content is converted to the
+    /// upstream placeholder text block when the model cannot accept images.
+    /// Empty when the server returned no content.
+    public var content: [JSONLite]
+    /// Upstream `CallToolResult.structured_content` — passed through untouched
+    /// for advanced consumers. `nil` when absent.
+    public var structuredContent: JSONLite?
+    /// Upstream `CallToolResult.meta` (the result-level `_meta`). `nil` when
+    /// absent.
+    public var meta: JSONLite?
+
+    public init(text: String, isError: Bool,
+                content: [JSONLite] = [],
+                structuredContent: JSONLite? = nil,
+                meta: JSONLite? = nil) {
+        self.text = text
+        self.isError = isError
+        self.content = content
+        self.structuredContent = structuredContent
+        self.meta = meta
+    }
+}
+
+/// Shared MCP `CallToolResult` decoding so the stdio and HTTP transports stay
+/// byte-for-byte consistent with each other and with upstream
+/// `connection_manager.rs::call_tool` + `mcp_tool_call.rs`.
+public enum McpResultDecoder {
+    /// Upstream placeholder substituted for `image` content blocks when the
+    /// model does not support image input (`mcp_tool_call.rs`).
+    public static let imageOmittedPlaceholder =
+        "<image content omitted because you do not support image input>"
+
+    /// Build an `McpCallResult` from a raw JSON-RPC `result` object, preserving
+    /// the full content array, structuredContent and `_meta`. Text blocks are
+    /// concatenated into `.text`.
+    ///
+    /// Upstream parity (`mcp_tool_call.rs::sanitize_mcp_tool_result_for_model`):
+    /// `image` blocks are passed through verbatim when the model supports image
+    /// input, and only replaced with the placeholder text block when it does
+    /// not. The default keeps the historical behaviour (no image input) so
+    /// existing callers stay byte-identical.
+    public static func decode(_ r: [String: JSONLite],
+                              supportsImageInput: Bool = false) -> McpCallResult {
+        var text = ""
+        var content: [JSONLite] = []
+        if let c = r["content"], case .array(let items) = c {
+            for it in items {
+                guard case .object(let o) = it else { content.append(it); continue }
+                if case .string("image")? = o["type"] {
+                    if supportsImageInput {
+                        // Image-capable model: preserve the block verbatim
+                        // (parity with `if supports_image_input { return result }`).
+                        content.append(it)
+                        continue
+                    }
+                    // Convert image block → placeholder text block (parity with
+                    // upstream `sanitize_mcp_tool_result_for_model`).
+                    let placeholder = JSONLite.object([
+                        "type": .string("text"),
+                        "text": .string(imageOmittedPlaceholder),
+                    ])
+                    content.append(placeholder)
+                    text += imageOmittedPlaceholder
+                    continue
+                }
+                content.append(it)
+                if case .string(let s)? = o["text"] { text += s }
+            }
+        }
+        var isError = false
+        if case .bool(let b)? = r["isError"] { isError = b }
+        let structured = r["structuredContent"]
+        let meta = r["_meta"]
+        return McpCallResult(text: text, isError: isError,
+                             content: content,
+                             structuredContent: structured,
+                             meta: meta)
+    }
 }
 
 public enum McpError: Error, Sendable, CustomStringConvertible {
@@ -336,16 +684,63 @@ public enum McpError: Error, Sendable, CustomStringConvertible {
 public protocol McpClientProtocol: Sendable, Actor {
     func start() throws
     func initialize() async throws
+    /// Whether the server advertised the `codex/sandbox-state-meta`
+    /// experimental capability in its `initialize` response
+    /// (upstream `server_supports_sandbox_state_meta_capability`,
+    /// `codex-mcp/src/rmcp_client.rs:501-506`). `false` until `initialize`
+    /// runs, and for any server that did not declare the capability.
+    func supportsSandboxStateMeta() async -> Bool
+    /// The server's `instructions` string captured from the `initialize`
+    /// response (upstream `initialize_result.instructions`,
+    /// `codex-mcp/src/rmcp_client.rs:496-499`). Used as the `namespace_description`
+    /// for the server's tools when they carry no connector metadata. `nil`
+    /// when the server returned no instructions.
+    func serverInstructions() async -> String?
     func listTools() async throws -> [McpToolSpec]
     func callTool(_ name: String, argumentsJSON: String,
+                  meta: [String: Any]?,
                   elicitationHandler: McpElicitationHandler?) async throws -> McpCallResult
     func readResource(uri: String) async throws -> [String: JSONLite]
+    /// Single-page `resources/list` request returning the raw result object
+    /// (`resources` array + optional `nextCursor`). Used by the model-visible
+    /// `list_mcp_resources` tool, which surfaces upstream's paginated single-
+    /// server shape. `cursor` requests the next page when provided.
+    func listResourcesPage(cursor: String?) async throws -> [String: JSONLite]
+    /// Single-page `resources/templates/list` request returning the raw result
+    /// object (`resourceTemplates` array + optional `nextCursor`). Backs the
+    /// `list_mcp_resource_templates` tool.
+    func listResourceTemplatesPage(cursor: String?) async throws -> [String: JSONLite]
     func stop() async
 }
 
 public extension McpClientProtocol {
+    /// Default: servers are assumed not to support the capability until a
+    /// conforming client overrides this after reading the `initialize`
+    /// response. Keeps mock / test clients source-compatible.
+    func supportsSandboxStateMeta() async -> Bool { false }
+    /// Default: no server instructions. Conforming clients override after
+    /// capturing `initialize_result.instructions`.
+    func serverInstructions() async -> String? { nil }
+
+    /// Default single-page list: no resources, no cursor. Real transports
+    /// (`McpClient`, `McpHttpClient`) override with a `resources/list` request.
+    func listResourcesPage(cursor: String?) async throws -> [String: JSONLite] {
+        ["resources": .array([])]
+    }
+    /// Default single-page template list: no templates, no cursor. Real
+    /// transports override with a `resources/templates/list` request.
+    func listResourceTemplatesPage(cursor: String?) async throws -> [String: JSONLite] {
+        ["resourceTemplates": .array([])]
+    }
+
     func callTool(_ name: String, argumentsJSON: String) async throws -> McpCallResult {
-        try await callTool(name, argumentsJSON: argumentsJSON, elicitationHandler: nil)
+        try await callTool(name, argumentsJSON: argumentsJSON, meta: nil, elicitationHandler: nil)
+    }
+    /// Back-compat overload (no `_meta`).
+    func callTool(_ name: String, argumentsJSON: String,
+                  elicitationHandler: McpElicitationHandler?) async throws -> McpCallResult {
+        try await callTool(name, argumentsJSON: argumentsJSON, meta: nil,
+                           elicitationHandler: elicitationHandler)
     }
 }
 
@@ -369,13 +764,35 @@ public actor McpClient: McpClientProtocol {
     private var pending: [Int: CheckedContinuation<[String: JSONLite], any Error>] = [:]
     private var timeouts: [Int: Task<Void, Never>] = [:]
     private var activeElicitationHandlers: [Int: McpElicitationHandler] = [:]
+    /// Registration order of `activeElicitationHandlers` keys. Upstream binds a
+    /// single `send_elicitation` closure per client connection
+    /// (`elicitation_client_service.rs:50-61`), so an inbound `elicitation/create`
+    /// is always served by the in-flight call's handler. The Swift port registers
+    /// a handler per outbound request; when several are in flight we must pick a
+    /// deterministic one rather than an arbitrary `Dictionary.values.first`. We
+    /// pick the most-recently-registered in-flight call — the one most likely to
+    /// have just triggered the elicitation.
+    private var activeElicitationOrder: [Int] = []
     private var nextId = 1
     private var readerThread: Thread?
     private var consumerTask: Task<Void, Never>?
     private var lineContinuation: AsyncStream<Data>.Continuation?
     private var initialized = false
+    /// Whether the server advertised `codex/sandbox-state-meta` in its
+    /// `initialize` response (upstream
+    /// `server_supports_sandbox_state_meta_capability`). `false` until
+    /// `initialize` runs.
+    private var sandboxStateMetaSupported = false
+    /// `initialize_result.instructions`, captured from the handshake. `nil`
+    /// when the server returned none.
+    private var instructions: String?
     private let requestTimeout: Duration
     private let maxFrameBytes: Int
+    /// Whether the session's model accepts image input. When false (the
+    /// default), `image` content blocks returned by `tools/call` are replaced
+    /// with the upstream placeholder; when true they are preserved verbatim
+    /// (parity with `mcp_tool_call.rs::sanitize_mcp_tool_result_for_model`).
+    private let supportsImageInput: Bool
     /// Where to route server-push notifications (logging, progress,
     /// list-changed, cancelled, …). Defaults to a stderr sink; tests use
     /// `CapturingMcpNotificationSink` to assert behavior.
@@ -388,6 +805,7 @@ public actor McpClient: McpClientProtocol {
     /// fix P7.1 / H-46).
     public init(_ config: McpServerConfig, requestTimeout: Duration? = nil,
                 maxFrameBytes: Int = 16 * 1024 * 1024,
+                supportsImageInput: Bool = false,
                 notificationSink: (any McpNotificationSink)? = nil) {
         self.config = config
         if let requestTimeout {
@@ -400,6 +818,7 @@ public actor McpClient: McpClientProtocol {
             self.requestTimeout = .seconds(whole)
         }
         self.maxFrameBytes = Swift.max(4096, maxFrameBytes)
+        self.supportsImageInput = supportsImageInput
         self.notificationSink = notificationSink ?? StderrMcpNotificationSink()
     }
 
@@ -421,7 +840,7 @@ public actor McpClient: McpClientProtocol {
         // was set, leaking `CODEX_API_KEY`, `ANTHROPIC_API_KEY`, and other
         // secrets to MCP servers. We ALWAYS set `p.environment` now so the
         // Foundation default (inherit-all) never applies.
-        p.environment = Self.buildStdioEnvironment(config: config)
+        p.environment = try Self.buildStdioEnvironment(config: config)
         // Upstream parity: honor `cwd` for stdio servers.
         if let cwd = config.cwd, !cwd.isEmpty {
             p.currentDirectoryURL = URL(fileURLWithPath: cwd)
@@ -458,10 +877,28 @@ public actor McpClient: McpClientProtocol {
         let thread = Thread {
             var buf = [UInt8]()
             var scan = 0
+            // Finding 6/7: when set, we have dropped an oversized partial frame
+            // and are discarding bytes until the next newline so the FOLLOWING
+            // frame parses cleanly. We never tear down the connection for an
+            // oversized frame — only EOF does that.
+            var resyncing = false
             while true {
                 let chunk = outHandle.availableData       // blocking — OK on a real thread
                 if chunk.isEmpty { break }                // EOF / pipe closed
-                buf.append(contentsOf: chunk)
+                if resyncing {
+                    // Discard up to and including the next newline, then resume
+                    // normal framing with whatever follows it.
+                    if let nl = chunk.firstIndex(of: 0x0A) {
+                        let after = chunk[(nl + 1)...]
+                        buf = Array(after)
+                        scan = 0
+                        resyncing = false
+                    } else {
+                        continue   // still no newline; keep discarding
+                    }
+                } else {
+                    buf.append(contentsOf: chunk)
+                }
                 while scan < buf.count {
                     if let nl = buf[scan...].firstIndex(of: 0x0A) {
                         let line = Array(buf[0..<nl])
@@ -473,8 +910,19 @@ public actor McpClient: McpClientProtocol {
                         break
                     }
                 }
+                // Finding 6/7: an oversized partial frame (no newline within
+                // `cap` bytes) must NOT tear down the whole connection. Upstream
+                // imposes no hard newline-frame size cap that kills the session.
+                // We keep `cap` only as a Swift-specific memory-safety bound:
+                // on overflow we DROP the in-progress (incomplete) frame and
+                // resync to the next newline, rather than breaking the reader
+                // loop and failing all in-flight requests.
                 if scan == buf.count && buf.count > cap {
-                    break
+                    FileHandle.standardError.write(Data(
+                        "[mcp] dropping oversized stdio frame (\(buf.count) bytes > cap \(cap)); resyncing\n".utf8))
+                    buf.removeAll(keepingCapacity: false)
+                    scan = 0
+                    resyncing = true
                 }
             }
             continuation.finish()
@@ -505,7 +953,7 @@ public actor McpClient: McpClientProtocol {
         if let idVal = o["id"], case .number(let idn) = idVal {
             let id = Int(idn)
             if let cont = pending.removeValue(forKey: id) {
-                activeElicitationHandlers.removeValue(forKey: id)
+                removeElicitationHandler(id)
                 timeouts.removeValue(forKey: id)?.cancel()
                 if let errVal = o["error"], case .object(let e) = errVal {
                     let msg: String
@@ -539,10 +987,10 @@ public actor McpClient: McpClientProtocol {
         }
         // notifications/cancelled has side-effects: resolve any pending
         // continuation with a timeout/cancel error so the caller unblocks.
-        if case .cancelled(_, let requestId, let reason) = notif,
+        if case .cancelled(_, let requestId, _, let reason) = notif,
            let rid = requestId,
            let cont = pending.removeValue(forKey: rid) {
-            activeElicitationHandlers.removeValue(forKey: rid)
+            removeElicitationHandler(rid)
             timeouts.removeValue(forKey: rid)?.cancel()
             cont.resume(throwing: McpError.server(
                 "cancelled by server: \(reason ?? "no reason")"))
@@ -554,13 +1002,14 @@ public actor McpClient: McpClientProtocol {
         for (_, t) in timeouts { t.cancel() }
         timeouts.removeAll()
         activeElicitationHandlers.removeAll()
+        activeElicitationOrder.removeAll()
         for (_, c) in pending { c.resume(throwing: error) }
         pending.removeAll()
     }
 
     private func fireTimeout(_ id: Int) {
         timeouts.removeValue(forKey: id)
-        activeElicitationHandlers.removeValue(forKey: id)
+        removeElicitationHandler(id)
         if let c = pending.removeValue(forKey: id) {
             c.resume(throwing: McpError.timeout("request \(id)"))
         }
@@ -591,6 +1040,7 @@ public actor McpClient: McpClientProtocol {
             pending[id] = cont
             if let elicitationHandler {
                 activeElicitationHandlers[id] = elicitationHandler
+                activeElicitationOrder.append(id)
             }
             let timeout = requestTimeout
             timeouts[id] = Task { [weak self] in
@@ -602,16 +1052,29 @@ public actor McpClient: McpClientProtocol {
                 try writeMessage(message)
             } catch {
                 pending.removeValue(forKey: id)
-                activeElicitationHandlers.removeValue(forKey: id)
+                removeElicitationHandler(id)
                 timeouts.removeValue(forKey: id)?.cancel()
                 cont.resume(throwing: error)
             }
         }
     }
 
+    /// Drop an in-flight elicitation handler and its ordering entry together so
+    /// `activeElicitationOrder` never references a removed id.
+    private func removeElicitationHandler(_ id: Int) {
+        if activeElicitationHandlers.removeValue(forKey: id) != nil {
+            activeElicitationOrder.removeAll { $0 == id }
+        }
+    }
+
     private func handleServerRequest(id: Int, object: [String: JSONLite]) async {
         guard case .string("elicitation/create")? = object["method"] else { return }
-        let handler = activeElicitationHandlers.values.first
+        // Serve the most-recently-registered in-flight call's handler. Upstream
+        // binds one closure per connection, so any in-flight call's handler is
+        // equivalent; picking the newest is deterministic (unlike
+        // `Dictionary.values.first`) and matches the call most likely to have
+        // just triggered the elicitation.
+        let handler = activeElicitationOrder.last.flatMap { activeElicitationHandlers[$0] }
         let result: JSONValue
         if let handler {
             result = await handler(.int(Int64(id)), config.name,
@@ -628,8 +1091,13 @@ public actor McpClient: McpClientProtocol {
         try? writeLiteMessage(response)
     }
 
+    /// Upstream `CreateElicitationResultWithMeta` serializes `content` and
+    /// `_meta` with `skip_serializing_if = "Option::is_none"`
+    /// (`rmcp-client/src/elicitation_client_service.rs:124-151`), so a decline
+    /// (no content, no meta) emits `{"action":"decline"}` only — we omit the
+    /// nil fields rather than writing JSON `null`.
     private static func defaultElicitationResult(action: String) -> JSONValue {
-        .object(["action": .string(action), "content": .null, "_meta": .null])
+        .object(["action": .string(action)])
     }
 
     public static func jsonLiteToValue(_ value: JSONLite) -> JSONValue {
@@ -649,6 +1117,24 @@ public actor McpClient: McpClientProtocol {
         }
     }
 
+    /// Convert a `JSONLite` value into a `JSONSerialization`-compatible `Any`
+    /// for embedding in an outbound request body (e.g. the verbatim
+    /// `permissionProfile` object inside `SandboxState`). `null` maps to
+    /// `NSNull`.
+    public static func jsonLiteToAny(_ value: JSONLite) -> Any {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let b): return b
+        case .number(let n): return n
+        case .string(let s): return s
+        case .array(let a): return a.map(jsonLiteToAny(_:))
+        case .object(let o):
+            var dict = [String: Any](minimumCapacity: o.count)
+            for (k, v) in o { dict[k] = jsonLiteToAny(v) }
+            return dict
+        }
+    }
+
     public static func jsonValueToLite(_ value: JSONValue) -> JSONLite {
         switch value {
         case .null: return .null
@@ -663,13 +1149,93 @@ public actor McpClient: McpClientProtocol {
 
     public func initialize() async throws {
         guard !initialized else { return }
-        _ = try await request("initialize", [
+        // Upstream identity is `codex-mcp-client`, and the client declares the
+        // `elicitation` capability so servers know they may issue
+        // `elicitation/create` server-requests (which we route to the host).
+        let result = try await request("initialize", [
             "protocolVersion": "2025-06-18",
-            "capabilities": [String: Any](),
-            "clientInfo": ["name": "CodexKit", "version": "0.1"],
+            "capabilities": ["elicitation": McpClientInfo.elicitationCapability],
+            "clientInfo": McpClientInfo.initializeClientInfo,
         ])
+        // Capture the server's advertised capabilities + instructions instead
+        // of discarding the result (upstream `rmcp_client.rs:496-506`).
+        Self.applyInitializeResult(result,
+                                   sandboxStateMetaSupported: &sandboxStateMetaSupported,
+                                   instructions: &instructions)
         try writeMessage(["jsonrpc": "2.0", "method": "notifications/initialized"])
         initialized = true
+    }
+
+    /// Shared parser for the `initialize` result: records whether the server
+    /// advertised `codex/sandbox-state-meta` under
+    /// `capabilities.experimental` and captures `instructions`. Static + pure
+    /// so both transports (and tests) use identical logic.
+    static func applyInitializeResult(_ result: [String: JSONLite],
+                                      sandboxStateMetaSupported: inout Bool,
+                                      instructions: inout String?) {
+        if case .object(let caps)? = result["capabilities"],
+           case .object(let exp)? = caps["experimental"],
+           exp[SandboxStateMeta.metaKey] != nil {
+            sandboxStateMetaSupported = true
+        }
+        if case .string(let s)? = result["instructions"] {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            instructions = trimmed.isEmpty ? nil : trimmed
+        }
+    }
+
+    public func supportsSandboxStateMeta() async -> Bool { sandboxStateMetaSupported }
+    public func serverInstructions() async -> String? { instructions }
+
+    /// `resources/list` — list the server's concrete resources. Mirrors the
+    /// upstream rmcp client's resource listing (used by `mcpServer/resource/read`
+    /// discovery). Returns the raw resource descriptors as JSON-lite values.
+    ///
+    /// Finding 3 (pagination): upstream `list_all_resources` walks every page,
+    /// sending `{ "cursor": <next> }` until `nextCursor` is absent and erroring
+    /// on a duplicate cursor (`"resources/list returned duplicate cursor"`).
+    public func listResources() async throws -> [JSONLite] {
+        try await paginate(method: "resources/list", arrayKey: "resources")
+    }
+
+    /// `resources/templates/list` — list URI-templated resources. Same
+    /// pagination semantics as `listResources` (Finding 3).
+    public func listResourceTemplates() async throws -> [JSONLite] {
+        try await paginate(method: "resources/templates/list",
+                           arrayKey: "resourceTemplates")
+    }
+
+    public func listResourcesPage(cursor: String?) async throws -> [String: JSONLite] {
+        let params: [String: Any] = cursor.map { ["cursor": $0] } ?? [:]
+        return try await request("resources/list", params)
+    }
+
+    public func listResourceTemplatesPage(cursor: String?) async throws
+        -> [String: JSONLite] {
+        let params: [String: Any] = cursor.map { ["cursor": $0] } ?? [:]
+        return try await request("resources/templates/list", params)
+    }
+
+    /// Shared paginated-list driver. Walks `method` page by page, accumulating
+    /// the `arrayKey` array, passing `{ "cursor": <next> }` for subsequent
+    /// pages, stopping when `nextCursor` is absent, and erroring on a repeated
+    /// cursor. Mirrors upstream `list_all_resources` / `list_all_resource_templates`.
+    private func paginate(method: String, arrayKey: String) async throws -> [JSONLite] {
+        var collected: [JSONLite] = []
+        var cursor: String?
+        while true {
+            let params: [String: Any]
+            if let cursor { params = ["cursor": cursor] } else { params = [:] }
+            let r = try await request(method, params)
+            if case .array(let arr)? = r[arrayKey] { collected.append(contentsOf: arr) }
+            guard case .string(let next)? = r["nextCursor"], !next.isEmpty else {
+                return collected
+            }
+            if cursor == next {
+                throw McpError.server("\(method) returned duplicate cursor")
+            }
+            cursor = next
+        }
     }
 
     public func listTools() async throws -> [McpToolSpec] {
@@ -681,31 +1247,52 @@ public actor McpClient: McpClientProtocol {
             let desc: String
             if case .string(let d)? = t["description"] { desc = d } else { desc = "" }
             let schema = t["inputSchema"].map { JSONLite.stringify($0) } ?? "{}"
-            return McpToolSpec(name: name, description: desc, inputSchemaJSON: schema)
+            // Finding 3: preserve the tool's `_meta` (connector identity +
+            // openai/fileParams) verbatim.
+            return McpToolSpec(name: name, description: desc,
+                               inputSchemaJSON: schema, meta: t["_meta"])
         }
     }
 
     public func callTool(_ name: String, argumentsJSON: String,
+                         meta: [String: Any]? = nil,
                          elicitationHandler: McpElicitationHandler? = nil) async throws
         -> McpCallResult {
-        let argsObject: Any
-        if let d = argumentsJSON.data(using: .utf8),
-           let parsed = try? JSONSerialization.jsonObject(with: d) {
-            argsObject = parsed
-        } else {
-            argsObject = [String: Any]()
-        }
-        let r = try await request("tools/call", ["name": name, "arguments": argsObject],
+        let args = try McpClient.parseToolArguments(argumentsJSON)
+        // Upstream `tools/call` carries optional request-level `_meta`
+        // (e.g. a `progressToken`); include it when supplied.
+        var params: [String: Any] = ["name": name]
+        if let args { params["arguments"] = args }
+        if let meta, !meta.isEmpty { params["_meta"] = meta }
+        let r = try await request("tools/call", params,
                                   elicitationHandler: elicitationHandler)
-        var text = ""
-        if let content = r["content"], case .array(let items) = content {
-            for it in items {
-                if case .object(let o) = it, case .string(let s)? = o["text"] { text += s }
-            }
+        return McpResultDecoder.decode(r, supportsImageInput: supportsImageInput)
+    }
+
+    /// Parse the model-supplied tool-call argument JSON into a JSON object.
+    ///
+    /// Upstream parity (`rmcp-client/src/rmcp_client.rs:553-561`): an empty /
+    /// absent argument string maps to *no arguments* (`nil`), a JSON object maps
+    /// to that object, and any other JSON value (array, number, string, …) is
+    /// rejected with `"MCP tool arguments must be a JSON object"` instead of
+    /// being silently coerced to `{}`.
+    static func parseToolArguments(_ argumentsJSON: String) throws -> [String: Any]? {
+        let trimmed = argumentsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        // Upstream parity (`rmcp-client/src/rmcp_client.rs:553-560`): the error
+        // surfaced for non-object arguments includes the offending value:
+        // `"MCP tool arguments must be a JSON object, got {other}"`.
+        guard let d = trimmed.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(
+                with: d, options: [.fragmentsAllowed]) else {
+            throw McpError.server(
+                "MCP tool arguments must be a JSON object, got \(trimmed)")
         }
-        var isError = false
-        if case .bool(let b)? = r["isError"] { isError = b }
-        return McpCallResult(text: text, isError: isError)
+        guard let obj = parsed as? [String: Any] else {
+            throw McpError.server(
+                "MCP tool arguments must be a JSON object, got \(trimmed)")
+        }
+        return obj
     }
 
     public func readResource(uri: String) async throws -> [String: JSONLite] {
@@ -767,16 +1354,24 @@ public actor McpClient: McpClientProtocol {
     ///   1. `DEFAULT_ENV_VARS` allowlist read from parent env
     ///   2. Locally-sourced `config.envVars` (parent env values)
     ///   3. `config.env` literal overrides
-    /// Remote-sourced entries are dropped — they are an upstream
-    /// remote-executor concept and have no meaning locally.
-    static func buildStdioEnvironment(config: McpServerConfig) -> [String: String] {
+    /// A remote-sourced `env_vars` entry on a LOCAL stdio launch is a hard
+    /// configuration error (upstream `local_stdio_env_var_names`,
+    /// `rmcp-client/src/utils.rs:50-58`): we throw `McpError.spawn` with the
+    /// upstream message rather than silently dropping the entry and starting
+    /// the server anyway.
+    static func buildStdioEnvironment(config: McpServerConfig) throws -> [String: String] {
         let parent = ProcessInfo.processInfo.environment
         var out: [String: String] = [:]
         for name in defaultEnvAllowlist {
             if let v = parent[name] { out[name] = v }
         }
         if let envVars = config.envVars {
-            for item in envVars where !item.isRemoteSource {
+            if let remote = envVars.first(where: { $0.isRemoteSource }) {
+                throw McpError.spawn(
+                    "env_vars entry `\(remote.name)` uses source `remote`, "
+                    + "which requires remote MCP stdio")
+            }
+            for item in envVars {
                 if let v = parent[item.name] { out[item.name] = v }
             }
         }

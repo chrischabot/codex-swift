@@ -103,6 +103,30 @@ final class ResponseFailedClassificationTests: XCTestCase {
         XCTAssertEqual(err.retryAfter?.seconds ?? -1, 0.5, accuracy: 0.001)
     }
 
+    func testRetryAfterOnlyParsedForRateLimitCode() {
+        // Upstream `try_parse_retry_after` (responses.rs:487-491) returns the
+        // parsed delay ONLY when code == "rate_limit_exceeded". For any other
+        // code — including missing/unknown codes — even a message embedding
+        // "try again in N s" must yield retryAfter nil so the backoff path
+        // drives timing.
+        let msg = "Something failed. Please try again in 3s."
+
+        let unknown = ModelClientErrorClassifier.classifyResponseFailed([
+            "code": "some_other_code", "message": msg])
+        XCTAssertNil(unknown.retryAfter,
+                     "non-rate-limit code must NOT sniff retry-after from the message")
+
+        let empty = ModelClientErrorClassifier.classifyResponseFailed([
+            "message": msg])
+        XCTAssertNil(empty.retryAfter,
+                     "missing code must NOT sniff retry-after from the message")
+
+        let rateLimited = ModelClientErrorClassifier.classifyResponseFailed([
+            "code": "rate_limit_exceeded", "message": msg])
+        XCTAssertEqual(rateLimited.retryAfter?.seconds ?? -1, 3.0, accuracy: 0.001,
+                       "rate_limit_exceeded must still parse retry-after from the message")
+    }
+
     func testResponseFailedCyberPolicyTerminal() {
         let payload: [String: Any] = [
             "code": "cyber_policy",
@@ -177,6 +201,19 @@ final class ResponseFailedClassificationTests: XCTestCase {
         XCTAssertEqual(err.codexErrorCode, .unknown)
         XCTAssertTrue(err.retryable,
                       "no error object → default retryable, mirroring upstream's fallback")
+        // model-client v12 finding 3: when `response.error` is absent the
+        // human-readable message must match upstream verbatim
+        // (`codex-api/src/sse/responses.rs:314/343`).
+        XCTAssertEqual(err.message, "response.failed event received")
+    }
+
+    func testResponseFailedEmptyErrorObjectUsesVerbatimMessage() {
+        // An error object with no `message`/`code` (code "" branch) also falls
+        // back to the verbatim upstream message.
+        let err = ModelClientErrorClassifier.classifyResponseFailed([:])
+        XCTAssertEqual(err.codexErrorCode, .unknown)
+        XCTAssertTrue(err.retryable)
+        XCTAssertEqual(err.message, "response.failed event received")
     }
 
     // MARK: – End-to-end: incomplete via URLSession SSE.

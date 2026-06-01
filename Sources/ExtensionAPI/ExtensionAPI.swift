@@ -180,10 +180,29 @@ public enum ApprovalReviewDecision: Sendable, Equatable {
     case aborted(message: String)
 }
 
+/// Decision of a TOOL-DISPATCH gate (`toolDispatchGateContributor`). Unlike
+/// `ApprovalReviewDecision` (an optional reviewer that can approve OR deny on the
+/// request-* approval branches), this is a deny-only GATE consulted in front of
+/// EVERY tool dispatch — including tools that never reach the approval path
+/// (sandboxed-shell, in-writable-root patches, dynamic/MCP tools). It can only
+/// `.deny` (block the dispatch) or `.abstain` (let the normal path decide); it
+/// can never grant, so it cannot weaken the existing approval policy.
+public enum ToolDispatchGateDecision: Sendable, Equatable {
+    case deny(message: String)
+    case abstain
+}
+
 public typealias ContextContribution =
     @Sendable (ExtensionData, ExtensionData) async -> [PromptFragment]
 public typealias ApprovalReviewContribution =
     @Sendable (ExtensionData, ExtensionData, String) async -> ApprovalReviewDecision?
+/// A tool-dispatch gate contributor. Receives the same stable
+/// `method=…\nparams=…` prompt as `approvalReview` (keyed on the resolved tool
+/// name, never the untrusted args). Return `.deny` to block, or `nil`/`.abstain`
+/// to let the normal path decide. The first contributor to return a `.deny`
+/// wins.
+public typealias ToolDispatchGateContribution =
+    @Sendable (ExtensionData, ExtensionData, String) async -> ToolDispatchGateDecision?
 
 public final class ExtensionRegistryBuilder<Config: Sendable>: @unchecked Sendable {
     private var threadStartHandlers: [@Sendable (ThreadStartInput<Config>) -> Void] = []
@@ -196,6 +215,7 @@ public final class ExtensionRegistryBuilder<Config: Sendable>: @unchecked Sendab
     private var tokenUsageHandlers: [@Sendable (TokenUsageInput) -> Void] = []
     private var contextHandlers: [ContextContribution] = []
     private var approvalReviewHandlers: [ApprovalReviewContribution] = []
+    private var toolDispatchGateHandlers: [ToolDispatchGateContribution] = []
 
     public init() {}
 
@@ -231,6 +251,14 @@ public final class ExtensionRegistryBuilder<Config: Sendable>: @unchecked Sendab
         approvalReviewHandlers.append(handler)
     }
 
+    /// Register a deny-only TOOL-DISPATCH gate (see `ToolDispatchGateDecision`).
+    /// Consulted in front of every tool dispatch, before the approval policy —
+    /// the seam the channel owner-gate uses to block a non-owner's privileged
+    /// action regardless of policy (sandboxed-shell, in-root patch, dynamic/MCP).
+    public func toolDispatchGateContributor(_ handler: @escaping ToolDispatchGateContribution) {
+        toolDispatchGateHandlers.append(handler)
+    }
+
     public func build() -> ExtensionRegistry<Config> {
         ExtensionRegistry(
             threadStartHandlers: threadStartHandlers,
@@ -242,7 +270,8 @@ public final class ExtensionRegistryBuilder<Config: Sendable>: @unchecked Sendab
             configHandlers: configHandlers,
             tokenUsageHandlers: tokenUsageHandlers,
             contextHandlers: contextHandlers,
-            approvalReviewHandlers: approvalReviewHandlers)
+            approvalReviewHandlers: approvalReviewHandlers,
+            toolDispatchGateHandlers: toolDispatchGateHandlers)
     }
 }
 
@@ -257,6 +286,7 @@ public final class ExtensionRegistry<Config: Sendable>: @unchecked Sendable {
     private let tokenUsageHandlers: [@Sendable (TokenUsageInput) -> Void]
     private let contextHandlers: [ContextContribution]
     private let approvalReviewHandlers: [ApprovalReviewContribution]
+    private let toolDispatchGateHandlers: [ToolDispatchGateContribution]
 
     fileprivate init(threadStartHandlers: [@Sendable (ThreadStartInput<Config>) -> Void],
                      threadResumeHandlers: [@Sendable (ThreadResumeInput) -> Void],
@@ -267,7 +297,8 @@ public final class ExtensionRegistry<Config: Sendable>: @unchecked Sendable {
                      configHandlers: [@Sendable (ConfigChangedInput<Config>) -> Void],
                      tokenUsageHandlers: [@Sendable (TokenUsageInput) -> Void],
                      contextHandlers: [ContextContribution],
-                     approvalReviewHandlers: [ApprovalReviewContribution]) {
+                     approvalReviewHandlers: [ApprovalReviewContribution],
+                     toolDispatchGateHandlers: [ToolDispatchGateContribution]) {
         self.threadStartHandlers = threadStartHandlers
         self.threadResumeHandlers = threadResumeHandlers
         self.threadStopHandlers = threadStopHandlers
@@ -278,6 +309,7 @@ public final class ExtensionRegistry<Config: Sendable>: @unchecked Sendable {
         self.tokenUsageHandlers = tokenUsageHandlers
         self.contextHandlers = contextHandlers
         self.approvalReviewHandlers = approvalReviewHandlers
+        self.toolDispatchGateHandlers = toolDispatchGateHandlers
     }
 
     public func onThreadStart(_ input: ThreadStartInput<Config>) {
@@ -330,6 +362,25 @@ public final class ExtensionRegistry<Config: Sendable>: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// Whether any tool-dispatch gate is installed. The engine checks this to
+    /// skip the dispatch-gate seam entirely (byte-identical hot path) when no
+    /// gate is registered — the common case.
+    public var hasToolDispatchGate: Bool { !toolDispatchGateHandlers.isEmpty }
+
+    /// Consult the tool-dispatch gates. The FIRST gate to return a non-nil
+    /// decision wins (a `.deny` blocks, an `.abstain` lets the next gate / the
+    /// normal path decide). Returns `.abstain` when no gate claims.
+    public func toolDispatchGate(sessionStore: ExtensionData,
+                                 threadStore: ExtensionData,
+                                 prompt: String) async -> ToolDispatchGateDecision {
+        for handler in toolDispatchGateHandlers {
+            if let decision = await handler(sessionStore, threadStore, prompt) {
+                return decision
+            }
+        }
+        return .abstain
     }
 }
 

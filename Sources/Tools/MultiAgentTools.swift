@@ -92,7 +92,7 @@ public struct SpawnAgentToolOptions: Sendable {
     public var includeUsageHint: Bool
     public var usageHintText: String?
 
-    public init(agentTypeDescription: String = "Agent role/type identifier.",
+    public init(agentTypeDescription: String = DefaultSpawnAgentAgentTypeDescription,
                 availableModelsDescription: String? = nil,
                 includeUsageHint: Bool = true,
                 usageHintText: String? = nil) {
@@ -103,11 +103,57 @@ public struct SpawnAgentToolOptions: Sendable {
     }
 }
 
+/// Built-in `default` agent role description (`role.rs` built_in::configs()).
+private let SPAWN_AGENT_BUILTIN_DEFAULT_ROLE_DESC = "Default agent."
+
+/// Built-in `explorer` agent role description (`role.rs` built_in::configs()).
+/// Its `config_file` (explorer.toml) is empty, so it carries no
+/// locked-settings note.
+private let SPAWN_AGENT_BUILTIN_EXPLORER_ROLE_DESC = """
+Use `explorer` for specific codebase questions.
+Explorers are fast and authoritative.
+They must be used to ask specific, well-scoped questions on the codebase.
+Rules:
+- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
+- You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.
+- Reuse existing explorers for related questions.
+"""
+
+/// Built-in `worker` agent role description (`role.rs` built_in::configs()).
+private let SPAWN_AGENT_BUILTIN_WORKER_ROLE_DESC = """
+Use for execution and production work.
+Typical tasks:
+- Implement part of a feature
+- Fix tests or bugs
+- Split large refactors into independent chunks
+Rules:
+- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
+- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product.
+"""
+
 /// Default `agent_type` description used when no session config supplies one.
-/// Matches the placeholder upstream tests use (`DEFAULT_AGENT_TYPE_DESCRIPTION`
-/// in `spec_plan_tests.rs`); real deployments override this per-session.
-public let DefaultSpawnAgentAgentTypeDescription =
-    "Agent role/type identifier."
+///
+/// Faithful port of upstream `spawn_tool_spec::build(&BTreeMap::new())`
+/// (`core/src/agent/role.rs:279-305`), which for a default session (no
+/// user-defined roles) emits the omit-default guidance plus the built-in role
+/// catalog. Built-in roles iterate in BTreeMap (sorted) order — default,
+/// explorer, worker — each formatted as `"{name}: {\n{description}\n}"`
+/// (no locked-settings note: none of the built-ins pin a model/effort) and
+/// joined with `"\n"`. This is the string injected as the `agent_type`
+/// property description (`multi_agents_spec.rs:526-528`).
+public let DefaultSpawnAgentAgentTypeDescription: String = {
+    let roleNames = ["default", "explorer", "worker"]
+    let descs = [
+        SPAWN_AGENT_BUILTIN_DEFAULT_ROLE_DESC,
+        SPAWN_AGENT_BUILTIN_EXPLORER_ROLE_DESC,
+        SPAWN_AGENT_BUILTIN_WORKER_ROLE_DESC,
+    ]
+    let formatted = zip(roleNames, descs)
+        .map { "\($0): {\n\($1)\n}" }
+        .joined(separator: "\n")
+    return "Optional type name for the new agent. If omitted, `default` is used.\n"
+        + "Available roles:\n" + formatted
+}()
 
 /// Upstream `SPAWN_AGENT_INHERITED_MODEL_GUIDANCE` (multi_agents_spec.rs:9).
 private let SPAWN_AGENT_INHERITED_MODEL_GUIDANCE =
@@ -213,7 +259,12 @@ public struct SpawnAgentTool: Tool {
     /// `ToolsConfig::agent_type_description` flow).
     public var jsonSchema: String {
         let agentTypeDesc = escapeJSONString(options.agentTypeDescription)
-        return #"{"type":"object","properties":{"message":{"type":"string","description":"Initial plain-text task for the new agent. Use either message or items."},"items":{"type":"array","description":"Structured input items. Use this to pass explicit mentions (for example app:// connector paths).","items":{"type":"object","properties":{"type":{"type":"string","description":"Input item type: text, image, local_image, skill, or mention."},"text":{"type":"string","description":"Text content when type is text."},"image_url":{"type":"string","description":"Image URL when type is image."},"path":{"type":"string","description":"Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."},"name":{"type":"string","description":"Display name when type is skill or mention."}},"additionalProperties":false}},"agent_type":{"type":"string","description":""# + agentTypeDesc + #""},"fork_context":{"type":"boolean","description":"When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."},"model":{"type":"string","description":"Optional model override for the new agent. Leave unset to inherit the same model as the parent, which is the preferred default. Only set this when the user explicitly asks for a different model or the task clearly requires one."},"reasoning_effort":{"type":"string","description":"Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."},"service_tier":{"type":"string","description":"Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one."}},"additionalProperties":false}"#
+        // Upstream `spawn_agent_common_properties_v1` builds a BTreeMap, so
+        // serde serializes the property keys in sorted (alphabetical) order:
+        //   agent_type, fork_context, items, message, model, reasoning_effort,
+        //   service_tier. The nested collab input-items object likewise sorts to
+        //   image_url, name, path, text, type (multi_agents_spec.rs:480-507).
+        return #"{"type":"object","properties":{"agent_type":{"type":"string","description":""# + agentTypeDesc + #""},"fork_context":{"type":"boolean","description":"When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."},"items":{"type":"array","description":"Structured input items. Use this to pass explicit mentions (for example app:// connector paths).","items":{"type":"object","properties":{"image_url":{"type":"string","description":"Image URL when type is image."},"name":{"type":"string","description":"Display name when type is skill or mention."},"path":{"type":"string","description":"Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."},"text":{"type":"string","description":"Text content when type is text."},"type":{"type":"string","description":"Input item type: text, image, local_image, skill, or mention."}},"additionalProperties":false}},"message":{"type":"string","description":"Initial plain-text task for the new agent. Use either message or items."},"model":{"type":"string","description":"Optional model override for the new agent. Leave unset to inherit the same model as the parent, which is the preferred default. Only set this when the user explicitly asks for a different model or the task clearly requires one."},"reasoning_effort":{"type":"string","description":"Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."},"service_tier":{"type":"string","description":"Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one."}},"additionalProperties":false}"#
     }
 
     public init(options: SpawnAgentToolOptions = SpawnAgentToolOptions()) {
@@ -254,9 +305,13 @@ public struct SpawnAgentTool: Tool {
 
 public struct WaitAgentTool: Tool {
     public let name = "wait_agent"
-    /// Wait is read-only against the registry; multiple waits can run
-    /// concurrently from different model turns.
-    public let parallelSafe = true
+    /// Upstream parity: the wait handler implements `ToolExecutor`/`CoreToolRuntime`
+    /// with NO `supports_parallel_tool_calls` override (core/src/tools/handlers/
+    /// multi_agents/wait.rs:31-205), so it falls back to the trait default
+    /// (`tools/src/tool_executor.rs:50-52` => `false`). It therefore takes the
+    /// exclusive (write) side of the per-turn parallel gate (`tools/parallel.rs`)
+    /// and runs serially, not concurrently.
+    public let parallelSafe = false
 
     public var toolDescription: String {
         "Wait for agents to reach a final status. Completed statuses may "
@@ -386,10 +441,13 @@ public struct SendInputTool: Tool {
         + "a previous task."
     }
 
-    /// Upstream parity (`create_send_input_tool_v1`).
+    /// Upstream parity (`create_send_input_tool_v1`). Properties emitted in
+    /// upstream BTreeMap (sorted) order: interrupt, items, message, target.
+    /// The nested collab input-items object likewise sorts to image_url, name,
+    /// path, text, type (multi_agents_spec.rs:480-507).
     public var jsonSchema: String {
         #"""
-        {"type":"object","properties":{"target":{"type":"string","description":"Agent id to message (from spawn_agent)."},"message":{"type":"string","description":"Legacy plain-text message to send to the agent. Use either message or items."},"items":{"type":"array","description":"Structured input items. Use this to pass explicit mentions (for example app:// connector paths).","items":{"type":"object","properties":{"type":{"type":"string","description":"Input item type: text, image, local_image, skill, or mention."},"text":{"type":"string","description":"Text content when type is text."},"image_url":{"type":"string","description":"Image URL when type is image."},"path":{"type":"string","description":"Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."},"name":{"type":"string","description":"Display name when type is skill or mention."}},"additionalProperties":false}},"interrupt":{"type":"boolean","description":"When true, stop the agent's current task and handle this immediately. When false (default), queue this message."}},"required":["target"],"additionalProperties":false}
+        {"type":"object","properties":{"interrupt":{"type":"boolean","description":"When true, stop the agent's current task and handle this immediately. When false (default), queue this message."},"items":{"type":"array","description":"Structured input items. Use this to pass explicit mentions (for example app:// connector paths).","items":{"type":"object","properties":{"image_url":{"type":"string","description":"Image URL when type is image."},"name":{"type":"string","description":"Display name when type is skill or mention."},"path":{"type":"string","description":"Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."},"text":{"type":"string","description":"Text content when type is text."},"type":{"type":"string","description":"Input item type: text, image, local_image, skill, or mention."}},"additionalProperties":false}},"message":{"type":"string","description":"Legacy plain-text message to send to the agent. Use either message or items."},"target":{"type":"string","description":"Agent id to message (from spawn_agent)."}},"required":["target"],"additionalProperties":false}
         """#
     }
 

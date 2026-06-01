@@ -364,8 +364,13 @@ public actor MemoryStore {
             input: [
                 .userText(Stage1Prompt.buildUserMessage(transcript: transcript))
             ])
+        // Memory-consolidation runs as a sub-agent upstream
+        // (`SessionSource::SubAgent(MemoryConsolidation)`), so the Responses
+        // request carries the `x-openai-subagent: memory_consolidation` header
+        // (`requests/headers.rs:16-31`).
         let settings = ModelSettings(model: consolidationModel,
-                                     threadId: threadId + "-mem-stage1")
+                                     threadId: threadId + "-mem-stage1",
+                                     subagentLabel: "memory_consolidation")
         do {
             let stream = try await client.stream(prompt, settings)
             var accumulated = ""

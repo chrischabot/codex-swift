@@ -41,15 +41,18 @@ private func fmLast(_ evs: [ServerNotification]) -> TurnStatus? {
 private func fmErrorInfos(_ evs: [ServerNotification]) -> [String] {
     var out: [String] = []
     for n in evs {
-        if case .error(_, _, _, let b) = n, let i = b.codexErrorInfo { out.append(i) }
-        if case .turnCompleted(_, let t) = n, let i = t.error?.codexErrorInfo { out.append(i) }
+        // Use the engine-internal fine-grained `reason` tag (not the collapsed
+        // wire `codexErrorInfo` enum), which preserves classifications like
+        // `ActiveTurnNotSteerable`/`StreamError` for assertion purposes.
+        if case .error(_, _, _, let b) = n, let i = b.reason { out.append(i) }
+        if case .turnCompleted(_, let t) = n, let i = t.error?.reason { out.append(i) }
     }
     return out
 }
 private func fmShellItems(_ evs: [ServerNotification]) -> [(ItemStatus, String)] {
     evs.compactMap { n in
-        if case .itemCompleted(_, _, let it) = n,
-           case .commandExecution(_, _, _, let s, let out, _) = it { return (s, out ?? "") }
+        if case .itemCompleted(_, _, let it, _) = n,
+           case .commandExecution(_, _, _, let s, _, let out, _, _, _, _) = it { return (s, out ?? "") }
         return nil
     }
 }
@@ -58,6 +61,7 @@ private func fmBlob(_ items: [PromptInput]) -> String {
         switch i {
         case .userText(let t), .developerText(let t), .assistantText(let t): return t
         case .toolOutput(_, let o): return o
+        case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
         }
     }.joined(separator: "\n")
 }
@@ -126,12 +130,12 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, router)
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: "use echo")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "use echo")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed, "turn recovers from garbled tool args")
         XCTAssertTrue(evs.contains {
-            if case .itemCompleted(_, _, let it) = $0,
-               case .commandExecution(_, _, _, let s, let o, _) = it {
+            if case .itemCompleted(_, _, let it, _) = $0,
+               case .commandExecution(_, _, _, let s, _, let o, _, _, _, _) = it {
                 return s == .failed && (o ?? "").contains("invalid echo arguments")
             }
             return false
@@ -143,7 +147,7 @@ final class FailureModeTests: XCTestCase {
         })
     }
 
-    // 2. Unknown tool call → "unknown tool", turn continues.
+    // 2. Unknown tool call → "unsupported call", turn continues.
 
     func testUnknownToolCallHandled() async throws {
         let home = fmTmp("unk"); defer { try? FileManager.default.removeItem(atPath: home) }
@@ -158,13 +162,13 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, ToolRouter(limits: Limits()))
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed)
         XCTAssertTrue(evs.contains {
-            if case .itemCompleted(_, _, let it) = $0,
-               case .commandExecution(_, _, _, _, let o, _) = it {
-                return (o ?? "").contains("unknown tool")
+            if case .itemCompleted(_, _, let it, _) = $0,
+               case .commandExecution(_, _, _, _, _, let o, _, _, _, _) = it {
+                return (o ?? "").contains("unsupported call")
             }
             return false
         })
@@ -186,12 +190,12 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, router)
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed)
         XCTAssertTrue(evs.contains {
-            if case .itemCompleted(_, _, let it) = $0,
-               case .commandExecution(_, _, _, let s, let o, _) = it {
+            if case .itemCompleted(_, _, let it, _) = $0,
+               case .commandExecution(_, _, _, let s, _, let o, _, _, _, _) = it {
                 return s == .failed && (o ?? "").contains("tool error")
             }
             return false
@@ -215,21 +219,21 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, router, lim)
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: "flood me")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "flood me")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed)
         let toolItem = evs.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it) = n,
-               case .commandExecution(_, let cmd, _, _, let o, _) = it,
+            if case .itemCompleted(_, _, let it, _) = n,
+               case .commandExecution(_, let cmd, _, _, _, let o, _, _, _, _) = it,
                cmd.first == "flood" { return o }
             return nil
         }.last ?? ""
-        XCTAssertTrue(toolItem.contains("bytes elided"), "router truncates the flood")
+        XCTAssertTrue(toolItem.contains("tokens truncated"), "router truncates the flood")
         XCTAssertLessThan(toolItem.utf8.count, 200_000,
                           "tool output is bounded, not 5 MB")
         // Reconstructed history is bounded (record-time truncation).
         let rebuilt = try await st.reconstruct(tid)
-        for case .commandExecution(_, _, _, _, let o, _) in rebuilt.items {
+        for case .commandExecution(_, _, _, _, _, let o, _, _, _, _) in rebuilt.items {
             XCTAssertLessThan((o ?? "").utf8.count, 200_000)
         }
         // The model's follow-up prompt was not flooded.
@@ -256,7 +260,7 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, ToolRouter(limits: Limits()))
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: weird)], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: weird)], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed, "weird-charset turn completes (no crash)")
         let rebuilt = try await st.reconstruct(tid)
@@ -313,13 +317,19 @@ final class FailureModeTests: XCTestCase {
         await e.start()
         let c = Task { await fmCollect(e) }
         await e.submit(.startTurn(input: [TurnInput(
-            text: FMInject.payload + " (this is the user's message)")], model: nil))
+            text: FMInject.payload + " (this is the user's message)")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed)
 
         let caps = await model.capturedRequests()
         XCTAssertGreaterThanOrEqual(caps.count, 1)
-        let stableSystem = PromptComposer(personality: .pragmatic).modelInstructions()
+        // Compose the byte-stable reference for the SAME model the engine uses
+        // (SessionConfig default "gpt-5.5"), which the prompt refactor routes
+        // through the bundled ModelsCatalog. Using the bare composer (empty
+        // model → Templates.defaultBaseInstructions) is what drifted the
+        // snapshot; the injection defense itself is intact.
+        let stableSystem = PromptComposer(personality: .pragmatic,
+                                          model: "gpt-5.5").modelInstructions()
         for cap in caps {
             // The system prompt is byte-identical regardless of injected data.
             XCTAssertEqual(cap.prompt.instructions, stableSystem,
@@ -363,9 +373,9 @@ final class FailureModeTests: XCTestCase {
             return out
         }
         let timer = Task { try? await Task.sleep(for: .seconds(30)); collector.cancel() }
-        await e.submit(.startTurn(input: [TurnInput(text: "first")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "first")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(150))
-        await e.submit(.startTurn(input: [TurnInput(text: "second")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "second")], model: nil, turnId: nil))
         let evs = await collector.value
         timer.cancel()
         let completions = evs.compactMap { n -> TurnStatus? in
@@ -390,7 +400,7 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, router, lim)
         await e.start()
         let c = Task { await fmCollect(e, timeout: .seconds(20)) }
-        await e.submit(.startTurn(input: [TurnInput(text: "loop")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "loop")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .failed, "an unbounded tool loop fails (not hangs)")
         XCTAssertTrue(fmErrorInfos(evs).contains("LoopGuard"),
@@ -412,35 +422,53 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, ToolRouter(limits: lim), lim)
         await e.start()
         let c = Task { await fmCollect(e, timeout: .seconds(20)) }
-        await e.submit(.startTurn(input: [TurnInput(text: "slow")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "slow")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .failed)
         XCTAssertTrue(fmErrorInfos(evs).contains("DeadlineExceeded"),
                       "turn deadline produces a clean DeadlineExceeded failure")
     }
 
-    // 10. Concurrent turn submission is rejected without corrupting the active turn.
+    // 10. A concurrent turn/start REPLACES the active turn (upstream
+    // `spawn_task` → `abort_all_tasks(TurnAbortReason::Replaced)`,
+    // tasks/mod.rs:302-311) rather than being rejected. The replaced turn
+    // completes interrupted (Replaced collapses to the wire status
+    // `interrupted`); the replacement turn then runs to completion. NO
+    // ActiveTurnNotSteerable error is produced — that code is reserved for
+    // `turn/steer` of a review/compact turn.
 
-    func testConcurrentTurnRejected() async throws {
+    func testConcurrentTurnReplacesActiveTurn() async throws {
         let home = fmTmp("concurrent"); defer { try? FileManager.default.removeItem(atPath: home) }
         let st = try store(home); let tid = ThreadId.generate()
         _ = try await st.create(SessionConfig(threadId: tid, cwd: "/w"))
         let model = MockModelClient([
-            MockScenario([.created, .slowMillis(400),
+            MockScenario([.created, .slowMillis(2000),
                           .agentDone(itemId: "m1", "first turn done"),
                           .completeEndTurn(responseId: "r", tokens: 1)]),
             .hello("second"),
         ])
         let e = engine(tid, "/w", model, st, ToolRouter(limits: Limits()))
         await e.start()
-        let c = Task { await fmCollect(e, untilCompletions: 1) }
-        await e.submit(.startTurn(input: [TurnInput(text: "first")], model: nil))
+        let c = Task { await fmCollect(e, untilCompletions: 2) }
+        await e.submit(.startTurn(input: [TurnInput(text: "first")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(60))
-        await e.submit(.startTurn(input: [TurnInput(text: "second-concurrent")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "second-concurrent")], model: nil, turnId: nil))
         let evs = await c.value
-        XCTAssertEqual(fmLast(evs), .completed, "the active turn completes uncorrupted")
-        XCTAssertTrue(fmErrorInfos(evs).contains("ActiveTurnNotSteerable"),
-                      "the concurrent turn is rejected with ActiveTurnNotSteerable")
+
+        let statuses: [TurnStatus] = evs.compactMap {
+            if case .turnCompleted(_, let t) = $0 { return t.status }; return nil
+        }
+        XCTAssertEqual(statuses.count, 2, "both the replaced and replacement turns complete")
+        XCTAssertEqual(statuses.first, .interrupted,
+                       "the replaced (first) turn completes interrupted (reason Replaced)")
+        XCTAssertEqual(statuses.last, .completed,
+                       "the replacement (second) turn runs to completion")
+        XCTAssertFalse(fmErrorInfos(evs).contains("ActiveTurnNotSteerable"),
+                       "turn/start collision must NOT emit ActiveTurnNotSteerable")
+        // Both the original and the replacement turn announce themselves
+        // (the collector observes both turn/started events).
+        let starts = evs.filter { if case .turnStarted = $0 { return true }; return false }.count
+        XCTAssertEqual(starts, 2, "both the replaced and replacement turns emit turn/started")
     }
 
     // 11. Empty model output (no deltas/messages) → clean completion, no crash.
@@ -455,7 +483,7 @@ final class FailureModeTests: XCTestCase {
         let e = engine(tid, "/w", model, st, ToolRouter(limits: Limits()))
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: "say nothing")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "say nothing")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed, "empty model output completes cleanly")
         let rebuilt = try await st.reconstruct(tid)
@@ -529,13 +557,15 @@ final class FailureModeTests: XCTestCase {
                               model: model, store: st, router: router, limits: Limits())
         await e.start()
         let c = Task { await fmCollect(e) }
-        await e.submit(.startTurn(input: [TurnInput(text: "apply patches")], model: nil))
+        await e.submit(.startTurn(input: [TurnInput(text: "apply patches")], model: nil, turnId: nil))
         let evs = await c.value
         XCTAssertEqual(fmLast(evs), .completed, "engine survives apply_patch failures")
-        let failed = evs.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it) = n,
-               case .commandExecution(_, let cmd, _, let s, let o, _) = it,
-               cmd.first == "apply_patch", s == .failed { return o }
+        // Upstream surfaces `apply_patch` as a `fileChange` ThreadItem (not a
+        // `commandExecution`); a failed apply commits no changes and carries
+        // `status == .failed`. Count those failed fileChange completions.
+        let failed = evs.compactMap { n -> ItemStatus? in
+            if case .itemCompleted(_, _, let it, _) = n,
+               case .fileChange(_, _, let s) = it, s == .failed { return s }
             return nil
         }
         XCTAssertGreaterThanOrEqual(failed.count, 2,

@@ -47,9 +47,22 @@ private func apCollect(_ e: SessionEngine,
 
 private func commandItems(_ evs: [ServerNotification]) -> [(ItemStatus, String)] {
     evs.compactMap { n in
-        if case .itemCompleted(_, _, let it) = n,
-           case .commandExecution(_, _, _, let s, let out, _) = it {
+        if case .itemCompleted(_, _, let it, _) = n,
+           case .commandExecution(_, _, _, let s, _, let out, _, _, _, _) = it {
             return (s, out ?? "")
+        }
+        return nil
+    }
+}
+
+/// Completed `fileChange` items (v9 app-server-events finding 3: `apply_patch`
+/// now surfaces as a `fileChange` ThreadItem, not `commandExecution`). Returns
+/// the terminal status and the committed per-file change set.
+private func fileChangeItems(_ evs: [ServerNotification]) -> [(ItemStatus, [ThreadItem.FileChange])] {
+    evs.compactMap { n in
+        if case .itemCompleted(_, _, let it, _) = n,
+           case .fileChange(_, let changes, let s) = it {
+            return (s, changes)
         }
         return nil
     }
@@ -65,11 +78,13 @@ final class ApprovalsTests: XCTestCase {
     private func engine(policy: ApprovalPolicy, cwd: String,
                         writableRoots: [String]? = nil,
                         approvalsReviewer: String = "user",
+                        sandboxMode: SandboxModeKind = .workspaceWrite,
                         store: ThreadStore, model: any ModelClient,
                         router: ToolRouter) async -> SessionEngine {
         let cfg = SessionConfig(threadId: ThreadId.generate(), cwd: cwd,
                                 approvalPolicy: policy,
                                 approvalsReviewer: approvalsReviewer,
+                                sandboxMode: sandboxMode,
                                 writableRoots: writableRoots)
         _ = try? await store.create(cfg)
         return SessionEngine(config: cfg, model: model, store: store,
@@ -99,7 +114,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
         let items = commandItems(evs)
         XCTAssertTrue(items.contains { $0.0 == .declined && $0.1.contains("Not approved") },
@@ -122,7 +137,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(MockApprover(.accept))
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
         XCTAssertTrue(commandItems(evs).contains { $0.0 == .completed },
                       "an approved command runs (escalated full-access)")
@@ -154,7 +169,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
         XCTAssertTrue(commandItems(evs).contains { $0.0 == .completed },
                       "guardian-approved command runs")
@@ -188,7 +203,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
         XCTAssertTrue(commandItems(evs).contains {
             $0.0 == .declined && $0.1.contains("Not approved")
@@ -211,7 +226,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
         let n = await approver.count()
         XCTAssertEqual(n, 0, "a safe read command must not prompt for approval")
@@ -232,7 +247,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         _ = await col.value
         let n = await approver.count()
         XCTAssertEqual(n, 0, "policy 'never' never prompts (runs sandboxed only)")
@@ -262,7 +277,7 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         _ = await col.value
         let n = await approver.count()
         XCTAssertEqual(n, 1, "acceptForSession suppresses the second same-prefix prompt")
@@ -277,27 +292,113 @@ final class ApprovalsTests: XCTestCase {
         let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
         let otherRoot = apTmp("other")
         defer { try? FileManager.default.removeItem(atPath: otherRoot) }
-        let sb = WorkspaceSandbox(SandboxPolicy(mode: .workspaceWrite,
-                                                writableRoots: [work]))
+        let sb = WorkspaceSandbox(SandboxPolicy(mode: .readOnly,
+                                                writableRoots: [otherRoot]))
         let router = ToolRouter(limits: Limits())
         await router.register(ApplyPatchTool(sandbox: sb))
+        // The ApplyPatch parser forbids absolute/`..` targets, so to be
+        // out-of-root the session must be read-only (no implicit cwd writable
+        // root, get_writable_roots_with_cwd) with explicit writableRoots that do
+        // not contain cwd. The relative `nope.txt` resolves under cwd=work,
+        // which is outside writableRoots=[otherRoot] → unconstrained → policy
+        // 'never' rejects without escalation.
         let patch = "*** Begin Patch\\n*** Add File: nope.txt\\n+x\\n*** End Patch"
         let model = toolCallModel("{\"patch\":\"\(patch)\"}", tool: "apply_patch")
-        // writableRoots = otherRoot, but the patch resolves under cwd=work →
-        // outside roots → policy 'never' rejects without escalation.
         let eng = await engine(policy: .never, cwd: work,
-                               writableRoots: [otherRoot], store: store,
+                               writableRoots: [otherRoot],
+                               sandboxMode: .readOnly, store: store,
                                model: model, router: router)
         await eng.setApprovalCoordinator(MockApprover(.accept))
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
-        XCTAssertTrue(commandItems(evs).contains {
-            $0.0 == .declined && $0.1.contains("Not approved")
+        // apply_patch surfaces as a `fileChange` item (finding 3); a rejected
+        // patch yields a declined fileChange item with no committed changes.
+        XCTAssertTrue(fileChangeItems(evs).contains {
+            $0.0 == .declined && $0.1.isEmpty
         }, "a patch outside writable roots under policy 'never' is rejected")
         XCTAssertFalse(FileManager.default.fileExists(atPath: work + "/nope.txt"),
                        "the rejected patch did not write")
+    }
+
+    /// New coverage for the move-destination containment fix
+    /// (sandbox-safety-policy finding 1): an Update whose target is inside the
+    /// writable roots but whose `*** Move to:` destination escapes them makes the
+    /// whole patch unconstrained, so under policy `never` it is rejected — the
+    /// previous inline `patchWithinWritableRoots` ignored `movePath` and would
+    /// have auto-sandboxed the rename. Mirrors the Update arm of
+    /// `is_write_patch_constrained_to_writable_paths` (safety.rs:179-188).
+    ///
+    /// The ApplyPatch parser forbids absolute/`..` move destinations, so the
+    /// escape is expressed as a relative path that lands outside an explicit
+    /// writable sub-root: cwd=work, writableRoots=[work/sub] (read-only so cwd is
+    /// not implicitly writable), target `sub/a.txt` is in-root, but move
+    /// destination `b.txt` resolves to work/b.txt — outside the sub-root.
+    func testPatchMoveDestinationOutsideRootsIsRejected() async throws {
+        let (store, home) = try makeStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let sub = work + "/sub"
+        try FileManager.default.createDirectory(
+            atPath: sub, withIntermediateDirectories: true)
+        // Seed the in-root file the Update targets so the patch parses cleanly.
+        try "old\n".write(toFile: sub + "/a.txt", atomically: true, encoding: .utf8)
+        let sb = WorkspaceSandbox(SandboxPolicy(mode: .readOnly,
+                                                writableRoots: [sub]))
+        let router = ToolRouter(limits: Limits())
+        await router.register(ApplyPatchTool(sandbox: sb))
+        let patch = "*** Begin Patch\\n*** Update File: sub/a.txt\\n*** Move to: b.txt\\n@@\\n-old\\n+new\\n*** End Patch"
+        let model = toolCallModel("{\"patch\":\"\(patch)\"}", tool: "apply_patch")
+        let eng = await engine(policy: .never, cwd: work,
+                               writableRoots: [sub],
+                               sandboxMode: .readOnly, store: store,
+                               model: model, router: router)
+        await eng.setApprovalCoordinator(MockApprover(.accept))
+        await eng.start()
+        let col = Task { await apCollect(eng) }
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
+        let evs = await col.value
+        XCTAssertTrue(fileChangeItems(evs).contains {
+            $0.0 == .declined && $0.1.isEmpty
+        }, "a rename whose destination escapes the writable roots is rejected under 'never'")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: work + "/b.txt"),
+                       "the rejected rename did not write the destination")
+    }
+
+    /// Control for finding 1: the SAME in-root Update with a move destination
+    /// that stays inside the writable sub-root is constrained, so under
+    /// danger-full-access (and any policy) it is auto-approved and committed.
+    /// Confirms the movePath check does not over-reject in-root renames.
+    func testPatchInRootMoveDestinationIsApproved() async throws {
+        let (store, home) = try makeStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        try FileManager.default.createDirectory(
+            atPath: work, withIntermediateDirectories: true)
+        try "old\n".write(toFile: work + "/a.txt", atomically: true, encoding: .utf8)
+        let sb = WorkspaceSandbox(SandboxPolicy(mode: .dangerFullAccess))
+        let router = ToolRouter(limits: Limits())
+        await router.register(ApplyPatchTool(sandbox: sb))
+        // Rename within cwd; under danger-full-access this auto-approves even
+        // under policy 'never' (has_full_disk_write_access, finding 2).
+        let patch = "*** Begin Patch\\n*** Update File: a.txt\\n*** Move to: b.txt\\n@@\\n-old\\n+new\\n*** End Patch"
+        let model = toolCallModel("{\"patch\":\"\(patch)\"}", tool: "apply_patch")
+        let eng = await engine(policy: .never, cwd: work,
+                               writableRoots: [],
+                               sandboxMode: .dangerFullAccess, store: store,
+                               model: model, router: router)
+        await eng.setApprovalCoordinator(MockApprover(.decline))
+        await eng.start()
+        let col = Task { await apCollect(eng) }
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
+        let evs = await col.value
+        XCTAssertFalse(fileChangeItems(evs).contains { $0.0 == .declined },
+                       "danger-full-access auto-approves the in-cwd rename under 'never'")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: work + "/b.txt"),
+                      "the approved rename wrote the destination")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: work + "/a.txt"),
+                       "the approved rename removed the source")
     }
 
     // MARK: - P4.1 follow-up — ApprovalPolicyEngine .granular pure-function decisions
@@ -324,6 +425,51 @@ final class ApprovalsTests: XCTestCase {
                                skillApproval: skillApproval,
                                requestPermissions: requestPermissions,
                                mcpElicitations: mcpElicitations)
+    }
+
+    // Finding 3 (sandbox-safety-policy): prompt_is_rejected_by_policy
+    // (exec_policy.rs:175-198). Never rejects any prompt; OnFailure/OnRequest/
+    // UnlessTrusted never reject; Granular gates rule-prompts on `rules` and
+    // sandbox-prompts on `sandbox_approval` independently.
+    func testPromptRejectedByPolicy() {
+        // Never rejects regardless of rule-ness.
+        XCTAssertEqual(
+            ApprovalPolicyEngine.promptRejectedByPolicy(policy: .never, promptIsRule: true),
+            ApprovalPolicyEngine.promptConflictReason)
+        XCTAssertEqual(
+            ApprovalPolicyEngine.promptRejectedByPolicy(policy: .never, promptIsRule: false),
+            ApprovalPolicyEngine.promptConflictReason)
+
+        // OnRequest / OnFailure / UnlessTrusted never reject.
+        for p in [ApprovalPolicy.onRequest, .onFailure, .unlessTrusted] {
+            XCTAssertNil(ApprovalPolicyEngine.promptRejectedByPolicy(
+                policy: p, promptIsRule: true))
+            XCTAssertNil(ApprovalPolicyEngine.promptRejectedByPolicy(
+                policy: p, promptIsRule: false))
+        }
+
+        // Granular: rules flag gates rule-prompts.
+        let rulesOff = ApprovalPolicy.granular(granularCfg(sandboxApproval: true, rules: false))
+        XCTAssertEqual(
+            ApprovalPolicyEngine.promptRejectedByPolicy(policy: rulesOff, promptIsRule: true),
+            ApprovalPolicyEngine.rejectRulesApprovalReason)
+        XCTAssertNil(
+            ApprovalPolicyEngine.promptRejectedByPolicy(policy: rulesOff, promptIsRule: false),
+            "rules=false must NOT reject a sandbox/escalation prompt")
+
+        // Granular: sandbox_approval flag gates sandbox-prompts.
+        let sandboxOff = ApprovalPolicy.granular(granularCfg(sandboxApproval: false, rules: true))
+        XCTAssertEqual(
+            ApprovalPolicyEngine.promptRejectedByPolicy(policy: sandboxOff, promptIsRule: false),
+            ApprovalPolicyEngine.rejectSandboxApprovalReason)
+        XCTAssertNil(
+            ApprovalPolicyEngine.promptRejectedByPolicy(policy: sandboxOff, promptIsRule: true),
+            "sandbox_approval=false must NOT reject a policy-rule prompt")
+
+        // Granular: both on → never reject.
+        let bothOn = ApprovalPolicy.granular(granularCfg(sandboxApproval: true, rules: true))
+        XCTAssertNil(ApprovalPolicyEngine.promptRejectedByPolicy(policy: bothOn, promptIsRule: true))
+        XCTAssertNil(ApprovalPolicyEngine.promptRejectedByPolicy(policy: bothOn, promptIsRule: false))
     }
 
     func testGranularCommandSandboxApprovalOnMatchesOnRequest() {
@@ -522,13 +668,16 @@ final class ApprovalsTests: XCTestCase {
         await eng.setApprovalCoordinator(approver)
         await eng.start()
         let col = Task { await apCollect(eng) }
-        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await col.value
         let n = await approver.count()
         XCTAssertEqual(n, 0, "an in-root patch under 'never' does not prompt")
-        XCTAssertTrue(commandItems(evs).contains { $0.0 == .completed },
-                      "the in-root patch applied")
+        // apply_patch surfaces as a completed `fileChange` item (finding 3)
+        // carrying the committed add of ok.txt.
+        XCTAssertTrue(fileChangeItems(evs).contains {
+            $0.0 == .completed && $0.1.contains { $0.path.hasSuffix("ok.txt") }
+        }, "the in-root patch applied")
         XCTAssertEqual(try? String(contentsOfFile: work + "/ok.txt", encoding: .utf8),
-                       "written", "the patch wrote the file")
+                       "written\n", "the patch wrote the file (upstream appends trailing newline)")
     }
 }

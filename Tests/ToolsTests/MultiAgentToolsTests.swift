@@ -80,6 +80,63 @@ final class MultiAgentToolsTests: XCTestCase {
                        "session-configured agent_type description must reach the JSON schema")
     }
 
+    /// Ordering parity: upstream `spawn_agent_common_properties_v1` builds a
+    /// BTreeMap, so the property keys serialize in sorted order:
+    /// agent_type, fork_context, items, message, model, reasoning_effort,
+    /// service_tier. The nested collab input-items object sorts to
+    /// image_url, name, path, text, type.
+    func testSpawnAgentSchemaPropertyOrderIsAlphabetical() {
+        let schema = SpawnAgentTool().jsonSchema
+        let topOrder = orderedTopLevelPropertyKeys(schema)
+        XCTAssertEqual(topOrder,
+                       ["agent_type", "fork_context", "items", "message",
+                        "model", "reasoning_effort", "service_tier"],
+                       "spawn_agent properties must be in upstream BTreeMap order")
+        let itemsOrder = orderedItemsPropertyKeys(schema)
+        XCTAssertEqual(itemsOrder,
+                       ["image_url", "name", "path", "text", "type"],
+                       "collab input-items properties must be in upstream BTreeMap order")
+    }
+
+    /// Ordering parity for send_input: top-level sorts to interrupt, items,
+    /// message, target; nested items object identical to spawn_agent.
+    func testSendInputSchemaPropertyOrderIsAlphabetical() {
+        let schema = SendInputTool().jsonSchema
+        let topOrder = orderedTopLevelPropertyKeys(schema)
+        XCTAssertEqual(topOrder,
+                       ["interrupt", "items", "message", "target"],
+                       "send_input properties must be in upstream BTreeMap order")
+        let itemsOrder = orderedItemsPropertyKeys(schema)
+        XCTAssertEqual(itemsOrder,
+                       ["image_url", "name", "path", "text", "type"],
+                       "collab input-items properties must be in upstream BTreeMap order")
+    }
+
+    /// Finding 5: the default `agent_type` description reproduces upstream
+    /// `spawn_tool_spec::build(&BTreeMap::new())` — the omit-default sentence,
+    /// the "Available roles:" header, and the built-in role catalog (default,
+    /// explorer, worker) in sorted order.
+    func testDefaultAgentTypeDescriptionPortsBuiltInRoleCatalog() {
+        let desc = DefaultSpawnAgentAgentTypeDescription
+        XCTAssertTrue(desc.hasPrefix(
+            "Optional type name for the new agent. If omitted, `default` is used.\nAvailable roles:\n"),
+            "must emit the upstream omit-default + Available roles prefix; got: \(desc.prefix(120))")
+        XCTAssertTrue(desc.contains("default: {\nDefault agent.\n}"),
+                      "built-in `default` role entry missing")
+        XCTAssertTrue(desc.contains("explorer: {\nUse `explorer` for specific codebase questions."),
+                      "built-in `explorer` role entry missing")
+        XCTAssertTrue(desc.contains("worker: {\nUse for execution and production work."),
+                      "built-in `worker` role entry missing")
+        // Sorted role order: default before explorer before worker.
+        guard let d = desc.range(of: "default: {"),
+              let e = desc.range(of: "explorer: {"),
+              let w = desc.range(of: "worker: {") else {
+            return XCTFail("all three role entries must be present")
+        }
+        XCTAssertTrue(d.lowerBound < e.lowerBound && e.lowerBound < w.lowerBound,
+                      "roles must be in sorted order default < explorer < worker")
+    }
+
     func testSpawnAgentDescriptionIncludesUpstreamUsageHint() {
         // Default options have `includeUsageHint=true` with no override,
         // so the rendered description must contain the full upstream
@@ -359,5 +416,58 @@ final class MultiAgentToolsTests: XCTestCase {
               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
         else { XCTFail("result not valid JSON: \(s)"); return [:] }
         return obj
+    }
+
+    /// Extract the property keys, in their literal emission order, from the
+    /// brace-balanced object that follows a given `"properties":{` occurrence.
+    /// Used to assert hand-crafted schema strings emit keys in upstream
+    /// BTreeMap (sorted) order, which `JSONSerialization` would otherwise lose.
+    private func orderedPropertyKeys(_ schema: String, afterMarkerIndex: String.Index)
+        -> [String] {
+        let chars = Array(schema)
+        // afterMarkerIndex points at the opening `{` of the properties object.
+        let start = schema.distance(from: schema.startIndex, to: afterMarkerIndex)
+        var depth = 0
+        var keys: [String] = []
+        var i = start
+        var atKeyPosition = false
+        while i < chars.count {
+            let c = chars[i]
+            if c == "{" {
+                depth += 1
+                // The properties object's direct children start at depth 1.
+                if depth == 1 { atKeyPosition = true }
+            } else if c == "}" {
+                depth -= 1
+                if depth == 0 { break }
+            } else if c == "\"" && depth == 1 && atKeyPosition {
+                // Read a key string at the top level of the properties object.
+                var j = i + 1
+                var key = ""
+                while j < chars.count && chars[j] != "\"" { key += String(chars[j]); j += 1 }
+                keys.append(key)
+                i = j
+                atKeyPosition = false
+            } else if c == "," && depth == 1 {
+                atKeyPosition = true
+            }
+            i += 1
+        }
+        return keys
+    }
+
+    private func orderedTopLevelPropertyKeys(_ schema: String) -> [String] {
+        guard let r = schema.range(of: "\"properties\":{") else { return [] }
+        return orderedPropertyKeys(schema, afterMarkerIndex: schema.index(before: r.upperBound))
+    }
+
+    /// The nested collab input-items property object. It is the SECOND
+    /// `"properties":{` in the schema (inside `items.items`).
+    private func orderedItemsPropertyKeys(_ schema: String) -> [String] {
+        guard let first = schema.range(of: "\"properties\":{"),
+              let second = schema.range(of: "\"properties\":{",
+                                        range: first.upperBound..<schema.endIndex)
+        else { return [] }
+        return orderedPropertyKeys(schema, afterMarkerIndex: schema.index(before: second.upperBound))
     }
 }

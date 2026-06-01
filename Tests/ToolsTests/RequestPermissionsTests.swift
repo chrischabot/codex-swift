@@ -12,15 +12,44 @@ final class RequestPermissionsTests: XCTestCase {
         return p
     }
 
-    func testRequestPermissionsToolRegistered() async {
+    /// Audit tools-router finding 1: upstream pushes the RequestPermissionsHandler
+    /// ONLY when `config.request_permissions_tool_enabled` (`spec_plan.rs:402-404`),
+    /// which resolves from `Feature::RequestPermissionsTool` — a stable feature OFF
+    /// by default (`features/src/tests.rs:129`). So a default-config session does
+    /// NOT advertise `request_permissions`; the port must match.
+    func testRequestPermissionsToolNotRegisteredByDefault() async {
         let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
         let sandbox = WorkspaceSandbox(SandboxPolicy(mode: .workspaceWrite,
                                                     writableRoots: [root]))
         let router = ToolRouter(limits: Limits())
         await DefaultTools.register(on: router, sandbox: sandbox)
         let names = await router.specs().map { $0.name }
+        XCTAssertFalse(names.contains("request_permissions"),
+                       "request_permissions must be OFF by default (Feature::RequestPermissionsTool default_enabled==false); got \(names)")
+        // Default flag mirrors the upstream feature default.
+        XCTAssertFalse(DefaultTools.defaultRequestPermissionsToolEnabled)
+    }
+
+    /// When the host opts in (mirroring `request_permissions_tool_enabled == true`)
+    /// the tool IS advertised — at upstream slot (6), after request_user_input and
+    /// before apply_patch (`spec_plan.rs:402-404`).
+    func testRequestPermissionsToolRegisteredWhenEnabled() async {
+        let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let sandbox = WorkspaceSandbox(SandboxPolicy(mode: .workspaceWrite,
+                                                    writableRoots: [root]))
+        let router = ToolRouter(limits: Limits())
+        await DefaultTools.register(on: router, sandbox: sandbox,
+                                    requestPermissionsToolEnabled: true)
+        let names = await router.specs().map { $0.name }
         XCTAssertTrue(names.contains("request_permissions"),
-                      "DefaultTools must register request_permissions (P3.4 / H-17); got \(names)")
+                      "request_permissions must be advertised when enabled (P3.4 / H-17); got \(names)")
+        guard let rpIdx = names.firstIndex(of: "request_permissions"),
+              let ruiIdx = names.firstIndex(of: "request_user_input"),
+              let apIdx = names.firstIndex(of: "apply_patch") else {
+            return XCTFail("expected request_user_input/request_permissions/apply_patch; got \(names)")
+        }
+        XCTAssertLessThan(ruiIdx, rpIdx, "request_user_input precedes request_permissions")
+        XCTAssertLessThan(rpIdx, apIdx, "request_permissions precedes apply_patch")
     }
 
     func testRequestPermissionsSchemaMatchesUpstream() {

@@ -44,6 +44,14 @@ public actor TransportFallbackModelClient: ModelClient {
 
     public func isFallbackEngaged() -> Bool { fallbackEngaged }
 
+    /// Forward remote compaction to the active transport. Both the primary
+    /// (WebSocket) and fallback (HTTP) clients share the same provider, so the
+    /// remote `/compact` endpoint is reached over whichever transport is live.
+    public func compactConversationHistory(_ prompt: Prompt, _ settings: ModelSettings)
+    async throws -> [RemoteCompaction.OutputMessage]? {
+        try await activeClient().compactConversationHistory(prompt, settings)
+    }
+
     private func activeClient() -> any ModelClient {
         fallbackEngaged ? fallback : primary
     }

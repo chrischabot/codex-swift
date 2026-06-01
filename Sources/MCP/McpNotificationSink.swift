@@ -18,8 +18,15 @@ public enum McpNotification: Sendable, Equatable {
                   message: String?)
     /// `notifications/cancelled` — the in-flight request id the server is
     /// abandoning. We surface this so callers know to stop awaiting a
-    /// response that will never arrive.
-    case cancelled(server: String, requestId: Int?, reason: String?)
+    /// response that will never arrive. Upstream models the request id as a
+    /// `NumberOrString` (`rmcp-0.15.0/src/model.rs:636-642`), so a server may
+    /// send either a JSON number or string. `requestId` is the numeric variant
+    /// (used to correlate against our integer-keyed pending requests, which is
+    /// the only id space the stdio client assigns); `requestIdString` preserves
+    /// the raw id as text for diagnostics / sink consumers regardless of
+    /// variant, so a string id is no longer silently dropped.
+    case cancelled(server: String, requestId: Int?, requestIdString: String?,
+                   reason: String?)
     case toolListChanged(server: String)
     case resourceListChanged(server: String)
     case promptListChanged(server: String)
@@ -58,8 +65,8 @@ public struct StderrMcpNotificationSink: McpNotificationSink {
             let messageSegment = message.map { " message=\($0)" } ?? ""
             line = "[mcp:\(server)] progress token=\(token) " +
                 "progress=\(progressSegment)\(totalSegment)\(messageSegment)"
-        case .cancelled(let server, let requestId, let reason):
-            let idSegment = requestId.map { "\($0)" } ?? "?"
+        case .cancelled(let server, _, let requestIdString, let reason):
+            let idSegment = requestIdString ?? "?"
             let reasonSegment = reason.map { " reason=\($0)" } ?? ""
             line = "[mcp:\(server)] cancelled request_id=\(idSegment)\(reasonSegment)"
         case .toolListChanged(let server):
@@ -141,11 +148,21 @@ enum McpNotificationDecoder {
             return .progress(server: server, token: token, progress: progress,
                              total: total, message: message)
         case "notifications/cancelled":
+            // Upstream `RequestId` is a NumberOrString; accept both. Keep the
+            // numeric variant for pending-request correlation and preserve the
+            // raw id as text so a string id is surfaced rather than nil'd out.
             var requestId: Int?
-            if case .number(let n)? = paramsObject["requestId"] { requestId = Int(n) }
+            var requestIdString: String?
+            if case .number(let n)? = paramsObject["requestId"] {
+                requestId = Int(n)
+                requestIdString = formatNumber(n)
+            } else if case .string(let s)? = paramsObject["requestId"] {
+                requestIdString = s
+            }
             var reason: String?
             if case .string(let s)? = paramsObject["reason"] { reason = s }
-            return .cancelled(server: server, requestId: requestId, reason: reason)
+            return .cancelled(server: server, requestId: requestId,
+                              requestIdString: requestIdString, reason: reason)
         case "notifications/tools/list_changed":
             return .toolListChanged(server: server)
         case "notifications/resources/list_changed":

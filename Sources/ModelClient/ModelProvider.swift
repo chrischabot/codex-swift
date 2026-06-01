@@ -1,4 +1,5 @@
 import Foundation
+import WireProtocol
 
 /// Wire protocol for a model provider (Codex `WireApi`).
 ///
@@ -48,6 +49,14 @@ public struct ModelProvider: Sendable, Equatable {
     public var requestMaxRetries: Int
     public var requiresOpenAIAuth: Bool
     public var supportsWebsockets: Bool
+    /// Per-event SSE idle timeout: the maximum time the Responses stream may
+    /// stay silent between events before it is aborted with a retryable
+    /// "idle timeout waiting for SSE" error. Mirrors upstream
+    /// `ModelProviderInfo::stream_idle_timeout` (codex-api provider.rs:49),
+    /// which the responses SSE loop wraps each `stream.next()` poll with
+    /// (responses.rs:410-434). Upstream's config default is 300_000 ms / 5m
+    /// (`stream_idle_timeout_ms`, config_tests.rs:7536).
+    public var streamIdleTimeout: Duration
 
     public init(id: String,
                 name: String,
@@ -60,7 +69,8 @@ public struct ModelProvider: Sendable, Equatable {
                 envHttpHeaders: [String: String] = [:],
                 requestMaxRetries: Int = 4,
                 requiresOpenAIAuth: Bool = false,
-                supportsWebsockets: Bool = false) {
+                supportsWebsockets: Bool = false,
+                streamIdleTimeout: Duration = .seconds(300)) {
         self.id = id
         self.name = name
         self.baseURL = baseURL
@@ -73,6 +83,7 @@ public struct ModelProvider: Sendable, Equatable {
         self.requestMaxRetries = requestMaxRetries
         self.requiresOpenAIAuth = requiresOpenAIAuth
         self.supportsWebsockets = supportsWebsockets
+        self.streamIdleTimeout = streamIdleTimeout
     }
 
     /// Built-in OpenAI provider (Codex default).
@@ -84,6 +95,30 @@ public struct ModelProvider: Sendable, Equatable {
         wireApi: .responses,
         requiresOpenAIAuth: true,
         supportsWebsockets: true)
+
+    /// True when the provider's `name` is exactly `"OpenAI"`
+    /// (`ModelProviderInfo::is_openai` — `self.name == OPENAI_PROVIDER_NAME`).
+    public var isOpenAI: Bool { name == "OpenAI" }
+
+    /// Faithful port of `codex-api::is_azure_responses_provider`: the provider
+    /// name is `azure` (case-insensitive) OR the base URL contains one of the
+    /// Azure Responses markers.
+    public var isAzureResponsesProvider: Bool {
+        if name.lowercased() == "azure" { return true }
+        let lower = baseURL.lowercased()
+        let markers = ["openai.azure.", "cognitiveservices.azure.",
+                       "aoai.azure.", "azure-api.", "azurefd.",
+                       "windows.net/openai"]
+        return markers.contains { lower.contains($0) }
+    }
+
+    /// Faithful port of `ModelProviderInfo::supports_remote_compaction`:
+    /// `is_openai() || is_azure_responses_provider(...)`. Gates whether the
+    /// session uses the server-side `/responses/compact` endpoint instead of
+    /// local prompt-driven compaction.
+    public var supportsRemoteCompaction: Bool {
+        isOpenAI || isAzureResponsesProvider
+    }
 
     /// `Authorization` header value: experimental bearer token wins, else the
     /// env-var-resolved key, else nil.
@@ -315,16 +350,32 @@ public struct UsageSnapshot: Sendable, Equatable {
     }
 }
 
+/// One rate-limit window. Mirrors upstream `RateLimitWindow`
+/// (`codex-protocol`): `resets_at` is an `Option<i64>` (a unix timestamp),
+/// NOT a string.
 public struct RateLimitWindow: Sendable, Equatable {
     public var usedPercent: Double
     public var windowMinutes: Int?
-    public var resetAt: String?
+    public var resetAt: Int64?
     public init(usedPercent: Double,
                 windowMinutes: Int? = nil,
-                resetAt: String? = nil) {
+                resetAt: Int64? = nil) {
         self.usedPercent = usedPercent
         self.windowMinutes = windowMinutes
         self.resetAt = resetAt
+    }
+}
+
+/// Credits telemetry parsed from the `x-codex-credits-*` header family.
+/// Mirrors upstream `CreditsSnapshot` (`codex-protocol`).
+public struct CreditsSnapshot: Sendable, Equatable {
+    public var hasCredits: Bool
+    public var unlimited: Bool
+    public var balance: String?
+    public init(hasCredits: Bool, unlimited: Bool, balance: String? = nil) {
+        self.hasCredits = hasCredits
+        self.unlimited = unlimited
+        self.balance = balance
     }
 }
 
@@ -333,26 +384,75 @@ public struct RateLimitSnapshot: Sendable, Equatable {
     public var limitName: String?
     public var primary: RateLimitWindow?
     public var secondary: RateLimitWindow?
+    /// Credits telemetry (`x-codex-credits-*`). Mirrors upstream
+    /// `RateLimitSnapshot.credits`.
+    public var credits: CreditsSnapshot?
+    /// Plan type (`x-codex-plan-type`). Mirrors upstream
+    /// `RateLimitSnapshot.plan_type`.
+    public var planType: String?
     public init(limitId: String? = nil,
                 limitName: String? = nil,
                 primary: RateLimitWindow? = nil,
-                secondary: RateLimitWindow? = nil) {
+                secondary: RateLimitWindow? = nil,
+                credits: CreditsSnapshot? = nil,
+                planType: String? = nil) {
         self.limitId = limitId
         self.limitName = limitName
         self.primary = primary
         self.secondary = secondary
+        self.credits = credits
+        self.planType = planType
     }
 
-    /// Parse the `x-<limitId>-{primary,secondary}-*` / `-limit-name` header
-    /// family out of a curl `-D` header dump. Header names are lowercased
-    /// (values preserved); last duplicate wins.
-    public static func parseRateLimits(
-        headerDump: String, limitId: String = "codex"
-    ) -> RateLimitSnapshot? {
+    /// Serializes this snapshot into the v2 `RateLimitSnapshot` wire shape
+    /// (`app-server-protocol/src/protocol/v2/account.rs:257-265`,
+    /// camelCase, every field `Option` → emitted as `null` when absent). This
+    /// is the payload carried by the `account/rateLimits/updated` notification
+    /// (`AccountRateLimitsUpdatedNotification.rate_limits`). `used_percent` is
+    /// rounded to an integer to match `RateLimitWindow::from` (`account.rs:347`).
+    public func asNotificationJSON() -> JSONValue {
+        func window(_ w: RateLimitWindow?) -> JSONValue {
+            guard let w else { return .null }
+            return .object([
+                "usedPercent": .int(Int64(w.usedPercent.rounded())),
+                "windowDurationMins": w.windowMinutes
+                    .map { JSONValue.int(Int64($0)) } ?? .null,
+                "resetsAt": w.resetAt.map { JSONValue.int($0) } ?? .null,
+            ])
+        }
+        func creditsJSON(_ c: CreditsSnapshot?) -> JSONValue {
+            guard let c else { return .null }
+            return .object([
+                "hasCredits": .bool(c.hasCredits),
+                "unlimited": .bool(c.unlimited),
+                "balance": c.balance.map(JSONValue.string) ?? .null,
+            ])
+        }
+        return .object([
+            "limitId": limitId.map(JSONValue.string) ?? .null,
+            "limitName": limitName.map(JSONValue.string) ?? .null,
+            "primary": window(primary),
+            "secondary": window(secondary),
+            "credits": creditsJSON(credits),
+            "planType": planType.map(JSONValue.string) ?? .null,
+            "rateLimitReachedType": .null,
+        ])
+    }
+
+    /// Parse a curl `-D` header dump into a lowercased name→value map. Last
+    /// duplicate wins (matches curl's accumulation order). Shared by the
+    /// single-family and all-families parsers.
+    private static func headerMap(_ headerDump: String) -> [String: String] {
         var map: [String: String] = [:]
-        for rawLine in headerDump.split(
+        // NOTE: split on Unicode *scalars*, not Characters. In Swift a `\r\n`
+        // sequence forms a single extended grapheme cluster (Character), so a
+        // `Character`-based `$0 == "\n" || $0 == "\r"` separator never matches a
+        // CRLF — which is exactly what real HTTP header dumps (`curl -D`,
+        // `HTTPURLResponse.allHeaderFields` re-serialized as `"k: v\r\n"`) use.
+        // Splitting on scalars handles both LF and CRLF line endings.
+        for rawLine in headerDump.unicodeScalars.split(
             whereSeparator: { $0 == "\n" || $0 == "\r" }) {
-            let line = String(rawLine)
+            let line = String(String.UnicodeScalarView(rawLine))
             guard let colon = line.firstIndex(of: ":") else { continue }
             let name = line[line.startIndex..<colon]
                 .trimmingCharacters(in: .whitespaces).lowercased()
@@ -361,28 +461,139 @@ public struct RateLimitSnapshot: Sendable, Equatable {
                 .trimmingCharacters(in: .whitespaces)
             map[name] = value
         }
-        let prefix = ("x-" + limitId.replacingOccurrences(
-            of: "_", with: "-")).lowercased()
+        return map
+    }
+
+    /// Normalizes a limit id the way upstream `normalize_limit_id` does:
+    /// trim, lowercase, and replace `-` with `_`.
+    private static func normalizeLimitId(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespaces)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+    }
+
+    private static func parseCredits(_ map: [String: String]) -> CreditsSnapshot? {
+        func boolHeader(_ name: String) -> Bool? {
+            guard let raw = map[name] else { return nil }
+            let lower = raw.lowercased()
+            if lower == "true" || raw == "1" { return true }
+            if lower == "false" || raw == "0" { return false }
+            return nil
+        }
+        guard let hasCredits = boolHeader("x-codex-credits-has-credits"),
+              let unlimited = boolHeader("x-codex-credits-unlimited") else {
+            return nil
+        }
+        let balance = map["x-codex-credits-balance"]?
+            .trimmingCharacters(in: .whitespaces)
+        return CreditsSnapshot(
+            hasCredits: hasCredits, unlimited: unlimited,
+            balance: (balance?.isEmpty == false) ? balance : nil)
+    }
+
+    /// Parse rate-limit headers for a single limit family. `limitId` matches
+    /// the server-provided metered limit id (e.g. `codex`, `codex_secondary`).
+    /// Mirrors `parse_rate_limit_for_limit` — applies the per-window
+    /// `has_data` gate so a bare `used_percent: 0` header does NOT yield a
+    /// window.
+    public static func parseRateLimits(
+        headerDump: String, limitId: String = "codex"
+    ) -> RateLimitSnapshot? {
+        let map = headerMap(headerDump)
+        let normalized = limitId.trimmingCharacters(in: .whitespaces).isEmpty
+            ? "codex" : limitId
+        let prefix = ("x-" + normalized.lowercased()
+            .replacingOccurrences(of: "_", with: "-"))
 
         func window(_ kind: String) -> RateLimitWindow? {
             guard let upStr = map["\(prefix)-\(kind)-used-percent"],
-                  let up = Double(upStr) else { return nil }
+                  let up = Double(upStr), up.isFinite else { return nil }
             let wm = map["\(prefix)-\(kind)-window-minutes"]
-                .flatMap { Int($0) }
+                .flatMap { Int64($0) }
             let ra = map["\(prefix)-\(kind)-reset-at"]
+                .flatMap { Int64($0) }
+            // Upstream `parse_rate_limit_window` has_data gate: emit only when
+            // used_percent != 0, window_minutes != 0, or resets_at present.
+            let hasData = up != 0.0
+                || (wm != nil && wm != 0)
+                || ra != nil
+            guard hasData else { return nil }
             return RateLimitWindow(
-                usedPercent: up, windowMinutes: wm, resetAt: ra)
+                usedPercent: up,
+                windowMinutes: wm.map { Int($0) },
+                resetAt: ra)
         }
 
         let primary = window("primary")
         let secondary = window("secondary")
-        let limitName = map["\(prefix)-limit-name"]
-        if primary == nil && secondary == nil && limitName == nil {
+        let limitName = map["\(prefix)-limit-name"]?
+            .trimmingCharacters(in: .whitespaces)
+        let credits = parseCredits(map)
+        // Upstream `parse_rate_limit_for_limit` (`rate_limits.rs:88-97`) always
+        // sets `plan_type: None` on a header-derived snapshot; plan_type is
+        // only populated by `parse_rate_limit_event` from the
+        // `codex.rate_limits` SSE payload. We mirror that: do NOT read an
+        // `x-codex-plan-type` header here, and do NOT include plan_type in the
+        // has_data presence gate (primary/secondary/limitName/credits only).
+        if primary == nil && secondary == nil
+            && (limitName?.isEmpty != false)
+            && credits == nil {
             return nil
         }
         return RateLimitSnapshot(
-            limitId: limitId, limitName: limitName,
-            primary: primary, secondary: secondary)
+            limitId: normalizeLimitId(normalized),
+            limitName: (limitName?.isEmpty == false) ? limitName : nil,
+            primary: primary, secondary: secondary,
+            credits: credits,
+            planType: nil)
+    }
+
+    /// Discover every metered limit family present in the header dump and
+    /// return a snapshot per family. Mirrors upstream `parse_all_rate_limits`:
+    /// the default `codex` family first, then every other family discovered
+    /// via an `x-<limit>-primary-used-percent` header, each gated by
+    /// `has_rate_limit_data` (primary/secondary/credits present).
+    public static func parseAllRateLimits(
+        headerDump: String
+    ) -> [RateLimitSnapshot] {
+        let map = headerMap(headerDump)
+        var snapshots: [RateLimitSnapshot] = []
+        // Upstream `parse_rate_limit_for_limit` ALWAYS returns
+        // `Some(RateLimitSnapshot{ .. })` for the default `codex` family even
+        // when every window/credit field is None (rate_limits.rs:89), and
+        // `parse_all_rate_limits` pushes it unconditionally (rate_limits.rs:27-31).
+        // The `has_rate_limit_data` gate (rate_limits.rs:44-47) applies ONLY to
+        // additional discovered families. So the result is never empty: with no
+        // rate-limit headers it is exactly one all-None `codex` snapshot
+        // (test parse_all_rate_limits_includes_default_codex_snapshot).
+        if let def = parseRateLimits(headerDump: headerDump, limitId: "codex") {
+            snapshots.append(def)
+        } else {
+            snapshots.append(RateLimitSnapshot(
+                limitId: "codex", limitName: nil,
+                primary: nil, secondary: nil,
+                credits: nil, planType: nil))
+        }
+        // Discover families from `x-<limit>-primary-used-percent` headers.
+        var limitIds = Set<String>()
+        for name in map.keys {
+            let suffix = "-primary-used-percent"
+            guard name.hasSuffix(suffix) else { continue }
+            let prefix = String(name.dropLast(suffix.count))
+            guard prefix.hasPrefix("x-") else { continue }
+            let limit = normalizeLimitId(String(prefix.dropFirst(2)))
+            if limit != "codex" { limitIds.insert(limit) }
+        }
+        for limitId in limitIds.sorted() {
+            guard let snap = parseRateLimits(
+                headerDump: headerDump, limitId: limitId) else { continue }
+            // has_rate_limit_data gate.
+            if snap.primary != nil || snap.secondary != nil
+                || snap.credits != nil {
+                snapshots.append(snap)
+            }
+        }
+        return snapshots
     }
 }
 

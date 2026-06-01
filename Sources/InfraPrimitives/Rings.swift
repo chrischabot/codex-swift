@@ -135,9 +135,11 @@ public final class OverwriteRing<Element: Sendable>: @unchecked Sendable {
 
 // MARK: - HeadTailBuffer (tool/exec output truncation)
 
-/// Bounded head+tail capture with a "… N bytes elided …" marker. Parity with
-/// Codex `utils/output-truncation` / `unified_exec` head_tail_buffer
-/// (hardening §3.2). Prevents a chatty subprocess from exhausting memory.
+/// Bounded head+tail capture with an inline "…N tokens truncated…" marker.
+/// Parity with Codex `utils/string/src/truncate.rs` `format_truncation_marker`
+/// + `assemble_truncated_output` (token policy: removed-byte count is reported
+/// as approximate tokens via ceil(removed_bytes / 4)). Prevents a chatty
+/// subprocess from exhausting memory.
 public struct HeadTailBuffer: Sendable {
     public let maxBytes: Int
     private var head: [UInt8] = []
@@ -179,7 +181,15 @@ public struct HeadTailBuffer: Sendable {
         }
         let h = String(decoding: head, as: UTF8.self)
         let t = String(decoding: tail, as: UTF8.self)
-        return "\(h)\n… \(elided) bytes elided …\n\(t)"
+        // Upstream `format_truncation_marker` (utils/string/src/truncate.rs:131-137)
+        // emits the marker inline (no surrounding newlines) and reports an
+        // approximate *token* count, not a byte count. The token policy used by
+        // exec_command/write_stdin/shell counts removed bytes as
+        // `approx_tokens_from_byte_count` = ceil(removed_bytes / 4)
+        // (truncate.rs:80-83). assemble_truncated_output concatenates
+        // prefix+marker+suffix directly.
+        let elidedTokens = (elided + 3) / 4
+        return "\(h)…\(elidedTokens) tokens truncated…\(t)"
     }
 
     public var totalBytes: Int { total }

@@ -1,6 +1,7 @@
 import XCTest
 @testable import HarnessCore
 @testable import ProtocolModel
+import Tokenizer
 
 final class CompactionHelpersTests: XCTestCase {
 
@@ -73,5 +74,76 @@ final class CompactionHelpersTests: XCTestCase {
         XCTAssertEqual(out.count, 2)
         if case .userMessage(_, let c) = out.last { XCTAssertEqual(c.first?.text, "CTX") }
         else { XCTFail("appended at end when no user messages") }
+    }
+
+    // Finding: third-tier fallback — when no user/summary message exists but a
+    // trailing compaction item does, upstream inserts initial context BEFORE the
+    // compaction item so the compaction item stays last
+    // (`insert_initial_context_before_last_real_user_or_summary`, compact.rs:419).
+    func testInsertInitialContextBeforeTrailingCompactionItem() {
+        let history: [ThreadItem] = [
+            .agentMessage(id: ItemId("a"), text: "assistant"),
+            .contextCompaction(id: ItemId("c")),
+        ]
+        let out = Compaction.insertInitialContext(history, [user("CTX")])
+        XCTAssertEqual(out.count, 3)
+        // Compaction item remains last; initial context inserted before it.
+        guard case .contextCompaction = out.last else {
+            return XCTFail("compaction item must remain last")
+        }
+        guard case .userMessage(_, let c) = out[1] else { return XCTFail("ctx before compaction") }
+        XCTAssertEqual(c.first?.text, "CTX")
+    }
+
+    // A real user message still takes priority over a trailing compaction item.
+    func testInsertInitialContextPrefersUserOverCompaction() {
+        let history: [ThreadItem] = [
+            user("real user"),
+            .contextCompaction(id: ItemId("c")),
+        ]
+        let out = Compaction.insertInitialContext(history, [user("CTX")])
+        XCTAssertEqual(out.count, 3)
+        guard case .userMessage(_, let c0) = out[0] else { return XCTFail() }
+        XCTAssertEqual(c0.first?.text, "CTX", "inserted before the real user message, not the compaction item")
+    }
+
+    // Finding: boundary-message truncation marker must match upstream
+    // `truncate_middle_with_token_budget` ("…N tokens truncated…", token units,
+    // no surrounding newlines) rather than the byte-elision HeadTailBuffer marker.
+    func testTruncateToTokensZeroLimitMarker() {
+        // Ported from upstream `truncate_with_token_budget_reports_truncation_at_zero_limit`.
+        XCTAssertEqual(Compaction.truncateToTokens("abcdef", 0), "…2 tokens truncated…")
+    }
+
+    func testTruncateToTokensUnderLimitReturnsOriginal() {
+        XCTAssertEqual(Compaction.truncateToTokens("short output", 100), "short output")
+    }
+
+    func testTruncateToTokensUtf8() {
+        // Ported from upstream `truncate_middle_tokens_handles_utf8_content`.
+        let s = "😀😀😀😀😀😀😀😀😀😀\nsecond line with text\n"
+        XCTAssertEqual(Compaction.truncateToTokens(s, 8),
+                       "😀😀😀😀…8 tokens truncated… line with text\n")
+    }
+
+    func testTruncateToTokensMarkerHasNoNewlines() {
+        // The marker must not introduce leading/trailing newlines (regression
+        // guard against the prior HeadTailBuffer "\n… bytes elided …\n" form).
+        let out = Compaction.truncateToTokens(String(repeating: "x", count: 200), 4)
+        XCTAssertTrue(out.contains("tokens truncated"))
+        XCTAssertFalse(out.contains("bytes elided"))
+        XCTAssertFalse(out.contains("\n… "))
+    }
+
+    // Finding: config-level model_auto_compact_token_limit min().
+    func testAutoCompactLimitMinsConfigOverride() {
+        let cat = ModelCatalog.default
+        let windowLimit = cat.autoCompactLimit(for: "gpt-5.5")  // (272000*9)/10
+        // No override → window-derived value verbatim.
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-5.5", configOverride: nil), windowLimit)
+        // Override lower than window → override wins (min).
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-5.5", configOverride: 1_000), 1_000)
+        // Override higher than window → window wins (min).
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-5.5", configOverride: 10_000_000), windowLimit)
     }
 }

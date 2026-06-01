@@ -43,19 +43,34 @@ public struct AuthDotJson: Sendable, Equatable, Codable {
     public var openaiAPIKey: String?
     public var tokens: Tokens?
     public var lastRefresh: String?
+    /// Additive (Swift-only) round-trip fidelity fields. Upstream `AuthDotJson`
+    /// does NOT `deny_unknown_fields`, so the real codex CLI silently ignores
+    /// these while still reading the canonical `OPENAI_API_KEY`/`tokens`/
+    /// `last_refresh`. They let the richer runtime `AuthTokens` (explicit
+    /// expiry + `BearerExternal` token type) round-trip losslessly. When a file
+    /// written by UPSTREAM (no extra fields) is read, expiry falls back to the
+    /// id_token JWT `exp` claim — exactly as upstream derives it.
+    public var expiresAt: Int64?
+    public var tokenType: String?
 
     public init(openaiAPIKey: String? = nil,
                 tokens: Tokens? = nil,
-                lastRefresh: String? = nil) {
+                lastRefresh: String? = nil,
+                expiresAt: Int64? = nil,
+                tokenType: String? = nil) {
         self.openaiAPIKey = openaiAPIKey
         self.tokens = tokens
         self.lastRefresh = lastRefresh
+        self.expiresAt = expiresAt
+        self.tokenType = tokenType
     }
 
     private enum CodingKeys: String, CodingKey {
         case openaiAPIKey = "OPENAI_API_KEY"
         case tokens
         case lastRefresh = "last_refresh"
+        case expiresAt = "expires_at"
+        case tokenType = "token_type"
     }
 
     /// Decode auth.json bytes. Throws on JSON parse errors. Empty/whitespace
@@ -94,17 +109,41 @@ extension AuthTokens {
             return AuthTokens(accessToken: key,
                               refreshToken: nil,
                               idToken: nil,
-                              tokenType: "APIKey",
-                              expiresAtUnix: AuthTokens.neverExpires,
+                              tokenType: a.tokenType ?? "APIKey",
+                              expiresAtUnix: a.expiresAt ?? AuthTokens.neverExpires,
                               accountId: a.tokens?.accountId)
         }
         guard let t = a.tokens else { return nil }
+        // Expiry precedence: the additive `expires_at` (our own round-trip) →
+        // the id_token JWT `exp` claim (how UPSTREAM derives it,
+        // login/src/token_data.rs:104-134) → never-expires sentinel.
+        let expiry = a.expiresAt ?? AuthTokens.expFromJWT(t.idToken) ?? AuthTokens.neverExpires
         return AuthTokens(accessToken: t.accessToken,
                           refreshToken: t.refreshToken,
                           idToken: t.idToken,
-                          tokenType: "Bearer",
-                          expiresAtUnix: AuthTokens.neverExpires,
+                          tokenType: a.tokenType ?? "Bearer",
+                          expiresAtUnix: expiry,
                           accountId: t.accountId)
+    }
+
+    /// Extract the `exp` (Unix seconds) claim from a JWT's payload segment.
+    /// Returns nil when `token` is absent or not a parseable JWT with `exp`.
+    static func expFromJWT(_ token: String?) -> Int64? {
+        guard let token, !token.isEmpty else { return nil }
+        let segs = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard segs.count >= 2 else { return nil }
+        // base64url → base64 with padding.
+        var b64 = String(segs[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64.append("=") }
+        guard let data = Data(base64Encoded: b64),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        if let e = obj["exp"] as? Int64 { return e }
+        if let e = obj["exp"] as? Int { return Int64(e) }
+        if let e = obj["exp"] as? Double { return Int64(e) }
+        return nil
     }
 
     public func toAuthDotJson() -> AuthDotJson {
@@ -114,7 +153,11 @@ extension AuthTokens {
             // mode rather than emitting a sentinel entry.
             return AuthDotJson(openaiAPIKey: accessToken,
                                tokens: nil,
-                               lastRefresh: nil)
+                               lastRefresh: nil,
+                               // Only record a non-default expiry/type for the
+                               // additive round-trip when meaningful.
+                               expiresAt: expiresAtUnix == AuthTokens.neverExpires ? nil : expiresAtUnix,
+                               tokenType: "APIKey")
         }
         return AuthDotJson(
             openaiAPIKey: nil,
@@ -122,7 +165,9 @@ extension AuthTokens {
                                        refreshToken: refreshToken,
                                        idToken: idToken,
                                        accountId: accountId),
-            lastRefresh: nil)
+            lastRefresh: nil,
+            expiresAt: expiresAtUnix == AuthTokens.neverExpires ? nil : expiresAtUnix,
+            tokenType: tokenType)
     }
 }
 
@@ -198,19 +243,25 @@ public enum AuthFileLock {
 
 // MARK: - EnvAuth — env-precedence overlay
 
-/// Snapshot of the env-derived auth overlay. Precedence:
-///   1. `CODEX_API_KEY`     — explicit Codex CLI override
-///   2. `OPENAI_API_KEY`    — upstream-compatible API key
-///   3. `CODEX_ACCESS_TOKEN` — pre-minted bearer (no refresh token)
+/// Snapshot of the env-derived auth overlay. Mirrors upstream `load_auth`
+/// (codex-rs/login/src/auth/manager.rs:731-768):
+///   1. `CODEX_API_KEY`      — explicit Codex CLI override, gated by
+///      `enableCodexApiKeyEnv` (the app-server always passes `false`:
+///      app-server/src/lib.rs:470,685,775 and in_process.rs:780).
+///   2. `CODEX_ACCESS_TOKEN`  — agent-identity bearer (no refresh token).
+///
+/// `OPENAI_API_KEY` is intentionally NOT an auth-overlay source: upstream
+/// reads it only via `read_openai_api_key_from_env` (manager.rs:469) for the
+/// request-time model client, never as an account/getAuthStatus auth source.
 ///
 /// Returning `nil` means no overlay is active and the caller should fall
-/// through to the persistent / ephemeral store.
+/// through to the ephemeral / persistent store.
 public enum EnvAuth {
-    public static func loadFromEnv(env: [String: String]) -> AuthDotJson? {
-        if let v = env["CODEX_API_KEY"], !v.isEmpty {
-            return AuthDotJson(openaiAPIKey: v)
-        }
-        if let v = env["OPENAI_API_KEY"], !v.isEmpty {
+    /// - Parameter enableCodexApiKeyEnv: gate for the `CODEX_API_KEY` overlay.
+    ///   Defaults to `false` to match the app-server, which never enables it.
+    public static func loadFromEnv(env: [String: String],
+                                   enableCodexApiKeyEnv: Bool = false) -> AuthDotJson? {
+        if enableCodexApiKeyEnv, let v = env["CODEX_API_KEY"], !v.isEmpty {
             return AuthDotJson(openaiAPIKey: v)
         }
         if let v = env["CODEX_ACCESS_TOKEN"], !v.isEmpty {
@@ -225,7 +276,7 @@ public enum EnvAuth {
 // MARK: - LoginShadowedByEnvError
 
 /// Thrown by `loginWithAPIKey` / `loginWithExternalChatGPTTokens` / `logout`
-/// when an env overlay (`CODEX_API_KEY`, `OPENAI_API_KEY`, or
+/// when an env overlay (`CODEX_API_KEY` — when enabled — or
 /// `CODEX_ACCESS_TOKEN`) is currently active. The persistent store *was*
 /// updated; the caller is warned that the running process will still see the
 /// env-overlay credential until the offending variable is unset.
@@ -252,10 +303,14 @@ public struct LoginShadowedByEnvError: Error, Sendable, Equatable,
     }
 
     /// Probe which env var (if any) is currently shadowing. Matches the
-    /// same precedence as `EnvAuth.loadFromEnv`.
-    public static func shadowingVar(env: [String: String]) -> String? {
-        if let v = env["CODEX_API_KEY"], !v.isEmpty { return "CODEX_API_KEY" }
-        if let v = env["OPENAI_API_KEY"], !v.isEmpty { return "OPENAI_API_KEY" }
+    /// same gated precedence as `EnvAuth.loadFromEnv`: `CODEX_API_KEY` only
+    /// counts when `enableCodexApiKeyEnv` is set, and `OPENAI_API_KEY` is not
+    /// an auth-overlay source.
+    public static func shadowingVar(env: [String: String],
+                                    enableCodexApiKeyEnv: Bool = false) -> String? {
+        if enableCodexApiKeyEnv, let v = env["CODEX_API_KEY"], !v.isEmpty {
+            return "CODEX_API_KEY"
+        }
         if let v = env["CODEX_ACCESS_TOKEN"], !v.isEmpty {
             return "CODEX_ACCESS_TOKEN"
         }

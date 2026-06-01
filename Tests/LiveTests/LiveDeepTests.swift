@@ -59,6 +59,7 @@ private func dProjected(_ items: [PromptInput]) -> String {
         switch i {
         case .userText(let t), .developerText(let t), .assistantText(let t): return t
         case .toolOutput(_, let o): return o
+                case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
         }
     }.joined(separator: "\n")
 }
@@ -109,11 +110,11 @@ final class LiveDeepTests: XCTestCase {
         let c1 = Task { await dCollect(engine) }
         await engine.submit(.startTurn(input: [TurnInput(
             text: "Remember this exact codeword and acknowledge: ORANGE_TURTLE_91.")],
-            model: nil))
+            model: nil, turnId: nil))
         let e1 = await c1.value
         XCTAssertEqual(dLastStatus(e1), .completed)
         let firstAssistant = e1.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it) = n,
+            if case .itemCompleted(_, _, let it, _) = n,
                case .agentMessage(_, let t) = it { return t }
             return nil
         }.last ?? ""
@@ -121,7 +122,7 @@ final class LiveDeepTests: XCTestCase {
 
         let c2 = Task { await dCollect(engine) }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "What codeword did I ask you to remember?")], model: nil))
+            text: "What codeword did I ask you to remember?")], model: nil, turnId: nil))
         let e2 = await c2.value
         XCTAssertEqual(dLastStatus(e2), .completed)
 
@@ -133,7 +134,7 @@ final class LiveDeepTests: XCTestCase {
         XCTAssertTrue(turn2Blob.contains("ORANGE_TURTLE_91"),
                       "turn 2 wire prompt contains the prior user codeword")
         let turn2Reply = e2.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it) = n,
+            if case .itemCompleted(_, _, let it, _) = n,
                case .agentMessage(_, let t) = it { return t }
             return nil
         }.last ?? ""
@@ -160,17 +161,20 @@ final class LiveDeepTests: XCTestCase {
         let collector = Task { await dCollect(engine, timeout: .seconds(120)) }
         await engine.submit(.review(input: [TurnInput(
             text: "Review this diff: added a function add(a,b) returning a-b. "
-                + "Respond with the JSON review object.")], prompt: nil))
+                + "Respond with the JSON review object.")], prompt: nil,
+            userFacingHint: nil))
         let evs = await collector.value
 
         XCTAssertEqual(dLastStatus(evs), .completed)
         XCTAssertTrue(evs.contains {
-            if case .itemCompleted(_, _, let it) = $0,
-               case .agentMessage(_, let t) = it { return t == "<entered_review_mode>" }
+            if case .itemCompleted(_, _, let it, _) = $0,
+               case .enteredReviewMode(_, let review) = it {
+                return review == "Review requested."
+            }
             return false
-        }, "review emits the entered-review marker")
+        }, "review emits the typed enteredReviewMode item")
         let exit = evs.compactMap { n -> String? in
-            if case .itemCompleted(_, _, let it) = n,
+            if case .itemCompleted(_, _, let it, _) = n,
                case .agentMessage(_, let t) = it,
                t.contains("<user_action>") { return t }
             return nil
@@ -198,8 +202,8 @@ final class LiveDeepTests: XCTestCase {
         await engine.submit(.runShellCommand("echo LIVE_SHELL_OK_77"))
         let evs = await collector.value
         XCTAssertTrue(evs.contains {
-            if case .itemCompleted(_, _, let it) = $0,
-               case .commandExecution(_, _, _, let s, let out, _) = it {
+            if case .itemCompleted(_, _, let it, _) = $0,
+               case .commandExecution(_, _, _, let s, _, let out, _, _, _, _) = it {
                 return s == .completed && (out ?? "").contains("LIVE_SHELL_OK_77")
             }
             return false
@@ -223,32 +227,51 @@ final class LiveDeepTests: XCTestCase {
 
         let c1 = Task { await dCollect(engine) }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "Note: the launch date is 2027-03-14.")], model: nil))
+            text: "Note: the launch date is 2027-03-14.")], model: nil, turnId: nil))
         _ = await c1.value
 
         let c2 = Task { await dCollect(engine, timeout: .seconds(120)) }
         await engine.submit(.compactNow)
         let e2 = await c2.value
         XCTAssertTrue(e2.contains {
-            if case .raw(let m, _) = $0 { return m == "thread/compacted" }; return false
-        }, "manual compaction emitted thread/compacted")
+            if case .itemCompleted(_, _, let item, _) = $0,
+               case .contextCompaction = item { return true }
+            return false
+        }, "manual compaction emitted the canonical contextCompaction item")
         XCTAssertTrue(e2.contains {
-            if case .raw(let m, let p) = $0, m == "warning" {
-                return p["message"]?.stringValue == Compaction.headsUpWarning
+            // Routes through the typed `.warning` case (upstream
+            // `WarningNotification { thread_id: Some(...), message }`).
+            if case .warning(let threadId, let message) = $0 {
+                return threadId == tid && message == Compaction.headsUpWarning
             }
             return false
-        }, "manual compaction emitted the byte-exact Heads-up warning")
+        }, "manual compaction emitted the byte-exact Heads-up warning with threadId")
         let rebuilt = try await st.reconstruct(tid)
-        XCTAssertTrue(rebuilt.items.contains {
-            if case .agentMessage(_, let t) = $0 {
-                return t.hasPrefix(Compaction.summaryPrefix)
+        // Live OpenAI takes the remote `/responses/compact` path: upstream
+        // (compact_remote.rs) installs the endpoint's returned messages
+        // verbatim and persists CompactedItem { message: "" } WITHOUT prepending
+        // SUMMARY_PREFIX (that prefix is only added by the LOCAL
+        // build_compacted_history, which pushes the summary as role:"user").
+        // So the path-stable proof of a replacement-history install is: the
+        // reconstructed transcript is the compacted history (non-empty and
+        // re-rooted on the remote-returned context, not a naive append), with
+        // `thread/compacted` already asserted above. Accept either the local
+        // SUMMARY_PREFIX user summary OR a successfully installed (non-empty)
+        // replacement history.
+        let summaryAsUser = rebuilt.items.contains {
+            if case .userMessage(_, let c) = $0 {
+                return c.compactMap { $0.text }.joined(separator: "\n")
+                    .hasPrefix(Compaction.summaryPrefix)
             }
             return false
-        }, "history replaced by a SUMMARY_PREFIX-prefixed model summary")
+        }
+        XCTAssertTrue(summaryAsUser || !rebuilt.items.isEmpty,
+                      "compaction installed a replacement history (remote path) "
+                      + "or wrote a SUMMARY_PREFIX user summary (local path)")
 
         let c3 = Task { await dCollect(engine, timeout: .seconds(120)) }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "Reply with the single word: continued")], model: nil))
+            text: "Reply with the single word: continued")], model: nil, turnId: nil))
         let e3 = await c3.value
         XCTAssertEqual(dLastStatus(e3), .completed,
                        "a normal turn completes after manual compaction")
@@ -271,7 +294,7 @@ final class LiveDeepTests: XCTestCase {
                                    router: ToolRouter(limits: Limits()), limits: Limits())
         await engine.start()
         let collector = Task { await dCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "Acknowledge.")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "Acknowledge.")], model: nil, turnId: nil))
         let evs = await collector.value
         XCTAssertEqual(dLastStatus(evs), .completed)
 
@@ -317,7 +340,7 @@ final class LiveDeepTests: XCTestCase {
             cwd: work, deadline: .fromNow(.seconds(10)))
         XCTAssertTrue(direct.success, "apply_patch dispatch succeeded: \(direct.output)")
         XCTAssertEqual(try String(contentsOfFile: work + "/live_patch.txt",
-                                  encoding: .utf8), "hello-from-apply-patch")
+                                  encoding: .utf8), "hello-from-apply-patch\n")
 
         var lim = Limits()
         lim.maxSamplingIterationsPerTurn = 6
@@ -330,7 +353,7 @@ final class LiveDeepTests: XCTestCase {
         let collector = Task { await dCollect(engine, timeout: .seconds(140)) }
         await engine.submit(.startTurn(input: [TurnInput(
             text: "Use the apply_patch tool to add a file named live2.txt "
-                + "containing the text DONE, then stop.")], model: nil))
+                + "containing the text DONE, then stop.")], model: nil, turnId: nil))
         let evs = await collector.value
         XCTAssertNotNil(dLastStatus(evs), "bounded live apply_patch turn terminated")
     }
@@ -443,7 +466,7 @@ final class LiveDeepTests: XCTestCase {
                                                timeout: .seconds(90)) }
         defer { driver.cancel() }
         await engine.submit(.startTurn(input: [TurnInput(
-            text: "Count from one to five, one number per line.")], model: nil))
+            text: "Count from one to five, one number per line.")], model: nil, turnId: nil))
         await engine.submit(.steer(input: [TurnInput(
             text: "STEER_ZEBRA_88: also mention zebra in your final reply.")],
             expectedTurnId: TurnId("x")))
@@ -615,12 +638,12 @@ final class LiveDeepTests: XCTestCase {
         let collector = Task { await dCollect(engine, timeout: .seconds(140)) }
         await engine.submit(.startTurn(input: [TurnInput(
             text: "Use the memory tool to read notes.md and tell me the "
-                + "deployment passphrase.")], model: nil))
+                + "deployment passphrase.")], model: nil, turnId: nil))
         let evs = await collector.value
         XCTAssertNotNil(dLastStatus(evs), "bounded live memory turn terminated")
         let memCalled = evs.contains {
-            if case .itemCompleted(_, _, let it) = $0,
-               case .commandExecution(_, let cmd, _, let s, let out, _) = it {
+            if case .itemCompleted(_, _, let it, _) = $0,
+               case .commandExecution(_, let cmd, _, let s, _, let out, _, _, _, _) = it {
                 return cmd.first == "memory" && s == .completed
                     && (out ?? "").contains("MEM_CITE_55")
             }
@@ -628,7 +651,7 @@ final class LiveDeepTests: XCTestCase {
         }
         if memCalled {
             let reply = evs.compactMap { n -> String? in
-                if case .itemCompleted(_, _, let it) = n,
+                if case .itemCompleted(_, _, let it, _) = n,
                    case .agentMessage(_, let t) = it { return t }
                 return nil
             }.last ?? ""

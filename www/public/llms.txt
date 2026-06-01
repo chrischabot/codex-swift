@@ -1,0 +1,40 @@
+# Diminuendo
+
+> Diminuendo is a Fabric-native conversation surface for coding agents. The
+> shadcn-stack web client renders live agent streams: text, code, tool
+> calls, diffs, plans, approvals, sub-agents, sandboxes, compaction.
+
+## Docs
+
+- [README](README.md): project intent, stack, layout, routes, hookup notes.
+- [Codex.app visual reference](https://github.com/openai/codex): the
+  decompiled production client whose look this UI replicates pixel-for-pixel.
+- [Fabric core](https://github.com/igentai/fabric-core): canonical types
+  for `PresentationBlock`, `IngressInputPart`, and stream events.
+
+## Surfaces
+
+- [/](.): project picker and first-turn composer.
+- [/thread/:id](thread): live virtualized message stream with the
+  Review / Browser / Git / Plan / Inbox side panel.
+- [/plugins](plugins): gallery of integrations.
+- [/plugins/manage](plugins/manage): Apps / MCPs / Skills / Marketplace
+  configuration.
+- [/automations](automations): scheduled chats with templates and run
+  history.
+- [/settings](settings): theme, models, shortcuts, account, data controls.
+
+## Block kinds rendered in chat
+
+markdown, thinking, summary, code, code-result, shell, mermaid, json,
+tool-call, tool-result, diff, diff-summary, attachments, image, audio,
+video, document, ref, citations, approval, question, plan, mission,
+compaction, sandbox, sub-agent, web-fetch, browser-action, error,
+token-usage, model-switch, section-heading.
+
+## Backend
+
+Diminuendo connects to a Fabric gateway via WebSocket (default
+`ws://127.0.0.1:8001`). The Connector seam at `src/runtime/connector.ts`
+isolates the UI from the transport; swap `MockConnector` for
+`DiminuendoConnector` to go live.

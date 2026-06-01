@@ -163,12 +163,14 @@ final class ModelProviderTests: XCTestCase {
     }
 
     func testParseRateLimitsHeaderFamily() {
+        // `resets_at` is an i64 unix timestamp upstream (RateLimitWindow), so
+        // the header carries an integer, not an ISO-8601 string.
         let dump = """
         HTTP/2 200
         content-type: text/event-stream
         x-codex-primary-used-percent: 42.5
         x-codex-primary-window-minutes: 60
-        x-codex-primary-reset-at: 2026-01-01T00:00:00Z
+        x-codex-primary-reset-at: 1704069000
         x-codex-secondary-used-percent: 10
         x-codex-limit-name: codex
         """
@@ -176,7 +178,7 @@ final class ModelProviderTests: XCTestCase {
         XCTAssertNotNil(snap)
         XCTAssertEqual(snap?.primary?.usedPercent, 42.5)
         XCTAssertEqual(snap?.primary?.windowMinutes, 60)
-        XCTAssertEqual(snap?.primary?.resetAt, "2026-01-01T00:00:00Z")
+        XCTAssertEqual(snap?.primary?.resetAt, 1704069000)
         XCTAssertEqual(snap?.secondary?.usedPercent, 10)
         XCTAssertNil(snap?.secondary?.windowMinutes)
         XCTAssertNil(snap?.secondary?.resetAt)
@@ -185,6 +187,94 @@ final class ModelProviderTests: XCTestCase {
         let none = RateLimitSnapshot.parseRateLimits(
             headerDump: "HTTP/2 200\ncontent-type: text/plain")
         XCTAssertNil(none)
+    }
+
+    func testParseRateLimitsHasDataGateSuppressesBareZero() {
+        // Upstream `parse_rate_limit_window` has_data gate: a bare 0.0
+        // used-percent with no window/reset must NOT yield a window.
+        let dump = """
+        HTTP/2 200
+        x-codex-primary-used-percent: 0
+        """
+        let snap = RateLimitSnapshot.parseRateLimits(headerDump: dump)
+        XCTAssertNil(snap, "bare 0 used-percent must be gated out (has_data == false)")
+    }
+
+    func testParseAllRateLimitsDiscoversSecondaryFamilies() {
+        // `parse_all_rate_limits` discovers every family via the
+        // `x-<limit>-primary-used-percent` suffix and emits one snapshot each.
+        let dump = """
+        HTTP/2 200
+        x-codex-primary-used-percent: 12.5
+        x-codex-primary-window-minutes: 60
+        x-codex-primary-reset-at: 1704069000
+        x-codex-secondary-bengalfox-primary-used-percent: 80
+        x-codex-secondary-bengalfox-primary-window-minutes: 1440
+        x-codex-secondary-bengalfox-primary-reset-at: 1704074400
+        """
+        let snaps = RateLimitSnapshot.parseAllRateLimits(headerDump: dump)
+        XCTAssertEqual(snaps.count, 2, "default codex + one secondary family")
+        XCTAssertEqual(snaps.first?.limitId, "codex")
+        XCTAssertEqual(snaps.first?.primary?.usedPercent, 12.5)
+        let secondary = snaps.first(where: { $0.limitId == "codex_secondary_bengalfox" })
+        XCTAssertNotNil(secondary, "secondary metered family must be discovered")
+        XCTAssertEqual(secondary?.primary?.usedPercent, 80)
+        XCTAssertEqual(secondary?.primary?.windowMinutes, 1440)
+        XCTAssertEqual(secondary?.primary?.resetAt, 1704074400)
+    }
+
+    func testParseAllRateLimitsIncludesDefaultCodexSnapshot() {
+        // v10 finding: upstream `parse_all_rate_limits` ALWAYS pushes a default
+        // `codex` snapshot (rate_limits.rs:27-31) because
+        // `parse_rate_limit_for_limit` returns `Some` even when every window is
+        // None (rate_limits.rs:89). The `has_rate_limit_data` gate applies only
+        // to ADDITIONAL discovered families. With NO rate-limit headers present,
+        // the result must be exactly one all-None `codex` snapshot — never
+        // empty (test parse_all_rate_limits_includes_default_codex_snapshot,
+        // rate_limits.rs:354-367).
+        let dump = "HTTP/2 200\r\n"
+        let snaps = RateLimitSnapshot.parseAllRateLimits(headerDump: dump)
+        XCTAssertEqual(snaps.count, 1, "empty headers must still yield the default codex snapshot")
+        XCTAssertEqual(snaps.first?.limitId, "codex")
+        XCTAssertNil(snaps.first?.limitName)
+        XCTAssertNil(snaps.first?.primary)
+        XCTAssertNil(snaps.first?.secondary)
+        XCTAssertNil(snaps.first?.credits)
+        XCTAssertNil(snaps.first?.planType)
+    }
+
+    func testProviderStreamIdleTimeoutDefaultsToFiveMinutes() {
+        // v10 finding: per-event SSE idle timeout, exposed as a provider
+        // property mirroring upstream `ModelProviderInfo::stream_idle_timeout`
+        // (provider.rs:49). Config default is 300_000 ms / 5m
+        // (config_tests.rs:7536).
+        let p = ModelProvider(id: "openai", name: "OpenAI", baseURL: "https://x")
+        XCTAssertEqual(p.streamIdleTimeout, .seconds(300))
+        XCTAssertEqual(ModelProvider.openAI.streamIdleTimeout, .seconds(300))
+        let custom = ModelProvider(id: "x", name: "X", baseURL: "https://x",
+                                   streamIdleTimeout: .seconds(9))
+        XCTAssertEqual(custom.streamIdleTimeout, .seconds(9))
+    }
+
+    func testParseRateLimitsCapturesCreditsButNotPlanType() {
+        // v9 finding 5: upstream `parse_rate_limit_for_limit`
+        // (`rate_limits.rs:88-97`) always sets `plan_type: None` on a
+        // header-derived snapshot — plan_type is only populated by the
+        // `codex.rate_limits` SSE event. Credits ARE still parsed from headers.
+        let dump = """
+        HTTP/2 200
+        x-codex-primary-used-percent: 5
+        x-codex-credits-has-credits: true
+        x-codex-credits-unlimited: false
+        x-codex-credits-balance: 42.50
+        x-codex-plan-type: pro
+        """
+        let snap = RateLimitSnapshot.parseRateLimits(headerDump: dump)
+        XCTAssertEqual(snap?.credits?.hasCredits, true)
+        XCTAssertEqual(snap?.credits?.unlimited, false)
+        XCTAssertEqual(snap?.credits?.balance, "42.50")
+        XCTAssertNil(snap?.planType,
+                     "header-derived snapshot must never carry plan_type (rate_limits.rs:95)")
     }
 
     func testUsageTrackerLastWriteWins() async {
@@ -262,8 +352,9 @@ final class ModelProviderTests: XCTestCase {
         XCTAssertEqual(request["prompt_cache_key"] as? String, "thread-123")
         XCTAssertEqual(request["previous_response_id"] as? String, "resp_previous")
         XCTAssertEqual(request["max_output_tokens"] as? Int, 128)
-        XCTAssertNil(request["stream"],
-                     "WebSocket response.create frames omit HTTP/SSE stream")
+        XCTAssertEqual(request["stream"] as? Bool, true,
+                       "WS response.create carries stream:true like upstream "
+                       + "ResponseCreateWsRequest (common.rs:216-240)")
         XCTAssertNil(request["generate"],
                      "only the prewarm frame may set generate=false")
         XCTAssertNil(request["x_codex_turn_state"],
@@ -278,8 +369,8 @@ final class ModelProviderTests: XCTestCase {
         XCTAssertEqual(prewarm["previous_response_id"] as? String, "resp_previous")
         XCTAssertEqual(prewarm["generate"] as? Bool, false,
                        "WS prewarm must use response.create generate=false")
-        XCTAssertNil(prewarm["stream"],
-                     "WebSocket prewarm frames omit HTTP/SSE stream")
+        XCTAssertEqual(prewarm["stream"] as? Bool, true,
+                       "WS prewarm (generate=false) also carries stream:true")
     }
 
     func testWebSocketRequestPlanOmitsOptionalHeadersAndPrewarmWhenDisabled() throws {
@@ -310,7 +401,9 @@ final class ModelProviderTests: XCTestCase {
         XCTAssertNil(request["previous_response_id"])
         XCTAssertNil(request["max_output_tokens"])
         XCTAssertNil(request["generate"])
-        XCTAssertNil(request["stream"])
+        XCTAssertEqual(request["stream"] as? Bool, true,
+                       "WS response.create carries stream:true even with "
+                       + "optional fields disabled")
     }
 #endif
 
@@ -483,10 +576,17 @@ final class ModelProviderTests: XCTestCase {
                        "Repeated calls must return the same id — upstream `resolve_installation_id` is idempotent.")
     }
 
-    func testRequestBodyIncludesStoreDefaultTrue() {
+    func testRequestBodyIncludesStoreDefaultFalse() {
+        // v9 finding 2: upstream `build_responses_request`
+        // (`core/src/client.rs:754`) sends `store: provider.is_azure_responses_endpoint()`,
+        // i.e. `false` for the standard OpenAI provider. The default is now
+        // false; the `previous_response_id` → `store:true` coupling (which the
+        // turn loop relies on for sticky chaining, avoiding the HTTP 400
+        // `previous_response_not_found` cat-scan finding) is preserved
+        // separately and exercised by `testPreviousResponseIdForcesStoreTrue`.
         let body = defaultBody()
-        XCTAssertEqual(body["store"] as? Bool, true,
-                       "Default `store` is true: OpenAI Responses API requires stored responses for `previous_response_id` chaining. Cat-scan verification surfaced HTTP 400 `previous_response_not_found` when this defaulted false.")
+        XCTAssertEqual(body["store"] as? Bool, false,
+                       "Default `store` is false for the standard OpenAI provider (upstream client.rs:754).")
     }
 
     func testRequestBodyHonorsStoreOverride() {
@@ -540,6 +640,111 @@ final class ModelProviderTests: XCTestCase {
         XCTAssertEqual(body["tool_choice"] as? String, "required",
                        "Caller-supplied tool_choice (`required`, `none`, etc.) must override the default.")
     }
+
+    // MARK: - Finding: function tools always emit `strict`, never `output_schema`
+
+    func testFunctionToolEmitsStrictAndNeverOutputSchema() {
+        // Upstream `ResponsesApiTool`: `strict` is non-skippable (always
+        // serialized) and `output_schema` is `#[serde(skip)]` (never sent).
+        let spec = ToolSpec(name: "edit", description: "edits",
+                            parametersJSON: #"{"type":"object","properties":{}}"#,
+                            outputSchemaJSON: #"{"type":"object","required":["ok"]}"#)
+        let prompt = Prompt(instructions: "i", input: [.userText("hi")], tools: [spec])
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, ModelSettings(model: "gpt", threadId: "t"), maxOutputTokens: nil)
+        let tool = (body["tools"] as? [[String: Any]])?.first
+        XCTAssertEqual(tool?["strict"] as? Bool, false,
+                       "every function tool must serialize `strict` (default false)")
+        XCTAssertNil(tool?["output_schema"],
+                     "output_schema is #[serde(skip)] upstream — must never be sent on the wire")
+    }
+
+    func testFunctionToolStrictHonorsSpec() {
+        let spec = ToolSpec(name: "edit", description: "edits",
+                            parametersJSON: #"{"type":"object"}"#,
+                            strict: true)
+        let prompt = Prompt(instructions: "i", input: [.userText("hi")], tools: [spec])
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, ModelSettings(model: "gpt", threadId: "t"), maxOutputTokens: nil)
+        let tool = (body["tools"] as? [[String: Any]])?.first
+        XCTAssertEqual(tool?["strict"] as? Bool, true)
+    }
+
+    // MARK: - Finding: instructions skipped when empty
+
+    func testInstructionsOmittedWhenEmpty() {
+        let prompt = Prompt(instructions: "", input: [.userText("hi")])
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, ModelSettings(model: "gpt", threadId: "t"), maxOutputTokens: nil)
+        XCTAssertNil(body["instructions"],
+                     "empty instructions must be omitted (skip_serializing_if = String::is_empty)")
+    }
+
+    func testInstructionsPresentWhenNonEmpty() {
+        let prompt = Prompt(instructions: "sys", input: [.userText("hi")])
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, ModelSettings(model: "gpt", threadId: "t"), maxOutputTokens: nil)
+        XCTAssertEqual(body["instructions"] as? String, "sys")
+    }
+
+    // MARK: - Finding: catalog reasoning/verbosity gating
+
+    func testReasoningSuppressedForNonReasoningModel() {
+        // supportsReasoningSummaries == false → reasoning suppressed even when
+        // the caller supplies an effort (upstream `build_reasoning` → None).
+        let prompt = Prompt(instructions: "s", input: [.userText("hi")])
+        let settings = ModelSettings(
+            model: "gpt-4o", threadId: "t",
+            reasoningEffort: "high",
+            supportsReasoningSummaries: false)
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, settings, maxOutputTokens: nil)
+        XCTAssertTrue(body["reasoning"] is NSNull,
+                      "non-reasoning model must send reasoning: null")
+        XCTAssertEqual(body["include"] as? [String], [],
+                       "include must be empty when reasoning is suppressed")
+    }
+
+    func testReasoningDefaultsEffortFromCatalogForReasoningModel() {
+        // supportsReasoningSummaries == true with no caller effort → reasoning
+        // object emitted with the catalog default level + encrypted include.
+        let prompt = Prompt(instructions: "s", input: [.userText("hi")])
+        let settings = ModelSettings(
+            model: "gpt-5.5", threadId: "t",
+            supportsReasoningSummaries: true,
+            defaultReasoningLevel: "medium")
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, settings, maxOutputTokens: nil)
+        let reasoning = body["reasoning"] as? [String: Any]
+        XCTAssertEqual(reasoning?["effort"] as? String, "medium",
+                       "effort must default to the catalog default_reasoning_level")
+        XCTAssertEqual(body["include"] as? [String], ["reasoning.encrypted_content"],
+                       "include must carry encrypted reasoning when reasoning is active")
+    }
+
+    func testVerbositySuppressedWhenModelDoesNotSupportIt() {
+        let prompt = Prompt(instructions: "s", input: [.userText("hi")])
+        let settings = ModelSettings(
+            model: "gpt-4o", threadId: "t",
+            textVerbosity: "high",
+            supportVerbosity: false)
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, settings, maxOutputTokens: nil)
+        XCTAssertNil(body["text"],
+                     "verbosity must be dropped for models that do not support it")
+    }
+
+    func testVerbosityEmittedWhenModelSupportsIt() {
+        let prompt = Prompt(instructions: "s", input: [.userText("hi")])
+        let settings = ModelSettings(
+            model: "gpt-5.5", threadId: "t",
+            textVerbosity: "low",
+            supportVerbosity: true)
+        let body = OpenAIResponsesClient.buildRequestBody(
+            prompt, settings, maxOutputTokens: nil)
+        XCTAssertEqual((body["text"] as? [String: Any])?["verbosity"] as? String, "low")
+    }
+
 
     private func decodeJSONDictionary(_ json: String) throws -> [String: Any] {
         let object = try JSONSerialization.jsonObject(with: Data(json.utf8))

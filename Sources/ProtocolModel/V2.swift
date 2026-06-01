@@ -15,7 +15,7 @@ public enum Method {
         "thread/unsubscribe", "thread/increment_elicitation",
         "thread/decrement_elicitation", "thread/name/set", "thread/goal/set",
         "thread/goal/get", "thread/goal/clear", "thread/metadata/update",
-        "thread/memoryMode/set", "memory/reset", "thread/unarchive",
+        "thread/memoryMode/set", "memory/reset", "thread/unarchive", "thread/pin/set", "git/action", "automation/action",
         "thread/compact/start", "thread/shellCommand",
         "thread/approveGuardianDeniedAction", "thread/backgroundTerminals/clean",
         "thread/rollback", "thread/list", "thread/loaded/list", "thread/read",
@@ -23,6 +23,9 @@ public enum Method {
         // skills / hooks / marketplace / plugins / apps
         "skills/list", "skills/config/write", "hooks/list",
         "marketplace/add", "marketplace/remove", "marketplace/upgrade",
+        // `plugin/installed` is a deliberate port marketplace extension (real
+        // handler in RequestRouter + GenericResponses); it must stay in the
+        // known-method set or dispatch rejects it before the handler runs.
         "plugin/list", "plugin/installed", "plugin/read", "plugin/skill/read",
         "plugin/share/save", "plugin/share/updateTargets", "plugin/share/list",
         "plugin/share/checkout", "plugin/share/delete", "plugin/install",
@@ -157,8 +160,52 @@ public struct ThreadForkParams: Sendable, Codable, Equatable {
     public var developerInstructions: String?
     public var modelProvider: String?
     public var sandbox: String?
-    public var serviceTier: String?
+    /// Upstream `ThreadForkParams.service_tier: Option<Option<String>>`
+    /// (app-server-protocol/v2/thread.rs:378) with `deserialize_double_option`
+    /// / `serialize_double_option` + `skip_serializing_if = Option::is_none`.
+    /// Three-state: `.none` = field absent (inherit), `.some(nil)` = explicit
+    /// `null` (clear/override to no tier), `.some(value)` = set tier.
+    public var serviceTier: String??
     public var threadSource: String?
+    enum CodingKeys: String, CodingKey {
+        case threadId, cwd, model, ephemeral, approvalPolicy, approvalsReviewer,
+             baseInstructions, config, developerInstructions, modelProvider,
+             sandbox, serviceTier, threadSource
+    }
+    public init(from d: any Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        threadId = try c.decode(ThreadId.self, forKey: .threadId)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        ephemeral = try c.decodeIfPresent(Bool.self, forKey: .ephemeral)
+        approvalPolicy = try c.decodeIfPresent(JSONValue.self, forKey: .approvalPolicy)
+        approvalsReviewer = try c.decodeIfPresent(String.self, forKey: .approvalsReviewer)
+        baseInstructions = try c.decodeIfPresent(String.self, forKey: .baseInstructions)
+        config = try c.decodeIfPresent(JSONValue.self, forKey: .config)
+        developerInstructions = try c.decodeIfPresent(String.self, forKey: .developerInstructions)
+        modelProvider = try c.decodeIfPresent(String.self, forKey: .modelProvider)
+        sandbox = try c.decodeIfPresent(String.self, forKey: .sandbox)
+        if c.contains(.serviceTier) {
+            serviceTier = .some(try c.decodeIfPresent(String.self, forKey: .serviceTier))
+        } else { serviceTier = .none }
+        threadSource = try c.decodeIfPresent(String.self, forKey: .threadSource)
+    }
+    public func encode(to e: any Encoder) throws {
+        var c = e.container(keyedBy: CodingKeys.self)
+        try c.encode(threadId, forKey: .threadId)
+        try c.encodeIfPresent(cwd, forKey: .cwd)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(ephemeral, forKey: .ephemeral)
+        try c.encodeIfPresent(approvalPolicy, forKey: .approvalPolicy)
+        try c.encodeIfPresent(approvalsReviewer, forKey: .approvalsReviewer)
+        try c.encodeIfPresent(baseInstructions, forKey: .baseInstructions)
+        try c.encodeIfPresent(config, forKey: .config)
+        try c.encodeIfPresent(developerInstructions, forKey: .developerInstructions)
+        try c.encodeIfPresent(modelProvider, forKey: .modelProvider)
+        try c.encodeIfPresent(sandbox, forKey: .sandbox)
+        if case .some(let v) = serviceTier { try c.encode(v, forKey: .serviceTier) }
+        try c.encodeIfPresent(threadSource, forKey: .threadSource)
+    }
 }
 public struct ThreadArchiveParams: Sendable, Codable, Equatable { public var threadId: ThreadId }
 public struct ThreadUnarchiveParams: Sendable, Codable, Equatable { public var threadId: ThreadId }
@@ -173,6 +220,27 @@ public struct ThreadUnsubscribeResponse: Sendable, Codable, Equatable {
 public struct ThreadSetNameParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId
     public var name: String
+}
+public struct ThreadPinSetParams: Sendable, Codable, Equatable {
+    public var threadId: ThreadId
+    public var pinned: Bool
+}
+public struct GitActionParams: Sendable, Codable, Equatable {
+    public var threadId: ThreadId
+    public var action: String   // status | commit | commitPush | push | pr | revert
+    public var message: String?
+    public var title: String?
+    public var body: String?
+}
+public struct AutomationActionParams: Sendable, Codable, Equatable {
+    public var action: String   // list | create | update | delete | run
+    public var id: String?
+    public var name: String?
+    public var schedule: String?
+    public var prompt: String?
+    public var enabled: Bool?
+    public var cwd: String?
+    public var model: String?
 }
 public struct ThreadCompactStartParams: Sendable, Codable, Equatable { public var threadId: ThreadId }
 public struct ThreadShellCommandParams: Sendable, Codable, Equatable {
@@ -210,18 +278,51 @@ public struct ModelListParams: Sendable, Codable, Equatable {
     public var limit: Int?
     public var includeHidden: Bool?
 }
+/// Upstream `ReasoningEffort` (protocol/src/openai_models.rs:44), serialized
+/// lowercase. `xhigh` is the highest tier.
+public enum ReasoningEffort: String, Sendable, Codable, Equatable, CaseIterable {
+    case none, minimal, low, medium, high, xhigh
+}
+
+/// Upstream `ReasoningEffortOption` (v2/model.rs:118): `{ reasoningEffort,
+/// description }`.
+public struct ReasoningEffortOption: Sendable, Codable, Equatable {
+    public var reasoningEffort: ReasoningEffort
+    public var description: String
+    public init(reasoningEffort: ReasoningEffort, description: String) {
+        self.reasoningEffort = reasoningEffort; self.description = description
+    }
+}
+
 public struct ModelInfo: Sendable, Codable, Equatable {
     public var id: String
     public var model: String
     public var displayName: String
     public var description: String
     public var hidden: Bool
+    /// Required upstream (`model/list` `Model`): the reasoning-effort options
+    /// the model supports and the default selection.
+    public var supportedReasoningEfforts: [ReasoningEffortOption]
+    public var defaultReasoningEffort: ReasoningEffort
     public var isDefault: Bool
     public init(id: String, model: String, displayName: String, description: String,
-                hidden: Bool, isDefault: Bool) {
+                hidden: Bool,
+                supportedReasoningEfforts: [ReasoningEffortOption] = ModelInfo.defaultReasoningOptions,
+                defaultReasoningEffort: ReasoningEffort = .medium,
+                isDefault: Bool) {
         self.id = id; self.model = model; self.displayName = displayName
-        self.description = description; self.hidden = hidden; self.isDefault = isDefault
+        self.description = description; self.hidden = hidden
+        self.supportedReasoningEfforts = supportedReasoningEfforts
+        self.defaultReasoningEffort = defaultReasoningEffort
+        self.isDefault = isDefault
     }
+    /// Default reasoning-effort options surfaced for models that don't declare
+    /// a specific set (low/medium/high), with `medium` as the default.
+    public static let defaultReasoningOptions: [ReasoningEffortOption] = [
+        ReasoningEffortOption(reasoningEffort: .low, description: "Fastest responses with limited reasoning."),
+        ReasoningEffortOption(reasoningEffort: .medium, description: "Balanced reasoning and speed."),
+        ReasoningEffortOption(reasoningEffort: .high, description: "Most thorough reasoning."),
+    ]
 }
 public struct ModelListResponse: Sendable, Codable, Equatable {
     public var data: [ModelInfo]

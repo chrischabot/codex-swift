@@ -34,6 +34,16 @@ public actor AuthRefreshingModelClient: ModelClient {
         }
     }
 
+    public func compactConversationHistory(_ prompt: Prompt, _ settings: ModelSettings)
+    async throws -> [RemoteCompaction.OutputMessage]? {
+        do {
+            return try await activeClient().compactConversationHistory(prompt, settings)
+        } catch let e as ModelError where e.httpStatus == 401 {
+            guard let retry = try await refreshedClientAfter401() else { throw e }
+            return try await retry.compactConversationHistory(prompt, settings)
+        }
+    }
+
     private func activeClient() -> any ModelClient {
         refreshed?.client ?? initial
     }

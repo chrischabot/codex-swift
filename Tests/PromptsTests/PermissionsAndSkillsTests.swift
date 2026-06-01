@@ -161,8 +161,11 @@ final class PermissionsAndSkillsTests: XCTestCase {
                       "rejected-categories header missing")
         XCTAssertTrue(b.contains("- `skill_approval`"),
                       "rejected skill_approval bullet missing")
-        XCTAssertTrue(b.contains("- `request_permissions`"),
-                      "rejected request_permissions bullet missing")
+        // request_permissions tool is disabled by default (matches upstream
+        // Feature::RequestPermissionsTool default_enabled=false), so the
+        // category is dropped entirely from the granular listing.
+        XCTAssertFalse(b.contains("- `request_permissions`"),
+                       "request_permissions bullet must be absent when the tool is disabled")
         XCTAssertTrue(b.contains("- `mcp_elicitations`"),
                       "rejected mcp_elicitations bullet missing")
 
@@ -192,11 +195,160 @@ final class PermissionsAndSkillsTests: XCTestCase {
                        "no allowed categories ⇒ no `may still prompt` header")
         XCTAssertTrue(b.contains("automatically rejected instead of prompting"),
                       "all-rejected list header missing")
-        // Every category appears in the rejected list.
+        // Every category appears in the rejected list — except
+        // `request_permissions`, which is dropped because the request_permissions
+        // tool is disabled by default (upstream default_enabled=false).
         for cat in ["sandbox_approval", "rules", "skill_approval",
-                    "request_permissions", "mcp_elicitations"] {
+                    "mcp_elicitations"] {
             XCTAssertTrue(b.contains("- `\(cat)`"),
                           "rejected category bullet `\(cat)` missing")
         }
+        XCTAssertFalse(b.contains("- `request_permissions`"),
+                       "request_permissions bullet must be absent when the tool is disabled")
+    }
+
+    // MARK: - request_permissions tool gating (port of upstream
+    // permissions_instructions_tests.rs).
+
+    func testRequestPermissionsToolSectionForUnlessTrustedWhenEnabled() {
+        let off = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .unlessTrusted, approvalsReviewer: .user,
+            writableRoots: [])
+        XCTAssertFalse(off.body().contains("# request_permissions Tool"),
+                       "section must be absent by default")
+        let on = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .unlessTrusted, approvalsReviewer: .user,
+            writableRoots: [], requestPermissionsToolEnabled: true)
+        XCTAssertTrue(on.body().contains("# request_permissions Tool"),
+                      "section must appear when the tool is enabled")
+    }
+
+    func testRequestPermissionsToolSectionForOnFailureWhenEnabled() {
+        let on = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .onFailure, approvalsReviewer: .user,
+            writableRoots: [], requestPermissionsToolEnabled: true)
+        XCTAssertTrue(on.body().contains("# request_permissions Tool"))
+    }
+
+    func testOnRequestToolSectionWhenToolEnabled() {
+        let on = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .onRequest, approvalsReviewer: .user,
+            writableRoots: [], requestPermissionsToolEnabled: true)
+        let b = on.body()
+        // Default on_request body (exec approvals off) + tool section.
+        XCTAssertTrue(b.contains("# Escalation Requests"))
+        XCTAssertTrue(b.contains("# request_permissions Tool"))
+    }
+
+    // MARK: - on_request rule-request-permission variant + approved prefixes.
+
+    func testOnRequestSwitchesToRulePermissionVariantWhenExecApprovalsEnabled() {
+        let on = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .onRequest, approvalsReviewer: .user,
+            writableRoots: [], execPermissionApprovalsEnabled: true)
+        let b = on.body()
+        XCTAssertTrue(b.contains("# Permission Requests"),
+                      "should serve on_request_rule_request_permission.md")
+        XCTAssertTrue(b.contains("`sandbox_permissions: \"with_additional_permissions\"`"))
+        // The default on_request.md header must NOT be the section header.
+        XCTAssertFalse(b.contains("\n# Escalation Requests\n"),
+                       "default on_request.md must not be served when exec approvals are on")
+    }
+
+    func testOnRequestAppendsApprovedPrefixesSection() {
+        let on = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .enabled,
+            approvalPolicy: .onRequest, approvalsReviewer: .user,
+            writableRoots: [],
+            allowedPrefixes: [["git", "pull"]])
+        let b = on.body()
+        XCTAssertTrue(b.contains("## Approved command prefixes"))
+        XCTAssertTrue(b.contains("The following prefix rules have already been approved:"))
+        XCTAssertTrue(b.contains("[\"git\", \"pull\"]"))
+    }
+
+    func testOnRequestNoApprovedPrefixesSectionWhenEmpty() {
+        let on = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .enabled,
+            approvalPolicy: .onRequest, approvalsReviewer: .user,
+            writableRoots: [])
+        XCTAssertFalse(on.body().contains("Approved command prefixes"))
+    }
+
+    // MARK: - granular shell-permission / tool / prefixes sections.
+
+    func testGranularEmitsShellPermissionGuidanceWhenSandboxApprovalCanPrompt() {
+        let cfg = PermissionsInstructions.GranularConfig(
+            sandboxApproval: true, rules: true, skillApproval: true,
+            requestPermissions: true, mcpElicitations: true)
+        let p = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .granular(cfg), approvalsReviewer: .user,
+            writableRoots: [], execPermissionApprovalsEnabled: true)
+        XCTAssertTrue(p.body().contains("# Permission Requests"),
+                      "inline shell-permission guidance must appear")
+    }
+
+    func testGranularOmitsShellPermissionGuidanceWhenExecApprovalsDisabled() {
+        let cfg = PermissionsInstructions.GranularConfig(
+            sandboxApproval: true, rules: true, skillApproval: true,
+            requestPermissions: true, mcpElicitations: true)
+        let p = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .granular(cfg), approvalsReviewer: .user,
+            writableRoots: [], execPermissionApprovalsEnabled: false)
+        XCTAssertFalse(p.body().contains("# Permission Requests"))
+    }
+
+    func testGranularRequestPermissionsToolOnlyWhenCategoryCanPrompt() {
+        let cfgAllowed = PermissionsInstructions.GranularConfig(
+            sandboxApproval: true, rules: true, skillApproval: true,
+            requestPermissions: true, mcpElicitations: true)
+        let allowed = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .granular(cfgAllowed), approvalsReviewer: .user,
+            writableRoots: [], requestPermissionsToolEnabled: true,
+            execPermissionApprovalsEnabled: true)
+        XCTAssertTrue(allowed.body().contains("# request_permissions Tool"))
+
+        let cfgRejected = PermissionsInstructions.GranularConfig(
+            sandboxApproval: true, rules: true, skillApproval: true,
+            requestPermissions: false, mcpElicitations: true)
+        let rejected = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .granular(cfgRejected), approvalsReviewer: .user,
+            writableRoots: [], requestPermissionsToolEnabled: true,
+            execPermissionApprovalsEnabled: true)
+        XCTAssertFalse(rejected.body().contains("# request_permissions Tool"))
+    }
+
+    func testGranularListsRequestPermissionsCategoryWithoutToolWhenUnavailable() {
+        let cfg = PermissionsInstructions.GranularConfig(
+            sandboxApproval: false, rules: false, skillApproval: false,
+            requestPermissions: true, mcpElicitations: false)
+        let p = PermissionsInstructions(
+            sandboxMode: .workspaceWrite, networkAccess: .restricted,
+            approvalPolicy: .granular(cfg), approvalsReviewer: .user,
+            writableRoots: [], requestPermissionsToolEnabled: false,
+            execPermissionApprovalsEnabled: true)
+        let b = p.body()
+        XCTAssertFalse(b.contains("- `request_permissions`"))
+        XCTAssertFalse(b.contains("# request_permissions Tool"))
+    }
+
+    // MARK: - format_allow_prefixes parity (sort + JSON rendering).
+
+    func testFormatAllowPrefixesSortsByLenThenTotalLenThenAlpha() {
+        let rendered = PermissionsInstructions.formatAllowPrefixes([
+            ["zzz"],
+            ["a", "b"],
+            ["b"],
+        ])
+        XCTAssertEqual(rendered, "- [\"b\"]\n- [\"zzz\"]\n- [\"a\", \"b\"]")
     }
 }

@@ -1,13 +1,39 @@
 import Foundation
 
+/// Skill source scope (upstream `codex_protocol::protocol::SkillScope`).
+/// Drives `prompt_scope_rank` for the `## Skills` render ordering and
+/// budget-omission priority (`core-skills/src/render.rs:898-903`).
+public enum SkillScope: String, Sendable, Equatable, Codable {
+    case system
+    case admin
+    case repo
+    case user
+
+    /// Upstream `prompt_scope_rank` (render.rs:898-903):
+    /// System=0, Admin=1, Repo=2, User=3.
+    public var promptScopeRank: Int {
+        switch self {
+        case .system: return 0
+        case .admin: return 1
+        case .repo: return 2
+        case .user: return 3
+        }
+    }
+}
+
 /// A discovered skill (Codex `core-skills`). `path` is the skill directory so
-/// the model can read the full SKILL.md on demand.
+/// the model can read the full SKILL.md on demand. `scope` records the source
+/// category (upstream `SkillMetadata.scope`) so the render ordering can apply
+/// `prompt_scope_rank`.
 public struct SkillRecord: Sendable, Equatable, Codable {
     public var name: String
     public var description: String
     public var path: String
-    public init(name: String, description: String, path: String) {
+    public var scope: SkillScope
+    public init(name: String, description: String, path: String,
+                scope: SkillScope = .repo) {
         self.name = name; self.description = description; self.path = path
+        self.scope = scope
     }
 }
 
@@ -39,19 +65,22 @@ public struct SkillsDiscovery: Sendable {
         let markers = projectRootMarkers ?? [".git"]
         let homeDir = home ?? ProcessInfo.processInfo.environment["HOME"]
 
-        // Upstream priority order (Admin → User → Repo → Legacy). De-dup is by
-        // skill name, first-write-wins, so this matches upstream's
-        // `prompt_scope_rank` precedence.
-        var roots: [String] = []
-        roots.append(codexHome + "/skills")
+        // Upstream priority order (User-deprecated → User → Repo → Legacy).
+        // De-dup is by skill name, first-write-wins. Each root carries its
+        // upstream `SkillScope` (loader.rs): `$CODEX_HOME/skills` and
+        // `$HOME/.agents/skills` are User; repo `.agents/skills` is Repo. The
+        // port-only legacy `.codex/skills` root is repo-local, so tag it Repo.
+        var roots: [(path: String, scope: SkillScope)] = []
+        roots.append((codexHome + "/skills", .user))
         if let h = homeDir, !h.isEmpty {
-            roots.append(h + "/.agents/skills")
+            roots.append((h + "/.agents/skills", .user))
         }
         for c in cwds {
-            roots.append(contentsOf: agentsSkillsRoots(forCwd: c, markers: markers))
+            roots.append(contentsOf:
+                agentsSkillsRoots(forCwd: c, markers: markers).map { ($0, .repo) })
         }
         for c in cwds {
-            roots.append(c + "/.codex/skills")
+            roots.append((c + "/.codex/skills", .repo))
         }
         var seen = Set<String>()
         var seenRoots = Set<String>()
@@ -59,9 +88,9 @@ public struct SkillsDiscovery: Sendable {
         for root in roots {
             // Dedup repeated paths (same dir appears as both repo root and
             // cwd when there's no marker, etc.).
-            let canon = (root as NSString).standardizingPath
+            let canon = (root.path as NSString).standardizingPath
             if !seenRoots.insert(canon).inserted { continue }
-            for rec in scanRoot(root) where !seen.contains(rec.name) {
+            for rec in scanRoot(root.path, scope: root.scope) where !seen.contains(rec.name) {
                 seen.insert(rec.name)
                 out.append(rec)
             }
@@ -109,7 +138,7 @@ public struct SkillsDiscovery: Sendable {
         return dirs.reversed().map { $0 + "/.agents/skills" }
     }
 
-    private func scanRoot(_ root: String) -> [SkillRecord] {
+    private func scanRoot(_ root: String, scope: SkillScope) -> [SkillRecord] {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: root, isDirectory: &isDir), isDir.boolValue,
@@ -125,7 +154,7 @@ public struct SkillsDiscovery: Sendable {
             let fm2 = parseFrontmatter(body)
             let name = fm2["name"] ?? entry
             let desc = fm2["description"] ?? firstBodyLine(body) ?? ""
-            recs.append(SkillRecord(name: name, description: desc, path: dir))
+            recs.append(SkillRecord(name: name, description: desc, path: dir, scope: scope))
         }
         return recs
     }

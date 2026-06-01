@@ -106,17 +106,38 @@ public struct CurlTokenRevoker: TokenRevoker {
         try await post(endpoint, jsonBody: data)
     }
 
-    /// Endpoint resolution mirrors upstream: caller may override via env
-    /// (`CODEX_REVOKE_TOKEN_URL_OVERRIDE`). Falls back to
+    /// Endpoint resolution mirrors upstream `revoke_token_endpoint`
+    /// (login/src/auth/revoke.rs:150-169): first the explicit
+    /// `CODEX_REVOKE_TOKEN_URL_OVERRIDE`; then, if only
+    /// `CODEX_REFRESH_TOKEN_URL_OVERRIDE` is set, derive the revoke endpoint
+    /// from it by replacing the path with `/oauth/revoke` and dropping any
+    /// query (`derive_revoke_token_endpoint`); finally fall back to
     /// `<issuer>/oauth/revoke`.
     static func revokeEndpoint(cfg: OAuthConfig) -> String {
-        if let override = ProcessInfo.processInfo
-            .environment["CODEX_REVOKE_TOKEN_URL_OVERRIDE"],
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["CODEX_REVOKE_TOKEN_URL_OVERRIDE"],
            !override.isEmpty {
             return override
         }
+        if let refreshOverride = env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"],
+           !refreshOverride.isEmpty,
+           let derived = deriveRevokeEndpoint(fromRefresh: refreshOverride) {
+            return derived
+        }
         return cfg.issuer.trimmingCharacters(
             in: CharacterSet(charactersIn: "/")) + "/oauth/revoke"
+    }
+
+    /// Mirrors upstream `derive_revoke_token_endpoint`: parse the refresh URL,
+    /// set its path to `/oauth/revoke`, and clear the query string. Returns nil
+    /// when the refresh override is not a parseable absolute URL.
+    static func deriveRevokeEndpoint(fromRefresh refresh: String) -> String? {
+        guard var comps = URLComponents(string: refresh),
+              comps.scheme != nil, comps.host != nil else { return nil }
+        comps.path = "/oauth/revoke"
+        comps.query = nil
+        comps.fragment = nil
+        return comps.string
     }
 
     private func post(_ url: String, jsonBody: Data) async throws {

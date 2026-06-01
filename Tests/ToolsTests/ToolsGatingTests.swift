@@ -60,6 +60,64 @@ final class ToolsGatingTests: XCTestCase {
         XCTAssertFalse(overlap, "a serial tool must not overlap any other tool")
     }
 
+    // Audit tools-router finding 1: upstream's wait handler has no
+    // `supports_parallel_tool_calls` override (wait.rs:31-205), so it falls back
+    // to the trait default `false` (tool_executor.rs:50-52) and takes the
+    // exclusive write side of the per-turn parallel gate. The Swift port must
+    // declare `wait_agent` serial, not parallel-safe.
+    func testWaitAgentIsSerial() {
+        XCTAssertFalse(WaitAgentTool().parallelSafe,
+            "wait_agent must be serial (upstream trait default) — finding 1")
+    }
+
+    func testWaitAgentDoesNotOverlapOtherTools() async {
+        let rec = IntervalRecorder()
+        let router = ToolRouter(limits: Limits())
+        // A wait-like serial tool must take the exclusive side and NOT overlap a
+        // concurrently dispatched parallel-safe tool.
+        await router.register(TimedTool(name: "wait_agent",
+                                        parallelSafe: WaitAgentTool().parallelSafe,
+                                        rec: rec, durationMs: 120))
+        await router.register(TimedTool(name: "p", parallelSafe: true, rec: rec, durationMs: 120))
+        async let a = router.dispatch(ToolCall(callId: "1", name: "wait_agent", argumentsJSON: "{}"),
+                                      cwd: "/tmp", deadline: .fromNow(.seconds(5)))
+        async let b = router.dispatch(ToolCall(callId: "2", name: "p", argumentsJSON: "{}"),
+                                      cwd: "/tmp", deadline: .fromNow(.seconds(5)))
+        _ = await [a, b]
+        let overlap = await rec.overlaps("wait_agent", "p")
+        XCTAssertFalse(overlap, "wait_agent (serial) must not overlap a parallel tool")
+    }
+
+    // Audit tools-router finding 2: upstream emits the model-visible tool list in
+    // deterministic executor-collection (registration) order, NOT alphabetically
+    // (spec_plan.rs:122-148). `specs()` must preserve registration insertion
+    // order rather than impose a flat alphabetical sort.
+    func testSpecsPreserveRegistrationOrder() async {
+        let rec = IntervalRecorder()
+        let router = ToolRouter(limits: Limits())
+        // Register in a deliberately non-alphabetical order.
+        await router.register(TimedTool(name: "zeta", parallelSafe: true, rec: rec, durationMs: 1))
+        await router.register(TimedTool(name: "alpha", parallelSafe: true, rec: rec, durationMs: 1))
+        await router.register(TimedTool(name: "mike", parallelSafe: true, rec: rec, durationMs: 1))
+        let names = await router.specs().map { $0.name }
+        XCTAssertEqual(names, ["zeta", "alpha", "mike"],
+            "specs() must preserve registration order, not sort alphabetically — finding 2")
+    }
+
+    func testSpecsAppendActivatedDeferredInActivationOrder() async {
+        let rec = IntervalRecorder()
+        let router = ToolRouter(limits: Limits())
+        await router.register(TimedTool(name: "shell", parallelSafe: true, rec: rec, durationMs: 1))
+        await router.registerDeferred(TimedTool(name: "d_beta", parallelSafe: true, rec: rec, durationMs: 1))
+        await router.registerDeferred(TimedTool(name: "d_alpha", parallelSafe: true, rec: rec, durationMs: 1))
+        // Activate in non-alphabetical order; deferred tools append after the
+        // directly-visible ones, in activation order.
+        await router.activate(["d_beta", "d_alpha"])
+        let names = await router.specs().map { $0.name }
+        XCTAssertEqual(names, ["shell", "d_beta", "d_alpha"],
+            "activated deferred tools append in activation order after registered tools")
+    }
+
     func testApplyPatchRejectsPathTraversal() {
         let ap = ApplyPatch()
         let escape = """
@@ -77,7 +135,7 @@ final class ToolsGatingTests: XCTestCase {
         }
     }
 
-    func testApplyPatchMergesRepeatedUpdateSections() throws {
+    func testApplyPatchRepeatedUpdateSectionsBecomeSeparateHunks() throws {
         let root = NSTemporaryDirectory() + "ap-merge-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: root) }
@@ -97,7 +155,12 @@ final class ToolsGatingTests: XCTestCase {
         """
         let ap = ApplyPatch()
         let applied = try ap.apply(patch, root: root)
-        XCTAssertEqual(applied.filter { $0.kind == .update }.count, 1, "merged into one entry")
-        XCTAssertEqual(try String(contentsOfFile: root + "/f.txt", encoding: .utf8), "a\nB\nC")
+        // Upstream parity (apply-patch parser.rs:314-365): each `*** Update File:`
+        // block becomes its OWN Hunk::UpdateFile — repeated sections for the same
+        // path are NOT merged into a single entry.
+        XCTAssertEqual(applied.filter { $0.kind == .update }.count, 2,
+                       "each Update block is a separate hunk (no merge)")
+        // Upstream guarantees a trailing newline on the updated file (lib.rs:681-683).
+        XCTAssertEqual(try String(contentsOfFile: root + "/f.txt", encoding: .utf8), "a\nB\nC\n")
     }
 }

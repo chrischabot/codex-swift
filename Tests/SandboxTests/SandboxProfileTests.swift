@@ -92,6 +92,98 @@ final class SandboxProfileTests: XCTestCase {
                        "dangerFullAccess must not insert metadata denies:\n\(profile)")
     }
 
+    // MARK: parity F-5 — danger-full-access emits the whole-disk write grant
+
+    /// Parity F-5: upstream `create_seatbelt_command_args` emits
+    /// `(allow file-write* (regex #"^/"))` for full-disk write access rather
+    /// than per-root subpath rules. The static profile generator must match
+    /// even though `sandboxedInvocation` bypasses the profile for
+    /// danger-full-access at runtime today.
+    func testSeatbeltProfileDangerFullAccessEmitsWholeDiskWrite() {
+        let policy = SandboxPolicy(mode: .dangerFullAccess,
+                                   writableRoots: ["/tmp/full"])
+        let (profile, params) = WorkspaceSandbox.buildSeatbeltProfileWithParams(
+            policy: policy, cwd: "/tmp/full")
+        XCTAssertTrue(profile.contains(#"(allow file-write* (regex #"^/"))"#),
+                      "danger-full-access must grant whole-disk write:\n\(profile)")
+        // It must NOT fall through to per-root subpath rules / params.
+        XCTAssertFalse(profile.contains("(subpath (param"),
+                       "danger-full-access must not emit per-root subpath rules:\n\(profile)")
+        XCTAssertTrue(params.isEmpty,
+                      "danger-full-access whole-disk grant needs no -D params: \(params)")
+    }
+
+    // MARK: parity F-4 — writable roots use -D parameter substitution
+
+    /// Parity F-4: writable roots are emitted as `(subpath (param
+    /// "WRITABLE_ROOT_n"))` and the concrete path is returned as a matching
+    /// `-DWRITABLE_ROOT_n=<path>` parameter, mirroring upstream's
+    /// `build_seatbelt_access_policy` + `create_seatbelt_command_args`.
+    func testSeatbeltProfileUsesWritableRootParams() {
+        let rootA = "/tmp/codex-swift-f4-a"
+        let rootB = "/tmp/codex-swift-f4-b"
+        let cwd = "/tmp/codex-swift-f4-cwd"
+        let policy = SandboxPolicy(mode: .workspaceWrite,
+                                   writableRoots: [rootA, rootB])
+        let (profile, params) = WorkspaceSandbox.buildSeatbeltProfileWithParams(
+            policy: policy, cwd: cwd)
+
+        // Three distinct writable roots → three params (rootA, rootB, cwd).
+        XCTAssertEqual(params.count, 3, "params: \(params)")
+        XCTAssertEqual(params.map { $0.0 },
+                       ["WRITABLE_ROOT_0", "WRITABLE_ROOT_1", "WRITABLE_ROOT_2"])
+        XCTAssertEqual(Set(params.map { $0.1 }),
+                       Set([WorkspaceSandbox.canonicalPath(rootA),
+                            WorkspaceSandbox.canonicalPath(rootB),
+                            WorkspaceSandbox.canonicalPath(cwd)]))
+
+        for key in ["WRITABLE_ROOT_0", "WRITABLE_ROOT_1", "WRITABLE_ROOT_2"] {
+            XCTAssertTrue(
+                profile.contains("(allow file-write* (subpath (param \"\(key)\")))"),
+                "expected parameterized writable-root clause for \(key):\n\(profile)")
+        }
+        // No concrete path may be inlined into the profile text.
+        for raw in [rootA, rootB, cwd] {
+            XCTAssertFalse(profile.contains(WorkspaceSandbox.canonicalPath(raw)),
+                           "writable root \(raw) must not be inlined into the profile")
+        }
+    }
+
+    /// Parity F-4: `sandboxedInvocation` appends `-DWRITABLE_ROOT_n=<path>`
+    /// definitions and a `--` separator, matching upstream's argv layout
+    /// (`-p <policy> -DKEY=val -- command`).
+    func testSandboxedInvocationThreadsWritableRootParams() throws {
+        #if os(macOS)
+        let tmp = NSTemporaryDirectory() + "codex-swift-f4-inv-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: tmp,
+                                                withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let fakeSandboxExec = tmp + "/sandbox-exec"
+        FileManager.default.createFile(atPath: fakeSandboxExec,
+                                       contents: Data("#!/bin/sh\n".utf8))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: fakeSandboxExec)
+        let policy = SandboxPolicy(mode: .workspaceWrite, writableRoots: [tmp])
+        let sandbox = WorkspaceSandbox(
+            policy,
+            backendResolver: SandboxBackendResolver(sandboxExecPaths: [fakeSandboxExec]))
+        guard case .run(let argv) = sandbox.sandboxedInvocation(
+            argv: ["/bin/echo", "ok"], cwd: tmp) else {
+            return XCTFail("expected sandbox-exec wrapped invocation")
+        }
+        XCTAssertEqual(argv.first, fakeSandboxExec)
+        XCTAssertEqual(argv.dropFirst().first, "-p")
+        XCTAssertTrue(argv.contains { $0.hasPrefix("-DWRITABLE_ROOT_0=") },
+                      "argv must carry the -D writable-root definition: \(argv)")
+        XCTAssertTrue(argv.contains("--"),
+                      "argv must include the -- end-of-options separator: \(argv)")
+        XCTAssertEqual(Array(argv.suffix(2)), ["/bin/echo", "ok"])
+        // The -D value must be the canonical writable root.
+        let def = try XCTUnwrap(argv.first { $0.hasPrefix("-DWRITABLE_ROOT_0=") })
+        XCTAssertEqual(def, "-DWRITABLE_ROOT_0=\(WorkspaceSandbox.canonicalPath(tmp))")
+        #endif
+    }
+
     // MARK: bwrap argv (parity H-23 / audit F-3)
 
     func testBwrapReadOnlyDoesNotAllowTmpWrites() {
@@ -288,7 +380,8 @@ final class SandboxProfileTests: XCTestCase {
         let policy = SandboxPolicy(mode: .workspaceWrite,
                                    writableRoots: [unsafe],
                                    networkAllowed: false)
-        let profile = WorkspaceSandbox.buildSeatbeltProfile(policy: policy, cwd: unsafe)
+        let (profile, params) = WorkspaceSandbox.buildSeatbeltProfileWithParams(
+            policy: policy, cwd: unsafe)
 
         // Profile must not have a literal newline inside any `#"..."` regex
         // literal. Newlines outside the literal (between top-level clauses)
@@ -309,14 +402,80 @@ final class SandboxProfileTests: XCTestCase {
                 "regex literal split across newlines (opener without closer on same line): \(line)\nprofile:\n\(profile)")
         }
 
-        // Profile must parse under sandbox-exec.
+        // Profile must parse under sandbox-exec — pass the matching -D
+        // definitions so the `(param "WRITABLE_ROOT_n")` references resolve.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-        p.arguments = ["-p", profile, "/bin/echo", "ok"]
+        var args = ["-p", profile]
+        for (key, value) in params { args.append("-D\(key)=\(value)") }
+        args += ["--", "/bin/echo", "ok"]
+        p.arguments = args
         try p.run()
         p.waitUntilExit()
         XCTAssertEqual(p.terminationStatus, 0,
                        "Seatbelt profile with unsafe root must still parse:\n\(profile)")
         #endif
+    }
+
+    // MARK: sandbox-safety-policy Finding 1 — restricted read-only platform defaults
+
+    /// The platform-defaults fragment must be reproduced byte-faithfully from
+    /// upstream `sandboxing/src/restricted_read_only_platform_defaults.sbpl`.
+    /// Compares against the upstream source file when it is reachable on this
+    /// checkout (the two repos are siblings); otherwise pins a set of anchor
+    /// clauses so a drifted copy still trips the test.
+    func testRestrictedReadOnlyPlatformDefaultsMatchesUpstream() throws {
+        let literal = SeatbeltPolicy.restrictedReadOnlyPlatformDefaults
+
+        // Anchor clauses that must be present verbatim regardless of where the
+        // upstream source lives.
+        XCTAssertTrue(literal.hasPrefix(
+            "; macOS platform defaults included when a split filesystem policy requests `:minimal`."),
+            "fragment must start with the upstream header comment")
+        XCTAssertTrue(literal.contains("(allow file-map-executable"),
+                      "fragment must grant file-map-executable for system frameworks")
+        XCTAssertTrue(literal.contains(#"(allow file-read* file-test-existence file-write* (subpath "/tmp"))"#),
+                      "fragment must grant /tmp scratch space")
+        XCTAssertTrue(literal.contains(#"(allow network-outbound (literal "/private/var/run/syslog"))"#),
+                      "fragment must grant the syslog socket")
+        XCTAssertTrue(literal.hasSuffix(
+            #"(allow file-read* file-write* (extension "com.apple.app-sandbox.read-write"))"#),
+            "fragment must end with the read-write app-sandbox extension grant")
+
+        // If the upstream source is reachable, require an exact byte match
+        // (modulo the trailing newline, which the include_str! consumer keeps
+        // but the Swift `#"""..."""#` literal drops).
+        let candidates = [
+            "/Users/chabotc/Projects/codex/codex-rs/sandboxing/src/restricted_read_only_platform_defaults.sbpl"
+        ]
+        for path in candidates where FileManager.default.fileExists(atPath: path) {
+            let upstream = try String(contentsOfFile: path, encoding: .utf8)
+            // Upstream file ends in a trailing newline; the literal does not.
+            let normalizedUpstream = upstream.hasSuffix("\n")
+                ? String(upstream.dropLast()) : upstream
+            XCTAssertEqual(literal, normalizedUpstream,
+                           "Swift literal drifted from upstream \(path)")
+            return
+        }
+    }
+
+    /// `includePlatformDefaults` mirrors upstream
+    /// `FileSystemSandboxPolicy::include_platform_defaults()`. The Swift policy
+    /// enum cannot express a `:minimal` readable special-path, so the gate must
+    /// return false for every expressible mode — and the platform-defaults
+    /// fragment must therefore never appear in a generated profile today.
+    func testPlatformDefaultsGateFalseForAllModes() {
+        for mode in [SandboxPolicy.Mode.readOnly, .workspaceWrite, .dangerFullAccess] {
+            let policy = SandboxPolicy(mode: mode,
+                                       writableRoots: ["/tmp/codex-swift-pd"],
+                                       networkAllowed: mode == .workspaceWrite)
+            XCTAssertFalse(WorkspaceSandbox.includePlatformDefaults(policy: policy),
+                           "platform defaults gate must be false for mode \(mode)")
+            let profile = WorkspaceSandbox.buildSeatbeltProfile(
+                policy: policy, cwd: "/tmp/codex-swift-pd")
+            XCTAssertFalse(
+                profile.contains("; macOS platform defaults included when a split filesystem policy requests"),
+                "platform-defaults fragment must not be emitted for mode \(mode):\n\(profile)")
+        }
     }
 }

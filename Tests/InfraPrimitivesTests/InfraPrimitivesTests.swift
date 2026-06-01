@@ -238,8 +238,18 @@ final class InfraPrimitivesTests: XCTestCase {
         b.append(String(repeating: "A", count: 100))
         let out = b.rendered()
         XCTAssertTrue(b.didTruncate)
-        XCTAssertTrue(out.contains("bytes elided"))
         XCTAssertEqual(b.totalBytes, 100)
+        // Upstream `format_truncation_marker` (utils/string/src/truncate.rs:131-137):
+        // inline "…{tokens} truncated…" with NO surrounding newlines, using an
+        // approximate token count (ceil(removed_bytes / 4)). halfBudget = 10,
+        // so head=10, tail=10, removed=80 bytes => 20 tokens.
+        XCTAssertEqual(out, String(repeating: "A", count: 10)
+                       + "…20 tokens truncated…"
+                       + String(repeating: "A", count: 10))
+        XCTAssertFalse(out.contains("bytes elided"),
+                       "must not use the old byte-unit marker")
+        XCTAssertFalse(out.contains("\n"),
+                       "upstream marker is inline with no newlines")
     }
 
     // MARK: BoundedChannel

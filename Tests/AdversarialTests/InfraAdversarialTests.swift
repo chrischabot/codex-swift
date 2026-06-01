@@ -226,7 +226,7 @@ final class InfraAdversarialTests: XCTestCase {
         var b = HeadTailBuffer(maxBytes: 9)               // just above the >8 floor
         b.append(String(repeating: "A", count: 1_000_000))
         XCTAssertTrue(b.didTruncate)
-        XCTAssertTrue(b.rendered().contains("bytes elided"))
+        XCTAssertTrue(b.rendered().contains("tokens truncated"))
         XCTAssertEqual(b.totalBytes, 1_000_000)
         // Multibyte content at the truncation boundary must not trap.
         var u = HeadTailBuffer(maxBytes: 16)

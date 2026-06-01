@@ -29,6 +29,29 @@ public struct ThreadRow: Sendable, Equatable {
     public var gitSha: String?
     public var gitBranch: String?
     public var gitOriginURL: String?
+    /// Whether the user pinned this thread to the top of the sidebar.
+    public var pinned: Bool
+    /// Unix-seconds timestamp recorded when the thread is archived (upstream
+    /// `mark_archived` writes `archived_at = now`; `mark_unarchived` clears it
+    /// to NULL). Distinct from the `archived` boolean so a listing can surface
+    /// both the flag and the moment of archival (archive_thread.rs asserts
+    /// `archived_at == updated_at`). `nil` when the thread is active.
+    public var archivedAt: Int64?
+
+    public init(id: String, cwd: String, model: String, createdAt: Int64,
+                updatedAt: Int64, archived: Bool, ephemeral: Bool,
+                rolloutPath: String, lastCommittedSeq: Int, name: String?,
+                memoryMode: String, gitSha: String?, gitBranch: String?,
+                gitOriginURL: String?, archivedAt: Int64? = nil, pinned: Bool = false) {
+        self.id = id; self.cwd = cwd; self.model = model
+        self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.archived = archived; self.ephemeral = ephemeral
+        self.rolloutPath = rolloutPath; self.lastCommittedSeq = lastCommittedSeq
+        self.name = name; self.memoryMode = memoryMode
+        self.gitSha = gitSha; self.gitBranch = gitBranch
+        self.gitOriginURL = gitOriginURL; self.archivedAt = archivedAt
+        self.pinned = pinned
+    }
 }
 
 public struct GoalRow: Sendable, Equatable {
@@ -86,13 +109,15 @@ public actor StateDB {
           updated_at INTEGER NOT NULL,
           archived INTEGER NOT NULL DEFAULT 0,
           ephemeral INTEGER NOT NULL DEFAULT 0,
+          pinned INTEGER NOT NULL DEFAULT 0,
           rollout_path TEXT NOT NULL,
           last_committed_seq INTEGER NOT NULL DEFAULT 0,
           name TEXT,
           memory_mode TEXT NOT NULL DEFAULT 'enabled',
           git_sha TEXT,
           git_branch TEXT,
-          git_origin_url TEXT
+          git_origin_url TEXT,
+          archived_at INTEGER
         );
         """)
         // Best-effort migrations for indexes created by an older schema.
@@ -101,6 +126,8 @@ public actor StateDB {
         try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN git_sha TEXT;")
         try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN git_branch TEXT;")
         try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN git_origin_url TEXT;")
+        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")
+        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN archived_at INTEGER;")
         try Self.execRaw(h, """
         CREATE TABLE IF NOT EXISTS goals(
           thread_id TEXT PRIMARY KEY,
@@ -177,8 +204,8 @@ public actor StateDB {
 
     public func upsertThread(_ r: ThreadRow) throws {
         try run("""
-        INSERT INTO threads(id,cwd,model,created_at,updated_at,archived,ephemeral,rollout_path,last_committed_seq,name,memory_mode,git_sha,git_branch,git_origin_url)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO threads(id,cwd,model,created_at,updated_at,archived,ephemeral,rollout_path,last_committed_seq,name,memory_mode,git_sha,git_branch,git_origin_url,archived_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
           cwd=excluded.cwd, model=excluded.model, updated_at=excluded.updated_at,
           archived=excluded.archived, ephemeral=excluded.ephemeral,
@@ -186,7 +213,7 @@ public actor StateDB {
           last_committed_seq=MAX(threads.last_committed_seq, excluded.last_committed_seq),
           name=excluded.name, memory_mode=excluded.memory_mode,
           git_sha=excluded.git_sha, git_branch=excluded.git_branch,
-          git_origin_url=excluded.git_origin_url;
+          git_origin_url=excluded.git_origin_url, archived_at=excluded.archived_at;
         """, [
             .text(r.id), .text(r.cwd), .text(r.model),
             .int(r.createdAt), .int(r.updatedAt),
@@ -196,6 +223,7 @@ public actor StateDB {
             r.gitSha.map(Bind.text) ?? .null,
             r.gitBranch.map(Bind.text) ?? .null,
             r.gitOriginURL.map(Bind.text) ?? .null,
+            r.archivedAt.map(Bind.int) ?? .null,
         ])
     }
 
@@ -227,6 +255,26 @@ public actor StateDB {
                 [.int(archived ? 1 : 0), .int(updatedAt), .text(id)])
     }
 
+    /// Mirror upstream `mark_archived` (archive_thread.rs:55-58): flip the
+    /// archived flag, repoint `rollout_path` to the archived location, and
+    /// record `archived_at = now` (asserted equal to `updated_at` upstream).
+    public func markArchived(_ id: String, rolloutPath: String, archivedAt: Int64) throws {
+        try run("""
+        UPDATE threads SET archived=1, rollout_path=?, archived_at=?, updated_at=?
+        WHERE id=?;
+        """, [.text(rolloutPath), .int(archivedAt), .int(archivedAt), .text(id)])
+    }
+
+    /// Mirror upstream `mark_unarchived` (unarchive_thread.rs:78-80): clear the
+    /// archived flag, repoint `rollout_path` back into the active sessions tree,
+    /// and reset `archived_at` to NULL.
+    public func markUnarchived(_ id: String, rolloutPath: String, updatedAt: Int64) throws {
+        try run("""
+        UPDATE threads SET archived=0, rollout_path=?, archived_at=NULL, updated_at=?
+        WHERE id=?;
+        """, [.text(rolloutPath), .int(updatedAt), .text(id)])
+    }
+
     /// Advance the committed sequence pointer. Called only **after** the
     /// rollout fsync (crash-consistent ordering, rework §8.1).
     public func advanceCommittedSeq(_ id: String, to seq: Int, updatedAt: Int64) throws {
@@ -241,6 +289,11 @@ public actor StateDB {
     public func setName(_ id: String, _ name: String?, updatedAt: Int64) throws {
         try run("UPDATE threads SET name=?, updated_at=? WHERE id=?;",
                 [name.map(Bind.text) ?? .null, .int(updatedAt), .text(id)])
+    }
+
+    public func setPinned(_ id: String, _ pinned: Bool, updatedAt: Int64) throws {
+        try run("UPDATE threads SET pinned=?, updated_at=? WHERE id=?;",
+                [.int(pinned ? 1 : 0), .int(updatedAt), .text(id)])
     }
 
     public func setMemoryMode(_ id: String, _ mode: String, updatedAt: Int64) throws {
@@ -327,6 +380,8 @@ public actor StateDB {
             memoryMode: (r["memory_mode"] as? String) ?? "enabled",
             gitSha: r["git_sha"] as? String,
             gitBranch: r["git_branch"] as? String,
-            gitOriginURL: r["git_origin_url"] as? String)
+            gitOriginURL: r["git_origin_url"] as? String,
+            archivedAt: r["archived_at"] as? Int64,
+            pinned: i("pinned") != 0)
     }
 }

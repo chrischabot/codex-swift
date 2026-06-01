@@ -54,14 +54,64 @@ import InfraPrimitives
 ///     model gets a synchronous failure rather than hanging the turn.
 ///   * Result: the upstream `RequestUserInputResponse` JSON
 ///     (`{"answers": {<id>: {"answers": [...]}}}`).
+/// Collaboration mode in which `request_user_input` may be offered to the
+/// model. Mirrors upstream `codex_protocol::config_types::ModeKind` —
+/// `display_name()` values are part of the model-facing tool description so
+/// they must match byte-for-byte (`protocol/src/config_types.rs:580`).
+public enum RequestUserInputMode: Sendable, Equatable {
+    case plan
+    case `default`
+    case pairProgramming
+    case execute
+
+    /// Verbatim parity with `ModeKind::display_name`.
+    public var displayName: String {
+        switch self {
+        case .plan: return "Plan"
+        case .default: return "Default"
+        case .pairProgramming: return "Pair Programming"
+        case .execute: return "Execute"
+        }
+    }
+}
+
 public struct RequestUserInputTool: Tool {
     public let name = "request_user_input"
     /// Serial — the model is asking the user for input, no other tool calls
     /// should be racing while the human is being prompted.
     public let parallelSafe = false
 
+    /// Collaboration modes in which this tool is available. The model-facing
+    /// description names these (see `toolDescription`). Upstream's default
+    /// feature set resolves `request_user_input_available_modes` to `[Plan]`
+    /// (`tools/src/tool_config.rs:36`), so the port defaults to `[.plan]` for
+    /// description parity with `request_user_input_tool_description`.
+    public let availableModes: [RequestUserInputMode]
+
+    /// Port of upstream `request_user_input_tool_description`
+    /// (`core/src/tools/handlers/request_user_input_spec.rs`): the upstream
+    /// model-facing description ALWAYS appends a sentence naming the modes the
+    /// tool is available in, formatted by `format_allowed_modes`.
     public var toolDescription: String {
-        "Request user input for one to three short questions and wait for the response."
+        "Request user input for one to three short questions and wait for the response. This tool is only available in \(Self.formatAllowedModes(availableModes))."
+    }
+
+    /// Verbatim port of upstream `format_allowed_modes`
+    /// (`request_user_input_spec.rs`): `[]`→"no modes",
+    /// `[m]`→"<m> mode", `[a,b]`→"<a> or <b> mode",
+    /// `[..]`→"modes: a,b,c" (comma-joined, no spaces).
+    static func formatAllowedModes(_ modes: [RequestUserInputMode]) -> String {
+        let names = modes.map { $0.displayName }
+        switch names.count {
+        case 0:
+            return "no modes"
+        case 1:
+            return "\(names[0]) mode"
+        case 2:
+            return "\(names[0]) or \(names[1]) mode"
+        default:
+            return "modes: \(names.joined(separator: ","))"
+        }
     }
 
     public var jsonSchema: String {
@@ -70,7 +120,12 @@ public struct RequestUserInputTool: Tool {
         """#
     }
 
-    public init() {}
+    /// - Parameter availableModes: collaboration modes named in the
+    ///   model-facing description. Defaults to upstream's default-feature
+    ///   resolution `[.plan]` (`tools/src/tool_config.rs:36`).
+    public init(availableModes: [RequestUserInputMode] = [.plan]) {
+        self.availableModes = availableModes
+    }
 
     private struct OptionArg: Decodable {
         var label: String

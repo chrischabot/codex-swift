@@ -822,9 +822,9 @@ final class EndToEndTests: XCTestCase {
                         process_inputs[pid] = []
                         process_argv[pid] = params.get("argv") or []
                         send_frame(c, {"id": rid, "result": {"processId": pid}})
-                elif method == "process/writeStdin":
-                    decoded = base64.b64decode(params.get("deltaBase64", ""))
-                    process_inputs.setdefault(params.get("processId") or params.get("processHandle"), []).append(decoded)
+                elif method == "process/write":
+                    decoded = base64.b64decode(params.get("chunk", ""))
+                    process_inputs.setdefault(params.get("processId"), []).append(decoded)
                     recorded = dict(params)
                     recorded["inputUtf8"] = decoded.decode(errors="replace")
                     with open(calls_path, "a") as f:
@@ -1147,10 +1147,104 @@ final class EndToEndTests: XCTestCase {
         }
         guard case .error(let e3)? = msgs2.first(where: {
             if case .error(let e) = $0 { return e.id == .int(3) }; return false }) else {
-            return XCTFail("expected -32601")
+            return XCTFail("expected -32600 invalid request")
         }
-        XCTAssertEqual(e3.error.code, -32601)
-        XCTAssertEqual(e3.error.message, "totally/unknown/method is not supported yet")
+        // Unknown method tags fail ClientRequest deserialization upstream and
+        // are rejected with -32600 "Invalid request: ..." (NOT -32601).
+        XCTAssertEqual(e3.error.code, -32600)
+        XCTAssertTrue(e3.error.message.hasPrefix("Invalid request:"),
+                      "unknown method must be -32600 invalid_request, got: \(e3.error.message)")
+    }
+
+    /// Buffered process/spawn (streamStdoutStderr=false): process/exited must
+    /// carry the required stdout/stdoutCapReached/stderr/stderrCapReached
+    /// fields (upstream ProcessExitedNotification), with the captured stdout
+    /// present (not streamed away).
+    func testProcessSpawnBufferedExitedCarriesStdoutAndCapFields() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+        s.conn.clientSend(req(1, "initialize", .object([
+            "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
+        ])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "process/spawn", .object([
+            "processHandle": .string("buf-1"),
+            "command": .array([.string("sh"), .string("-c"), .string("printf hello")]),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .notification(let n) = $0 { return n.method == "process/exited" }
+            return false
+        }
+        guard case .notification(let exited)? = msgs.first(where: {
+            if case .notification(let n) = $0 { return n.method == "process/exited" }
+            return false
+        }) else {
+            return XCTFail("expected process/exited notification")
+        }
+        XCTAssertEqual(exited.params?["processHandle"]?.stringValue, "buf-1")
+        XCTAssertEqual(exited.params?["exitCode"]?.intValue, 0)
+        // All four fields are required (non-Option) upstream and must be present.
+        XCTAssertEqual(exited.params?["stdout"]?.stringValue, "hello")
+        XCTAssertEqual(exited.params?["stdoutCapReached"]?.boolValue, false)
+        XCTAssertEqual(exited.params?["stderr"]?.stringValue, "")
+        XCTAssertEqual(exited.params?["stderrCapReached"]?.boolValue, false)
+        // No outputDelta in buffered mode.
+        let deltas = await waitOutbound(s.conn) { _ in false }
+        XCTAssertFalse(deltas.contains {
+            if case .notification(let n) = $0 { return n.method == "process/outputDelta" }
+            return false
+        })
+    }
+
+    /// Streaming process/spawn: process/outputDelta must carry capReached, and
+    /// process/exited reports empty stdout/stderr (bytes were streamed) with
+    /// cap flags reflecting the cap state. Use a tiny outputBytesCap to force
+    /// the cap to be reached.
+    func testProcessSpawnStreamingOutputDeltaCarriesCapReached() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+        s.conn.clientSend(req(1, "initialize", .object([
+            "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
+        ])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "process/spawn", .object([
+            "processHandle": .string("stream-1"),
+            "command": .array([.string("sh"), .string("-c"), .string("printf abcdef")]),
+            "streamStdoutStderr": .bool(true),
+            "outputBytesCap": .int(3),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .notification(let n) = $0 { return n.method == "process/exited" }
+            return false
+        }
+        let deltas = msgs.compactMap { m -> JSONRPCNotification? in
+            if case .notification(let n) = m, n.method == "process/outputDelta" { return n }
+            return nil
+        }
+        XCTAssertFalse(deltas.isEmpty, "streaming mode must emit process/outputDelta")
+        for d in deltas {
+            XCTAssertNotNil(d.params?["capReached"]?.boolValue,
+                            "every outputDelta must carry capReached")
+            XCTAssertEqual(d.params?["stream"]?.stringValue, "stdout")
+        }
+        // The stdout cap of 3 bytes is reached by the 6-byte output.
+        XCTAssertTrue(deltas.contains { $0.params?["capReached"]?.boolValue == true },
+                      "final stdout delta must report capReached=true")
+        guard case .notification(let exited)? = msgs.first(where: {
+            if case .notification(let n) = $0 { return n.method == "process/exited" }
+            return false
+        }) else {
+            return XCTFail("expected process/exited notification")
+        }
+        // Streamed: stdout/stderr empty, cap flags reflect tracked state.
+        XCTAssertEqual(exited.params?["stdout"]?.stringValue, "")
+        XCTAssertEqual(exited.params?["stderr"]?.stringValue, "")
+        XCTAssertEqual(exited.params?["stdoutCapReached"]?.boolValue, true)
+        XCTAssertEqual(exited.params?["stderrCapReached"]?.boolValue, false)
     }
 
     func testMemoryResetClearsDurableMemories() async throws {
@@ -1322,7 +1416,14 @@ final class EndToEndTests: XCTestCase {
         }
         XCTAssertEqual(completedParams["loginId"], .string(loginId))
         XCTAssertEqual(completedParams["success"], .bool(false))
-        XCTAssertEqual(completedParams["error"], .string("canceled"))
+        // v9 app-server-events finding 5: a cancelled BROWSER login (type
+        // "chatgpt" → pendingBrowserLogins) surfaces the login-server io::Error
+        // wrapped as "Login server error: {err}" (account_processor.rs:397-398
+        // over login/server.rs:195-196). Device-code cancellation (separate test)
+        // keeps the bare "Login was not completed". The cancel *response* status
+        // above stays "canceled".
+        XCTAssertEqual(completedParams["error"],
+                       .string("Login server error: Login was not completed"))
 
         try store.save(AuthTokens(accessToken: "ak", refreshToken: "rk",
                                   expiresAtUnix: 4_102_444_800, accountId: "acct"))
@@ -1559,6 +1660,134 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(store.load()?.accountId, "acct-device")
     }
 
+    /// Real OpenAI ChatGPT id_tokens carry the plan type at the NESTED path
+    /// `https://api.openai.com/auth` -> `chatgpt_plan_type` (and the email under
+    /// `https://api.openai.com/profile`), not a flat top-level key. Asserts the
+    /// plan resolves from the nested claim for both `account/updated` (login)
+    /// and `account/read` (which must NOT throw MissingChatgptAccountDetails).
+    func testAccountLoginReadsPlanTypeFromNestedAuthClaim() async throws {
+        let home = NSTemporaryDirectory() + "e2e-nested-plan-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        // Realistic nested-claim id_token: NO flat plan_type / email keys.
+        let idToken = try unsignedJWT([
+            "https://api.openai.com/profile": ["email": "user@example.com"],
+            "https://api.openai.com/auth": [
+                "chatgpt_plan_type": "Business",
+                "chatgpt_account_id": "acct-nested",
+            ],
+        ])
+        let challenge = DeviceCodeChallenge(
+            verificationURL: "https://issuer.example/codex/device",
+            userCode: "CODE-NESTED",
+            deviceAuthId: "device-auth-nested",
+            intervalSeconds: 1)
+        let deviceClient = MockDeviceCodeClient(
+            challenge: challenge,
+            completion: .succeed(AuthTokens(
+                accessToken: "nested-access",
+                refreshToken: "nested-refresh",
+                idToken: idToken,
+                expiresAtUnix: 4_102_444_800,
+                accountId: "acct-nested")))
+        let auth = AuthManager(store: store, deviceCodeClient: deviceClient)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("chatgptDeviceCode"),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .notification(let n) = $0 { return n.method == "account/updated" }
+            return false
+        }
+        guard case .notification(let updated)? = msgs.first(where: {
+            if case .notification(let n) = $0 { return n.method == "account/updated" }
+            return false
+        }), let updatedParams = updated.params else {
+            return XCTFail("expected account/updated notification")
+        }
+        // Plan resolves from the nested claim, normalized to lowercase
+        // ("Business" -> "business" via PlanType::from_raw_value semantics).
+        XCTAssertEqual(updatedParams["authMode"], .string("chatgpt"))
+        XCTAssertEqual(updatedParams["planType"], .string("business"))
+
+        // account/read must surface the nested plan + email instead of throwing
+        // MissingChatgptAccountDetails (which would map to invalid_request).
+        s.conn.clientSend(req(3, "account/read", .object([:])))
+        let readMsgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(3) }
+            return false
+        }
+        guard case .response(let read)? = readMsgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(3) }
+            return false
+        }) else {
+            return XCTFail("expected account/read response")
+        }
+        // Reaching a `.response` (not a WireError) already proves account/read
+        // did not throw MissingChatgptAccountDetails.
+        let account = read.result["account"]
+        XCTAssertEqual(account?["type"], .string("chatgpt"))
+        XCTAssertEqual(account?["email"], .string("user@example.com"))
+        XCTAssertEqual(account?["planType"], .string("business"))
+    }
+
+    /// When the id_token has no plan claim at all (nested or flat), upstream
+    /// `AuthManager::account_plan_type` defaults to `Unknown` and only a missing
+    /// email is fatal. account/read must default planType to "unknown" rather
+    /// than throwing.
+    func testAccountReadDefaultsPlanTypeToUnknownWhenClaimAbsent() async throws {
+        let home = NSTemporaryDirectory() + "e2e-no-plan-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        let idToken = try unsignedJWT([
+            "email": "noplan@example.com",
+            "https://api.openai.com/auth": ["chatgpt_account_id": "acct-noplan"],
+        ])
+        let challenge = DeviceCodeChallenge(
+            verificationURL: "https://issuer.example/codex/device",
+            userCode: "CODE-NOPLAN",
+            deviceAuthId: "device-auth-noplan",
+            intervalSeconds: 1)
+        let deviceClient = MockDeviceCodeClient(
+            challenge: challenge,
+            completion: .succeed(AuthTokens(
+                accessToken: "noplan-access",
+                refreshToken: "noplan-refresh",
+                idToken: idToken,
+                expiresAtUnix: 4_102_444_800,
+                accountId: "acct-noplan")))
+        let auth = AuthManager(store: store, deviceCodeClient: deviceClient)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("chatgptDeviceCode"),
+        ])))
+        _ = await waitOutbound(s.conn) {
+            if case .notification(let n) = $0 { return n.method == "account/updated" }
+            return false
+        }
+
+        s.conn.clientSend(req(3, "account/read", .object([:])))
+        let readMsgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(3) }
+            return false
+        }
+        guard case .response(let read)? = readMsgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(3) }
+            return false
+        }) else {
+            return XCTFail("expected account/read response")
+        }
+        let account = read.result["account"]
+        XCTAssertEqual(account?["type"], .string("chatgpt"))
+        XCTAssertEqual(account?["email"], .string("noplan@example.com"))
+        XCTAssertEqual(account?["planType"], .string("unknown"))
+    }
+
     func testAccountDeviceCodeLoginFailureEmitsCompletionWithoutPersisting() async throws {
         let home = NSTemporaryDirectory() + "e2e-device-code-fail-" + UUID().uuidString
         let store = FileTokenStore(codexHome: home)
@@ -1653,7 +1882,7 @@ final class EndToEndTests: XCTestCase {
                let params = n.params {
                 return params["loginId"] == .string(loginId)
                     && params["success"] == .bool(false)
-                    && params["error"] == .string("canceled")
+                    && params["error"] == .string("Login was not completed")
             }
             return false
         })
@@ -1807,6 +2036,387 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(chatgpt.result["requiresOpenaiAuth"], .bool(true))
     }
 
+    /// A ChatGPT-authenticated token MISSING the `email` claim must produce an
+    /// invalid_request error ("email and plan type are required for chatgpt
+    /// authentication"), not a fabricated account with email="".
+    ///
+    /// Upstream (`model-provider/src/provider.rs:216-223` +
+    /// `AuthManager::account_plan_type`) requires `(Some(email), Some(plan))`;
+    /// a missing PLAN is NOT fatal because `account_plan_type` defaults to
+    /// `Some(AccountPlanType::Unknown)` whenever token data exists (covered by
+    /// `testAccountReadDefaultsPlanTypeToUnknownWhenClaimAbsent`). The genuine
+    /// fatal condition is therefore a missing EMAIL, which this test exercises.
+    func testAccountReadMissingClaimsReturnsInvalidRequest() async throws {
+        let home = NSTemporaryDirectory() + "e2e-account-read-missing-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+
+        // Token carries a plan_type claim but NO email — the genuinely fatal
+        // condition upstream.
+        let accessToken = try unsignedJWT(["plan_type": "pro"])
+        try await auth.loginWithExternalChatGPTTokens(accessToken: accessToken,
+                                                      accountId: "acct-missing")
+        s.conn.clientSend(req(2, "account/read", .object(["refreshToken": .bool(false)])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.last else {
+            return XCTFail("expected invalid_request error for missing claims")
+        }
+        XCTAssertEqual(err.error.code, -32600)
+        XCTAssertEqual(err.error.message,
+                       "email and plan type are required for chatgpt authentication")
+    }
+
+    /// Auth Finding #3: account/read derives the ChatGPT email/plan
+    /// EXCLUSIVELY from the id_token JWT claims (upstream
+    /// `AuthManager::get_account_email`/`account_plan_type`,
+    /// manager.rs:357-388), never the access_token. A managed credential whose
+    /// id_token lacks an email must return invalid_request even when the
+    /// access_token happens to carry an email claim — Swift previously fell
+    /// back to decoding the access_token, surfacing a fabricated chatgpt
+    /// account.
+    func testAccountReadDoesNotFallBackToAccessTokenForClaims() async throws {
+        let home = NSTemporaryDirectory() + "e2e-account-read-idtoken-only-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+
+        // access_token carries email + plan; id_token has NEITHER.
+        let accessToken = try unsignedJWT([
+            "email": "leak@example.com",
+            "plan_type": "pro",
+        ])
+        let idToken = try unsignedJWT(["sub": "user-123"])
+        // Persist a managed ChatGPT credential with both tokens set.
+        try store.save(AuthTokens(accessToken: accessToken,
+                                  refreshToken: nil,
+                                  idToken: idToken,
+                                  tokenType: "Bearer",
+                                  expiresAtUnix: 4_102_444_800,
+                                  accountId: "acct-idtoken-only"))
+        s.conn.clientSend(req(2, "account/read", .object(["refreshToken": .bool(false)])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.last else {
+            return XCTFail("expected invalid_request: claims must come from id_token only")
+        }
+        XCTAssertEqual(err.error.code, -32600)
+        XCTAssertEqual(err.error.message,
+                       "email and plan type are required for chatgpt authentication")
+    }
+
+    /// Finding 3: the primary rate-limit snapshot maps the backend usage
+    /// payload's `credits` object to the camelCase CreditsSnapshot shape;
+    /// additional rate limits carry no credits. Absent credits → null.
+    /// (backend-client/src/client.rs:455-475,557-564)
+    func testRateLimitSnapshotMapsBackendCredits() throws {
+        let body: [String: JSONValue] = [
+            "plan_type": .string("pro"),
+            "rate_limit": .object([
+                "primary_window": .object([
+                    "used_percent": .int(42),
+                    "limit_window_seconds": .int(3600),
+                    "reset_at": .int(1_735_689_720),
+                ]),
+            ]),
+            "credits": .object([
+                "has_credits": .bool(true),
+                "unlimited": .bool(false),
+                "balance": .string("9.99"),
+            ]),
+            "additional_rate_limits": .array([
+                .object([
+                    "metered_feature": .string("codex_other"),
+                    "limit_name": .string("codex_other"),
+                    "rate_limit": .object([
+                        "primary_window": .object([
+                            "used_percent": .int(70),
+                            "limit_window_seconds": .int(3600),
+                            "reset_at": .int(1_735_689_720),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]
+        let result = RequestRouter._rateLimitResponseForTesting(from: body)
+        // Primary snapshot carries mapped credits.
+        XCTAssertEqual(result["rateLimits"]?["credits"], .object([
+            "hasCredits": .bool(true),
+            "unlimited": .bool(false),
+            "balance": .string("9.99"),
+        ]))
+        XCTAssertEqual(result["rateLimitsByLimitId"]?["codex"]?["credits"], .object([
+            "hasCredits": .bool(true),
+            "unlimited": .bool(false),
+            "balance": .string("9.99"),
+        ]))
+        // Additional rate limit carries no credits.
+        XCTAssertEqual(result["rateLimitsByLimitId"]?["codex_other"]?["credits"], .null)
+    }
+
+    /// Finding 3: when the backend usage payload has no `credits` object the
+    /// snapshot's credits field is null (upstream map_credits returns None).
+    func testRateLimitSnapshotCreditsNullWhenAbsent() throws {
+        let body: [String: JSONValue] = [
+            "plan_type": .string("pro"),
+            "rate_limit": .object([
+                "primary_window": .object([
+                    "used_percent": .int(10),
+                    "limit_window_seconds": .int(3600),
+                    "reset_at": .int(1_735_689_720),
+                ]),
+            ]),
+        ]
+        let result = RequestRouter._rateLimitResponseForTesting(from: body)
+        XCTAssertEqual(result["rateLimits"]?["credits"], .null)
+    }
+
+    /// auth finding 1: account/rateLimits/read must canonicalize the backend
+    /// `plan_type` through map_plan_type before emitting (client.rs:567-589):
+    /// "education" -> "edu"; guest/free_workspace/quorum/k12/unrecognized ->
+    /// "unknown"; known plans (e.g. "pro") pass through; the same normalized
+    /// value flows to every additional-rate-limit snapshot too.
+    func testRateLimitSnapshotNormalizesPlanType() throws {
+        func planType(for raw: String) -> JSONValue? {
+            let body: [String: JSONValue] = [
+                "plan_type": .string(raw),
+                "rate_limit": .object([
+                    "primary_window": .object([
+                        "used_percent": .int(1),
+                        "limit_window_seconds": .int(3600),
+                        "reset_at": .int(1_735_689_720),
+                    ]),
+                ]),
+                "additional_rate_limits": .array([
+                    .object([
+                        "metered_feature": .string("codex_other"),
+                        "limit_name": .string("codex_other"),
+                        "rate_limit": .object(["primary_window": .object([
+                            "used_percent": .int(2),
+                            "limit_window_seconds": .int(3600),
+                            "reset_at": .int(1_735_689_720),
+                        ])]),
+                    ]),
+                ]),
+            ]
+            let result = RequestRouter._rateLimitResponseForTesting(from: body)
+            // The additional snapshot must carry the same normalized value.
+            XCTAssertEqual(result["rateLimitsByLimitId"]?["codex_other"]?["planType"],
+                           result["rateLimits"]?["planType"],
+                           "additional rate limit planType must match primary for \(raw)")
+            return result["rateLimits"]?["planType"]
+        }
+        XCTAssertEqual(planType(for: "education"), .string("edu"))
+        XCTAssertEqual(planType(for: "pro"), .string("pro"))
+        XCTAssertEqual(planType(for: "hc"), .string("enterprise"))
+        XCTAssertEqual(planType(for: "guest"), .string("unknown"))
+        XCTAssertEqual(planType(for: "free_workspace"), .string("unknown"))
+        XCTAssertEqual(planType(for: "quorum"), .string("unknown"))
+        XCTAssertEqual(planType(for: "k12"), .string("unknown"))
+        XCTAssertEqual(planType(for: "mystery-tier"), .string("unknown"))
+    }
+
+    /// auth finding 1: an absent plan_type stays null (no normalization to
+    /// "unknown" — the snapshot field simply has no value).
+    func testRateLimitSnapshotPlanTypeNullWhenAbsent() throws {
+        let body: [String: JSONValue] = [
+            "rate_limit": .object(["primary_window": .object([
+                "used_percent": .int(1),
+                "limit_window_seconds": .int(3600),
+                "reset_at": .int(1_735_689_720),
+            ])]),
+        ]
+        let result = RequestRouter._rateLimitResponseForTesting(from: body)
+        XCTAssertEqual(result["rateLimits"]?["planType"], .null)
+    }
+
+    /// auth finding 2: account/rateLimits/read maps the five known
+    /// rate_limit_reached_type kinds 1:1 and collapses "unknown"/unrecognized
+    /// to JSON null (map_rate_limit_reached_type, client.rs:504-525).
+    func testRateLimitReachedTypeNormalization() throws {
+        func reached(_ type: String?) -> JSONValue? {
+            var body: [String: JSONValue] = [
+                "rate_limit": .object(["primary_window": .object([
+                    "used_percent": .int(1),
+                    "limit_window_seconds": .int(3600),
+                    "reset_at": .int(1_735_689_720),
+                ])]),
+            ]
+            if let type {
+                body["rate_limit_reached_type"] = .object(["type": .string(type)])
+            }
+            let result = RequestRouter._rateLimitResponseForTesting(from: body)
+            return result["rateLimits"]?["rateLimitReachedType"]
+        }
+        XCTAssertEqual(reached("rate_limit_reached"), .string("rate_limit_reached"))
+        XCTAssertEqual(reached("workspace_owner_credits_depleted"),
+                       .string("workspace_owner_credits_depleted"))
+        XCTAssertEqual(reached("workspace_member_credits_depleted"),
+                       .string("workspace_member_credits_depleted"))
+        XCTAssertEqual(reached("workspace_owner_usage_limit_reached"),
+                       .string("workspace_owner_usage_limit_reached"))
+        XCTAssertEqual(reached("workspace_member_usage_limit_reached"),
+                       .string("workspace_member_usage_limit_reached"))
+        // Unknown / unrecognized / absent collapse to null.
+        XCTAssertEqual(reached("unknown"), .null)
+        XCTAssertEqual(reached("some_future_kind"), .null)
+        XCTAssertEqual(reached(nil), .null)
+    }
+
+    /// auth finding 3: a failed browser-login completion notification prefixes
+    /// the error text with "Login server error: ", matching upstream's browser
+    /// background task (account_processor.rs:397-398) and the cancelled-browser
+    /// path. The bare AuthError description must always be wrapped.
+    func testBrowserLoginCompletionErrorPrefix() throws {
+        XCTAssertEqual(
+            RequestRouter.browserLoginCompletionError(.server("boom")),
+            "Login server error: auth server: boom")
+        XCTAssertEqual(
+            RequestRouter.browserLoginCompletionError(.malformed("missing authorization code")),
+            "Login server error: auth: malformed (missing authorization code)")
+        XCTAssertEqual(
+            RequestRouter.browserLoginCompletionError(.invalidState),
+            "Login server error: auth: state mismatch (possible CSRF)")
+    }
+
+    /// Finding 4: forced_login_method=chatgpt blocks API-key login with the
+    /// upstream invalid_request message (account_processor.rs:259-266).
+    func testForcedLoginMethodChatgptRejectsApiKeyLogin() async throws {
+        let home = NSTemporaryDirectory() + "e2e-forced-chatgpt-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        try "forced_login_method = \"chatgpt\"\n"
+            .write(toFile: home + "/config.toml", atomically: true, encoding: .utf8)
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("apiKey"), "apiKey": .string("sk-test")])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.last else {
+            return XCTFail("expected forced-login error for api key")
+        }
+        XCTAssertEqual(err.error.message,
+                       "API key login is disabled. Use ChatGPT login instead.")
+    }
+
+    /// Finding 4: forced_login_method=api blocks ChatGPT browser login with
+    /// the upstream invalid_request message (account_processor.rs:314-318).
+    func testForcedLoginMethodApiRejectsChatgptLogin() async throws {
+        let home = NSTemporaryDirectory() + "e2e-forced-api-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        try "forced_login_method = \"api\"\n"
+            .write(toFile: home + "/config.toml", atomically: true, encoding: .utf8)
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        s.conn.clientSend(req(2, "account/login/start", .object(["type": .string("chatgpt")])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.last else {
+            return XCTFail("expected forced-login error for chatgpt")
+        }
+        XCTAssertEqual(err.error.message,
+                       "ChatGPT login is disabled. Use API key login instead.")
+    }
+
+    /// Finding 4: forced_login_method=api blocks chatgptAuthTokens login with
+    /// the upstream invalid_request message (account_processor.rs:556-563).
+    func testForcedLoginMethodApiRejectsChatgptAuthTokens() async throws {
+        let home = NSTemporaryDirectory() + "e2e-forced-api-tokens-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        try "forced_login_method = \"api\"\n"
+            .write(toFile: home + "/config.toml", atomically: true, encoding: .utf8)
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("chatgptAuthTokens"),
+            "accessToken": .string("tok"),
+            "chatgptAccountId": .string("acct")])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.last else {
+            return XCTFail("expected forced-login error for chatgptAuthTokens")
+        }
+        XCTAssertEqual(err.error.message,
+                       "External ChatGPT auth is disabled. Use API key login instead.")
+    }
+
+    /// Finding 4: an active external ChatGPT auth blocks API-key login with the
+    /// external-auth-active message (account_processor.rs:245-249,255-258).
+    func testExternalAuthActiveRejectsApiKeyLogin() async throws {
+        let home = NSTemporaryDirectory() + "e2e-external-active-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        try await auth.loginWithExternalChatGPTTokens(accessToken: "tok", accountId: "acct")
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("apiKey"), "apiKey": .string("sk-test")])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.last else {
+            return XCTFail("expected external-auth-active error for api key")
+        }
+        XCTAssertEqual(err.error.message,
+                       "External auth is active. Use account/login/start (chatgptAuthTokens) to update it or account/logout to clear it.")
+    }
+
     func testAccountReadUsesProviderRequiresOpenAIAuth() async throws {
         let home = NSTemporaryDirectory() + "e2e-account-read-provider-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
@@ -1958,6 +2568,174 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(withToken.result["requiresOpenaiAuth"], .bool(true))
     }
 
+    /// Finding 3: a stored credential whose access token is the empty string
+    /// must be reported as the no-token state (authMethod:null /
+    /// authToken:null / requiresOpenaiAuth:true), NOT as a present-token state.
+    /// Mirrors upstream get_auth_status_response's `get_token()` branch:
+    /// `Ok(token) if !token.is_empty()` yields the auth method, while `Ok(_)`
+    /// (empty token) yields `(None, None)` (account_processor.rs:776-787).
+    func testGetAuthStatusEmptyAccessTokenReportsNoAuthMethod() async throws {
+        let home = NSTemporaryDirectory() + "e2e-auth-status-empty-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        // A Bearer credential with an empty access token survives a round-trip
+        // (the tokens object is present) but represents a degenerate empty
+        // token; authMethod(for:) keys off tokenType and would otherwise
+        // report "chatgpt".
+        try store.save(AuthTokens(accessToken: "",
+                                  refreshToken: nil,
+                                  idToken: nil,
+                                  tokenType: "Bearer",
+                                  expiresAtUnix: AuthTokens.neverExpires,
+                                  accountId: "acct_empty"))
+        let auth = AuthManager(store: store, env: [:])
+        // Sanity: the empty token actually persisted and reloads.
+        let reloaded = await auth.storedTokens()
+        XCTAssertEqual(reloaded?.accessToken, "")
+
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        s.conn.clientSend(req(2, "getAuthStatus", .object([
+            "includeToken": .bool(true),
+            "refreshToken": .bool(false),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(2) }
+            return false
+        }
+        guard case .response(let resp)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }
+            return false
+        }) else { return XCTFail("missing empty-token getAuthStatus response") }
+        XCTAssertEqual(resp.result["authMethod"], .null,
+                       "an empty access token is the no-token state")
+        XCTAssertEqual(resp.result["authToken"], .null)
+        XCTAssertEqual(resp.result["requiresOpenaiAuth"], .bool(true))
+    }
+
+    /// When the active model provider declares `requires_openai_auth = false`,
+    /// the deprecated `getAuthStatus` must report
+    /// authMethod:null / authToken:null / requiresOpenaiAuth:false WITHOUT
+    /// consulting the token store, mirroring upstream
+    /// get_auth_status_response (account_processor.rs:751-758). Even when a
+    /// valid API-key credential is present, the no-auth provider short-circuits
+    /// the token branches.
+    func testGetAuthStatusReportsRequiresOpenAIAuthFalseForNoAuthProvider() async throws {
+        let home = NSTemporaryDirectory() + "e2e-auth-status-noauth-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        try """
+        model_provider = "custom"
+
+        [model_providers.custom]
+        name = "Custom"
+        base_url = "https://example.test/v1"
+        requires_openai_auth = false
+        """.write(toFile: home + "/config.toml", atomically: true, encoding: .utf8)
+        let store = FileTokenStore(codexHome: home)
+        let auth = AuthManager(store: store)
+        // Seed a credential the no-auth path must ignore.
+        try await auth.loginWithAPIKey("sk-should-be-ignored")
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(
+            1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+
+        s.conn.clientSend(req(2, "getAuthStatus", .object([
+            "includeToken": .bool(true),
+            "refreshToken": .bool(false),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(2) }
+            return false
+        }
+        guard case .response(let response)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }
+            return false
+        }) else { return XCTFail("missing no-auth-provider getAuthStatus response") }
+        XCTAssertEqual(response.result["authMethod"], .null)
+        XCTAssertEqual(response.result["authToken"], .null)
+        XCTAssertEqual(response.result["requiresOpenaiAuth"], .bool(false))
+    }
+
+    /// Device-code login *start* failures must mirror
+    /// login_chatgpt_device_code_start_error (account_processor.rs:344-351):
+    /// a NotFound condition (device-code login not enabled, HTTP 404) maps to
+    /// `invalid_request` (-32600) carrying the error's own message, while any
+    /// other (transient) failure maps to `internal_error` (-32603) prefixed
+    /// "failed to request device code:".
+    func testDeviceCodeStartNotFoundMapsToInvalidRequest() async throws {
+        let home = NSTemporaryDirectory() + "e2e-device-start-notfound-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        let challenge = DeviceCodeChallenge(
+            verificationURL: "https://issuer.example/codex/device",
+            userCode: "X", deviceAuthId: "id", intervalSeconds: 1)
+        let notEnabledMessage = "device code login is not enabled for this Codex server. Use the browser login or verify the server URL."
+        let deviceClient = MockDeviceCodeClient(
+            challenge: challenge,
+            requestError: .deviceCodeNotEnabled(notEnabledMessage),
+            completion: .succeed(AuthTokens(accessToken: "x", expiresAtUnix: 0)))
+        let auth = AuthManager(store: store, deviceCodeClient: deviceClient)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("chatgptDeviceCode"),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.first(where: {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }) else { return XCTFail("expected invalid_request error for not-enabled device code") }
+        XCTAssertEqual(err.error.code, WireError.invalidRequestCode)
+        XCTAssertEqual(err.error.message, notEnabledMessage)
+    }
+
+    func testDeviceCodeStartTransientFailureMapsToInternalError() async throws {
+        let home = NSTemporaryDirectory() + "e2e-device-start-transient-" + UUID().uuidString
+        let store = FileTokenStore(codexHome: home)
+        let challenge = DeviceCodeChallenge(
+            verificationURL: "https://issuer.example/codex/device",
+            userCode: "X", deviceAuthId: "id", intervalSeconds: 1)
+        let deviceClient = MockDeviceCodeClient(
+            challenge: challenge,
+            requestError: .server("device code request failed with status 500"),
+            completion: .succeed(AuthTokens(accessToken: "x", expiresAtUnix: 0)))
+        let auth = AuthManager(store: store, deviceCodeClient: deviceClient)
+        let s = try makeStack(MockModelClient([.hello()]), codexHome: home, auth: auth)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "account/login/start", .object([
+            "type": .string("chatgptDeviceCode"),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = msgs.first(where: {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }) else { return XCTFail("expected internal_error for transient device-code failure") }
+        XCTAssertEqual(err.error.code, WireError.internalCode)
+        XCTAssertTrue(err.error.message.hasPrefix("failed to request device code:"),
+                      "message must carry upstream prefix, got: \(err.error.message)")
+    }
+
     func testGetAuthStatusRefreshesChatGPTBearerAndOmitsTokenOnRefreshFailure() async throws {
         let home = NSTemporaryDirectory() + "e2e-auth-status-refresh-" + UUID().uuidString
         let store = FileTokenStore(codexHome: home)
@@ -2041,7 +2819,11 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(recovered.result["requiresOpenaiAuth"], .bool(true))
     }
 
-    func testAccountRateLimitsReadReturnsAndEmitsSnapshot() async throws {
+    /// Upstream's get_account_rate_limits_response returns only the
+    /// GetAccountRateLimitsResponse; the account/rateLimits/updated
+    /// notification is emitted exclusively from in-turn token-usage events
+    /// (bespoke_event_handling.rs:1573), never from this read handler.
+    func testAccountRateLimitsReadReturnsResponseWithoutNotification() async throws {
         let home = NSTemporaryDirectory() + "e2e-rate-limits-" + UUID().uuidString
         let store = FileTokenStore(codexHome: home)
         let auth = AuthManager(store: store)
@@ -2079,7 +2861,7 @@ final class EndToEndTests: XCTestCase {
 
         s.conn.clientSend(req(2, "account/rateLimits/read", .object([:])))
         let msgs = await waitOutbound(s.conn) {
-            if case .notification(let n) = $0 { return n.method == "account/rateLimits/updated" }
+            if case .response(let r) = $0 { return r.id == .int(2) }
             return false
         }
         guard case .response(let response)? = msgs.first(where: {
@@ -2093,13 +2875,12 @@ final class EndToEndTests: XCTestCase {
         }
         XCTAssertEqual(responseSnapshot, expectedSnapshot)
         XCTAssertEqual(response.result["rateLimitsByLimitId"]?["codex"], expectedSnapshot)
-        guard case .notification(let updated)? = msgs.first(where: {
+        // The read handler must not push an account/rateLimits/updated
+        // notification (Finding 5).
+        XCTAssertFalse(msgs.contains {
             if case .notification(let n) = $0 { return n.method == "account/rateLimits/updated" }
             return false
-        }), let updatedParams = updated.params else {
-            return XCTFail("expected account/rateLimits/updated notification")
-        }
-        XCTAssertEqual(updatedParams["rateLimits"], responseSnapshot)
+        }, "account/rateLimits/read must not emit account/rateLimits/updated")
     }
 
     func testAccountRateLimitsRequireChatGPTAuth() async throws {
@@ -2327,7 +3108,12 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(env.cwd, "/work")
         XCTAssertEqual(env.modelProvider, "openai")
         XCTAssertEqual(env.approvalsReviewer, "user")
-        XCTAssertEqual(env.approvalPolicy, .string("never"))
+        // No `approvalPolicy` was passed in `thread/start` params above, so the
+        // port falls back to its intended faithful default of `on-request`
+        // (matches upstream `parse_or_default(&metadata.approval_mode,
+        // AskForApproval::OnRequest)` in thread-store/src/local/read_thread.rs
+        // and `RequestRouter.approvalPolicyFallback`).
+        XCTAssertEqual(env.approvalPolicy, .string("on-request"))
         // P2.4 / H-09: thread/start responses now emit the structured tagged
         // sandbox-policy form (upstream wire shape from
         // `codex-rs/app-server-protocol/src/protocol/v2/permissions.rs`)
@@ -2420,6 +3206,70 @@ final class EndToEndTests: XCTestCase {
         } == true)
     }
 
+    /// Turn-id correlation regression: the `turn/start` response `turn.id` MUST
+    /// equal the engine turn id carried by every subsequent `turn/started` and
+    /// `turn/completed` notification (and the id the client echoes in
+    /// `turn/steer.expectedTurnId` / `turn/interrupt.turnId`). Previously the
+    /// request handler replied with a freshly generated id unrelated to the
+    /// engine's own turn id, so the response correlated with nothing.
+    func testTurnStartResponseIdMatchesTurnNotificationIds() async throws {
+        let s = try makeStack(MockModelClient([.hello("Hello correlation")]))
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+        s.conn.clientSend(req(1, "initialize", .object([
+            "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
+        ])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+        s.conn.clientSend(.notification(JSONRPCNotification(method: "initialized")))
+
+        s.conn.clientSend(req(2, "thread/start", .object(["cwd": .string("/work")])))
+        let startMsgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }
+        guard case .response(let sr)? = startMsgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false }),
+              let env = try? JSONBridge.decode(ThreadSessionResponseEnvelope.self, from: sr.result) else {
+            return XCTFail("no thread/start response")
+        }
+        let tid = env.thread.id
+
+        s.conn.clientSend(req(3, "turn/start", .object([
+            "threadId": .string(tid.raw),
+            "input": .array([.object(["type": .string("text"), "text": .string("hi")])]),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .notification(let n) = $0 { return n.method == "turn/completed" }; return false
+        }
+
+        // The turn/start response id.
+        guard case .response(let turnResp)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(3) }; return false
+        }), let responseTurnId = turnResp.result["turn"]?["id"]?.stringValue else {
+            return XCTFail("missing turn/start response turn.id")
+        }
+
+        // The turn id carried by turn/started.
+        guard let startedTurnId = msgs.compactMap({ m -> String? in
+            if case .notification(let n) = m, n.method == "turn/started" {
+                return n.params?["turn"]?["id"]?.stringValue
+            }
+            return nil
+        }).first else { return XCTFail("missing turn/started turn.id") }
+
+        // The turn id carried by turn/completed.
+        guard let completedTurnId = msgs.compactMap({ m -> String? in
+            if case .notification(let n) = m, n.method == "turn/completed" {
+                return n.params?["turn"]?["id"]?.stringValue
+            }
+            return nil
+        }).first else { return XCTFail("missing turn/completed turn.id") }
+
+        XCTAssertEqual(responseTurnId, startedTurnId,
+                       "turn/start response id must equal the turn/started turn id")
+        XCTAssertEqual(responseTurnId, completedTurnId,
+                       "turn/start response id must equal the turn/completed turn id")
+    }
+
     func testThreadInjectItemsValidatesPersistsAndUpdatesLoadedContext() async throws {
         let model = RecordingModelClient(MockModelClient([
             .hello("first answer"),
@@ -2466,7 +3316,10 @@ final class EndToEndTests: XCTestCase {
             if case .error(let e) = $0 { return e.id == .int(3) }
             return false
         }) else { return XCTFail("missing malformed thread/inject_items error") }
-        XCTAssertEqual(malformed.error.message, "invalid threadId")
+        // Audit app-server-registry/finding-3: upstream emits
+        // `invalid thread id: <error>` (turn_processor.rs:192 et al.).
+        XCTAssertTrue(malformed.error.message.hasPrefix("invalid thread id"),
+                      "got: \(malformed.error.message)")
 
         s.conn.clientSend(req(4, "thread/inject_items", .object([
             "threadId": .string("thr_not_found"),
@@ -2587,7 +3440,8 @@ final class EndToEndTests: XCTestCase {
         guard let malformedError = await awaitError(sink, id: 1) else {
             return XCTFail("missing malformed thread/rollback error")
         }
-        XCTAssertEqual(malformedError.error.message, "invalid threadId")
+        XCTAssertTrue(malformedError.error.message.hasPrefix("invalid thread id"),
+                      "got: \(malformedError.error.message)")
 
         s.conn.clientSend(req(2, "thread/rollback", .object([
             "threadId": .string("thr_not_found"),
@@ -2749,7 +3603,7 @@ final class EndToEndTests: XCTestCase {
 
         let rebuilt = try await s.store.reconstruct(tid)
         XCTAssertTrue(rebuilt.items.contains {
-            if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
+            if case .commandExecution(_, let command, let cwd, let status, _, let output, let exitCode, _, _, _) = $0 {
                 return command == ["printf shell-appserver-ran"]
                     && cwd == work
                     && status == .completed
@@ -2822,13 +3676,21 @@ final class EndToEndTests: XCTestCase {
             return nil
         }
         XCTAssertTrue(compactMethods.contains("turn/started"))
-        XCTAssertTrue(compactMethods.contains("thread/compacted"))
+        // v2 app-server suppresses the deprecated `thread/compacted`
+        // notification (upstream bespoke_event_handling.rs:866-869); the
+        // canonical compaction signal is the `item/completed` (contextCompaction)
+        // notification instead.
+        XCTAssertFalse(compactMethods.contains("thread/compacted"))
         XCTAssertTrue(compactMethods.contains("item/completed"))
         XCTAssertTrue(compactMethods.contains("turn/completed"))
 
         let rebuilt = try await s.store.reconstruct(tid)
+        // P1.1 / F2: replace-then-replay reconstruction surfaces the compaction
+        // summary as the `.userMessage` bridge from the replayed
+        // replacement_history (faithful to upstream), not an `.agentMessage`.
         XCTAssertTrue(rebuilt.items.contains {
-            if case .agentMessage(_, let text) = $0 {
+            if case .userMessage(_, let content) = $0 {
+                let text = content.first?.text ?? ""
                 return text.hasPrefix(Compaction.summaryPrefix)
                     && text.contains("manual compact summary")
             }
@@ -2958,7 +3820,8 @@ final class EndToEndTests: XCTestCase {
         guard case .error(let invalidError)? = invalidMessages.last else {
             return XCTFail("missing invalid threadId error")
         }
-        XCTAssertEqual(invalidError.error.message, "invalid threadId")
+        XCTAssertTrue(invalidError.error.message.hasPrefix("invalid thread id"),
+                      "got: \(invalidError.error.message)")
 
         s.conn.clientSend(req(13, "thread/backgroundTerminals/clean", .object([
             "threadId": .string("thr_not_found"),
@@ -3065,7 +3928,11 @@ final class EndToEndTests: XCTestCase {
             return XCTFail("missing getConversationSummary by id response")
         }
         XCTAssertEqual(idSummary["conversationId"]?.stringValue, threadId)
-        XCTAssertEqual(idSummary["path"]?.stringValue, rolloutPath)
+        // Upstream date-partitioned layout: sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl.
+        let actualRolloutPath = idSummary["path"]?.stringValue ?? rolloutPath
+        XCTAssertTrue(actualRolloutPath.contains("/sessions/")
+                      && actualRolloutPath.hasSuffix("-\(threadId).jsonl"),
+                      "rollout path uses the date-partitioned layout: \(actualRolloutPath)")
         XCTAssertEqual(idSummary["preview"]?.stringValue, "summarize real stored thread")
         XCTAssertEqual(idSummary["cwd"]?.stringValue, "/summary-work")
         XCTAssertEqual(idSummary["modelProvider"]?.stringValue, "openai")
@@ -3079,7 +3946,7 @@ final class EndToEndTests: XCTestCase {
                        "https://example.test/repo.git")
 
         s.conn.clientSend(req(6, "getConversationSummary", .object([
-            "rolloutPath": .string(rolloutPath),
+            "rolloutPath": .string(actualRolloutPath),
         ])))
         let byPathMessages = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(6) }
@@ -3092,10 +3959,10 @@ final class EndToEndTests: XCTestCase {
             return XCTFail("missing getConversationSummary by rolloutPath response")
         }
         XCTAssertEqual(pathSummary["conversationId"]?.stringValue, threadId)
-        XCTAssertEqual(pathSummary["path"]?.stringValue, rolloutPath)
+        XCTAssertEqual(pathSummary["path"]?.stringValue, actualRolloutPath)
 
         s.conn.clientSend(req(7, "getConversationSummary", .object([
-            "rolloutPath": .string(rolloutPath),
+            "rolloutPath": .string(actualRolloutPath),
             "conversationId": .string("thr_missing_summary"),
         ])))
         let bothMessages = await waitOutbound(s.conn) {
@@ -3109,7 +3976,7 @@ final class EndToEndTests: XCTestCase {
             return XCTFail("missing getConversationSummary both-params response")
         }
         XCTAssertEqual(bothSummary["conversationId"]?.stringValue, threadId)
-        XCTAssertEqual(bothSummary["path"]?.stringValue, rolloutPath)
+        XCTAssertEqual(bothSummary["path"]?.stringValue, actualRolloutPath)
 
         s.conn.clientSend(req(8, "getConversationSummary", .object([
             "conversationId": .string("thr_missing_summary"),
@@ -3673,7 +4540,7 @@ final class EndToEndTests: XCTestCase {
                 XCTAssertTrue(calls.contains(#""argv": ["cat"]"#))
                 XCTAssertTrue(calls.contains(#""tty": true"#))
                 XCTAssertTrue(calls.contains(#""pipeStdin": true"#))
-                XCTAssertTrue(calls.contains(#""method": "process/writeStdin""#))
+                XCTAssertTrue(calls.contains(#""method": "process/write""#))
                 XCTAssertTrue(calls.contains(#""inputUtf8": "ping\n""#))
                 XCTAssertTrue(calls.contains(#""argv": ["git", "rev-parse", "--is-inside-work-tree"]"#))
                 XCTAssertTrue(calls.contains(#""argv": ["git", "merge-base", "HEAD", "origin/main"]"#))
@@ -3682,7 +4549,7 @@ final class EndToEndTests: XCTestCase {
                 XCTAssertTrue(calls.contains(#""argv": ["git", "diff", "--no-index", "/dev/null", "untracked.txt"]"#))
                 let rebuilt = try await s.store.reconstruct(remoteEnv.thread.id)
         XCTAssertTrue(rebuilt.items.contains {
-            if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
+            if case .commandExecution(_, let command, let cwd, let status, _, let output, let exitCode, _, _, _) = $0 {
                 return command == ["shell_command"]
                     && cwd == "/remote-env-work"
                     && status == .completed
@@ -3692,7 +4559,7 @@ final class EndToEndTests: XCTestCase {
             return false
         })
                 XCTAssertTrue(rebuilt.items.contains {
-                    if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
+                    if case .commandExecution(_, let command, let cwd, let status, _, let output, let exitCode, _, _, _) = $0 {
                         return command == ["file_search"]
                             && cwd == "/remote-env-work"
                             && status == .completed
@@ -3701,20 +4568,24 @@ final class EndToEndTests: XCTestCase {
                     }
                     return false
                 })
+                // v9 app-server-events finding 3: apply_patch surfaces as a
+                // `fileChange` ThreadItem (not commandExecution), carrying the
+                // per-file change set (path + kind) rather than a text summary.
                 XCTAssertTrue(rebuilt.items.contains {
-                    if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
-                        return command == ["apply_patch"]
-                            && cwd == "/remote-env-work"
-                            && status == .completed
-                            && exitCode == 0
-                            && (output ?? "").contains("update README.md")
-                            && (output ?? "").contains("add docs/NewRemote.md")
-                            && (output ?? "").contains("delete Sources/AppServerGuide.md")
+                    guard case .fileChange(_, let changes, let status) = $0,
+                          status == .completed else { return false }
+                    func has(_ suffix: String, _ pred: (ThreadItem.FileChange.Kind) -> Bool) -> Bool {
+                        changes.contains { $0.path.hasSuffix(suffix) && pred($0.kind) }
                     }
-                    return false
-                })
+                    let isUpdate: (ThreadItem.FileChange.Kind) -> Bool = {
+                        if case .update = $0 { return true }; return false
+                    }
+                    return has("README.md", isUpdate)
+                        && has("docs/NewRemote.md", { $0 == .add })
+                        && has("Sources/AppServerGuide.md", { $0 == .delete })
+                }, "remote apply_patch surfaces as a completed fileChange item")
                 XCTAssertTrue(rebuilt.items.contains {
-                    if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
+                    if case .commandExecution(_, let command, let cwd, let status, _, let output, let exitCode, _, _, _) = $0 {
                         return command == ["unified_exec"]
                             && cwd == "/remote-env-work"
                             && status == .completed
@@ -3725,7 +4596,7 @@ final class EndToEndTests: XCTestCase {
                     return false
                 })
                 XCTAssertTrue(rebuilt.items.contains {
-                    if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
+                    if case .commandExecution(_, let command, let cwd, let status, _, let output, let exitCode, _, _, _) = $0 {
                         return command == ["unified_exec"]
                             && cwd == "/remote-env-work"
                             && status == .completed
@@ -3736,7 +4607,7 @@ final class EndToEndTests: XCTestCase {
                     return false
                 })
                 XCTAssertTrue(rebuilt.items.contains {
-                    if case .commandExecution(_, let command, let cwd, let status, let output, let exitCode) = $0 {
+                    if case .commandExecution(_, let command, let cwd, let status, _, let output, let exitCode, _, _, _) = $0 {
                         return command == ["git_diff"]
                             && cwd == "/remote-env-work"
                             && status == .completed
@@ -4038,7 +4909,15 @@ final class EndToEndTests: XCTestCase {
         // Force a durability barrier so write-behind env-rebound records
         // land on disk before we inspect the rollout.
         try? await s.store.durabilityBarrier(ThreadId(threadId))
-        let rolloutPath = home + "/sessions/\(threadId).rollout.jsonl"
+        // Discover the rollout under upstream's date-partitioned layout
+        // (sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl); fall back to the flat path.
+        let sessionsDir = home + "/sessions"
+        var rolloutPath = sessionsDir + "/\(threadId).rollout.jsonl"
+        let rels = (FileManager.default.enumerator(atPath: sessionsDir)?
+            .allObjects.compactMap { $0 as? String }) ?? []
+        if let match = rels.first(where: { $0.hasSuffix("-\(threadId).jsonl") }) {
+            rolloutPath = sessionsDir + "/" + match
+        }
         let rolloutText = (try? String(contentsOfFile: rolloutPath)) ?? ""
         let rebindCount = rolloutText
             .components(separatedBy: "\"t\":\"environmentRebound\"").count - 1
@@ -4236,10 +5115,10 @@ final class EndToEndTests: XCTestCase {
                       // assert wire shape below.
 
         let calls = (try? String(contentsOfFile: callsPath)) ?? ""
-        let writeStdinCount = calls.components(separatedBy: #""method": "process/writeStdin""#).count - 1
+        let writeStdinCount = calls.components(separatedBy: #""method": "process/write""#).count - 1
         XCTAssertEqual(
             writeStdinCount, 1,
-            "process/writeStdin must not be replayed across reconnect (replay would duplicate stdin)")
+            "exec-server process/write must not be replayed across reconnect (replay would duplicate stdin)")
     }
 
     func testFilesystemRPCsRoundTripRealBytes() async throws {
@@ -4653,6 +5532,9 @@ final class EndToEndTests: XCTestCase {
                 .string("IFS= read line; printf \"pout:$line\"; printf \"perr:$line\" >&2"),
             ]),
             "cwd": .string(root),
+            // streamStdoutStderr defaults to false (buffered) upstream; opt in
+            // to receive process/outputDelta notifications.
+            "streamStdoutStderr": .bool(true),
         ])))
         let spawnAck = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(2) }
@@ -4926,7 +5808,7 @@ final class EndToEndTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: s.home)
             try? FileManager.default.removeItem(atPath: root)
         }
-        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
         _ = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
             return false
@@ -4992,7 +5874,7 @@ final class EndToEndTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: s.home)
             try? FileManager.default.removeItem(atPath: root)
         }
-        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
         _ = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
             return false
@@ -5055,7 +5937,7 @@ final class EndToEndTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: s.home)
             try? FileManager.default.removeItem(atPath: root)
         }
-        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
         _ = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
             return false
@@ -5112,7 +5994,7 @@ final class EndToEndTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: rootA)
             try? FileManager.default.removeItem(atPath: rootB)
         }
-        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
         _ = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
             return false
@@ -5240,6 +6122,295 @@ final class EndToEndTests: XCTestCase {
         XCTAssertTrue(written.contains(#"model = "gpt-4o-mini""#))
         XCTAssertTrue(written.contains("[features]"))
         XCTAssertTrue(written.contains("personality = true"))
+    }
+
+    /// FINDING(config): the write path must reject configs that would fail
+    /// `try_into::<ConfigToml>()` — wrong scalar type or unknown enum variant —
+    /// with `configValidationError` (config_manager_service.rs:274-279,539-542).
+    func testConfigWriteRejectsInvalidTypesAndEnumVariants() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer {
+            s.pump.cancel()
+            try? FileManager.default.removeItem(atPath: s.home)
+        }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        func expectValidationError(_ id: Int64, _ keyPath: String, _ value: JSONValue) async {
+            s.conn.clientSend(req(Int(id), "config/value/write", .object([
+                "keyPath": .string(keyPath),
+                "value": value,
+                "mergeStrategy": .string("replace"),
+            ])))
+            let msgs = await waitOutbound(s.conn) {
+                if case .error(let e) = $0 { return e.id == .int(id) }
+                if case .response(let r) = $0 { return r.id == .int(id) }
+                return false
+            }
+            guard case .error(let err)? = msgs.first(where: {
+                if case .error(let e) = $0 { return e.id == .int(id) }
+                if case .response(let r) = $0 { return r.id == .int(id) }
+                return false
+            }) else { return XCTFail("expected error for \(keyPath)=\(value)") }
+            // Wire shape: error data carries the config_write_error_code.
+            let code = err.error.data?["config_write_error_code"]?.stringValue
+            XCTAssertEqual(code, "configValidationError",
+                           "\(keyPath)=\(value) must be rejected as configValidationError")
+        }
+
+        // Wrong scalar type: model expects a string.
+        await expectValidationError(2, "model", .int(123))
+        // Unknown enum variant: approval_policy.
+        await expectValidationError(3, "approval_policy", .string("bogus"))
+        // Unknown enum variant: sandbox_mode (upstream has no "full-write").
+        await expectValidationError(4, "sandbox_mode", .string("full-write"))
+        // Wrong scalar type: project_doc_max_bytes expects an integer.
+        await expectValidationError(5, "project_doc_max_bytes", .string("x"))
+        // Unknown enum variant: model_reasoning_effort.
+        await expectValidationError(6, "model_reasoning_effort", .string("turbo"))
+        // audit v11 config Finding 2: enum range-check the three previously
+        // unvalidated ConfigToml enum keys (web_search / personality /
+        // plan_mode_reasoning_effort), matching upstream's
+        // `try_into::<ConfigToml>()` rejection (config_manager_service.rs:274-279).
+        await expectValidationError(7, "web_search", .string("bogus"))
+        await expectValidationError(8, "personality", .string("snarky"))
+        await expectValidationError(9, "plan_mode_reasoning_effort", .string("ultra"))
+
+        // The invalid writes must NOT have been persisted.
+        let written = (try? String(contentsOfFile: s.home + "/config.toml", encoding: .utf8)) ?? ""
+        XCTAssertFalse(written.contains("bogus"))
+        XCTAssertFalse(written.contains("full-write"))
+        XCTAssertFalse(written.contains("snarky"))
+        XCTAssertFalse(written.contains("ultra"))
+
+        // Valid values for the newly-validated enum keys still succeed.
+        for (offset, kv) in [("web_search", "live"), ("personality", "friendly"),
+                             ("plan_mode_reasoning_effort", "high")].enumerated() {
+            let rid = 20 + offset
+            s.conn.clientSend(req(rid, "config/value/write", .object([
+                "keyPath": .string(kv.0), "value": .string(kv.1),
+                "mergeStrategy": .string("replace"),
+            ])))
+            let m = await waitOutbound(s.conn) {
+                if case .response(let r) = $0 { return r.id == .int(Int64(rid)) }
+                if case .error(let e) = $0 { return e.id == .int(Int64(rid)) }
+                return false
+            }
+            guard case .response(let r)? = m.first(where: {
+                if case .response(let r) = $0 { return r.id == .int(Int64(rid)) }
+                if case .error(let e) = $0 { return e.id == .int(Int64(rid)) }
+                return false
+            }) else { return XCTFail("valid \(kv.0)=\(kv.1) write should succeed") }
+            XCTAssertEqual(r.result["status"]?.stringValue, "ok",
+                           "valid \(kv.0)=\(kv.1) must persist")
+        }
+
+        // A VALID enum/scalar write still succeeds.
+        s.conn.clientSend(req(7, "config/value/write", .object([
+            "keyPath": .string("sandbox_mode"),
+            "value": .string("workspace-write"),
+            "mergeStrategy": .string("replace"),
+        ])))
+        let okMsgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(7) }; return false
+        }
+        guard case .response(let okr)? = okMsgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(7) }; return false
+        }) else { return XCTFail("missing valid write response") }
+        XCTAssertEqual(okr.result["status"]?.stringValue, "ok")
+    }
+
+    /// FINDING(config): the `version` returned by a write (and compared for
+    /// `expectedVersion`) is the version of the RAW on-disk config.toml, so a
+    /// read→write round-trip matches even when a `[profiles]` table exists
+    /// (config_manager_service.rs:322-333, fingerprint.rs:37).
+    func testConfigWriteVersionMatchesRawFileEvenWithProfiles() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer {
+            s.pump.cancel()
+            try? FileManager.default.removeItem(atPath: s.home)
+        }
+        // Seed config.toml with an inline [profiles.<name>] table so the
+        // user-layer projection differs from the raw file.
+        try """
+        model = "seed-model"
+
+        [profiles.work]
+        approval_policy = "never"
+        """.write(toFile: s.home + "/config.toml", atomically: true, encoding: .utf8)
+
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        // First write: capture the returned version.
+        s.conn.clientSend(req(2, "config/value/write", .object([
+            "keyPath": .string("model"),
+            "value": .string("v1"),
+            "mergeStrategy": .string("replace"),
+        ])))
+        let m1 = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(2) }; return false }
+        guard case .response(let r1)? = m1.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }) else { return XCTFail("missing first write response") }
+        let version = r1.result["version"]?.stringValue
+        XCTAssertNotNil(version)
+        XCTAssertTrue(version?.hasPrefix("sha256:") == true)
+
+        // The returned version must equal the fingerprint of the RAW on-disk
+        // file (profiles intact), not a profile-stripped/overlaid transform.
+        let rawText = try String(contentsOfFile: s.home + "/config.toml", encoding: .utf8)
+        let rawParsed = try TOML.parse(rawText)
+        XCTAssertEqual(version, ConfigCanonicalVersion.version(of: rawParsed),
+                       "write version must be the raw config.toml fingerprint")
+
+        // Round-trip: a second write supplying that version as expectedVersion
+        // must NOT spuriously conflict.
+        s.conn.clientSend(req(3, "config/value/write", .object([
+            "keyPath": .string("model"),
+            "value": .string("v2"),
+            "mergeStrategy": .string("replace"),
+            "expectedVersion": .string(version!),
+        ])))
+        let m2 = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(3) }
+            if case .response(let r) = $0 { return r.id == .int(3) }
+            return false
+        }
+        guard case .response(let r2)? = m2.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(3) }
+            return false
+        }) else { return XCTFail("expectedVersion round-trip spuriously conflicted") }
+        XCTAssertEqual(r2.result["status"]?.stringValue, "ok")
+    }
+
+    /// FINDING(config): always-defaulted ConfigToml maps/structs + history
+    /// max_bytes:null must appear in config/read for an empty config
+    /// (config_toml.rs HashMaps/ShellEnvironmentPolicyToml, types.rs History).
+    func testConfigReadEmitsAlwaysPresentDefaultMapsAndHistoryMaxBytes() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer {
+            s.pump.cancel()
+            try? FileManager.default.removeItem(atPath: s.home)
+        }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "config/read", .object([:])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }
+        guard case .response(let rr)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }) else { return XCTFail("missing config/read response") }
+        let cfg = rr.result["config"]
+        // Always-present empty maps.
+        XCTAssertEqual(cfg?["mcp_servers"], .object([:]))
+        XCTAssertEqual(cfg?["model_providers"], .object([:]))
+        XCTAssertEqual(cfg?["plugins"], .object([:]))
+        XCTAssertEqual(cfg?["marketplaces"], .object([:]))
+        // shell_environment_policy default: an object with all-null leaves.
+        guard case .object(let sep)? = cfg?["shell_environment_policy"] else {
+            return XCTFail("shell_environment_policy must be an object")
+        }
+        XCTAssertEqual(sep["inherit"], .null)
+        // history default carries max_bytes: null.
+        guard case .object(let hist)? = cfg?["history"] else {
+            return XCTFail("history must be an object")
+        }
+        XCTAssertEqual(hist["persistence"], .string("save-all"))
+        XCTAssertTrue(hist.keys.contains("max_bytes"), "history must include max_bytes")
+        XCTAssertEqual(hist["max_bytes"], .null)
+    }
+
+    /// audit v11 config Finding 1: an UNTRUSTED project-local layer surfaces in
+    /// `config/read` `layers[]` with a `disabledReason` and is EXCLUDED from the
+    /// effective `config` (upstream trust gating + v2 `ConfigLayer.disabled_reason`,
+    /// loader/mod.rs:1162-1163, v2/config.rs:298-304).
+    func testConfigReadSurfacesDisabledReasonForUntrustedProjectLayer() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+        // A repo (with .git) carrying a project-local config, NOT trusted in the
+        // user config under $CODEX_HOME.
+        let repo = NSTemporaryDirectory() + "repo-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: repo) }
+        try FileManager.default.createDirectory(atPath: repo + "/.git",
+                                                withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: repo + "/.codex",
+                                                withIntermediateDirectories: true)
+        try #"model = "untrusted-project-model""#.write(
+            toFile: repo + "/.codex/config.toml", atomically: true, encoding: .utf8)
+
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "config/read", .object([
+            "cwd": .string(repo),
+            "includeLayers": .bool(true),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }
+        guard case .response(let rr)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }) else { return XCTFail("missing config/read response") }
+
+        // Effective config does NOT carry the untrusted repo's model.
+        XCTAssertNotEqual(rr.result["config"]?["model"]?.stringValue,
+                          "untrusted-project-model",
+                          "untrusted project config must be excluded from effective config")
+
+        // The project layer is still surfaced with a disabledReason.
+        guard case .array(let layers)? = rr.result["layers"] else {
+            return XCTFail("config/read must include layers[]")
+        }
+        let projectLayer = layers.first { layer in
+            if case .object(let o) = layer, case .object(let name)? = o["name"],
+               name["type"]?.stringValue == "project" { return true }
+            return false
+        }
+        guard case .object(let pl)? = projectLayer else {
+            return XCTFail("expected a project layer in layers[]")
+        }
+        let reason = pl["disabledReason"]?.stringValue
+        XCTAssertNotNil(reason, "untrusted project layer must carry disabledReason")
+        XCTAssertTrue(reason?.contains("trusted project") ?? false,
+                      "disabledReason names the trust requirement")
+    }
+
+    /// FINDING(config): config/batchWrite accepts the reloadUserConfig flag
+    /// (it is honored for newly spawned workers; the running-worker hot-reload
+    /// is a documented multi-process divergence). The write itself must still
+    /// succeed and persist.
+    func testConfigBatchWriteAcceptsReloadUserConfigFlag() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer {
+            s.pump.cancel()
+            try? FileManager.default.removeItem(atPath: s.home)
+        }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) { if case .response(let r) = $0 { return r.id == .int(1) }; return false }
+
+        s.conn.clientSend(req(2, "config/batchWrite", .object([
+            "reloadUserConfig": .bool(true),
+            "edits": .array([
+                .object([
+                    "keyPath": .string("model"),
+                    "value": .string("reloaded-model"),
+                    "mergeStrategy": .string("replace"),
+                ]),
+            ]),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            if case .response(let r) = $0 { return r.id == .int(2) }
+            return false
+        }
+        guard case .response(let rr)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }) else { return XCTFail("missing batchWrite response") }
+        XCTAssertEqual(rr.result["status"]?.stringValue, "ok")
+        let written = try String(contentsOfFile: s.home + "/config.toml", encoding: .utf8)
+        XCTAssertTrue(written.contains(#"model = "reloaded-model""#))
     }
 
     func testExternalAgentConfigDetectImportAndIdempotency() async throws {
@@ -6479,7 +7650,7 @@ final class EndToEndTests: XCTestCase {
             s.pump.cancel()
             try? FileManager.default.removeItem(atPath: s.home)
         }
-        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
         _ = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
             return false
@@ -6504,6 +7675,178 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(items[1]["mode"]?.stringValue, "default")
         XCTAssertEqual(items[1]["model"]?.isNull, true)
         XCTAssertEqual(items[1]["reasoning_effort"]?.isNull, true)
+    }
+
+    /// Audit app-server-registry/finding-1: collaborationMode/list (and the
+    /// goal/realtime/remoteControl/fuzzyFileSearch session methods) are
+    /// whole-method `#[experimental(...)]` upstream. A connection that did NOT
+    /// negotiate experimentalApi must be rejected with
+    /// `<method> requires experimentalApi capability` (-32600), never dispatched.
+    func testCollaborationModeListGatedWithoutExperimentalApi() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer {
+            s.pump.cancel()
+            try? FileManager.default.removeItem(atPath: s.home)
+        }
+        s.conn.clientSend(req(1, "initialize",
+                              .object(["clientInfo": .object(["name": .string("t")])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        s.conn.clientSend(req(2, "collaborationMode/list", .object([:])))
+        let messages = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }
+        guard case .error(let err)? = messages.first(where: {
+            if case .error(let e) = $0 { return e.id == .int(2) }
+            return false
+        }) else { return XCTFail("expected experimental gate error") }
+        XCTAssertEqual(err.error.code, -32600)
+        XCTAssertEqual(err.error.message,
+                       "collaborationMode/list requires experimentalApi capability")
+    }
+
+    // MARK: turn/steer validation (turn_processor.rs:621-723)
+
+    /// Starts a thread and returns its id over the wire `(stack, threadId)`.
+    private func startThreadForSteer(experimentalApi: Bool = false)
+        async throws -> (Stack, ThreadId) {
+        let s = try makeStack(MockModelClient([.hello()]))
+        var initCaps: JSONValue = .object(["clientInfo": .object(["name": .string("t")])])
+        if experimentalApi {
+            initCaps = .object([
+                "clientInfo": .object(["name": .string("t")]),
+                "capabilities": .object(["experimentalApi": .bool(true)]),
+            ])
+        }
+        s.conn.clientSend(req(1, "initialize", initCaps))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }; return false
+        }
+        s.conn.clientSend(req(2, "thread/start", .object([
+            "cwd": .string(FileManager.default.currentDirectoryPath),
+            "model": .string("mock"),
+        ])))
+        let startMessages = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }
+        guard case .response(let start)? = startMessages.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(2) }; return false
+        }), let tidRaw = start.result["thread"]?["id"]?.stringValue else {
+            throw XCTSkip("missing thread/start response")
+        }
+        return (s, ThreadId(tidRaw))
+    }
+
+    func testTurnSteerRejectsEmptyExpectedTurnId() async throws {
+        let (s, tid) = try await startThreadForSteer()
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+
+        s.conn.clientSend(req(3, "turn/steer", .object([
+            "threadId": .string(tid.raw),
+            "input": .array([.object(["type": .string("text"),
+                                      "text": .string("steer me")])]),
+            "expectedTurnId": .string(""),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(3) }; return false
+        }
+        guard case .error(let e)? = msgs.first(where: {
+            if case .error(let e) = $0 { return e.id == .int(3) }; return false
+        }) else { return XCTFail("expected empty-expectedTurnId error") }
+        XCTAssertEqual(e.error.code, -32600)
+        XCTAssertEqual(e.error.message, "expectedTurnId must not be empty")
+    }
+
+    func testTurnSteerRejectsOversizedTextInput() async throws {
+        let (s, tid) = try await startThreadForSteer()
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+
+        let limit = 1 << 20
+        let oversized = String(repeating: "x", count: limit + 1)
+        s.conn.clientSend(req(3, "turn/steer", .object([
+            "threadId": .string(tid.raw),
+            "input": .array([.object(["type": .string("text"),
+                                      "text": .string(oversized)])]),
+            "expectedTurnId": .string("t"),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(3) }; return false
+        }
+        guard case .error(let e)? = msgs.first(where: {
+            if case .error(let e) = $0 { return e.id == .int(3) }; return false
+        }) else { return XCTFail("expected input-too-large error") }
+        // Upstream uses invalid_params (-32602) with structured data.
+        XCTAssertEqual(e.error.code, -32602)
+        XCTAssertEqual(e.error.message,
+                       "Input exceeds the maximum length of 1048576 characters.")
+        XCTAssertEqual(e.error.data?["input_error_code"]?.stringValue, "input_too_large")
+        XCTAssertEqual(e.error.data?["max_chars"]?.intValue, Int64(limit))
+        XCTAssertEqual(e.error.data?["actual_chars"]?.intValue, Int64(limit + 1))
+    }
+
+    func testTurnSteerReturnsActiveTurnId() async throws {
+        let (s, tid) = try await startThreadForSteer()
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+
+        s.conn.clientSend(req(3, "turn/steer", .object([
+            "threadId": .string(tid.raw),
+            "input": .array([.object(["type": .string("text"),
+                                      "text": .string("steer me")])]),
+            "expectedTurnId": .string("turn_active_42"),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(3) }; return false
+        }
+        guard case .response(let r)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(3) }; return false
+        }) else { return XCTFail("expected turn/steer response") }
+        // Wire shape: {"turnId": "<expectedTurnId>"} (TurnSteerResponse).
+        XCTAssertEqual(r.result["turnId"]?.stringValue, "turn_active_42")
+    }
+
+    func testTurnSteerResponsesapiClientMetadataGatedWithoutExperimentalApi() async throws {
+        let (s, tid) = try await startThreadForSteer(experimentalApi: false)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+
+        s.conn.clientSend(req(3, "turn/steer", .object([
+            "threadId": .string(tid.raw),
+            "input": .array([.object(["type": .string("text"),
+                                      "text": .string("steer me")])]),
+            "expectedTurnId": .string("t"),
+            "responsesapiClientMetadata": .object(["k": .string("v")]),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .error(let e) = $0 { return e.id == .int(3) }; return false
+        }
+        guard case .error(let e)? = msgs.first(where: {
+            if case .error(let e) = $0 { return e.id == .int(3) }; return false
+        }) else { return XCTFail("expected experimental-field gate error") }
+        XCTAssertEqual(e.error.code, -32600)
+        XCTAssertEqual(e.error.message,
+                       "turn/steer.responsesapiClientMetadata requires experimentalApi capability")
+    }
+
+    func testTurnSteerResponsesapiClientMetadataAllowedWithExperimentalApi() async throws {
+        let (s, tid) = try await startThreadForSteer(experimentalApi: true)
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+
+        s.conn.clientSend(req(3, "turn/steer", .object([
+            "threadId": .string(tid.raw),
+            "input": .array([.object(["type": .string("text"),
+                                      "text": .string("steer me")])]),
+            "expectedTurnId": .string("turn_active_7"),
+            "responsesapiClientMetadata": .object(["k": .string("v")]),
+        ])))
+        let msgs = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(3) }; return false
+        }
+        guard case .response(let r)? = msgs.first(where: {
+            if case .response(let r) = $0 { return r.id == .int(3) }; return false
+        }) else { return XCTFail("expected turn/steer success with experimentalApi") }
+        XCTAssertEqual(r.result["turnId"]?.stringValue, "turn_active_7")
     }
 
     func testRemoteControlStatusEnableDisableLifecycleAndEnrollment() async throws {
@@ -6538,6 +7881,7 @@ final class EndToEndTests: XCTestCase {
         defer { drain.cancel() }
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let initResponse = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(initResponse)
@@ -6653,6 +7997,7 @@ final class EndToEndTests: XCTestCase {
         defer { drain.cancel() }
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let initResponse = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(initResponse)
@@ -6709,6 +8054,7 @@ final class EndToEndTests: XCTestCase {
         defer { drain.cancel() }
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let initResponse = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(initResponse)
@@ -6760,6 +8106,7 @@ final class EndToEndTests: XCTestCase {
         defer { drain.cancel() }
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let initResponse = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(initResponse)
@@ -6813,6 +8160,7 @@ final class EndToEndTests: XCTestCase {
         defer { drain.cancel() }
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("control")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let controlInitResponse = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(controlInitResponse)
@@ -6931,6 +8279,7 @@ final class EndToEndTests: XCTestCase {
 
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("control")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let controlInitialize = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(controlInitialize)
@@ -7050,6 +8399,7 @@ final class EndToEndTests: XCTestCase {
 
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("control")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let controlInitialize = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(controlInitialize)
@@ -7134,6 +8484,7 @@ final class EndToEndTests: XCTestCase {
 
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("control")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let controlInitialize = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(controlInitialize)
@@ -7206,6 +8557,7 @@ final class EndToEndTests: XCTestCase {
 
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("control")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let controlInitialize = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(controlInitialize)
@@ -7256,6 +8608,7 @@ final class EndToEndTests: XCTestCase {
         defer { drain.cancel() }
         s.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         let initResponse = await awaitResponse(sink, id: 1)
         XCTAssertNotNil(initResponse)
@@ -7325,6 +8678,7 @@ final class EndToEndTests: XCTestCase {
         defer { noAuth.pump.cancel(); try? FileManager.default.removeItem(atPath: noAuth.home) }
         noAuth.conn.clientSend(req(1, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         _ = await waitOutbound(noAuth.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
@@ -7348,6 +8702,7 @@ final class EndToEndTests: XCTestCase {
         defer { apiKey.pump.cancel(); try? FileManager.default.removeItem(atPath: home) }
         apiKey.conn.clientSend(req(3, "initialize", .object([
             "clientInfo": .object(["name": .string("t")]),
+            "capabilities": .object(["experimentalApi": .bool(true)]),
         ])))
         _ = await waitOutbound(apiKey.conn) {
             if case .response(let r) = $0 { return r.id == .int(3) }
@@ -7371,7 +8726,7 @@ final class EndToEndTests: XCTestCase {
             s.pump.cancel()
             try? FileManager.default.removeItem(atPath: s.home)
         }
-        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")])])))
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
         _ = await waitOutbound(s.conn) {
             if case .response(let r) = $0 { return r.id == .int(1) }
             return false
@@ -7523,6 +8878,47 @@ final class EndToEndTests: XCTestCase {
             }
             return false
         })
+    }
+
+    /// v9 app-server-events finding 6: a realtime session started with NO
+    /// explicit prompt (and no config prompt) injects the default backend
+    /// system prompt (templates/realtime/backend_prompt.md) as a system
+    /// itemAdded, with `{{ user_first_name }}` substituted — parity with
+    /// `prepare_realtime_backend_prompt` returning BACKEND_PROMPT.
+    func testRealtimeStartWithoutPromptInjectsDefaultBackendPrompt() async throws {
+        let s = try makeStack(MockModelClient([.hello()]))
+        defer { s.pump.cancel(); try? FileManager.default.removeItem(atPath: s.home) }
+        s.conn.clientSend(req(1, "initialize", .object(["clientInfo": .object(["name": .string("t")]), "capabilities": .object(["experimentalApi": .bool(true)])])))
+        _ = await waitOutbound(s.conn) {
+            if case .response(let r) = $0 { return r.id == .int(1) }
+            return false
+        }
+        let threadId = ThreadId.generate().raw
+        // No `prompt` key at all → upstream `None` → default backend prompt.
+        s.conn.clientSend(req(2, "thread/realtime/start", .object([
+            "threadId": .string(threadId),
+            "outputModality": .string("text"),
+        ])))
+        let msgs = await waitOutbound(s.conn, {
+            if case .notification(let n) = $0 { return n.method == "thread/realtime/itemAdded" }
+            return false
+        }, timeoutMs: 10_000)
+        let systemItem = msgs.first {
+            if case .notification(let n) = $0 {
+                return n.method == "thread/realtime/itemAdded"
+                    && n.params?["item"]?["role"]?.stringValue == "system"
+            }
+            return false
+        }
+        guard case .notification(let note)? = systemItem else {
+            return XCTFail("expected a default system prompt itemAdded")
+        }
+        let text = note.params?["item"]?["text"]?.stringValue ?? ""
+        XCTAssertTrue(text.hasPrefix("## Identity, tone, and role"),
+                      "default backend prompt injected")
+        XCTAssertTrue(text.contains("You are Codex, an OpenAI general-purpose agentic assistant"))
+        XCTAssertFalse(text.contains("{{ user_first_name }}"),
+                       "placeholder must be substituted")
     }
 
     func testMcpServerStatusAndToolCallUseRealConfiguredServer() async throws {
@@ -8365,7 +9761,8 @@ final class EndToEndTests: XCTestCase {
             if case .error(let e) = $0 { return e.id == .int(3) }
             return false
         }) else { return XCTFail("missing invalid thread id error") }
-        XCTAssertEqual(invalid.error.message, "invalid threadId")
+        XCTAssertTrue(invalid.error.message.hasPrefix("invalid thread id"),
+                      "got: \(invalid.error.message)")
     }
 
     func testThreadMetadataUpdatePersistsGitInfo() async throws {
@@ -8658,12 +10055,86 @@ final class EndToEndTests: XCTestCase {
         await supervisor.ensureWorker(cfg) { _ in Task { await b.inc() } }
         let subs = await supervisor.subscriberCount(cfg.threadId)
         XCTAssertEqual(subs, 2)
-        await supervisor.submit(cfg.threadId, .startTurn(input: [TurnInput(text: "go")], model: nil))
+        await supervisor.submit(cfg.threadId, .startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(400))
         let av = await a.value
         let bv = await b.value
         XCTAssertGreaterThan(av, 0)
         XCTAssertGreaterThan(bv, 0, "second subscriber must also receive notifications")
+    }
+
+    /// prompts finding A/B/C: `RequestRouter.agentsMdConfig` must seed the
+    /// model-visible user-instructions from the GLOBAL
+    /// `~/.codex/AGENTS.override.md` / `AGENTS.md` and forward the AGENTS.md
+    /// config knobs (`project_doc_fallback_filenames`, `project_root_markers`,
+    /// `project_doc_max_bytes`, `child_agents_md` feature) into SessionConfig.
+    func testAgentsMdConfigLoadsGlobalAndForwardsKnobs() throws {
+        let home = NSTemporaryDirectory() + "agentsmd-cfg-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        // Global AGENTS.md in $CODEX_HOME.
+        try "GLOBAL-AGENTS-MARKER".write(toFile: home + "/AGENTS.md",
+                                         atomically: true, encoding: .utf8)
+        try """
+        project_doc_fallback_filenames = ["WORKFLOW.md"]
+        project_root_markers = [".hg"]
+        project_doc_max_bytes = 4096
+
+        [features]
+        child_agents_md = true
+        """.write(toFile: home + "/config.toml", atomically: true, encoding: .utf8)
+
+        let cwd = NSTemporaryDirectory() + "agentsmd-cwd-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: cwd) }
+
+        let config = ConfigLoader(codexHome: home).load()
+        let agentsMd = RequestRouter.agentsMdConfig(config, codexHome: home, cwd: cwd)
+
+        // Finding A: global AGENTS.md content seeds user instructions.
+        XCTAssertEqual(agentsMd.userInstructions, "GLOBAL-AGENTS-MARKER",
+                       "global ~/.codex/AGENTS.md must seed agentsMdUserInstructions")
+        // Finding B: fallback filenames / root markers / child feature forwarded.
+        XCTAssertEqual(agentsMd.filenames, ["WORKFLOW.md"])
+        XCTAssertEqual(agentsMd.projectRootMarkers, [".hg"])
+        XCTAssertTrue(agentsMd.childEnabled,
+                      "child_agents_md feature must reach agentsMdChildEnabled")
+        // Finding C: project_doc_max_bytes forwarded verbatim.
+        XCTAssertEqual(agentsMd.projectDocMaxBytes, 4096)
+    }
+
+    /// prompts finding C: `project_doc_max_bytes = 0` disables *discovered
+    /// project AGENTS.md docs* (`read_agents_md` short-circuit), but the GLOBAL
+    /// override (`~/.codex/AGENTS.override.md` / `AGENTS.md`) is loaded
+    /// unconditionally into `Config.user_instructions` (`config/mod.rs:2349`)
+    /// and prepended regardless of the budget (`agents_md.rs:98-100`), so it
+    /// must survive a zero budget.
+    func testAgentsMdConfigZeroBudgetKeepsGlobalDropsProjectDocs() throws {
+        let home = NSTemporaryDirectory() + "agentsmd-zero-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        try "GLOBAL-AGENTS-MARKER".write(toFile: home + "/AGENTS.md",
+                                         atomically: true, encoding: .utf8)
+        try "project_doc_max_bytes = 0\n".write(toFile: home + "/config.toml",
+                                                 atomically: true, encoding: .utf8)
+        let config = ConfigLoader(codexHome: home).load()
+        // cwd that contains its own project AGENTS.md to prove the budget gate
+        // drops the *project* doc while the global override still flows through.
+        let cwd = NSTemporaryDirectory() + "agentsmd-zero-cwd-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: cwd) }
+        try "PROJECT-DOC".write(toFile: cwd + "/AGENTS.md", atomically: true, encoding: .utf8)
+
+        let agentsMd = RequestRouter.agentsMdConfig(config, codexHome: home, cwd: cwd)
+        XCTAssertEqual(agentsMd.projectDocMaxBytes, 0)
+        // Global override survives the zero budget (upstream loads it into
+        // config.user_instructions regardless of project_doc_max_bytes; the
+        // budget only gates the discovered project AGENTS.md docs via
+        // read_agents_md's zero short-circuit). The project-doc drop under a
+        // zero budget is asserted engine-side in
+        // SkillsAgentsMdParityTests.testProjectDocMaxBytesZeroDisablesAgentsMd.
+        XCTAssertEqual(agentsMd.userInstructions, "GLOBAL-AGENTS-MARKER",
+                       "global AGENTS.md must survive project_doc_max_bytes=0")
     }
 }
 

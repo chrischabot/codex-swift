@@ -24,7 +24,8 @@ final class ToolsTests: XCTestCase {
         """
         var applied = try ap.apply(add, root: root)
         XCTAssertEqual(applied.first?.kind, .add)
-        XCTAssertEqual(try String(contentsOfFile: root + "/a.txt", encoding: .utf8), "line1\nline2")
+        // Upstream appends a trailing newline per added line (parser.rs:291-299).
+        XCTAssertEqual(try String(contentsOfFile: root + "/a.txt", encoding: .utf8), "line1\nline2\n")
 
         let update = """
         *** Begin Patch
@@ -38,7 +39,7 @@ final class ToolsTests: XCTestCase {
         applied = try ap.apply(update, root: root)
         XCTAssertEqual(applied.first?.kind, .update)
         XCTAssertEqual(try String(contentsOfFile: root + "/a.txt", encoding: .utf8),
-                       "line1\nline2-changed")
+                       "line1\nline2-changed\n")
 
         let del = """
         *** Begin Patch
@@ -50,19 +51,55 @@ final class ToolsTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root + "/a.txt"))
     }
 
+    // Port of upstream test_pure_addition_chunk_followed_by_removal
+    // (codex-rs/apply-patch/src/lib.rs:1261-1295). A pure-addition chunk
+    // followed by an edit chunk must compute all replacements against the
+    // immutable original lines and apply them descending, so the pure addition
+    // anchors at the ORIGINAL end of file (not after the in-place edit).
+    func testApplyPatchPureAdditionChunkFollowedByRemoval() throws {
+        let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let ap = ApplyPatch()
+        let create = "*** Begin Patch\n*** Add File: panic.txt\n+line1\n+line2\n+line3\n*** End Patch"
+        _ = try ap.apply(create, root: root)
+        XCTAssertEqual(try String(contentsOfFile: root + "/panic.txt", encoding: .utf8),
+                       "line1\nline2\nline3\n")
+
+        let patch = """
+        *** Begin Patch
+        *** Update File: panic.txt
+        @@
+        +after-context
+        +second-line
+        @@
+         line1
+        -line2
+        -line3
+        +line2-replacement
+        *** End Patch
+        """
+        let applied = try ap.apply(patch, root: root)
+        XCTAssertEqual(applied.first?.kind, .update)
+        XCTAssertEqual(try String(contentsOfFile: root + "/panic.txt", encoding: .utf8),
+                       "line1\nline2-replacement\nafter-context\nsecond-line\n")
+    }
+
     func testApplyPatchErrors() throws {
         let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
         let ap = ApplyPatch()
         XCTAssertThrowsError(try ap.apply("garbage", root: root)) {
             guard case ApplyPatchError.malformed = $0 else { return XCTFail("expected malformed") }
         }
-        // add then add again → targetExists
+        // add then add again → upstream overwrites (lib.rs:397-417), capturing
+        // the prior content as `oldContents` (overwritten_content).
         let add = "*** Begin Patch\n*** Add File: x.txt\n+hi\n*** End Patch"
         _ = try ap.apply(add, root: root)
-        XCTAssertThrowsError(try ap.apply(add, root: root)) {
-            guard case ApplyPatchError.targetExists = $0 else { return XCTFail("expected targetExists") }
-        }
-        // update with non-matching context → contextMismatch
+        let readd = "*** Begin Patch\n*** Add File: x.txt\n+bye\n*** End Patch"
+        let reapplied = try ap.apply(readd, root: root)
+        XCTAssertEqual(reapplied.first?.kind, .add)
+        XCTAssertEqual(reapplied.first?.oldContents, "hi\n")
+        XCTAssertEqual(try String(contentsOfFile: root + "/x.txt", encoding: .utf8), "bye\n")
+        // update with non-matching context → contextMismatch with the upstream
+        // "Failed to find expected lines in <path>:\n<old_lines>" text.
         let badUpdate = """
         *** Begin Patch
         *** Update File: x.txt
@@ -72,8 +109,114 @@ final class ToolsTests: XCTestCase {
         *** End Patch
         """
         XCTAssertThrowsError(try ap.apply(badUpdate, root: root)) {
-            guard case ApplyPatchError.contextMismatch = $0 else { return XCTFail("expected contextMismatch") }
+            guard case let ApplyPatchError.contextMismatch(msg) = $0 else {
+                return XCTFail("expected contextMismatch")
+            }
+            // v10 Finding 4: error renders the ABSOLUTE resolved path
+            // (upstream compute_replacements uses path_abs, lib.rs:678,771-775).
+            let abs = (root as NSString).appendingPathComponent("x.txt")
+            XCTAssertEqual(msg, "Failed to find expected lines in \(abs):\nnot-present")
         }
+    }
+
+    // Finding: Update-with-Move overwrites an existing destination (upstream
+    // lib.rs:465-486) instead of erroring, recording the prior destination
+    // content as `overwrittenMoveContents`.
+    func testApplyPatchUpdateWithMoveOverwritesDestination() throws {
+        let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let ap = ApplyPatch()
+        _ = try ap.apply("*** Begin Patch\n*** Add File: src.txt\n+hello\n*** End Patch", root: root)
+        _ = try ap.apply("*** Begin Patch\n*** Add File: dst.txt\n+old-dest\n*** End Patch", root: root)
+        let move = """
+        *** Begin Patch
+        *** Update File: src.txt
+        *** Move to: dst.txt
+        @@
+        -hello
+        +hello-moved
+        *** End Patch
+        """
+        let applied = try ap.apply(move, root: root)
+        XCTAssertEqual(applied.first?.kind, .update)
+        XCTAssertEqual(applied.first?.movePath, "dst.txt")
+        XCTAssertEqual(applied.first?.overwrittenMoveContents, "old-dest\n")
+        XCTAssertEqual(try String(contentsOfFile: root + "/dst.txt", encoding: .utf8),
+                       "hello-moved\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root + "/src.txt"))
+    }
+
+    // Finding: empty (hunk-less) patch is NOT a parse error upstream
+    // (parser.rs:623-632 returns Ok with empty hunks); the "No files were
+    // modified." text is an APPLY-time bail (lib.rs:371-373) surfaced as a bare
+    // stderr line. So `parse()` returns an empty list and `apply()` throws
+    // `.emptyPatch` whose `formatted` carries NO `invalid patch:` prefix.
+    func testApplyPatchEmptyPatchMessage() throws {
+        let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let ap = ApplyPatch()
+        // parse() no longer throws for a boundary-valid empty patch.
+        XCTAssertEqual(try ap.parse("*** Begin Patch\n*** End Patch").count, 0)
+        XCTAssertThrowsError(try ap.apply("*** Begin Patch\n*** End Patch", root: root)) {
+            guard case let ApplyPatchError.emptyPatch(msg) = $0 else {
+                return XCTFail("expected emptyPatch")
+            }
+            XCTAssertEqual(msg, "No files were modified.")
+            // Bare message — no parser prefix.
+            XCTAssertEqual((($0 as? ApplyPatchError)?.formatted), "No files were modified.")
+        }
+    }
+
+    // Finding: change_context miss surfaces the upstream
+    // "Failed to find context '<ctx>' in <path>" text (lib.rs:714-718).
+    func testApplyPatchChangeContextMismatchMessage() throws {
+        let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let ap = ApplyPatch()
+        _ = try ap.apply("*** Begin Patch\n*** Add File: x.txt\n+line1\n+line2\n*** End Patch",
+                         root: root)
+        let badContext = """
+        *** Begin Patch
+        *** Update File: x.txt
+        @@ no-such-context
+         line1
+        -line2
+        +line2b
+        *** End Patch
+        """
+        XCTAssertThrowsError(try ap.apply(badContext, root: root)) {
+            guard case let ApplyPatchError.contextMismatch(msg) = $0 else {
+                return XCTFail("expected contextMismatch")
+            }
+            // v10 Finding 4: error renders the ABSOLUTE resolved path
+            // (upstream compute_replacements uses path_abs, lib.rs:714-718).
+            let abs = (root as NSString).appendingPathComponent("x.txt")
+            XCTAssertEqual(msg, "Failed to find context 'no-such-context' in \(abs)")
+        }
+    }
+
+    // Finding: the success summary for an Update-with-move uses the move
+    // DESTINATION ("M dst.txt"), matching upstream print_summary which pushes
+    // hunk.path() (= move_path for renames; lib.rs:524).
+    func testApplyPatchToolSummaryUsesMoveDestination() async throws {
+        let root = tmpDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let sb = WorkspaceSandbox(SandboxPolicy(mode: .workspaceWrite, writableRoots: [root]))
+        let tool = ApplyPatchTool(sandbox: sb)
+        // Seed src.txt.
+        let add = ToolCall(callId: "a", name: "apply_patch",
+                           argumentsJSON: "*** Begin Patch\n*** Add File: src.txt\n+hello\n*** End Patch")
+        _ = try await tool.run(add, cwd: root)
+        let move = ToolCall(callId: "m", name: "apply_patch", argumentsJSON: """
+        *** Begin Patch
+        *** Update File: src.txt
+        *** Move to: dst.txt
+        @@
+        -hello
+        +hello2
+        *** End Patch
+        """)
+        let result = try await tool.run(move, cwd: root)
+        XCTAssertTrue(result.success)
+        XCTAssertTrue(result.output.contains("M dst.txt"),
+                      "expected move destination in summary, got: \(result.output)")
+        XCTAssertFalse(result.output.contains("M src.txt"))
     }
 
     func testSandboxPolicyClasses() {
@@ -121,9 +264,18 @@ final class ToolsTests: XCTestCase {
         let sb = WorkspaceSandbox(SandboxPolicy(mode: .workspaceWrite,
                                                 writableRoots: [link],
                                                 networkAllowed: false))
-        let profile = try XCTUnwrap(sb.confinementProfile(cwd: link))
+        let (profile, params) = try XCTUnwrap(sb.confinementProfileWithParams(cwd: link))
         let canonical = WorkspaceSandbox.canonicalPath(injected)
-        XCTAssertTrue(profile.contains(WorkspaceSandbox.sbplStringLiteral(canonical)))
+        // The concrete (canonical) writable-root path is now passed out-of-band
+        // as a `-DWRITABLE_ROOT_n=<path>` parameter rather than inlined into the
+        // SBPL text — mirroring upstream `create_seatbelt_command_args`. The
+        // profile references `(param "WRITABLE_ROOT_n")` instead.
+        XCTAssertTrue(params.contains { $0.1 == canonical },
+                      "canonical writable root must be a -D param value: \(params)")
+        XCTAssertTrue(profile.contains("(subpath (param \"WRITABLE_ROOT_0\"))"),
+                      "writable root must be referenced via a param, not inlined: \(profile)")
+        XCTAssertFalse(profile.contains(canonical),
+                       "raw canonical path must not be inlined into the SBPL profile")
         XCTAssertFalse(profile.split(separator: "\n").contains("(allow network*)"),
                        "network remains denied despite quote/newline injection in a path")
         XCTAssertFalse(profile.contains("quote\")\n(allow network*)"),
@@ -131,7 +283,12 @@ final class ToolsTests: XCTestCase {
         if FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec") {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-            p.arguments = ["-p", profile, "/bin/echo", "profile-ok"]
+            // Pass the matching -D definitions so the profile's param
+            // references resolve, exactly as sandboxedInvocation does.
+            var args = ["-p", profile]
+            for (key, value) in params { args.append("-D\(key)=\(value)") }
+            args += ["--", "/bin/echo", "profile-ok"]
+            p.arguments = args
             try p.run()
             p.waitUntilExit()
             XCTAssertEqual(p.terminationStatus, 0,
@@ -193,7 +350,8 @@ final class ToolsTests: XCTestCase {
         let r = await router.dispatch(ToolCall(callId: "1", name: "nope", argumentsJSON: "{}"),
                                       cwd: "/tmp", deadline: .fromNow(.seconds(5)))
         XCTAssertFalse(r.success)
-        XCTAssertTrue(r.output.contains("unknown tool"))
+        // Upstream `registry.rs::unsupported_tool_call_message`.
+        XCTAssertEqual(r.output, "unsupported call: nope")
 
         await router.register(EchoTool())
         let ok = await router.dispatch(ToolCall(callId: "2", name: "echo", argumentsJSON: "{\"text\":\"hey\"}"),
@@ -209,7 +367,7 @@ final class ToolsTests: XCTestCase {
         let r = await router.dispatch(ToolCall(callId: "3", name: "flood", argumentsJSON: "{}"),
                                       cwd: "/tmp", deadline: .fromNow(.seconds(5)))
         XCTAssertTrue(r.truncated)
-        XCTAssertTrue(r.output.contains("bytes elided"))
+        XCTAssertTrue(r.output.contains("tokens truncated"))
     }
 
     func testToolRouterTimeout() async {

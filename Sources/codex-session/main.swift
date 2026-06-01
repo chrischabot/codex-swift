@@ -11,11 +11,14 @@ import MCP
 import Skills
 import Connectors
 import HarnessCore
+import Workflows
 import IPC
 import SessionWorkerCore
 import Tokenizer
 import Observability
 import Auth
+import Config
+import MemoryExtension
 
 /// Fails clearly until the production HTTP/WS Responses client is wired
 /// (parity with codexd). `CODEXKIT_MOCK=1` forces the deterministic mock.
@@ -38,6 +41,14 @@ struct SessionWorkerMain {
                                      limits: Limits,
                                      attestationProvider: (@Sendable (String) async -> String?)? = nil)
     -> any ModelClient {
+        let endpoint: String = {
+            if let base = ProcessInfo.processInfo.environment["OPENAI_BASE_URL"], !base.isEmpty {
+                var trimmed = base
+                while trimmed.hasSuffix("/") { trimmed.removeLast() }
+                return "\(trimmed)/responses"
+            }
+            return "https://api.openai.com/v1/responses"
+        }()
         #if os(macOS)
         if ProcessInfo.processInfo.environment["CODEXKIT_RESPONSES_WEBSOCKET"] == "1" {
             let ws = WebSocketResponsesClient(
@@ -47,12 +58,12 @@ struct SessionWorkerMain {
                     prewarm: ProcessInfo.processInfo.environment["CODEXKIT_WS_PREWARM"] != "0",
                     explicitNoZstd: true),
                 attestationProvider: attestationProvider)
-            let http = URLSessionResponsesClient(apiKey: apiKey, limits: limits)
+            let http = URLSessionResponsesClient(apiKey: apiKey, endpoint: endpoint, limits: limits)
             return TransportFallbackModelClient(primary: ws, fallback: http, limits: limits)
         }
-        return URLSessionResponsesClient(apiKey: apiKey, limits: limits)
+        return URLSessionResponsesClient(apiKey: apiKey, endpoint: endpoint, limits: limits)
         #else
-        return OpenAIResponsesClient(apiKey: apiKey, limits: limits)
+        return OpenAIResponsesClient(apiKey: apiKey, endpoint: endpoint, limits: limits)
         #endif
     }
 
@@ -109,8 +120,15 @@ struct SessionWorkerMain {
             await attestationBroker.header(for: threadId, link: link)
         }
 
+        // Honor the configured credential store mode
+        // (`cli_auth_credentials_store`, upstream default File) instead of
+        // unconditionally using the Keychain; keeps interop with the official
+        // codex CLI on a shared CODEX_HOME.
+        let authStoreMode = AuthCredentialsStoreMode.parse(
+            ConfigLoader(codexHome: codexHome).load()
+                .value("cli_auth_credentials_store")?.stringValue)
         let authManager = AuthManager(
-            store: TokenStoreFactory.production(codexHome: codexHome),
+            store: TokenStoreFactory.production(codexHome: codexHome, mode: authStoreMode),
             externalTokenRefresh: { previousAccountId in
                 let request = ServerRequest.chatgptAuthTokensRefresh(
                     .string("auth_refresh_\(UUID().uuidString.lowercased())"),
@@ -206,8 +224,19 @@ struct SessionWorkerMain {
             if let agentTypeDesc = c.agentTypeDescription, !agentTypeDesc.isEmpty {
                 spawnAgentOptions.agentTypeDescription = agentTypeDesc
             }
+            // Upstream `spec_plan.rs` gates the shell-tool family on the model's
+            // `shell_type` (`ConfigShellToolType`): the model is offered exactly
+            // one coherent shell interface. Resolve it from the bundled catalog
+            // (every shipped model declares `shell_command`; falls back to
+            // `.shellCommand` for unknown slugs).
+            let shellType = ShellToolType.from(
+                rawValue: ModelsCatalog.entry(for: c.model)?.shellType)
             await DefaultTools.register(on: router, sandbox: sb, limits: limits,
+                                        shellType: shellType,
                                         spawnAgentOptions: spawnAgentOptions)
+            // Dynamic workflows: enabled gate (the orchestrator is wired after
+            // the engine exists, so progress can be pushed over its stream).
+            let workflowsEnabled = WorkflowGating.isEnabled()
             if let remote = c.remoteEnvironment {
                 await RemoteExecServerTools.register(
                     on: router,
@@ -229,7 +258,29 @@ struct SessionWorkerMain {
             await router.register(MemoriesReadTool(store: memory))
             await router.register(MemoriesSearchTool(store: memory))
             let mcp = McpManager()
+            // Upstream parity (codex-mcp/src/elicitation.rs::make_sender):
+            // apply the elicitation policy BEFORE surfacing a prompt. Under
+            // approval policy `Never` (or Granular with MCP elicitations off)
+            // we auto-decline; schemaless confirm/approval form elicitations
+            // are auto-accepted when the permission prompt is auto-approved
+            // (Never + full-disk-write/danger-full-access). Only otherwise is
+            // the request forwarded to the frontend. `auto_deny` has no host
+            // toggle here, so it is always false.
+            let elicitationAutoApproved =
+                c.approvalPolicy == .never && c.sandboxMode == .dangerFullAccess
             let mcpElicitationHandler: McpElicitationHandler = { requestId, serverName, params in
+                switch McpElicitationPolicy.decide(approvalPolicy: c.approvalPolicy,
+                                                   autoDeny: false,
+                                                   autoApproved: elicitationAutoApproved,
+                                                   params: params) {
+                case .decline:
+                    return .object(["action": .string("decline")])
+                case .accept:
+                    return .object(["action": .string("accept"),
+                                    "content": .object([:])])
+                case .prompt:
+                    break
+                }
                 let request = ServerRequest.mcpElicitation(
                     requestId,
                     Self.mcpElicitationParams(threadId: c.threadId,
@@ -243,29 +294,123 @@ struct SessionWorkerMain {
             // OAuth-protected HTTP MCP servers can re-attach without re-
             // authenticating every session. Was hardcoded `nil` before P7.3.
             let mcpOAuthStore = McpOAuthStore(codexHome: codexHome)
+            // Upstream parity (mcp_tool_call.rs::sanitize_mcp_tool_result_for_model):
+            // forward MCP `image` content blocks to the model only when it
+            // accepts image input (`models.json` `input_modalities` ∋ image).
+            let modelSupportsImageInput =
+                ModelsCatalog.entry(for: c.model)?.supportsImageInput ?? false
+            // Upstream `augment_mcp_tool_request_meta_with_sandbox_state`
+            // (`core/src/mcp_tool_call.rs:705-751`): build the turn's
+            // `SandboxState` so MCP servers that advertised the
+            // `codex/sandbox-state-meta` capability receive it in every
+            // `tools/call` request's `_meta`. The port does not surface a
+            // `permission_profile` or `codex_linux_sandbox_exe` at this layer,
+            // so those are omitted/null (matching the serde skip / null rules).
+            let mcpWritableRoots = c.writableRoots.isEmpty ? [c.cwd] : c.writableRoots
+            let mcpSandboxState = SandboxStateMeta(
+                permissionProfile: nil,
+                sandboxPolicy: SandboxStateMeta.policy(
+                    mode: c.sandboxMode,
+                    writableRoots: mcpWritableRoots,
+                    networkAccess: c.networkAccess || c.sandboxMode == .dangerFullAccess),
+                codexLinuxSandboxExe: nil,
+                sandboxCwd: c.cwd,
+                useLegacyLandlock: false)
             await mcp.startAll(McpManager.loadConfigs(codexHome: codexHome),
                                router: router,
                                oauthStore: mcpOAuthStore,
-                               elicitationHandler: mcpElicitationHandler)
+                               elicitationHandler: mcpElicitationHandler,
+                               supportsImageInput: modelSupportsImageInput,
+                               threadId: c.threadId.raw,
+                               sandboxState: mcpSandboxState)
             let skills = SkillsDiscovery()
                 .discover(codexHome: codexHome, cwds: [c.cwd])
                 .map { PromptComposer.SkillInjection(
-                    name: $0.name, description: $0.description, path: $0.path) }
+                    name: $0.name, description: $0.description, path: $0.path,
+                    scopeRank: $0.scope.promptScopeRank) }
             let connectors = ConnectorsDiscovery()
                 .discover(codexHome: codexHome)
                 .map { PromptComposer.ConnectorInjection(
                     id: $0.id, name: $0.name, description: $0.description) }
-            let autoCompact = ModelCatalog.default.autoCompactLimit(for: c.model)
+            // Upstream `auto_compact_token_limit()` mins the model's 90%
+            // context-window value with any user-configured
+            // `model_auto_compact_token_limit` (openai_models.rs:322).
+            let autoCompactOverride = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd)
+                .load().modelAutoCompactTokenLimit
+            let autoCompact = ModelCatalog.default.autoCompactLimit(
+                for: c.model, configOverride: autoCompactOverride)
             let approved = ApprovedRuleStore(codexHome: codexHome)
+            // Extension spine (ARCHITECTURE.md §5.4 / Phase 0): build this
+            // session's registry from the enabled `[extensions]` manifests.
+            // Returns nil (→ byte-identical core) when the `extensions` feature
+            // is off or nothing is enabled. Mirrors `HookEngine.load`.
+            let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
+            // Phase 1 (ARCHITECTURE.md §7.1): the core `.md` memories are the
+            // default MemoryProvider slot candidate. `selectMemoryProvider`
+            // honors `[memory].provider` ("none" disables recall; "wiki"
+            // selects the vector store). Recall (fenced) + capture wire into
+            // the registry; the memory *tools* stay registered above.
+            //
+            // The vector "Memory Wiki" candidate is built ONLY when
+            // `[memory].provider == "wiki"` — constructing it opens a SQLite
+            // handle on the wiki DB, which we must not do for sessions that
+            // never select it. `makeWikiMemoryProvider` reuses THIS session's
+            // `ModelClient` for the wiki's own text inference (D1) and returns
+            // nil if the DB can't be opened (degrade to the core candidate).
+            var memoryCandidates: [any MemoryProvider] = [CoreMemoriesProvider(store: memory)]
+            if addonConfig.value("memory")?.objectValue?["provider"]?.stringValue == "wiki",
+               let wiki = makeWikiMemoryProvider(config: addonConfig, modelClient: model) {
+                memoryCandidates.append(wiki)
+            }
+            let memoryProvider = selectMemoryProvider(
+                config: addonConfig, candidates: memoryCandidates)
+            // Register the selected provider's tools (core's are [] — the core
+            // memory tools are registered above; a "wiki" provider's MemoryToolset
+            // would wire here). Closes the tools() contract limb. Gated on the
+            // SAME `extensions` feature that gates the provider's recall/capture
+            // (installAddons, below): registering the provider's tools while
+            // recall stayed off was an asymmetry that leaked e.g. wiki tools into
+            // an extensions-off session, diverging the tool list from the core
+            // (violating "extensions off → byte-identical core").
+            if addonConfig.isFeatureEnabled("extensions") {
+                for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
+            }
+            let extRegistry = installAddons(
+                config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
             let engine = SessionEngine(config: c, model: model, store: store,
                                        router: router, limits: limits,
                                        autoCompactTokens: autoCompact,
+                                       autoCompactConfigOverride: autoCompactOverride,
+                                       recomputeAutoCompactPerTurn: true,
                                        memoryStore: memory, sandbox: sb,
                                        skills: skills, connectors: connectors,
                                        approvedStore: approved, execPolicy: execPolicy,
+                                       workflowsEnabled: workflowsEnabled,
                                        hooks: HookEngine.load(
                                         codexHome: codexHome, cwd: c.cwd,
-                                        legacyNotifyArgv: c.notify))
+                                        legacyNotifyArgv: c.notify),
+                                       registry: extRegistry)
+            // Dynamic workflows: install the orchestrator on the shared bus.
+            // Subagents get a fresh default tool router (plus any schema
+            // `final_answer` tool); progress is pushed (16ms-debounced) over
+            // this session's already-relayed event stream.
+            if workflowsEnabled {
+                let wfRunner = WorkflowAgentRunner(
+                    store: store, limits: limits, model: model,
+                    routerFactory: { subCwd, extra in
+                        let r = ToolRouter(limits: limits)
+                        await DefaultTools.register(on: r, sandbox: sb, limits: limits,
+                                                    shellType: shellType)
+                        for t in extra { await r.register(t) }
+                        return r
+                    })
+                let orch = WorkflowOrchestrator(
+                    store: WorkflowStore(codexHome: codexHome),
+                    codexHome: codexHome, runner: wfRunner, defaultModel: c.model,
+                    progressSink: { n in Task { await engine.injectNotification(n) } })
+                await orch.installOnBus()
+                WorkflowHolder.shared.set(orch)   // retain for process lifetime
+            }
             let directMcp: WorkerMcpHandler = { request in
                 await Self.handleDirectMcp(request,
                                            manager: mcp,
@@ -282,13 +427,18 @@ struct SessionWorkerMain {
 
     private static func mcpElicitationParams(threadId: ThreadId, serverName: String,
                                              params: JSONValue) -> McpElicitationParams {
-        let mode = params["requestedSchema"] == nil ? "url" : "form"
+        // Finding 4 (v12): classify off the authoritative `mode` discriminator
+        // (rmcp tags `CreateElicitationRequestParams` by `mode` = "form"/"url").
+        // Finding 3 (v12): scrub the transport-level `progressToken` out of
+        // `_meta` before surfacing to the frontend (restore_context_meta). Both
+        // live in McpElicitationPolicy so the policy + surfaced-event paths share
+        // one classification/scrub implementation.
         return McpElicitationParams(
             threadId: threadId,
             turnId: nil,
             serverName: serverName,
-            mode: mode,
-            meta: params["_meta"] ?? .null,
+            mode: McpElicitationPolicy.classifyMode(params: params),
+            meta: McpElicitationPolicy.scrubMeta(params["_meta"]),
             message: params["message"]?.stringValue ?? "",
             requestedSchema: params["requestedSchema"],
             url: params["url"]?.stringValue,
@@ -309,13 +459,22 @@ struct SessionWorkerMain {
                                                         tool: tool,
                                                         argumentsJSON: argumentsJSON,
                                                         elicitationHandler: elicitationHandler)
-                return WorkerMcpResponse(requestId: request.requestId, result: .object([
-                    "content": .array([
+                // Finding 2 (v7): surface the full content array,
+                // structuredContent and result `_meta` instead of collapsing to
+                // a single text block (parity with upstream call_tool result).
+                let content: JSONValue
+                if result.content.isEmpty {
+                    content = .array([
                         .object(["type": .string("text"), "text": .string(result.text)])
-                    ]),
-                    "structuredContent": .null,
+                    ])
+                } else {
+                    content = .array(result.content.map(Self.jsonLiteToValue(_:)))
+                }
+                return WorkerMcpResponse(requestId: request.requestId, result: .object([
+                    "content": content,
+                    "structuredContent": result.structuredContent.map(Self.jsonLiteToValue(_:)) ?? .null,
                     "isError": .bool(result.isError),
-                    "_meta": .null,
+                    "_meta": result.meta.map(Self.jsonLiteToValue(_:)) ?? .null,
                 ]))
             case .readResource:
                 guard let uri = request.uri else {

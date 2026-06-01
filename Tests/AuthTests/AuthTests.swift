@@ -95,6 +95,44 @@ final class AuthTests: XCTestCase {
         XCTAssertTrue(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcb"))
     }
 
+    // MARK: - Revoke endpoint resolution (revoke.rs:150-169)
+
+    func testRevokeEndpointPrefersExplicitRevokeOverride() {
+        setenv("CODEX_REVOKE_TOKEN_URL_OVERRIDE", "https://x.test/custom/revoke", 1)
+        setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", "https://y.test/oauth/token?a=1", 1)
+        defer {
+            unsetenv("CODEX_REVOKE_TOKEN_URL_OVERRIDE")
+            unsetenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
+        }
+        let cfg = OAuthConfig(issuer: "https://auth.example.com")
+        XCTAssertEqual(CurlTokenRevoker.revokeEndpoint(cfg: cfg),
+                       "https://x.test/custom/revoke")
+    }
+
+    func testRevokeEndpointDerivesFromRefreshOverrideWhenOnlyRefreshSet() {
+        unsetenv("CODEX_REVOKE_TOKEN_URL_OVERRIDE")
+        setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+               "https://idp.local:8443/oauth/token?foo=bar", 1)
+        defer { unsetenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE") }
+        let cfg = OAuthConfig(issuer: "https://auth.example.com")
+        // derive_revoke_token_endpoint: set_path("/oauth/revoke"), set_query(None)
+        XCTAssertEqual(CurlTokenRevoker.revokeEndpoint(cfg: cfg),
+                       "https://idp.local:8443/oauth/revoke")
+    }
+
+    func testRevokeEndpointFallsBackToIssuerWhenNoOverrides() {
+        unsetenv("CODEX_REVOKE_TOKEN_URL_OVERRIDE")
+        unsetenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
+        let cfg = OAuthConfig(issuer: "https://auth.example.com/")
+        XCTAssertEqual(CurlTokenRevoker.revokeEndpoint(cfg: cfg),
+                       "https://auth.example.com/oauth/revoke")
+    }
+
+    func testDeriveRevokeEndpointRejectsNonURL() {
+        XCTAssertNil(CurlTokenRevoker.deriveRevokeEndpoint(fromRefresh: "not a url"))
+        XCTAssertNil(CurlTokenRevoker.deriveRevokeEndpoint(fromRefresh: "/relative/path"))
+    }
+
     // MARK: FileTokenStore
 
     func testFileTokenStoreRoundTripAnd0600() throws {
@@ -165,40 +203,158 @@ final class AuthTests: XCTestCase {
                        "legacy auth.json is removed after successful Keychain migration")
     }
 
-    func testProductionTokenStoreMigratesFileFallbackUnlessExplicitlyOverridden() throws {
+    /// Upstream default is File mode (config/src/types.rs:89): the production
+    /// store must write/read `auth.json` and must NOT migrate to (or touch) the
+    /// Keychain. This preserves credential interop with the official codex CLI
+    /// on a shared CODEX_HOME.
+    func testProductionTokenStoreDefaultsToFileMode() throws {
         let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
-        let legacy = FileTokenStore(codexHome: home)
         let service = "ai.igent.codexkit.tests.\(UUID().uuidString)"
         let account = "acct-\(UUID().uuidString)"
-        let keychain = KeychainTokenStore(service: service,
-                                          account: account,
-                                          codexHome: home)
+        let keychain = KeychainTokenStore(service: service, account: account, codexHome: home)
         defer { try? keychain.clear() }
-        let tokens = AuthTokens(accessToken: "factory-ak",
-                                refreshToken: "factory-rk",
+        let tokens = AuthTokens(accessToken: "file-ak",
+                                refreshToken: "file-rk",
                                 expiresAtUnix: 67_890,
-                                accountId: "acct_factory")
-        try legacy.save(tokens)
+                                accountId: "acct_file")
 
         let production = TokenStoreFactory.production(
             codexHome: home,
             environment: [:],
             keychainService: service,
             keychainAccount: account)
-        XCTAssertEqual(production.load(), tokens)
-        XCTAssertEqual(keychain.load(), tokens)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        try production.save(tokens)
+        XCTAssertEqual(FileTokenStore(codexHome: home).load(), tokens,
+                       "default File mode writes auth.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home + "/auth.json"))
+        XCTAssertNil(keychain.load(),
+                     "default File mode never writes the Keychain")
+    }
 
-        let fallbackHome = atTmp()
-        defer { try? FileManager.default.removeItem(atPath: fallbackHome) }
-        let fallback = TokenStoreFactory.production(
-            codexHome: fallbackHome,
-            environment: ["CODEXKIT_AUTH_STORE": "file"],
-            keychainService: service,
-            keychainAccount: "unused-\(UUID().uuidString)")
-        try fallback.save(tokens)
-        XCTAssertNotNil(FileTokenStore(codexHome: fallbackHome).load(),
-                        "explicit file override remains available for tests/dev")
+    /// Keyring mode uses the Keychain only (and never auth.json).
+    func testProductionTokenStoreKeyringMode() throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let service = "ai.igent.codexkit.tests.\(UUID().uuidString)"
+        let account = "acct-\(UUID().uuidString)"
+        let keychain = KeychainTokenStore(service: service, account: account, codexHome: home)
+        defer { try? keychain.clear() }
+        let tokens = AuthTokens(accessToken: "kr-ak", refreshToken: "kr-rk",
+                                expiresAtUnix: 1, accountId: "acct_kr")
+
+        let production = TokenStoreFactory.production(
+            codexHome: home, mode: .keyring, environment: [:],
+            keychainService: service, keychainAccount: account)
+        try production.save(tokens)
+        XCTAssertEqual(keychain.load(), tokens)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home + "/auth.json"),
+                       "Keyring mode does not write auth.json")
+    }
+
+    /// Auto mode reads keyring-then-file but a successful keyring write does NOT
+    /// delete auth.json (mirrors upstream AutoAuthStorage, storage.rs:277-291).
+    func testProductionTokenStoreAutoModeDoesNotDeleteFileOnKeyringSuccess() throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let service = "ai.igent.codexkit.tests.\(UUID().uuidString)"
+        let account = "acct-\(UUID().uuidString)"
+        let keychain = KeychainTokenStore(service: service, account: account, codexHome: home)
+        defer { try? keychain.clear() }
+        let file = FileTokenStore(codexHome: home)
+        let fileTokens = AuthTokens(accessToken: "file-old", expiresAtUnix: 1,
+                                    accountId: "acct_old")
+        try file.save(fileTokens)
+
+        let newTokens = AuthTokens(accessToken: "kr-new", expiresAtUnix: 2,
+                                   accountId: "acct_new")
+        let production = TokenStoreFactory.production(
+            codexHome: home, mode: .auto, environment: [:],
+            keychainService: service, keychainAccount: account)
+        try production.save(newTokens)
+        XCTAssertEqual(keychain.load(), newTokens, "Auto prefers the keyring")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path),
+                      "Auto must NOT delete auth.json after a keyring success")
+        XCTAssertEqual(production.load(), newTokens,
+                       "Auto reads the keyring first")
+    }
+
+    /// Ephemeral mode keeps credentials in memory only — nothing on disk.
+    func testProductionTokenStoreEphemeralMode() throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let tokens = AuthTokens(accessToken: "eph", expiresAtUnix: 1, accountId: "acct_eph")
+        let production = TokenStoreFactory.production(
+            codexHome: home, mode: .ephemeral, environment: [:])
+        try production.save(tokens)
+        XCTAssertEqual(production.load(), tokens)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home + "/auth.json"),
+                       "Ephemeral mode never touches disk")
+    }
+
+    /// `CODEXKIT_AUTH_STORE=file` forces the file store regardless of mode.
+    func testProductionTokenStoreFileEnvOverride() throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = TokenStoreFactory.production(
+            codexHome: home, mode: .keyring,
+            environment: ["CODEXKIT_AUTH_STORE": "file"])
+        XCTAssertTrue(store is FileTokenStore)
+    }
+
+    /// `AuthCredentialsStoreMode.parse` mirrors serde lowercase spellings with a
+    /// File default for unknown/absent values (core/src/config/mod.rs:3308).
+    func testAuthCredentialsStoreModeParse() {
+        XCTAssertEqual(AuthCredentialsStoreMode.parse(nil), .file)
+        XCTAssertEqual(AuthCredentialsStoreMode.parse("file"), .file)
+        XCTAssertEqual(AuthCredentialsStoreMode.parse("Keyring"), .keyring)
+        XCTAssertEqual(AuthCredentialsStoreMode.parse("AUTO"), .auto)
+        XCTAssertEqual(AuthCredentialsStoreMode.parse("ephemeral"), .ephemeral)
+        XCTAssertEqual(AuthCredentialsStoreMode.parse("bogus"), .file)
+        XCTAssertEqual(AuthCredentialsStoreMode.default, .file)
+    }
+
+    /// Keychain interop with the official CLI keyring
+    /// (storage.rs:160-174): service "Codex Auth", and a per-codex_home key
+    /// `cli|<first16 hex of sha256(canonical codex_home)>`.
+    func testKeychainStoreKeyMatchesUpstreamComputeStoreKey() {
+        // Stable, deterministic key prefix + length for a fixed path.
+        let key = KeychainTokenStore.storeKey(codexHome: "/tmp/fixed-home")
+        XCTAssertTrue(key.hasPrefix("cli|"), "key uses upstream cli| prefix")
+        let hex = String(key.dropFirst(4))
+        XCTAssertEqual(hex.count, 16, "truncated to first 16 hex chars")
+        XCTAssertTrue(hex.allSatisfy { $0.isHexDigit && (!$0.isLetter || $0.isLowercase) },
+                      "lowercase hex digest")
+        // Independent recomputation of the upstream algorithm over the
+        // symlink-resolved path.
+        let canonical = URL(fileURLWithPath: "/tmp/fixed-home")
+            .resolvingSymlinksInPath().path
+        let expected = "cli|" + String(SHA256.hexDigest(canonical).prefix(16))
+        XCTAssertEqual(key, expected)
+        // Distinct codex_home paths yield distinct keys.
+        XCTAssertNotEqual(KeychainTokenStore.storeKey(codexHome: "/tmp/a"),
+                          KeychainTokenStore.storeKey(codexHome: "/tmp/b"))
+        // Default service matches upstream KEYRING_SERVICE.
+        XCTAssertEqual(KeychainTokenStore.defaultService, "Codex Auth")
+    }
+
+    /// The keychain payload is the serialized AuthDotJson (upstream
+    /// `serde_json::to_string(auth)`), so an entry written by the real CLI is
+    /// readable here: a CLI-style AuthDotJson JSON projects into the runtime
+    /// AuthTokens.
+    func testKeychainPayloadInteropProjectsAuthDotJson() throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = KeychainTokenStore(
+            service: "ai.igent.codexkit.tests.\(UUID().uuidString)",
+            codexHome: home)
+        defer { try? store.clear() }
+        let tokens = AuthTokens(accessToken: "ak", refreshToken: "rk",
+                                idToken: "ik", expiresAtUnix: 12_345,
+                                accountId: "acct_interop")
+        try store.save(tokens)
+        // Round-trips through the AuthDotJson serialization the CLI shares.
+        XCTAssertEqual(store.load(), tokens)
+        // And the on-keychain payload IS an AuthDotJson the CLI could read.
+        let dot = tokens.toAuthDotJson()
+        XCTAssertEqual(dot.tokens?.accessToken, "ak")
+        XCTAssertEqual(dot.tokens?.refreshToken, "rk")
+        XCTAssertEqual(dot.tokens?.idToken, "ik")
+        XCTAssertEqual(dot.tokens?.accountId, "acct_interop")
     }
     #endif
 
@@ -575,8 +731,11 @@ final class AuthTests: XCTestCase {
     func testLoginWithAPIKeyThrowsShadowedByEnvWhenOverlayActive() async throws {
         let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
         let store = FileTokenStore(codexHome: home)
+        // CODEX_API_KEY only shadows when enableCodexApiKeyEnv is set (the
+        // app-server passes false). Pass true here to exercise the overlay.
         let mgr = AuthManager(store: store,
-                              env: ["CODEX_API_KEY": "env-key"])
+                              env: ["CODEX_API_KEY": "env-key"],
+                              enableCodexApiKeyEnv: true)
         do {
             try await mgr.loginWithAPIKey("sk-user")
             XCTFail("expected LoginShadowedByEnvError")
@@ -596,14 +755,16 @@ final class AuthTests: XCTestCase {
         let store = FileTokenStore(codexHome: home)
         try store.save(AuthTokens(accessToken: "ax", expiresAtUnix: 9_999_999_999,
                                   accountId: "acct"))
+        // OPENAI_API_KEY is NOT an auth-overlay source upstream; only
+        // CODEX_ACCESS_TOKEN (agent identity) shadows logout here.
         let mgr = AuthManager(store: store,
-                              env: ["OPENAI_API_KEY": "env-key"])
+                              env: ["CODEX_ACCESS_TOKEN": "env-bearer"])
         do {
             try await mgr.logout()
             XCTFail("expected LoginShadowedByEnvError")
         } catch let e as LoginShadowedByEnvError {
             XCTAssertEqual(e.operation, .logout)
-            XCTAssertEqual(e.shadowingVar, "OPENAI_API_KEY")
+            XCTAssertEqual(e.shadowingVar, "CODEX_ACCESS_TOKEN")
         }
         XCTAssertNil(store.load(), "local clear still completed before the throw")
     }
@@ -619,14 +780,35 @@ final class AuthTests: XCTestCase {
 
     // MARK: - AuthSupport spot checks
 
-    func testEnvAuthPrecedenceCodexAPIKeyWinsOverOpenAI() {
+    func testEnvAuthCodexAPIKeyGatedWinsWhenEnabled() {
+        // With the gate enabled, CODEX_API_KEY beats CODEX_ACCESS_TOKEN and
+        // OPENAI_API_KEY is never consulted (mirrors load_auth, manager.rs:731).
         let a = EnvAuth.loadFromEnv(env: [
             "CODEX_API_KEY": "codex",
             "OPENAI_API_KEY": "openai",
             "CODEX_ACCESS_TOKEN": "bearer",
-        ])
+        ], enableCodexApiKeyEnv: true)
         XCTAssertEqual(a?.openaiAPIKey, "codex")
         XCTAssertNil(a?.tokens, "API key path doesn't populate tokens section")
+    }
+
+    func testEnvAuthCodexAPIKeyIgnoredWhenGateDisabled() {
+        // Default gate (false, matching the app-server): CODEX_API_KEY is NOT
+        // an overlay source, so the CODEX_ACCESS_TOKEN agent identity wins.
+        let a = EnvAuth.loadFromEnv(env: [
+            "CODEX_API_KEY": "codex",
+            "CODEX_ACCESS_TOKEN": "bearer",
+        ])
+        XCTAssertNil(a?.openaiAPIKey)
+        XCTAssertEqual(a?.tokens?.accessToken, "bearer")
+    }
+
+    func testEnvAuthOpenAIKeyIsNeverAnOverlaySource() {
+        // OPENAI_API_KEY is read only by the model client at request time;
+        // it must never produce an auth overlay (manager.rs:469).
+        XCTAssertNil(EnvAuth.loadFromEnv(env: ["OPENAI_API_KEY": "openai"]))
+        XCTAssertNil(EnvAuth.loadFromEnv(env: ["OPENAI_API_KEY": "openai"],
+                                         enableCodexApiKeyEnv: true))
     }
 
     func testEnvAuthCodexAccessTokenPopulatesTokensSection() {
@@ -636,8 +818,98 @@ final class AuthTests: XCTestCase {
     }
 
     func testEnvAuthEmptyStringIsTreatedAsUnset() {
-        let a = EnvAuth.loadFromEnv(env: ["CODEX_API_KEY": ""])
+        let a = EnvAuth.loadFromEnv(env: ["CODEX_API_KEY": ""],
+                                    enableCodexApiKeyEnv: true)
         XCTAssertNil(a, "empty env values must not produce an overlay")
+    }
+
+    // MARK: - Finding #2: ephemeral external ChatGPT beats CODEX_ACCESS_TOKEN
+
+    func testEphemeralExternalChatGPTTokensBeatCodexAccessTokenEnv() async {
+        // Upstream load_auth checks the ephemeral store BEFORE reading
+        // CODEX_ACCESS_TOKEN (manager.rs:742-768). With both present, the
+        // external ChatGPT token must win.
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let ephemeral = EphemeralTokenStore(
+            AuthTokens(accessToken: "external-chatgpt",
+                       tokenType: "BearerExternal",
+                       expiresAtUnix: AuthTokens.neverExpires,
+                       accountId: "acct_ext"))
+        let mgr = AuthManager(store: FileTokenStore(codexHome: home),
+                              ephemeralStore: ephemeral,
+                              env: ["CODEX_ACCESS_TOKEN": "agent-bearer"])
+        let visible = await mgr.storedTokens()
+        XCTAssertEqual(visible?.accessToken, "external-chatgpt",
+                       "ephemeral external ChatGPT tokens take precedence over CODEX_ACCESS_TOKEN")
+        XCTAssertEqual(visible?.accountId, "acct_ext")
+    }
+
+    func testCodexAccessTokenEnvUsedWhenNoEphemeral() async {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let mgr = AuthManager(store: FileTokenStore(codexHome: home),
+                              env: ["CODEX_ACCESS_TOKEN": "agent-bearer"])
+        let visible = await mgr.storedTokens()
+        XCTAssertEqual(visible?.accessToken, "agent-bearer")
+    }
+
+    func testCodexAPIKeyGatedBeatsEphemeralWhenEnabled() async {
+        // Step 1 of precedence: gated CODEX_API_KEY beats even the ephemeral
+        // store (manager.rs:737-740 returns before the ephemeral check).
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let ephemeral = EphemeralTokenStore(
+            AuthTokens(accessToken: "external-chatgpt",
+                       tokenType: "BearerExternal",
+                       expiresAtUnix: AuthTokens.neverExpires))
+        let mgr = AuthManager(store: FileTokenStore(codexHome: home),
+                              ephemeralStore: ephemeral,
+                              env: ["CODEX_API_KEY": "codex-key"],
+                              enableCodexApiKeyEnv: true)
+        let visible = await mgr.storedTokens()
+        XCTAssertEqual(visible?.accessToken, "codex-key")
+    }
+
+    func testCodexAPIKeyOverlayInertWhenGateDisabled() async {
+        // With the default gate (false), CODEX_API_KEY does not shadow the
+        // persisted login; OPENAI_API_KEY likewise has no effect.
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try? store.save(AuthTokens(accessToken: "persisted-bearer",
+                                   refreshToken: "rt",
+                                   idToken: "id",
+                                   expiresAtUnix: 9_999_999_999,
+                                   accountId: "acct"))
+        let mgr = AuthManager(store: store,
+                              env: ["CODEX_API_KEY": "codex-key",
+                                    "OPENAI_API_KEY": "openai-key"])
+        let visible = await mgr.storedTokens()
+        XCTAssertEqual(visible?.accessToken, "persisted-bearer",
+                       "ungated CODEX_API_KEY / OPENAI_API_KEY must not shadow a real login")
+    }
+
+    // MARK: - Finding #4: refresh endpoint honors override
+
+    func testRefreshTokenEndpointHonorsOverride() {
+        let cfg = OAuthConfig(issuer: "https://auth.openai.com")
+        setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+               "https://staging.example.com/oauth/token", 1)
+        defer { unsetenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE") }
+        XCTAssertEqual(CurlTokenExchanger.refreshTokenEndpoint(cfg: cfg),
+                       "https://staging.example.com/oauth/token")
+    }
+
+    func testRefreshTokenEndpointFallsBackToIssuerWhenNoOverride() {
+        unsetenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE")
+        let cfg = OAuthConfig(issuer: "https://auth.openai.com")
+        XCTAssertEqual(CurlTokenExchanger.refreshTokenEndpoint(cfg: cfg),
+                       "https://auth.openai.com/oauth/token")
+    }
+
+    func testRefreshTokenEndpointIgnoresEmptyOverride() {
+        setenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE", "", 1)
+        defer { unsetenv("CODEX_REFRESH_TOKEN_URL_OVERRIDE") }
+        let cfg = OAuthConfig(issuer: "https://issuer.test")
+        XCTAssertEqual(CurlTokenExchanger.refreshTokenEndpoint(cfg: cfg),
+                       "https://issuer.test/oauth/token")
     }
 
     func testAuthDotJsonRoundTripsViaAuthTokensProjection() throws {
@@ -672,6 +944,37 @@ final class AuthTests: XCTestCase {
         XCTAssertEqual(a.tokens?.idToken, "IDT")
         XCTAssertEqual(a.tokens?.accountId, "acct_42")
         XCTAssertEqual(a.lastRefresh, "2026-01-01T00:00:00Z")
+    }
+
+    /// The on-disk auth.json must be interoperable with the real codex CLI:
+    /// canonical `OPENAI_API_KEY` / `tokens.{access_token,refresh_token,
+    /// id_token,account_id}` keys present. And when a file written by UPSTREAM
+    /// (no Swift `expires_at`) carries a JWT id_token, expiry is derived from
+    /// its `exp` claim (matching upstream token_data.rs).
+    func testFileTokenStoreWritesInteroperableSchemaAndDerivesJWTExp() throws {
+        let home = atTmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = FileTokenStore(codexHome: home)
+        try store.save(AuthTokens(accessToken: "AT", refreshToken: "RT",
+                                  idToken: "ix", expiresAtUnix: 12_345,
+                                  accountId: "acct_1"))
+        let raw = try String(contentsOfFile: store.path, encoding: .utf8)
+        XCTAssertTrue(raw.contains("\"access_token\""), "canonical snake_case tokens key")
+        XCTAssertTrue(raw.contains("\"id_token\""))
+        XCTAssertTrue(raw.contains("\"account_id\""))
+        XCTAssertFalse(raw.contains("\"accessToken\""), "must not emit the legacy flat camelCase shape")
+
+        // Upstream-written file: canonical tokens with a real JWT id_token
+        // (exp=4000000000), NO Swift expires_at. Expiry must come from the JWT.
+        let exp: Int64 = 4_000_000_000
+        let payloadB64 = Data("{\"exp\":\(exp)}".utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let jwt = "h.\(payloadB64).s"
+        let upstreamFile = #"{"OPENAI_API_KEY":null,"tokens":{"access_token":"AT","id_token":"\#(jwt)"}}"#
+        try upstreamFile.write(toFile: store.path, atomically: true, encoding: .utf8)
+        XCTAssertEqual(store.load()?.expiresAtUnix, exp,
+                       "Bearer expiry is derived from the id_token JWT exp claim")
     }
 
     func testAuthFileLockReadsExistingFileAndReturnsNilForMissing() throws {

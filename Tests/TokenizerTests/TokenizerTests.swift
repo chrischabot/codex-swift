@@ -75,13 +75,27 @@ final class TokenizerTests: XCTestCase {
         XCTAssertEqual(fb.contextWindow, 272_000)
         XCTAssertEqual(fb.maxContextWindow, 272_000)
         XCTAssertEqual(fb.effectiveContextPercent, 95)
-        // auto_compact_token_limit = floor(window * 95 / 100).
-        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-5.1-codex"), 272_000 * 95 / 100)
-        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-4o-mini"), 128_000 * 95 / 100)
-        XCTAssertEqual(cat.autoCompactLimit(for: "unknown"), 272_000 * 95 / 100)
+        // Upstream auto_compact_token_limit = (window * 9) / 10 (hardcoded 90%
+        // window factor — NOT effective_context_window_percent/95%).
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-5.1-codex"), (272_000 * 9) / 10)
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-4o-mini"), (128_000 * 9) / 10)
+        XCTAssertEqual(cat.autoCompactLimit(for: "unknown"), (272_000 * 9) / 10)
+        // Upstream `ModelInfo::auto_compact_token_limit()` mins the 90%-window
+        // value with any configured `model_auto_compact_token_limit`
+        // (protocol/src/openai_models.rs:322): config_limit.map_or(window, min).
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-5.1-codex", configOverride: 10_000),
+                       10_000, "a smaller config override wins (min)")
+        XCTAssertEqual(cat.autoCompactLimit(for: "gpt-4o-mini", configOverride: 9_999_999),
+                       (128_000 * 9) / 10,
+                       "a larger config override loses to the 90%-window value (min)")
+        // The per-turn limit tracks the per-turn model: a smaller-window model
+        // yields a smaller auto-compact limit than a larger-window model.
+        XCTAssertLessThan(cat.autoCompactLimit(for: "gpt-4o-mini"),
+                          cat.autoCompactLimit(for: "gpt-5.1-codex"),
+                          "the per-turn auto-compact limit scales with the model's context window")
         XCTAssertEqual(cat.contextWindow(for: "gpt-4o-mini"), 128_000)
-        XCTAssertEqual(cat.defaultEntry().slug, "gpt-5.1-codex")
-        XCTAssertEqual(cat.listed().first?.slug, "gpt-5.1-codex",
+        XCTAssertEqual(cat.defaultEntry().slug, "gpt-5.5")
+        XCTAssertEqual(cat.listed().first?.slug, "gpt-5.5",
                        "the default model is listed first")
         XCTAssertTrue(cat.listed().allSatisfy { !$0.hidden })
     }

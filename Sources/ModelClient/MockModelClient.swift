@@ -17,6 +17,10 @@ public enum MockStep: Sendable, Equatable {
     /// trim-and-retry path (P6.3) can be exercised deterministically.
     case failContextWindow(String)
     case slowMillis(Int)
+    /// Emit a rate-limit snapshot (upstream `TokenCountEvent.rate_limits`) so
+    /// the SessionEngine's `account/rateLimits/updated` forwarding can be
+    /// exercised deterministically.
+    case rateLimits(RateLimitSnapshot)
 }
 
 public struct MockScenario: Sendable, Equatable {
@@ -77,6 +81,11 @@ public struct CapturedRequest: Sendable, Equatable {
     public let previousResponseId: String?
     public let model: String
     public let inputCount: Int
+    /// The text payload of every `PromptInput` that carries one (userText /
+    /// developerText / assistantText / toolOutput). Lets tests assert which
+    /// prompt extras — e.g. the goal-context budget-limit steering fragment —
+    /// were injected into a given sampling request.
+    public let inputTexts: [String]
 }
 
 /// Deterministic mock. Scenarios are consumed FIFO across calls so a test can
@@ -104,7 +113,17 @@ public actor MockModelClient: ModelClient {
             turnState: settings.turnState,
             previousResponseId: settings.previousResponseId,
             model: settings.model,
-            inputCount: prompt.input.count))
+            inputCount: prompt.input.count,
+            inputTexts: prompt.input.compactMap { inp in
+                switch inp {
+                case .userText(let t), .developerText(let t), .assistantText(let t):
+                    return t
+                case .toolOutput(_, let o):
+                    return o
+                case .reasoning:
+                    return nil
+                }
+            }))
 
         let scenario = scenarios.isEmpty ? MockScenario.hello() : scenarios.removeFirst()
 
@@ -150,6 +169,8 @@ public actor MockModelClient: ModelClient {
                                                  codexErrorCode: .contextWindowExceeded)
                             case .slowMillis(let ms):
                                 try await Task.sleep(for: .milliseconds(ms))
+                            case .rateLimits(let snap):
+                                cont.yield(.rateLimits(snap))
                             }
                         }
                         cont.finish()

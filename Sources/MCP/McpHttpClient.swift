@@ -30,7 +30,7 @@ private final class ResumeGuard: @unchecked Sendable {
 /// content-type (delivered first, before any body), one parsed JSON frame
 /// (an SSE `data:` event or a single JSON object), or end-of-stream.
 internal enum HttpStreamEvent: Sendable {
-    case head(status: Int, contentType: String)
+    case head(status: Int, contentType: String, sessionId: String?)
     case frame([String: JSONLite])
     case end
 }
@@ -54,9 +54,24 @@ public actor McpHttpClient: McpClientProtocol {
     private let requestTimeout: Duration
     private let oauthStore: McpOAuthStore?
     private let env: [String: String]
+    /// See `McpClient.supportsImageInput`. When false (default), `image`
+    /// content blocks are replaced with the upstream placeholder.
+    private let supportsImageInput: Bool
     private let notificationSink: any McpNotificationSink
     private var nextId = 1
     private var initialized = false
+    /// Whether the server advertised `codex/sandbox-state-meta` in its
+    /// `initialize` response (upstream
+    /// `server_supports_sandbox_state_meta_capability`). `false` until
+    /// `initialize` runs.
+    private var sandboxStateMetaSupported = false
+    /// `initialize_result.instructions` captured from the handshake. `nil`
+    /// when the server returned none.
+    private var instructions: String?
+    /// Server-assigned `Mcp-Session-Id` captured from the initialize response
+    /// header and echoed on every subsequent POST/GET/DELETE (upstream rmcp
+    /// Streamable-HTTP transport). nil until the server assigns one.
+    private var sessionId: String?
     /// Single-flight reinitialization task. When an HTTP 404 (session
     /// expired) is observed, the first caller installs a Task here that
     /// re-runs the initialize handshake; concurrent callers `await` the
@@ -65,6 +80,20 @@ public actor McpHttpClient: McpClientProtocol {
     /// `reinitialize_after_session_expiry`).
     private var pendingReinit: Task<Void, any Error>?
 
+    /// Finding 1: the long-lived standalone GET SSE listening stream. After a
+    /// successful initialize that yields a `sessionId`, upstream's
+    /// Streamable-HTTP transport unconditionally opens a persistent
+    /// `GET <url>` with `Accept: text/event-stream` so the server can push
+    /// notifications and server-initiated requests (progress, list_changed,
+    /// elicitation/create) that are NOT tied to a client POST
+    /// (rmcp streamable_http_client.rs:371-405). nil until started; a 405
+    /// (ServerDoesNotSupportSse) tears it down without retry.
+    private var getStreamTask: Task<Void, Never>?
+    /// The handler to invoke for server-initiated `elicitation/create` requests
+    /// that arrive on the standalone GET stream. Captured from the most recent
+    /// `callTool` so out-of-band elicitations can still be answered.
+    private var getStreamElicitationHandler: McpElicitationHandler?
+
     /// Initializes a Streamable-HTTP MCP client. If `requestTimeout` is
     /// `nil` (the new default), the per-call timeout is taken from
     /// `config.effectiveToolTimeout` — the upstream `tool_timeout_sec`
@@ -72,6 +101,7 @@ public actor McpHttpClient: McpClientProtocol {
     public init(_ config: McpServerConfig, requestTimeout: Duration? = nil,
                 env: [String: String] = ProcessInfo.processInfo.environment,
                 oauthStore: McpOAuthStore? = nil,
+                supportsImageInput: Bool = false,
                 notificationSink: (any McpNotificationSink)? = nil) {
         self.config = config
         if let requestTimeout {
@@ -83,11 +113,28 @@ public actor McpHttpClient: McpClientProtocol {
         }
         self.env = env
         self.oauthStore = oauthStore
+        self.supportsImageInput = supportsImageInput
         self.notificationSink = notificationSink ?? StderrMcpNotificationSink()
     }
 
     public func start() throws {}   // HTTP is connectionless.
-    public func stop() async {}     // No persistent process.
+
+    /// Tear down the persistent GET listening stream (Finding 1) and send a
+    /// best-effort DELETE to release the server-side session (Finding 2).
+    public func stop() async {
+        // Cancel the standalone GET stream listener first so it stops
+        // dispatching frames; its curl child observes cancellation via the
+        // AsyncThrowingStream onTermination hook.
+        getStreamTask?.cancel()
+        getStreamTask = nil
+        // Best-effort DELETE to release the server-side session.
+        if let sid = sessionId, !sid.isEmpty,
+           let url = config.url, !url.isEmpty {
+            await deleteSession(url: url, sessionId: sid)
+        }
+        sessionId = nil
+        initialized = false
+    }
 
     /// Test-only: number of times `reinitialize()` has run to completion.
     /// Asserts that concurrent 404 callers fold into a single recovery.
@@ -174,6 +221,10 @@ public actor McpHttpClient: McpClientProtocol {
                     "-H", "Accept: application/json, text/event-stream"]
         if let auth = authorizationHeader(env: env) {
             args += ["-H", "Authorization: \(auth)"]
+        }
+        // Echo the server-assigned session id once established.
+        if let sessionId, !sessionId.isEmpty {
+            args += ["-H", "Mcp-Session-Id: \(sessionId)"]
         }
         for k in config.httpHeaders.keys.sorted() {
             args += ["-H", "\(k): \(config.httpHeaders[k] ?? "")"]
@@ -270,57 +321,20 @@ public actor McpHttpClient: McpClientProtocol {
         var sawHead = false
         for try await event in stream {
             switch event {
-            case .head(let status, _):
+            case .head(let status, _, let sid):
                 sawHead = true
+                // Capture the server-assigned Mcp-Session-Id (set on the
+                // initialize response) so every subsequent request echoes it.
+                if let sid, !sid.isEmpty { sessionId = sid }
                 if status >= 400 {
                     throw McpError.transport("HTTP \(status)")
                 }
             case .frame(let frame):
-                // Notifications: method present, id absent.
-                if frame["id"] == nil, frame["method"] != nil {
-                    if let notif = McpNotificationDecoder.decode(
-                        server: config.name, object: frame) {
-                        notificationSink.handle(notif)
-                    }
-                    continue
-                }
-                // Server-initiated request (elicitation/create has both
-                // id + method). We must reply on `url` so the server
-                // can correlate by JSON-RPC id at the application
-                // layer.
-                if case .string(let serverMethod)? = frame["method"],
-                   case .number(let n)? = frame["id"] {
-                    if serverMethod == "elicitation/create" {
-                        let reqId = Int(n)
-                        let result: JSONValue
-                        if let handler = elicitationHandler {
-                            let paramsValue: JSONValue
-                            if let raw = frame["params"] {
-                                paramsValue = McpClient.jsonLiteToValue(raw)
-                            } else {
-                                paramsValue = .object([:])
-                            }
-                            result = await handler(.int(Int64(reqId)), config.name,
-                                                    paramsValue)
-                                ?? .object(["action": .string("decline"),
-                                            "content": .null,
-                                            "_meta": .null])
-                        } else {
-                            // P7.2 follow-up: parity with the stdio
-                            // path — when no handler is registered we
-                            // must still reply with a `decline` so the
-                            // server is not left waiting.
-                            result = .object(["action": .string("decline"),
-                                              "content": .null,
-                                              "_meta": .null])
-                        }
-                        // Important: post the reply WITHOUT awaiting
-                        // the original stream's completion. The
-                        // server may be blocked on this reply before
-                        // emitting the next frame.
-                        try? await replyToServerRequest(url: url, id: reqId,
-                                                         result: result)
-                    }
+                // Notifications + server-initiated requests are dispatched on
+                // the shared path; a frame that matches our own `id` is the
+                // response we are waiting for.
+                if try await dispatchServerFrame(frame, url: url,
+                                                 elicitationHandler: elicitationHandler) {
                     continue
                 }
                 // Response to our request.
@@ -344,6 +358,177 @@ public actor McpHttpClient: McpClientProtocol {
         }
         if let r = obj["result"], case .object(let ro) = r { return ro }
         return [:]
+    }
+
+    /// Shared dispatch for an inbound frame that is NOT a response to one of
+    /// our own pending request ids. Routes notifications to `notificationSink`
+    /// and replies to a server-initiated `elicitation/create` request on a
+    /// fresh POST. Returns `true` when the frame was consumed here (caller must
+    /// `continue`), `false` when it might be a response to our own request.
+    ///
+    /// Used by both the per-POST stream reader (`processStreamingResponse`) and
+    /// the standalone GET listening stream (Finding 1).
+    private func dispatchServerFrame(
+        _ frame: [String: JSONLite], url: String,
+        elicitationHandler: McpElicitationHandler?) async throws -> Bool {
+        // Notifications: method present, id absent.
+        if frame["id"] == nil, frame["method"] != nil {
+            if let notif = McpNotificationDecoder.decode(
+                server: config.name, object: frame) {
+                notificationSink.handle(notif)
+            }
+            return true
+        }
+        // Server-initiated request (elicitation/create has both id + method).
+        // We must reply on `url` so the server can correlate by JSON-RPC id at
+        // the application layer.
+        if case .string(let serverMethod)? = frame["method"],
+           case .number(let n)? = frame["id"] {
+            if serverMethod == "elicitation/create" {
+                let reqId = Int(n)
+                let result: JSONValue
+                if let handler = elicitationHandler {
+                    let paramsValue: JSONValue
+                    if let raw = frame["params"] {
+                        paramsValue = McpClient.jsonLiteToValue(raw)
+                    } else {
+                        paramsValue = .object([:])
+                    }
+                    // Omit `content`/`_meta` on a decline (upstream
+                    // skip_serializing_if) rather than emitting JSON null.
+                    result = await handler(.int(Int64(reqId)), config.name,
+                                            paramsValue)
+                        ?? .object(["action": .string("decline")])
+                } else {
+                    // Parity with the stdio path — when no handler is
+                    // registered we still reply with a `decline` so the server
+                    // is not left waiting.
+                    result = .object(["action": .string("decline")])
+                }
+                // Post the reply WITHOUT awaiting the original stream's
+                // completion. The server may be blocked on this reply before
+                // emitting the next frame.
+                try? await replyToServerRequest(url: url, id: reqId,
+                                                 result: result)
+            }
+            return true
+        }
+        return false
+    }
+
+    // MARK: - Standalone GET listening stream (Finding 1)
+
+    /// Capture the elicitation handler used for out-of-band server requests
+    /// arriving on the GET stream. Called from `callTool` so the most recently
+    /// supplied handler is available to the persistent listener.
+    private func setGetStreamElicitationHandler(_ h: McpElicitationHandler?) {
+        if let h { getStreamElicitationHandler = h }
+    }
+
+    /// Open the persistent standalone GET SSE stream once a session id exists.
+    /// Idempotent: a no-op if one is already running, if there is no session
+    /// id, or if there is no URL. The server may answer `405` (it does not
+    /// support the GET stream); we tolerate that by simply not retrying
+    /// (rmcp `ServerDoesNotSupportSse`, streamable_http_client.rs:406-409).
+    private func startGetStreamIfNeeded() {
+        guard getStreamTask == nil,
+              let sid = sessionId, !sid.isEmpty,
+              let url = config.url, !url.isEmpty else { return }
+        getStreamTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runGetStream(url: url, sessionId: sid)
+        }
+    }
+
+    private func clearGetStreamTask() { getStreamTask = nil }
+
+    /// Drive one lifetime of the GET listening stream. Frames are fed through
+    /// the same dispatch path as the POST reader. On a clean EOF or any error
+    /// we exit without retrying (parity with rmcp, which re-opens the GET
+    /// stream only on a transport error mid-session; the port keeps it simple
+    /// and lets the next request's POST stream resume delivery — the upstream
+    /// 405 branch is the important one to honor).
+    private func runGetStream(url: String, sessionId initialSid: String) async {
+        let stream: AsyncThrowingStream<HttpStreamEvent, any Error>
+        do {
+            stream = try await streamCurlGET(url: url, sessionId: initialSid)
+        } catch {
+            clearGetStreamTask()
+            return
+        }
+        do {
+            loop: for try await event in stream {
+                if Task.isCancelled { break }
+                switch event {
+                case .head(let status, _, let sid):
+                    if let sid, !sid.isEmpty { sessionId = sid }
+                    // 405 → server does not support the standalone stream.
+                    // Any other 4xx/5xx → give up too.
+                    if status >= 400 { break loop }
+                case .frame(let frame):
+                    _ = try? await dispatchServerFrame(
+                        frame, url: url,
+                        elicitationHandler: getStreamElicitationHandler)
+                case .end:
+                    break loop
+                }
+            }
+        } catch {
+            // Transport error: stop listening (the next POST's stream still
+            // delivers any inlined frames).
+        }
+        clearGetStreamTask()
+    }
+
+    /// Launch `curl -sS -N -X GET <url> -H 'Accept: text/event-stream'
+    /// -H 'Mcp-Session-Id: <sid>' [auth]` and return a stream of parsed
+    /// `HttpStreamEvent`s, reusing the same SSE reader as the POST path.
+    private func streamCurlGET(url: String, sessionId: String)
+        async throws -> AsyncThrowingStream<HttpStreamEvent, any Error> {
+        var args = ["curl", "-sS", "-N", "-i",
+                    "-X", "GET", url,
+                    "-H", "Accept: text/event-stream",
+                    "-H", "Mcp-Session-Id: \(sessionId)"]
+        if let auth = authorizationHeader(env: env) {
+            args += ["-H", "Authorization: \(auth)"]
+        }
+        for k in config.httpHeaders.keys.sorted() {
+            args += ["-H", "\(k): \(config.httpHeaders[k] ?? "")"]
+        }
+        if let envHeaders = config.envHttpHeaders {
+            for k in envHeaders.keys.sorted() {
+                guard let varName = envHeaders[k], !varName.isEmpty,
+                      let value = env[varName], !value.isEmpty else { continue }
+                args += ["-H", "\(k): \(value)"]
+            }
+        }
+        // No request body for the GET stream; reuse the streaming reader with
+        // an empty body (curl will not send `--data-binary`).
+        return try await streamCurl(args: args, body: nil)
+    }
+
+    /// Best-effort session termination (Finding 2). When a session id exists,
+    /// upstream sends an HTTP DELETE with `Mcp-Session-Id` (within a 5s
+    /// timeout) so the server releases the session; a non-2xx / 405
+    /// (ServerDoesNotSupportDeleteSession) is tolerated
+    /// (rmcp streamable_http_client.rs:524-537).
+    private func deleteSession(url: String, sessionId: String) async {
+        var args = ["curl", "-sS", "-i",
+                    "--max-time", "5",
+                    "-X", "DELETE", url,
+                    "-H", "Mcp-Session-Id: \(sessionId)"]
+        if let auth = authorizationHeader(env: env) {
+            args += ["-H", "Authorization: \(auth)"]
+        }
+        for k in config.httpHeaders.keys.sorted() {
+            args += ["-H", "\(k): \(config.httpHeaders[k] ?? "")"]
+        }
+        do {
+            let stream = try await streamCurl(args: args, body: nil)
+            for try await _ in stream {}   // drain; result ignored.
+        } catch {
+            // Best-effort: ignore failures (server will expire the session).
+        }
     }
 
     /// Single-flight re-initialize. Concurrent callers awaiting a 404
@@ -428,6 +613,14 @@ public actor McpHttpClient: McpClientProtocol {
     ///     the curl process).
     private func streamCurlPOST(args: [String], body: Data)
         async throws -> AsyncThrowingStream<HttpStreamEvent, any Error> {
+        try await streamCurl(args: args, body: body)
+    }
+
+    /// Generic curl launcher used by the POST, GET-stream, and DELETE paths.
+    /// When `body` is non-nil it is written to curl's stdin (the POST data);
+    /// when nil (GET / DELETE) stdin is simply closed.
+    private func streamCurl(args: [String], body: Data?)
+        async throws -> AsyncThrowingStream<HttpStreamEvent, any Error> {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = args
@@ -438,7 +631,7 @@ public actor McpHttpClient: McpClientProtocol {
         do { try p.run() } catch { throw McpError.spawn("curl: \(error)") }
         let writeHandle = inPipe.fileHandleForWriting
         do {
-            try writeHandle.write(contentsOf: body)
+            if let body { try writeHandle.write(contentsOf: body) }
             try writeHandle.close()
         } catch {
             try? writeHandle.close()
@@ -505,10 +698,10 @@ public actor McpHttpClient: McpClientProtocol {
                     let rest = headerBuf.suffix(
                         from: split.terminatorStart + split.terminatorLength)
                     let headerStr = String(decoding: headerBytes, as: UTF8.self)
-                    let (status, ct) = Self.parseStatusAndContentType(headerStr)
+                    let (status, ct, sid) = Self.parseStatusAndContentType(headerStr)
                     contentType = ct
                     isSSE = ct.lowercased().hasPrefix("text/event-stream")
-                    continuation.yield(.head(status: status, contentType: ct))
+                    continuation.yield(.head(status: status, contentType: ct, sessionId: sid))
                     headersParsed = true
                     input = Data(rest)
                     headerBuf.removeAll(keepingCapacity: false)
@@ -629,17 +822,20 @@ public actor McpHttpClient: McpClientProtocol {
     }
 
     /// Parse the HTTP status line + headers (CR-stripped, separated by
-    /// LF). Returns the status code (0 on parse failure) and the
-    /// `Content-Type` header value (empty string if absent).
+    /// LF). Returns the status code (0 on parse failure), the `Content-Type`
+    /// header value (empty if absent), and the `Mcp-Session-Id` header value
+    /// (nil if absent — the Streamable-HTTP transport assigns it on
+    /// `initialize` and it must be echoed on every subsequent request).
     internal static func parseStatusAndContentType(_ headerBlock: String)
-        -> (Int, String) {
+        -> (Int, String, String?) {
         var status = 0
         var contentType = ""
+        var sessionId: String?
         // First line is "HTTP/x.y NNN reason". Strip stray CRs.
         let lines = headerBlock
             .replacingOccurrences(of: "\r", with: "")
             .split(separator: "\n", omittingEmptySubsequences: false)
-        guard let first = lines.first else { return (0, "") }
+        guard let first = lines.first else { return (0, "", nil) }
         let parts = first.split(separator: " ", maxSplits: 2,
                                 omittingEmptySubsequences: true)
         if parts.count >= 2, let code = Int(parts[1]) { status = code }
@@ -649,26 +845,41 @@ public actor McpHttpClient: McpClientProtocol {
                 .trimmingCharacters(in: .whitespaces).lowercased()
             let value = line[line.index(after: colon)...]
                 .trimmingCharacters(in: .whitespaces)
+            // `Mcp-Session-Id` is matched case-insensitively (header names are
+            // case-insensitive per RFC 7230).
             if name == "content-type" {
                 contentType = value
-                break
+            } else if name == "mcp-session-id" {
+                sessionId = value.isEmpty ? nil : value
             }
         }
-        return (status, contentType)
+        return (status, contentType, sessionId)
     }
 
     // MARK: - Protocol methods
 
+    public func supportsSandboxStateMeta() async -> Bool { sandboxStateMetaSupported }
+    public func serverInstructions() async -> String? { instructions }
+
     public func initialize() async throws {
         guard !initialized else { return }
-        _ = try await request(method: "initialize", params: [
+        let result = try await request(method: "initialize", params: [
             "protocolVersion": "2025-06-18",
-            "capabilities": [String: Any](),
-            "clientInfo": ["name": "CodexKit", "version": "0.1"],
+            "capabilities": ["elicitation": McpClientInfo.elicitationCapability],
+            "clientInfo": McpClientInfo.initializeClientInfo,
         ], expectResult: true)
+        // Capture the server's advertised capabilities + instructions instead
+        // of discarding the result (upstream `rmcp_client.rs:496-506`). Shared
+        // parser with the stdio transport keeps both byte-for-byte consistent.
+        McpClient.applyInitializeResult(result,
+                                        sandboxStateMetaSupported: &sandboxStateMetaSupported,
+                                        instructions: &instructions)
         _ = try await request(method: "notifications/initialized",
                               params: [String: Any](), expectResult: false)
         initialized = true
+        // Finding 1: open the standalone GET listening stream now that the
+        // server has assigned a session id (a no-op if it did not).
+        startGetStreamIfNeeded()
     }
 
     public func listTools() async throws -> [McpToolSpec] {
@@ -683,44 +894,94 @@ public actor McpHttpClient: McpClientProtocol {
             let desc: String
             if case .string(let d)? = t["description"] { desc = d } else { desc = "" }
             let schema = t["inputSchema"].map { JSONLite.stringify($0) } ?? "{}"
-            return McpToolSpec(name: name, description: desc, inputSchemaJSON: schema)
+            // Finding 3: preserve the tool's `_meta` (connector identity +
+            // openai/fileParams) verbatim.
+            return McpToolSpec(name: name, description: desc,
+                               inputSchemaJSON: schema, meta: t["_meta"])
         }
     }
 
     public func callTool(_ name: String,
                          argumentsJSON: String,
+                         meta: [String: Any]? = nil,
                          elicitationHandler: McpElicitationHandler? = nil) async throws
         -> McpCallResult {
-        let argsObject: Any
-        if let d = argumentsJSON.data(using: .utf8),
-           let parsed = try? JSONSerialization.jsonObject(with: d) {
-            argsObject = parsed
-        } else {
-            argsObject = [String: Any]()
-        }
+        // Finding 4: reject non-object arguments instead of silently coercing
+        // to `{}`; an empty/absent argument string maps to no arguments.
+        let args = try McpClient.parseToolArguments(argumentsJSON)
         // H-49 / area-04 F5: wire the elicitation handler through to
         // `request`. If the server emits a mid-stream
         // `elicitation/create` server request, we invoke the handler
         // and POST the result back on the same URL.
+        var params: [String: Any] = ["name": name]
+        if let args { params["arguments"] = args }
+        if let meta, !meta.isEmpty { params["_meta"] = meta }
+        // Finding 1: make this handler available to out-of-band
+        // `elicitation/create` requests arriving on the standalone GET stream.
+        setGetStreamElicitationHandler(elicitationHandler)
         let r = try await request(method: "tools/call",
-                                  params: ["name": name, "arguments": argsObject],
+                                  params: params,
                                   expectResult: true,
                                   elicitationHandler: elicitationHandler)
-        var text = ""
-        if let content = r["content"], case .array(let items) = content {
-            for it in items {
-                if case .object(let o) = it,
-                   case .string(let s)? = o["text"] { text += s }
-            }
-        }
-        var isError = false
-        if case .bool(let b)? = r["isError"] { isError = b }
-        return McpCallResult(text: text, isError: isError)
+        // Finding 2: preserve the full content array, structuredContent and
+        // `_meta` (shared with the stdio transport). Image blocks are passed
+        // through when the model supports image input, else replaced with the
+        // placeholder.
+        return McpResultDecoder.decode(r, supportsImageInput: supportsImageInput)
     }
 
     public func readResource(uri: String) async throws -> [String: JSONLite] {
         try await request(method: "resources/read",
                           params: ["uri": uri],
                           expectResult: true)
+    }
+
+    /// `resources/list` — list the server's concrete resources, walking every
+    /// page (Finding 3). Mirrors `McpClient.listResources`.
+    public func listResources() async throws -> [JSONLite] {
+        try await paginate(method: "resources/list", arrayKey: "resources")
+    }
+
+    /// `resources/templates/list` — list URI-templated resources, paginated
+    /// (Finding 3). Mirrors `McpClient.listResourceTemplates`.
+    public func listResourceTemplates() async throws -> [JSONLite] {
+        try await paginate(method: "resources/templates/list",
+                           arrayKey: "resourceTemplates")
+    }
+
+    public func listResourcesPage(cursor: String?) async throws -> [String: JSONLite] {
+        let params: [String: Any] = cursor.map { ["cursor": $0] } ?? [:]
+        return try await request(method: "resources/list", params: params,
+                                 expectResult: true)
+    }
+
+    public func listResourceTemplatesPage(cursor: String?) async throws
+        -> [String: JSONLite] {
+        let params: [String: Any] = cursor.map { ["cursor": $0] } ?? [:]
+        return try await request(method: "resources/templates/list",
+                                 params: params, expectResult: true)
+    }
+
+    /// Shared paginated-list driver. Walks `method` page by page, accumulating
+    /// `arrayKey`, passing `{ "cursor": <next> }` for subsequent pages, stopping
+    /// when `nextCursor` is absent, and erroring on a repeated cursor. Mirrors
+    /// upstream `list_all_resources` / `list_all_resource_templates`.
+    private func paginate(method: String, arrayKey: String) async throws -> [JSONLite] {
+        var collected: [JSONLite] = []
+        var cursor: String?
+        while true {
+            let params: [String: Any]
+            if let cursor { params = ["cursor": cursor] } else { params = [:] }
+            let r = try await request(method: method, params: params,
+                                      expectResult: true)
+            if case .array(let arr)? = r[arrayKey] { collected.append(contentsOf: arr) }
+            guard case .string(let next)? = r["nextCursor"], !next.isEmpty else {
+                return collected
+            }
+            if cursor == next {
+                throw McpError.server("\(method) returned duplicate cursor")
+            }
+            cursor = next
+        }
     }
 }

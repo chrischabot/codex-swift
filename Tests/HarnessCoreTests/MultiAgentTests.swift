@@ -112,33 +112,35 @@ final class MultiAgentTests: XCTestCase {
         await orch.installAgentControl(on: router)
         let dl = Deadline.fromNow(.seconds(30))
 
+        // Upstream multi-agent tool names (multi_agents_spec.rs):
+        // spawn_agent / list_agents / wait_agent / send_message / close_agent.
         let spawnRes = await router.dispatch(
-            ToolCall(callId: "c1", name: "agent_spawn",
+            ToolCall(callId: "c1", name: "spawn_agent",
                      argumentsJSON: "{\"name\":\"w\",\"prompt\":\"do\"}"),
             cwd: ".", deadline: dl)
         XCTAssertTrue(spawnRes.output.contains("\"agent\":\"/root/w\""))
 
         let listRes = await router.dispatch(
-            ToolCall(callId: "c2", name: "agent_list", argumentsJSON: "{}"),
+            ToolCall(callId: "c2", name: "list_agents", argumentsJSON: "{}"),
             cwd: ".", deadline: dl)
         XCTAssertTrue(listRes.output.contains("/root/w"))
 
         let waitRes = await router.dispatch(
-            ToolCall(callId: "c3", name: "agent_wait",
+            ToolCall(callId: "c3", name: "wait_agent",
                      argumentsJSON: "{\"path\":\"/root/w\"}"),
             cwd: ".", deadline: dl)
         XCTAssertTrue(waitRes.output.contains("\"status\":\"completed\""))
         XCTAssertTrue(waitRes.output.contains("\"output\":\"ran:w:do\""))
 
         let msgRes = await router.dispatch(
-            ToolCall(callId: "c4", name: "agent_message",
+            ToolCall(callId: "c4", name: "send_message",
                      argumentsJSON:
                         "{\"to\":\"/root/w\",\"content\":\"hi\",\"triggerTurn\":true}"),
             cwd: ".", deadline: dl)
         XCTAssertEqual(msgRes.output, "{\"delivered\":true}")
 
         let closeRes = await router.dispatch(
-            ToolCall(callId: "c5", name: "agent_close",
+            ToolCall(callId: "c5", name: "close_agent",
                      argumentsJSON: "{\"path\":\"/root/w\"}"),
             cwd: ".", deadline: dl)
         XCTAssertEqual(closeRes.output, "{\"closed\":true}")

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import InfraPrimitives
 
 private final class CurlStreamState: @unchecked Sendable {
@@ -125,7 +128,17 @@ public actor OpenAIResponsesClient: ModelClient {
     /// thread id (Codex contract); developer/assistant roles and
     /// function-call-output replay are mapped faithfully.
     public static func buildRequestBody(_ prompt: Prompt, _ settings: ModelSettings,
-                                        maxOutputTokens: Int?) -> [String: Any] {
+                                        maxOutputTokens: Int?,
+                                        isAzureResponsesProvider: Bool = false) -> [String: Any] {
+        // Upstream `Prompt::get_formatted_input` (`client_common.rs:65-82`):
+        // when a Freeform `apply_patch` custom tool is present, prior shell /
+        // apply_patch tool outputs in the transcript are reserialized from the
+        // JSON envelope into structured `Exit code:/Wall time:/Output:` text
+        // before serialization. The transform is a no-op for outputs that are
+        // not a shell-output JSON envelope (returns nil), so non-shell outputs
+        // pass through unchanged.
+        let reserializeFreeformShellOutputs =
+            FreeformApplyPatchFormatting.isFreeformApplyPatchToolPresent(prompt.tools)
         var input: [[String: Any]] = []
         for item in prompt.input {
             switch item {
@@ -143,8 +156,34 @@ public actor OpenAIResponsesClient: ModelClient {
                 // the function_call_output (it requires a matching call).
                 input.append(["type": "function_call", "call_id": callId,
                               "name": "tool", "arguments": "{}"])
+                let formattedOutput = reserializeFreeformShellOutputs
+                    ? (FreeformApplyPatchFormatting
+                        .reserializeShellOutput(output) ?? output)
+                    : output
                 input.append(["type": "function_call_output",
-                              "call_id": callId, "output": output])
+                              "call_id": callId, "output": formattedOutput])
+            case .reasoning(let summary, let content, let encryptedContent):
+                // Replay the reasoning item so encrypted chain-of-thought
+                // survives across turns (Codex `ResponseItem::Reasoning`,
+                // protocol/src/models.rs:766). The upstream `id` field is
+                // `#[serde(skip_serializing)]` — never sent. `summary` and
+                // `encrypted_content` are always serialized (the latter as
+                // `null` when absent). `content` is omitted unless it carries
+                // reasoning-text parts (`should_serialize_reasoning_content`).
+                var item: [String: Any] = [
+                    "type": "reasoning",
+                    "summary": summary.map {
+                        ["type": "summary_text", "text": $0]
+                    },
+                    "encrypted_content": encryptedContent.map { $0 as Any }
+                        ?? NSNull(),
+                ]
+                if !content.isEmpty {
+                    item["content"] = content.map {
+                        ["type": "reasoning_text", "text": $0]
+                    }
+                }
+                input.append(item)
             }
         }
         if input.isEmpty {
@@ -169,10 +208,19 @@ public actor OpenAIResponsesClient: ModelClient {
         // for sticky routing within a turn, so we must force `store: true`
         // whenever it's set. Callers that explicitly want `store: false`
         // for an un-chained call simply leave `previousResponseId` nil.
-        let effectiveStore = settings.previousResponseId != nil ? true : settings.store
+        //
+        // Provider coupling mirrors upstream `build_responses_request`
+        // (`core/src/client.rs:754` — `store: provider.is_azure_responses_endpoint()`):
+        // standard OpenAI sends `store: false`; an Azure Responses endpoint
+        // sends `store: true`. `ModelSettings.store` defaults to `false`
+        // (matching the non-Azure default); the Azure provider forces it on
+        // here so callers do not have to thread the provider kind through
+        // settings.
+        let effectiveStore = settings.previousResponseId != nil
+            || isAzureResponsesProvider
+            ? true : settings.store
         var body: [String: Any] = [
             "model": settings.model,
-            "instructions": prompt.instructions,
             "input": input,
             "stream": true,
             "prompt_cache_key": settings.threadId,
@@ -180,26 +228,39 @@ public actor OpenAIResponsesClient: ModelClient {
             "parallel_tool_calls": settings.parallelToolCalls,
             "store": effectiveStore,
         ]
+        // `instructions` is `skip_serializing_if = "String::is_empty"`
+        // upstream (`codex-api/src/common.rs:172-173`): omit the key entirely
+        // when the instructions string is empty rather than sending `""`.
+        if !prompt.instructions.isEmpty {
+            body["instructions"] = prompt.instructions
+        }
         if let previousResponseId = settings.previousResponseId {
             body["previous_response_id"] = previousResponseId
         }
         if !prompt.tools.isEmpty {
             body["tools"] = prompt.tools.map { spec -> [String: Any] in
+                // Freeform custom-grammar tool (apply_patch): emit
+                // `{"type":"custom","name","description","format":{…}}` instead
+                // of a JSON function tool (upstream `ToolSpec::Freeform`).
+                if let fmt = spec.freeformFormat {
+                    return ["type": "custom", "name": spec.name,
+                            "description": spec.description,
+                            "format": ["type": fmt.type, "syntax": fmt.syntax,
+                                       "definition": fmt.definition]]
+                }
                 let params = ((try? JSONSerialization.jsonObject(
                     with: Data(spec.parametersJSON.utf8))) as? [String: Any])
                     ?? ["type": "object", "additionalProperties": true]
-                var entry: [String: Any] = ["type": "function", "name": spec.name,
+                // Upstream `ResponsesApiTool` always serializes `strict` (a
+                // non-skippable bool, `responses_api.rs:32`) and marks
+                // `output_schema` `#[serde(skip)]` — so the wire shape is
+                // `{"type":"function","name","description","strict":<bool>,
+                // "parameters":…}` with NO output_schema. We mirror that
+                // exactly: emit `strict`, never emit `output_schema`.
+                let entry: [String: Any] = ["type": "function", "name": spec.name,
                                             "description": spec.description,
+                                            "strict": spec.strict,
                                             "parameters": params]
-                // P4.8 / H-32 — optional `output_schema` declared alongside
-                // `parameters` (mirrors `codex_tools::ResponsesApiTool.output_schema`).
-                // Only emitted when the tool declared one; otherwise we keep
-                // the wire shape unchanged so existing fixtures stay byte-stable.
-                if let outSchema = spec.outputSchemaJSON,
-                   let parsed = (try? JSONSerialization.jsonObject(
-                    with: Data(outSchema.utf8))) as? [String: Any] {
-                    entry["output_schema"] = parsed
-                }
                 return entry
             }
         } else {
@@ -208,46 +269,69 @@ public actor OpenAIResponsesClient: ModelClient {
             // matches `ResponsesApiRequest::tools: Vec<Value>`.
             body["tools"] = [] as [Any]
         }
+        // `max_output_tokens` is NOT part of upstream `ResponsesApiRequest`
+        // (`codex-api/src/common.rs:169-190`); `build_responses_request` never
+        // sets it. codex-swift keeps it as an intentional, OFF-BY-DEFAULT
+        // non-upstream extension: `maxOutputTokens` is `nil` unless a caller /
+        // config explicitly opts in to capping output, in which case the cap is
+        // emitted. When nil (the default) the key is omitted, so the wire shape
+        // matches upstream for every normal request.
         if let m = maxOutputTokens { body["max_output_tokens"] = m }
 
-        // Reasoning + `include`. Upstream's `build_reasoning` only emits the
-        // object when the model "supports reasoning summaries". codex-swift
-        // does not yet maintain a model-info table, so we treat the caller-
-        // provided `reasoningEffort` as the authoritative signal: present
-        // means the model is reasoning-capable, absent means it is not.
-        // `include` defaults to `["reasoning.encrypted_content"]` when
-        // reasoning is active (matches upstream `client.rs` lines 722-726).
+        // Reasoning + `include`, resolved exactly as upstream `build_reasoning`
+        // (`client.rs:690-726`). See `ReasoningResolution` for the catalog
+        // gating semantics. `include` defaults to
+        // `["reasoning.encrypted_content"]` iff a reasoning object is emitted.
         //
         // Wire shape for `reasoning`: upstream's `ResponsesApiRequest.reasoning`
         // is `Option<Reasoning>` with NO `skip_serializing_if`
         // (`codex-api/src/common.rs:178`), so serde emits `"reasoning": null`
         // when the field is `None`. We mirror that by emitting `NSNull()` when
-        // reasoning is inactive rather than omitting the key — keeps wire
-        // shape byte-equivalent to upstream Rust output.
-        var reasoning: [String: Any] = [:]
-        if let effort = settings.reasoningEffort, !effort.isEmpty {
-            reasoning["effort"] = effort
-        }
-        if let summary = settings.reasoningSummary, !summary.isEmpty {
-            reasoning["summary"] = summary
-        }
-        if !reasoning.isEmpty {
+        // reasoning is inactive rather than omitting the key.
+        let reasoning = ReasoningResolution.resolveReasoning(settings)
+        if let reasoning {
             body["reasoning"] = reasoning
         } else {
             body["reasoning"] = NSNull()
         }
         let include: [String] = settings.include
-            ?? (reasoning.isEmpty ? [] : ["reasoning.encrypted_content"])
+            ?? (reasoning == nil ? [] : ["reasoning.encrypted_content"])
         body["include"] = include
 
-        if let tier = settings.serviceTier, !tier.isEmpty {
+        // `service_tier` is gated on model-catalog support exactly like
+        // upstream (`client.rs:744-745`):
+        // `service_tier.filter(|t| model_info.supports_service_tier(t))`.
+        // When the caller resolved a catalog entry that does NOT advertise the
+        // requested tier (`supportsServiceTier == false`), the field is dropped
+        // before serialization. A `nil` gate preserves legacy behaviour
+        // (emit as-is when a tier is set).
+        if let tier = settings.serviceTier, !tier.isEmpty,
+           settings.supportsServiceTier != false {
             body["service_tier"] = tier
         }
 
-        // Optional `text` controls — verbosity only for now; JSON-schema
-        // output is intentionally deferred (no callers route through it yet).
-        if let verbosity = settings.textVerbosity, !verbosity.isEmpty {
-            body["text"] = ["verbosity": verbosity]
+        // Optional `text` controls — verbosity gated on model support
+        // (`client.rs:727-742`): when the catalog says the model does not
+        // support verbosity, the field is dropped even if the caller set it.
+        // Structured-output schema is carried as `text.format` mirroring
+        // upstream `create_text_param_for_request` (`common.rs:279-297`):
+        // the `text` object is emitted iff verbosity OR an output schema is
+        // present; each sub-key (`verbosity`, `format`) is itself
+        // `skip_serializing_if = Option::is_none`, so only present keys appear.
+        var text: [String: Any] = [:]
+        if let verbosity = ReasoningResolution.resolveVerbosity(settings) {
+            text["verbosity"] = verbosity
+        }
+        if let schema = prompt.outputSchema {
+            text["format"] = [
+                "type": "json_schema",
+                "name": "codex_output_schema",
+                "strict": prompt.outputSchemaStrict,
+                "schema": JSONValueFoundation.toAny(schema),
+            ]
+        }
+        if !text.isEmpty {
+            body["text"] = text
         }
 
         // `client_metadata` mirrors upstream's REST shape
@@ -267,14 +351,250 @@ public actor OpenAIResponsesClient: ModelClient {
             body["client_metadata"] = settings.clientMetadata
         }
 
+        // Azure-only: when the request is stored on an Azure Responses endpoint,
+        // re-attach the originating item ids to the serialized input array
+        // (upstream `attach_item_ids`, `endpoint/responses.rs:86-88` +
+        // `requests/responses.rs:11-37`). `effectiveStore` is forced true for
+        // Azure above, so the gate collapses to `isAzureResponsesProvider` in
+        // practice, but we keep both conditions to mirror upstream exactly.
+        if effectiveStore && isAzureResponsesProvider {
+            AzureItemIDs.attach(into: &body, prompt: prompt)
+        }
+
         return body
+    }
+
+    /// Serialize a Responses request body to JSON bytes that match upstream's
+    /// serde field ordering for the tool-definition subtree.
+    ///
+    /// `JSONSerialization.data(..., [.sortedKeys])` alphabetizes EVERY object's
+    /// keys, which reorders each nested `JsonSchema` object to
+    /// `{"description":…,"type":…}` (alphabetical) — the opposite of upstream's
+    /// serde struct order, where `type` is the first field
+    /// (`tools/src/json_schema.rs:33-55`: type, description, enum, items,
+    /// properties, required, additionalProperties, anyOf). Upstream serializes
+    /// each `ToolSpec` via `serde_json::to_value` preserving struct field order
+    /// (`tools/src/tool_spec.rs:79-89`), so a string property serializes as
+    /// `{"type":"string","description":…}`. To keep the tool-definition bytes
+    /// byte-identical to upstream (OpenAI prompt-prefix cache parity), we emit
+    /// every object's keys in sorted order EXCEPT schema objects inside each
+    /// `tools[].parameters` subtree, whose keys follow the canonical
+    /// `JsonSchema` serde order. `properties`/`client_metadata`-style maps keep
+    /// alphabetical key order (upstream `BTreeMap`), and their schema *values*
+    /// recurse with the canonical order.
+    public static func serializeBody(_ body: [String: Any]) throws -> Data {
+        var out = Data()
+        out.reserveCapacity(4096)
+        encodeJSON(body, scope: .plain, into: &out)
+        return out
+    }
+
+    /// Ordering scope for the recursive encoder.
+    private enum EncodeScope: Equatable {
+        /// Object keys sorted alphabetically; children inherit `.plain` unless
+        /// the key is `parameters` (a tool's schema root → `.schema`).
+        case plain
+        /// Object treated as a `JsonSchema`: keys follow the canonical serde
+        /// field order; `properties` descends to `.propertyMap`, every other
+        /// child descends to `.schema`.
+        case schema
+        /// A `properties` map: keys (property names) stay alphabetical, but each
+        /// value is itself a `JsonSchema` (`.schema`).
+        case propertyMap
+    }
+
+    /// Canonical serde field order for `JsonSchema` (`tools/src/json_schema.rs`).
+    private static let jsonSchemaFieldOrder: [String] = [
+        "type", "description", "enum", "items", "properties",
+        "required", "additionalProperties", "anyOf",
+    ]
+
+    /// Recursive deterministic JSON encoder. In `.schema` scope the receiving
+    /// object's keys are ordered by `jsonSchemaFieldOrder` (any remaining keys
+    /// appended alphabetically); otherwise keys are alphabetical.
+    private static func encodeJSON(_ value: Any, scope: EncodeScope, into out: inout Data) {
+        switch value {
+        case let dict as [String: Any]:
+            out.append(UInt8(ascii: "{"))
+            let keys: [String]
+            switch scope {
+            case .schema:
+                let known = jsonSchemaFieldOrder.filter { dict[$0] != nil }
+                let rest = dict.keys.filter { !jsonSchemaFieldOrder.contains($0) }.sorted()
+                keys = known + rest
+            case .plain, .propertyMap:
+                keys = dict.keys.sorted()
+            }
+            var first = true
+            for key in keys {
+                guard let v = dict[key] else { continue }
+                if !first { out.append(UInt8(ascii: ",")) }
+                first = false
+                encodeString(key, into: &out)
+                out.append(UInt8(ascii: ":"))
+                let childScope: EncodeScope
+                switch scope {
+                case .plain:
+                    // A tool entry's `parameters` is the schema root.
+                    childScope = (key == "parameters") ? .schema : .plain
+                case .schema:
+                    // Within a schema: `properties` is a name→schema map (its
+                    // keys are property names, kept alphabetical), every other
+                    // schema field (`items`, `anyOf` elements, …) is a schema.
+                    childScope = (key == "properties") ? .propertyMap : .schema
+                case .propertyMap:
+                    // Each property value is itself a schema.
+                    childScope = .schema
+                }
+                encodeJSON(v, scope: childScope, into: &out)
+            }
+            out.append(UInt8(ascii: "}"))
+        case let arr as [Any]:
+            out.append(UInt8(ascii: "["))
+            var first = true
+            for element in arr {
+                if !first { out.append(UInt8(ascii: ",")) }
+                first = false
+                // Array elements inherit `.schema` (e.g. `anyOf`) but never
+                // `.propertyMap`; a plain-scope array stays plain.
+                let elementScope: EncodeScope = (scope == .plain) ? .plain : .schema
+                encodeJSON(element, scope: elementScope, into: &out)
+            }
+            out.append(UInt8(ascii: "]"))
+        case let s as String:
+            encodeString(s, into: &out)
+        case is NSNull:
+            out.append(contentsOf: Array("null".utf8))
+        case let n as NSNumber:
+            encodeNumber(n, into: &out)
+        default:
+            // Fallback: round-trip through JSONSerialization for any exotic
+            // leaf (should not occur for request bodies).
+            if let d = try? JSONSerialization.data(withJSONObject: [value], options: []),
+               d.count >= 2 {
+                out.append(d.subdata(in: 1..<(d.count - 1)))
+            } else {
+                out.append(contentsOf: Array("null".utf8))
+            }
+        }
+    }
+
+    private static func encodeNumber(_ n: NSNumber, into out: inout Data) {
+        // Match JSONSerialization's bool vs number distinction.
+        let typeChar = n.objCType.pointee
+        if typeChar == UInt8(ascii: "c") || typeChar == UInt8(ascii: "B") {
+            // Could be a bool or a tiny int; treat the canonical Bool bridge.
+            if n === (true as NSNumber) || n === (false as NSNumber)
+                || CFGetTypeID(n) == CFBooleanGetTypeID() {
+                out.append(contentsOf: Array((n.boolValue ? "true" : "false").utf8))
+                return
+            }
+        }
+        if let d = try? JSONSerialization.data(withJSONObject: [n], options: []),
+           d.count >= 2 {
+            out.append(d.subdata(in: 1..<(d.count - 1)))
+        } else {
+            out.append(contentsOf: Array("0".utf8))
+        }
+    }
+
+    private static func encodeString(_ s: String, into out: inout Data) {
+        out.append(UInt8(ascii: "\""))
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out.append(contentsOf: Array("\\\"".utf8))
+            case "\\": out.append(contentsOf: Array("\\\\".utf8))
+            case "\n": out.append(contentsOf: Array("\\n".utf8))
+            case "\r": out.append(contentsOf: Array("\\r".utf8))
+            case "\t": out.append(contentsOf: Array("\\t".utf8))
+            case "\u{08}": out.append(contentsOf: Array("\\b".utf8))
+            case "\u{0C}": out.append(contentsOf: Array("\\f".utf8))
+            default:
+                if scalar.value < 0x20 {
+                    out.append(contentsOf: Array(String(format: "\\u%04x", scalar.value).utf8))
+                } else {
+                    out.append(contentsOf: Array(String(scalar).utf8))
+                }
+            }
+        }
+        out.append(UInt8(ascii: "\""))
+    }
+
+    /// Remote `/responses/compact` request (unary POST). Faithful to
+    /// `compact_conversation_history`. Streaming uses curl SSE; this unary call
+    /// uses `URLSession` (a non-streaming JSON POST works the same on Linux and
+    /// macOS, and keeps bearer credentials out of process argv). Returns `nil`
+    /// when the provider does not support remote compaction.
+    public func compactConversationHistory(_ prompt: Prompt,
+                                           _ settings: ModelSettings) async throws
+    -> [RemoteCompaction.OutputMessage]? {
+        guard provider.supportsRemoteCompaction else { return nil }
+        if prompt.input.isEmpty { return [] }
+
+        let body = RemoteCompaction.buildRequestBody(prompt, settings)
+        // Byte-deterministic serialization with upstream serde field ordering:
+        // sorted top-level/map keys, but tool-definition schema objects keep the
+        // canonical `JsonSchema` order (type-first), preserving OpenAI
+        // prompt-prefix cache hit-rate parity (audit tools-router).
+        let data = try Self.serializeBody(body)
+        let responsesURL = explicitEndpoint ?? provider.responsesURL()
+        let urlString = RemoteCompaction.compactURL(fromResponsesURL: responsesURL)
+        guard let url = URL(string: urlString) else {
+            throw ModelError("invalid compact URL: \(urlString)", retryable: false)
+        }
+        let timeout = TimeInterval(requestTimeoutSeconds)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = data
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let authHeader: String? = {
+            if let b = explicitBearer { return "Bearer \(b)" }
+            return provider.effectiveAuthHeader(env: env)
+        }()
+        if let auth = authHeader {
+            request.setValue(auth, forHTTPHeaderField: "Authorization")
+        }
+        for (k, v) in provider.resolvedHeaders(env: env) {
+            request.setValue(v, forHTTPHeaderField: k)
+        }
+        let preparedRequest = request
+
+        let sessionConfig = URLSessionConfiguration.ephemeral
+        sessionConfig.timeoutIntervalForRequest = timeout
+        sessionConfig.timeoutIntervalForResource = timeout
+        let session = URLSession(configuration: sessionConfig)
+        defer { session.finishTasksAndInvalidate() }
+        let respData: Data
+        let response: URLResponse
+        do {
+            (respData, response) = try await session.data(for: preparedRequest)
+        } catch {
+            throw ModelError("compact request failed: \(error)", retryable: true)
+        }
+        if let http = response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            let bodyStr = String(decoding: respData.prefix(1500), as: UTF8.self)
+            throw ModelError(
+                "compact HTTP \(http.statusCode): \(bodyStr)",
+                retryable: http.statusCode == 429 || http.statusCode >= 500,
+                httpStatus: http.statusCode)
+        }
+        return try RemoteCompaction.parseOutput(respData)
     }
 
     public func stream(_ prompt: Prompt,
                        _ settings: ModelSettings) async throws -> ResponseStream {
-        let body = Self.buildRequestBody(prompt, settings,
-                                         maxOutputTokens: maxOutputTokens)
-        let data = try JSONSerialization.data(withJSONObject: body)
+        let body = Self.buildRequestBody(
+            prompt, settings,
+            maxOutputTokens: maxOutputTokens,
+            isAzureResponsesProvider: provider.isAzureResponsesProvider)
+        // Byte-deterministic serialization with upstream serde field ordering:
+        // sorted top-level/map keys, but tool-definition schema objects keep the
+        // canonical `JsonSchema` order (type-first), preserving OpenAI
+        // prompt-prefix cache hit-rate parity (audit tools-router).
+        let data = try Self.serializeBody(body)
         let cap = streamCapacity
         let url = explicitEndpoint ?? provider.responsesURL()
         let authHeader: String? = {
@@ -288,6 +608,10 @@ public actor OpenAIResponsesClient: ModelClient {
             + "codexkit-curl-" + UUID().uuidString
         let tracker = usageTracker
         let timeoutSecs = requestTimeoutSeconds
+        // Shared box so the SSE reader can write the server-assigned
+        // `x-codex-turn-state` back for the turn loop to replay (upstream
+        // OnceLock round-trip, responses.rs:55-62).
+        let box = LastResponseBox()
 
         @Sendable func intOf(_ v: Any?) -> Int {
             if let i = v as? Int { return i }
@@ -295,17 +619,44 @@ public actor OpenAIResponsesClient: ModelClient {
             if let n = v as? NSNumber { return n.intValue }
             return 0
         }
+        // Distinguishes absent / JSON-null (→ nil) from a present numeric
+        // value, matching upstream `Option<i64>`. Used to gate reasoning-delta
+        // emission on index presence (`responses.rs:291-305`).
+        @Sendable func intIfPresent(_ v: Any?) -> Int? {
+            guard let v = v, !(v is NSNull) else { return nil }
+            if let i = v as? Int { return i }
+            if let n = v as? NSNumber { return n.intValue }
+            if let d = v as? Double { return Int(d) }
+            return nil
+        }
 
-        return StreamMapper.map(capacity: cap) {
+        return StreamMapper.map(capacity: cap, lastResponse: box) {
             AsyncThrowingStream<ResponseEvent, any Error> { cont in
                 let recordTelemetry: @Sendable () -> Void = {
                     let dump = (try? String(
                         contentsOfFile: headerDumpPath,
                         encoding: .utf8)) ?? ""
-                    if let tracker = tracker,
-                       let snap = RateLimitSnapshot.parseRateLimits(
-                        headerDump: dump) {
-                        Task.detached { await tracker.recordRateLimits(snap) }
+                    // One snapshot per metered family
+                    // (`parse_all_rate_limits`, responses.rs:68-70).
+                    let snaps = RateLimitSnapshot.parseAllRateLimits(
+                        headerDump: dump)
+                    if let tracker = tracker, !snaps.isEmpty {
+                        Task.detached {
+                            for snap in snaps {
+                                await tracker.recordRateLimits(snap)
+                            }
+                        }
+                    }
+                    // Surface EVERY snapshot as a stream event so the
+                    // SessionEngine can forward `account/rateLimits/updated`
+                    // (`bespoke_event_handling.rs:1571-1579`) for secondary /
+                    // other metered families too — upstream emits one event per
+                    // snapshot (`responses.rs:68-70`). Order codex-family first,
+                    // then the rest, matching upstream's discovery order.
+                    let codexSnaps = snaps.filter { $0.limitId == "codex" }
+                    let restSnaps = snaps.filter { $0.limitId != "codex" }
+                    for snap in codexSnaps + restSnaps {
+                        cont.yield(.rateLimits(snap))
                     }
                     try? FileManager.default.removeItem(
                         atPath: headerDumpPath)
@@ -328,6 +679,33 @@ public actor OpenAIResponsesClient: ModelClient {
                 if let turnState = settings.turnState {
                     configLines.append(
                         "header = \"x-codex-turn-state: \(Self.curlConfigValue(turnState))\"")
+                }
+                // Per-turn metadata header (upstream `build_responses_headers`,
+                // `client.rs:1651`, inserting `X_CODEX_TURN_METADATA_HEADER` =
+                // "x-codex-turn-metadata" when `turn_metadata_header` is `Some`).
+                if let turnMetadata = settings.turnMetadata {
+                    configLines.append(
+                        "header = \"x-codex-turn-metadata: \(Self.curlConfigValue(turnMetadata))\"")
+                }
+                // Request-correlation / session-continuity headers (upstream
+                // `endpoint/responses.rs:91-94` + `build_session_headers`,
+                // `requests/headers.rs:5-14`): `x-client-request-id` (= thread
+                // id), `session-id` (= session id, falling back to thread id),
+                // and `thread-id` (= thread id).
+                let sessionIdHeader = settings.sessionId ?? settings.threadId
+                configLines.append(
+                    "header = \"x-client-request-id: \(Self.curlConfigValue(settings.threadId))\"")
+                configLines.append(
+                    "header = \"session-id: \(Self.curlConfigValue(sessionIdHeader))\"")
+                configLines.append(
+                    "header = \"thread-id: \(Self.curlConfigValue(settings.threadId))\"")
+                // Sub-agent source routing header (upstream
+                // `endpoint/responses.rs:95-97` + `requests/headers.rs:16-31`):
+                // review/compact/memory_consolidation/collab_spawn turns carry
+                // `x-openai-subagent`; primary turns omit it.
+                if let label = settings.subagentLabel, !label.isEmpty {
+                    configLines.append(
+                        "header = \"x-openai-subagent: \(Self.curlConfigValue(label))\"")
                 }
                 for (k, v) in extraHeaders.sorted(by: { $0.key < $1.key }) {
                     configLines.append(
@@ -381,6 +759,9 @@ public actor OpenAIResponsesClient: ModelClient {
                 let reader = Thread {
                     var buf = Data()
                     var sawAny = false
+                    var sawCompleted = false
+                    var emittedHeaderSignals = false
+                    var lastServerModel: String?
                     while true {
                         let chunk = outH.availableData
                         if chunk.isEmpty { break }
@@ -400,21 +781,139 @@ public actor OpenAIResponsesClient: ModelClient {
                                   let obj = (try? JSONSerialization.jsonObject(
                                     with: pd)) as? [String: Any] else { continue }
                             sawAny = true
-                            if let err = obj["error"] as? [String: Any] {
-                                let msg = (err["message"] as? String) ?? "OpenAI error"
-                                recordTelemetry()
-                                cont.finish(throwing: ModelError(msg, retryable: false))
-                                return
+                            // Upstream `ResponsesStreamEvent` has no `error`
+                            // field; a stray top-level `{"error":{...}}` frame
+                            // with no recognized `type` is ignored and the
+                            // stream continues (responses.rs:266-394, `_ =>`
+                            // arm). Genuine errors arrive inside `response.failed`
+                            // (handled below via classifyResponseFailed). We do
+                            // NOT short-circuit the stream on a top-level
+                            // `error` key.
+                            // Header-derived stream signals are emitted lazily on
+                            // the first parsed frame (curl has flushed the `-D`
+                            // header dump by now). Mirrors the URLSession path's
+                            // pre-body header emission (serverModel / modelsEtag /
+                            // serverReasoningIncluded) and the turn-state capture.
+                            if !emittedHeaderSignals {
+                                emittedHeaderSignals = true
+                                let dump = (try? String(
+                                    contentsOfFile: headerDumpPath,
+                                    encoding: .utf8)) ?? ""
+                                let h = ResponsesStreamParsing
+                                    .parseHeaderDump(dump)
+                                if let model = h[ResponsesStreamParsing
+                                    .openAIModelHeader.lowercased()],
+                                   !model.isEmpty {
+                                    lastServerModel = model
+                                    cont.yield(.serverModel(model))
+                                }
+                                if let etag = h[ResponsesStreamParsing
+                                    .xModelsEtagHeader.lowercased()],
+                                   !etag.isEmpty {
+                                    cont.yield(.modelsEtag(etag))
+                                }
+                                if h[ResponsesStreamParsing
+                                    .xReasoningIncludedHeader.lowercased()]
+                                    != nil {
+                                    cont.yield(.serverReasoningIncluded(true))
+                                }
+                                if let ts = h[ResponsesStreamParsing
+                                    .xCodexTurnStateHeader.lowercased()],
+                                   !ts.isEmpty {
+                                    let b = box
+                                    Task { await b.setTurnState(ts) }
+                                }
+                            }
+                            // Per-event server-model + verifications
+                            // (responses.rs:447-467).
+                            if let model = ResponsesStreamParsing
+                                .serverModelFromFrame(obj),
+                               model != lastServerModel {
+                                lastServerModel = model
+                                cont.yield(.serverModel(model))
+                            }
+                            if (obj["type"] as? String) == "response.metadata",
+                               let verifs = ResponsesStreamParsing
+                                .modelVerificationsFromFrame(obj),
+                               !verifs.isEmpty {
+                                cont.yield(.modelVerifications(verifs))
                             }
                             let type = obj["type"] as? String ?? ""
                             switch type {
                             case "response.created":
-                                cont.yield(.created)
+                                // Upstream only emits Created when the frame
+                                // carries a `response` object
+                                // (`responses.rs:307-311`). A bare
+                                // `response.created` without one is ignored.
+                                if obj["response"] != nil { cont.yield(.created) }
                             case "response.output_text.delta":
                                 let id = obj["item_id"] as? String ?? "msg"
                                 let d = obj["delta"] as? String ?? ""
-                                if !d.isEmpty {
-                                    cont.yield(.agentDelta(itemId: id, delta: d))
+                                // Upstream (`responses.rs:275-279`) emits
+                                // whenever `delta` is present, even when empty.
+                                cont.yield(.agentDelta(itemId: id, delta: d))
+                            case "response.reasoning_text.delta":
+                                // Upstream only yields when BOTH delta and
+                                // content_index are present (responses.rs:298).
+                                let id = obj["item_id"] as? String ?? "reasoning"
+                                let d = obj["delta"] as? String ?? ""
+                                guard let ci = intIfPresent(obj["content_index"])
+                                else { continue }
+                                // Upstream emits even for empty deltas; only the
+                                // index presence guard is required.
+                                cont.yield(.reasoningContentDelta(
+                                    itemId: id, delta: d, contentIndex: ci))
+                            case "response.reasoning_summary_text.delta":
+                                // Upstream only yields when BOTH delta and
+                                // summary_index are present (responses.rs:291).
+                                let id = obj["item_id"] as? String ?? "reasoning"
+                                let d = obj["delta"] as? String ?? ""
+                                guard let si = intIfPresent(obj["summary_index"])
+                                else { continue }
+                                // Upstream emits even for empty deltas; only the
+                                // index presence guard is required.
+                                cont.yield(.reasoningSummaryDelta(
+                                    itemId: id, delta: d, summaryIndex: si))
+                            case "response.reasoning_summary_part.added":
+                                // Upstream yields only when summary_index is
+                                // present (responses.rs:384-387).
+                                let id = obj["item_id"] as? String ?? "reasoning"
+                                guard let si = intIfPresent(obj["summary_index"])
+                                else { continue }
+                                cont.yield(.reasoningSummaryPartAdded(
+                                    itemId: id, summaryIndex: si))
+                            case "response.custom_tool_call_input.delta":
+                                // Upstream (`responses.rs:280-289`) has a branch
+                                // ONLY for `custom_tool_call_input.delta`; there
+                                // is NO branch for `function_call_arguments.delta`
+                                // (it falls into the `_ =>` arm and yields
+                                // nothing — see `parses_tool_call_input_deltas`,
+                                // responses.rs:765-795). It resolves the id as
+                                // `item_id ?? call_id`, carries `call_id`, and
+                                // emits whenever a resolved id is present —
+                                // `Some("")` is still present in Rust, so an
+                                // empty-string delta with a valid id still emits.
+                                let callId = (obj["call_id"] as? String)
+                                    .flatMap { $0.isEmpty ? nil : $0 }
+                                let itemId = (obj["item_id"] as? String)
+                                    .flatMap { $0.isEmpty ? nil : $0 } ?? callId
+                                let d = obj["delta"] as? String ?? ""
+                                if let itemId {
+                                    cont.yield(.toolCallInputDelta(
+                                        itemId: itemId, callId: callId, delta: d))
+                                }
+                            case "response.output_item.added":
+                                if let it = obj["item"] as? [String: Any] {
+                                    let id = it["id"] as? String ?? ""
+                                    let itype = it["type"] as? String ?? ""
+                                    cont.yield(.outputItemAdded(itemId: id, itemType: itype))
+                                    // Surface server-side tool items so they are
+                                    // not lost (upstream deserializes EVERY
+                                    // ResponseItem, responses.rs:376-382).
+                                    if let ev = ResponsesStreamParsing
+                                        .serverToolItemEvent(it, done: false) {
+                                        cont.yield(ev)
+                                    }
                                 }
                             case "response.output_item.done":
                                 if let it = obj["item"] as? [String: Any] {
@@ -440,6 +939,43 @@ public actor OpenAIResponsesClient: ModelClient {
                                         cont.yield(.toolCall(callId: callId,
                                                              name: name,
                                                              argumentsJSON: args))
+                                    } else if itype == "custom_tool_call" {
+                                        // Freeform tool result (e.g.
+                                        // apply_patch). `input` is the RAW patch
+                                        // envelope, NOT JSON. Route it through
+                                        // the generic toolCall contract; the
+                                        // handler (ApplyPatchTool) accepts raw
+                                        // patch text directly. Upstream item
+                                        // shape: {type:"custom_tool_call",
+                                        // call_id, name, input}
+                                        // (protocol/src/models.rs:824).
+                                        let callId = it["call_id"]
+                                            as? String ?? "call"
+                                        let name = it["name"] as? String ?? ""
+                                        let input = it["input"] as? String ?? ""
+                                        cont.yield(.toolCall(callId: callId,
+                                                             name: name,
+                                                             argumentsJSON: input))
+                                    } else if itype == "reasoning" {
+                                        // Reasoning item carrying encrypted
+                                        // chain-of-thought; surface it so the
+                                        // turn loop can persist + replay it
+                                        // (upstream OutputItemDone(Reasoning),
+                                        // responses.rs:267).
+                                        let r = ResponsesStreamParsing
+                                            .parseReasoningItem(it)
+                                        cont.yield(.reasoning(
+                                            itemId: r.id, summary: r.summary,
+                                            content: r.content,
+                                            encryptedContent: r.encryptedContent))
+                                    } else if let ev = ResponsesStreamParsing
+                                        .serverToolItemEvent(it, done: true) {
+                                        // Server-side tool items
+                                        // (local_shell_call, web_search_call,
+                                        // tool_search_call) — surface rather than
+                                        // drop (upstream deserializes EVERY
+                                        // ResponseItem, responses.rs:267-274).
+                                        cont.yield(ev)
                                     }
                                 }
                             case "response.failed":
@@ -472,7 +1008,24 @@ public actor OpenAIResponsesClient: ModelClient {
                                 fallthrough
                             case "response.completed":
                                 let resp = obj["response"] as? [String: Any]
-                                let id = resp?["id"] as? String ?? "resp"
+                                // Upstream (responses.rs:358-374) requires a
+                                // String `id` on response.completed; a missing
+                                // one is a fatal stream error. The
+                                // response.incomplete max_output_tokens
+                                // soft-success fallthrough (documented
+                                // divergence, STATUS.md:624-629) has no id, so
+                                // synthesize one only there.
+                                let isGenuineCompleted =
+                                    (obj["type"] as? String) == "response.completed"
+                                let parsedId = resp?["id"] as? String
+                                if isGenuineCompleted, parsedId == nil {
+                                    recordTelemetry()
+                                    cont.finish(throwing: ModelError(
+                                        "failed to parse ResponseCompleted: missing id",
+                                        retryable: true))
+                                    return
+                                }
+                                let id = parsedId ?? "resp"
                                 let usage = resp?["usage"] as? [String: Any]
                                 let total = intOf(usage?["total_tokens"])
                                 let details = usage?["input_tokens_details"]
@@ -496,10 +1049,17 @@ public actor OpenAIResponsesClient: ModelClient {
                                         await tracker.recordUsage(snap)
                                     }
                                 }
+                                // Upstream reads `end_turn` from the
+                                // response.completed payload: `Some(false)`
+                                // signals the model wants the turn to CONTINUE
+                                // (needs_follow_up). Absent → fall back to
+                                // "ended" (codex-api/src/sse/responses.rs:365).
+                                let endTurn = (resp?["end_turn"] as? Bool) ?? true
                                 cont.yield(.completed(responseId: id,
                                                       totalTokens: total,
-                                                      endTurn: true,
+                                                      endTurn: endTurn,
                                                       usage: snap))
+                                sawCompleted = true
                                 recordTelemetry()
                                 cont.finish()
                                 return
@@ -516,6 +1076,18 @@ public actor OpenAIResponsesClient: ModelClient {
                         cont.finish(throwing: ModelError(
                             "no SSE from OpenAI (exit \(state.process.terminationStatus)): "
                             + "\(emsg.prefix(400))", retryable: false))
+                        return
+                    }
+                    // Frames were seen but the stream closed before any terminal
+                    // event (response.completed / .failed / terminal incomplete):
+                    // surface a retryable stream error so the turn/retry loop
+                    // reacts, matching upstream's "stream closed before
+                    // response.completed" (responses.rs:422-428).
+                    if !sawCompleted {
+                        recordTelemetry()
+                        cont.finish(throwing: ModelError(
+                            "stream closed before response.completed",
+                            retryable: true))
                         return
                     }
                     recordTelemetry()

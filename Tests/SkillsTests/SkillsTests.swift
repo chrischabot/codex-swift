@@ -129,6 +129,48 @@ final class SkillsTests: XCTestCase {
                        "Admin (CODEX_HOME/skills) takes precedence")
     }
 
+    /// prompts finding E: each discovered skill carries its source
+    /// `SkillScope` so the `## Skills` render ordering can apply
+    /// `prompt_scope_rank`. Upstream `core-skills/src/loader.rs` maps
+    /// `$CODEX_HOME/skills` and `$HOME/.agents/skills` to User and repo
+    /// `.agents/skills` to Repo.
+    func testSkillsDiscoveryCarriesScope() {
+        let admin = tmp(); defer { try? FileManager.default.removeItem(atPath: admin) }
+        let home = tmp(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let project = tmp(); defer { try? FileManager.default.removeItem(atPath: project) }
+        try? FileManager.default.createDirectory(atPath: project + "/.git",
+                                                  withIntermediateDirectories: true)
+        // $CODEX_HOME/skills → User scope.
+        writeSkill(admin, "codexhome-skill",
+                   "---\nname: codexhome-skill\ndescription: d\n---\nx")
+        // $HOME/.agents/skills → User scope.
+        let homeSkill = home + "/.agents/skills/home-skill"
+        try? FileManager.default.createDirectory(atPath: homeSkill,
+                                                  withIntermediateDirectories: true)
+        try? "---\nname: home-skill\ndescription: d\n---\nx"
+            .write(toFile: homeSkill + "/SKILL.md", atomically: true, encoding: .utf8)
+        // repo .agents/skills → Repo scope.
+        let repoSkill = project + "/.agents/skills/repo-skill"
+        try? FileManager.default.createDirectory(atPath: repoSkill,
+                                                  withIntermediateDirectories: true)
+        try? "---\nname: repo-skill\ndescription: d\n---\nx"
+            .write(toFile: repoSkill + "/SKILL.md", atomically: true, encoding: .utf8)
+
+        let recs = SkillsDiscovery().discover(
+            codexHome: admin, cwds: [project], home: home)
+            .reduce(into: [String: SkillRecord]()) { $0[$1.name] = $1 }
+        XCTAssertEqual(recs["codexhome-skill"]?.scope, .user)
+        XCTAssertEqual(recs["home-skill"]?.scope, .user)
+        XCTAssertEqual(recs["repo-skill"]?.scope, .repo)
+        // prompt_scope_rank: System=0, Admin=1, Repo=2, User=3.
+        XCTAssertEqual(SkillScope.system.promptScopeRank, 0)
+        XCTAssertEqual(SkillScope.admin.promptScopeRank, 1)
+        XCTAssertEqual(SkillScope.repo.promptScopeRank, 2)
+        XCTAssertEqual(SkillScope.user.promptScopeRank, 3)
+        XCTAssertEqual(recs["repo-skill"]?.scope.promptScopeRank, 2)
+        XCTAssertEqual(recs["home-skill"]?.scope.promptScopeRank, 3)
+    }
+
     func testFrontmatterHandlesYAMLBlockScalars() {
         // Live regression: a `description: |` block previously parsed as
         // `description = "|"` and the model never saw the rules. The

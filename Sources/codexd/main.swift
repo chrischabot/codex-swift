@@ -11,6 +11,7 @@ import MCP
 import Skills
 import Connectors
 import HarnessCore
+import Workflows
 import IPC
 import SessionWorkerCore
 import Supervisor
@@ -19,6 +20,8 @@ import Observability
 import Auth
 import Tokenizer
 import Config
+import MemoryExtension
+import WebGateway
 
 /// Fails clearly when no model credentials are configured. Set
 /// CODEXKIT_MOCK=1 to run the full pipeline against the deterministic mock.
@@ -72,6 +75,77 @@ struct CodexDaemon {
         return port
     }
 
+    /// Parse `--listen-web[=HOST:PORT]` / `CODEXKIT_LISTEN_WEB` into a gateway
+    /// config, or nil when the web gateway is not requested. Defaults to
+    /// loopback 127.0.0.1:8443. `wwwRoot`/cert/key are overridable via env.
+    private static func webGatewayConfig(codexHome: String) -> WebGatewayConfig? {
+        let args = CommandLine.arguments
+        var present = false
+        var raw: String?
+        for i in 1..<args.count {
+            let a = args[i]
+            if a == "--listen-web" {
+                present = true
+                if i + 1 < args.count, !args[i + 1].hasPrefix("--") { raw = args[i + 1] }
+            } else if a.hasPrefix("--listen-web=") {
+                present = true
+                raw = String(a.dropFirst("--listen-web=".count))
+            }
+        }
+        let env = ProcessInfo.processInfo.environment
+        if !present, let e = env["CODEXKIT_LISTEN_WEB"], !e.isEmpty { present = true; raw = e }
+        guard present else { return nil }
+
+        var host = "127.0.0.1"
+        var port = 8443
+        if let raw, !raw.isEmpty {
+            if let colon = raw.lastIndex(of: ":"), let p = Int(raw[raw.index(after: colon)...]) {
+                let h = String(raw[..<colon])
+                if !h.isEmpty { host = h }
+                port = p
+            } else if let p = Int(raw) {
+                port = p
+            }
+        }
+        let wwwRoot = env["CODEXKIT_WEB_ROOT"]
+            ?? (FileManager.default.currentDirectoryPath + "/www/dist")
+        let certPath = env["CODEXKIT_WEB_CERT"] ?? (codexHome + "/web-gateway/cert.pem")
+        let keyPath = env["CODEXKIT_WEB_KEY"] ?? (codexHome + "/web-gateway/key.pem")
+        // Plaintext (no TLS) is local-dev/CI only — never for a real bind.
+        let tls = env["CODEXKIT_WEB_INSECURE"] != "1"
+
+        // Auth is mandatory for any non-loopback bind (fail-closed), and can be
+        // forced on for loopback via CODEXKIT_WEB_REQUIRE_AUTH=1. The agent
+        // control-plane is arbitrary local RCE; never expose it unauthenticated.
+        let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+        let requireAuth = !loopback || env["CODEXKIT_WEB_REQUIRE_AUTH"] == "1"
+        var token = env["CODEXKIT_WEB_TOKEN"]
+        if requireAuth, (token?.isEmpty ?? true) {
+            token = Self.generateToken()
+            FileHandle.standardError.write(
+                Data("codexd web gateway auth token: \(token!)\n".utf8))
+        }
+        let origins = (env["CODEXKIT_WEB_ORIGINS"] ?? "")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return WebGatewayConfig(host: host, port: port, wwwRoot: wwwRoot,
+                                certPath: certPath, keyPath: keyPath, tls: tls,
+                                requireAuth: requireAuth, bearerToken: token,
+                                allowedOrigins: origins,
+                                mediaRoot: codexHome + "/web-gateway/media")
+    }
+
+    /// A URL-safe random bearer token for the web gateway.
+    private static func generateToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 24)
+        for i in bytes.indices { bytes[i] = UInt8.random(in: 0...255) }
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
     private static func unixPath(from raw: String, codexHome: String) -> String? {
         let expanded: String
         if raw == "$CODEX_HOME" {
@@ -112,6 +186,14 @@ struct CodexDaemon {
     }
 
     private static func openAIClient(apiKey: String, limits: Limits) -> any ModelClient {
+        let endpoint: String = {
+            if let base = ProcessInfo.processInfo.environment["OPENAI_BASE_URL"], !base.isEmpty {
+                var trimmed = base
+                while trimmed.hasSuffix("/") { trimmed.removeLast() }
+                return "\(trimmed)/responses"
+            }
+            return "https://api.openai.com/v1/responses"
+        }()
         #if os(macOS)
         if ProcessInfo.processInfo.environment["CODEXKIT_RESPONSES_WEBSOCKET"] == "1" {
             let ws = WebSocketResponsesClient(
@@ -120,12 +202,12 @@ struct CodexDaemon {
                 options: .init(
                     prewarm: ProcessInfo.processInfo.environment["CODEXKIT_WS_PREWARM"] != "0",
                     explicitNoZstd: true))
-            let http = URLSessionResponsesClient(apiKey: apiKey, limits: limits)
+            let http = URLSessionResponsesClient(apiKey: apiKey, endpoint: endpoint, limits: limits)
             return TransportFallbackModelClient(primary: ws, fallback: http, limits: limits)
         }
-        return URLSessionResponsesClient(apiKey: apiKey, limits: limits)
+        return URLSessionResponsesClient(apiKey: apiKey, endpoint: endpoint, limits: limits)
         #else
-        return OpenAIResponsesClient(apiKey: apiKey, limits: limits)
+        return OpenAIResponsesClient(apiKey: apiKey, endpoint: endpoint, limits: limits)
         #endif
     }
 
@@ -144,8 +226,15 @@ struct CodexDaemon {
         // codexd is a long-running, multi-session daemon. Env overlay
         // is intentionally NOT applied here for the same reason as
         // codex-broker — see comment there.
+        // Resolve the configured credential store mode
+        // (`cli_auth_credentials_store`, upstream default File) so the Swift
+        // server stays interoperable with the official codex CLI on a shared
+        // CODEX_HOME instead of unconditionally using the Keychain.
+        let authStoreMode = AuthCredentialsStoreMode.parse(
+            ConfigLoader(codexHome: codexHome).load()
+                .value("cli_auth_credentials_store")?.stringValue)
         let authManager = AuthManager(
-            store: TokenStoreFactory.production(codexHome: codexHome),
+            store: TokenStoreFactory.production(codexHome: codexHome, mode: authStoreMode),
             apiKeyExchanger: CurlAPIKeyExchanger(),
             revoker: CurlTokenRevoker())
         let useMock = ProcessInfo.processInfo.environment["CODEXKIT_MOCK"] == "1"
@@ -200,8 +289,19 @@ struct CodexDaemon {
                     if let agentTypeDesc = c.agentTypeDescription, !agentTypeDesc.isEmpty {
                         spawnAgentOptions.agentTypeDescription = agentTypeDesc
                     }
+                    // Upstream `spec_plan.rs` gates the shell-tool family on the
+                    // model's `shell_type` (`ConfigShellToolType`): exactly one
+                    // coherent shell interface is offered. Resolve from the
+                    // bundled catalog (falls back to `.shellCommand`).
+                    let shellType = ShellToolType.from(
+                        rawValue: ModelsCatalog.entry(for: c.model)?.shellType)
                     await DefaultTools.register(on: router, sandbox: sb, limits: limits,
+                                                shellType: shellType,
                                                 spawnAgentOptions: spawnAgentOptions)
+                    // Dynamic workflows: enabled gate (the orchestrator is
+                    // wired after the engine exists, so progress can be pushed
+                    // over its stream).
+                    let workflowsEnabled = WorkflowGating.isEnabled()
                     if let remote = c.remoteEnvironment {
                         await RemoteExecServerTools.register(
                             on: router,
@@ -233,22 +333,83 @@ struct CodexDaemon {
                     let skills = SkillsDiscovery()
                         .discover(codexHome: codexHome, cwds: [c.cwd])
                         .map { PromptComposer.SkillInjection(
-                            name: $0.name, description: $0.description, path: $0.path) }
+                            name: $0.name, description: $0.description, path: $0.path,
+                            scopeRank: $0.scope.promptScopeRank) }
                     let connectors = ConnectorsDiscovery()
                         .discover(codexHome: codexHome)
                         .map { PromptComposer.ConnectorInjection(
                             id: $0.id, name: $0.name, description: $0.description) }
-                    let autoCompact = ModelCatalog.default.autoCompactLimit(for: c.model)
+                    // Upstream `auto_compact_token_limit()` mins the model's 90%
+                    // context-window value with any user-configured
+                    // `model_auto_compact_token_limit` (openai_models.rs:322).
+                    let autoCompactOverride = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd)
+                        .load().modelAutoCompactTokenLimit
+                    let autoCompact = ModelCatalog.default.autoCompactLimit(
+                        for: c.model, configOverride: autoCompactOverride)
                     let approved = ApprovedRuleStore(codexHome: codexHome)
-                    return SessionEngine(config: c, model: model, store: store,
+                    // Extension spine (ARCHITECTURE.md §5.4 / Phase 0): mirror
+                    // the codex-session wiring (this is the in-process worker
+                    // path). nil registry → byte-identical core.
+                    let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
+                    // Phase 1 (ARCHITECTURE.md §7.1): core `.md` memories as the
+                    // default MemoryProvider slot candidate; `[memory].provider`
+                    // selects/disables. Recall+capture wire into the registry.
+                    // The vector "Memory Wiki" candidate is built ONLY when
+                    // `[memory].provider == "wiki"` (constructing it opens a
+                    // SQLite handle on the wiki DB). It reuses this session's
+                    // `ModelClient` for its own text inference (D1) and returns
+                    // nil if the DB can't be opened (degrade to core).
+                    var memoryCandidates: [any MemoryProvider] = [CoreMemoriesProvider(store: memory)]
+                    if addonConfig.value("memory")?.objectValue?["provider"]?.stringValue == "wiki",
+                       let wiki = makeWikiMemoryProvider(config: addonConfig, modelClient: model) {
+                        memoryCandidates.append(wiki)
+                    }
+                    let memoryProvider = selectMemoryProvider(
+                        config: addonConfig, candidates: memoryCandidates)
+                    // Gate the provider's tools on the SAME `extensions` feature
+                    // that gates its recall/capture (installAddons, below) — see
+                    // codex-session/main.swift: registering provider tools while
+                    // recall stayed off leaked e.g. wiki tools into an
+                    // extensions-off session (asymmetry → tool-list divergence).
+                    if addonConfig.isFeatureEnabled("extensions") {
+                        for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
+                    }
+                    let extRegistry = installAddons(
+                        config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
+                    let engine = SessionEngine(config: c, model: model, store: store,
                                          router: router, limits: limits,
                                          autoCompactTokens: autoCompact,
+                                         autoCompactConfigOverride: autoCompactOverride,
+                                         recomputeAutoCompactPerTurn: true,
                                          memoryStore: memory, sandbox: sb,
                                          skills: skills, connectors: connectors,
                                          approvedStore: approved, execPolicy: execPolicy,
+                                         workflowsEnabled: workflowsEnabled,
                                          hooks: HookEngine.load(
                                             codexHome: codexHome, cwd: c.cwd,
-                                            legacyNotifyArgv: c.notify))
+                                            legacyNotifyArgv: c.notify),
+                                         registry: extRegistry)
+                    // Dynamic workflows: install the orchestrator on the shared
+                    // bus; progress is pushed (16ms-debounced) over this
+                    // session's already-relayed event stream.
+                    if workflowsEnabled {
+                        let wfRunner = WorkflowAgentRunner(
+                            store: store, limits: limits, model: model,
+                            routerFactory: { _, extra in
+                                let r = ToolRouter(limits: limits)
+                                await DefaultTools.register(on: r, sandbox: sb, limits: limits,
+                                                            shellType: shellType)
+                                for t in extra { await r.register(t) }
+                                return r
+                            })
+                        let orch = WorkflowOrchestrator(
+                            store: WorkflowStore(codexHome: codexHome),
+                            codexHome: codexHome, runner: wfRunner, defaultModel: c.model,
+                            progressSink: { n in Task { await engine.injectNotification(n) } })
+                        await orch.installOnBus()
+                        WorkflowHolder.shared.set(orch)
+                    }
+                    return engine
                 }
                 let task = Task { await runtime.run() }
                 return WorkerHandle(link: link, task: task)
@@ -295,6 +456,44 @@ struct CodexDaemon {
                                    codexHome: codexHome, auth: authManager,
                                    config: appConfig,
                                    memoryResetHandler: { await appMemory.reset() })
+
+        // Automations: persistent store + interval scheduler (fires saved
+        // prompts on a schedule). Shared with the RequestRouter handler via the
+        // holder so automation/action CRUD + run work.
+        let automationStore = AutomationStore(codexHome: codexHome)
+        AutomationStoreHolder.shared.set(automationStore)
+        let automationScheduler = AutomationScheduler(
+            store: automationStore, supervisor: supervisor, threadStore: store,
+            defaultCwd: FileManager.default.currentDirectoryPath)
+        await automationScheduler.start()
+
+        // Web gateway (docs/webgateway/). Started alongside the app-server
+        // transport, sharing this process's SessionSupervisor so web tabs and
+        // local stdio/UDS clients see the same session pool. Each browser tab
+        // gets its OWN per-connection RequestRouter via the factory below.
+        let webGatewayConfig = Self.webGatewayConfig(codexHome: codexHome)
+        let webGatewayEnabled = webGatewayConfig != nil
+        if let webGatewayConfig {
+            let gateway = WebGateway(
+                config: webGatewayConfig,
+                limits: limits,
+                routerFactory: {
+                    RequestRouter(supervisor: supervisor, store: store,
+                                  codexHome: codexHome, auth: authManager,
+                                  config: appConfig,
+                                  memoryResetHandler: { await appMemory.reset() })
+                })
+            Task {
+                do { try await gateway.run() }
+                catch {
+                    FileHandle.standardError.write(
+                        Data("codexd: web gateway failed: \(error)\n".utf8))
+                }
+            }
+            let scheme = webGatewayConfig.tls ? "https" : "http"
+            FileHandle.standardError.write(
+                Data("codexd web gateway \(scheme)://\(webGatewayConfig.host):\(webGatewayConfig.port) (auth=\(webGatewayConfig.requireAuth))\n".utf8))
+        }
 
         // Spawn the host-wide `codex-memory` child when the Memory Wiki is
         // enabled. One process per host (the wiki is global, not per session).
@@ -343,6 +542,17 @@ struct CodexDaemon {
             let conn = StdioConnection(limits: limits)
             conn.startReading()
             log.info("codexd ready on stdio (mock=\(useMock), codexHome=\(codexHome))")
+            // NOTE (audit app-server-registry/finding-5): per-connection messages
+            // are dispatched strictly serially in receive order, awaiting each
+            // `router.handle` before the next. Upstream instead computes a
+            // `serialization_scope()` per request (app-server/src/message_processor.rs:804,
+            // 831-840): scope-free requests are `tokio::spawn`ed concurrently and only
+            // requests sharing a scope (e.g. global("config"), thread_id(...)) are
+            // queued. Wire correctness is preserved here because every handler
+            // (thread/start, turn/start, …) returns promptly and runs the actual turn
+            // asynchronously in the background — no handler blocks on turn completion —
+            // so strict serial dispatch never reorders observable responses. Accepted
+            // as a deliberate single-loop concurrency simplification for this port.
             for await message in conn.incoming() {
                 await router.handle(message, conn)
             }
@@ -358,6 +568,14 @@ struct CodexDaemon {
                 let listener = try SocketListener(port: port, limits: limits)
                 listener.start { conn in
                     Task {
+                        // NOTE (audit app-server-registry/finding-5): see the stdio
+                        // path above — each connection dispatches its messages serially
+                        // in receive order. Upstream's serialization_scope model
+                        // (message_processor.rs:804,831-840) spawns scope-free requests
+                        // concurrently and queues only scoped ones; the port keeps a single
+                        // serial loop per connection. Handlers return promptly and run turns
+                        // in the background, so wire ordering stays correct. Deliberate,
+                        // accepted divergence.
                         for await message in conn.incoming() {
                             await router.handle(message, conn)
                         }
@@ -382,6 +600,10 @@ struct CodexDaemon {
                 let listener = try UnixSocketListener(path: resolvedPath, limits: limits)
                 listener.start { conn in
                     Task {
+                        // NOTE (audit app-server-registry/finding-5): serial per-connection
+                        // dispatch, same as the stdio/ws paths above. Wire ordering is
+                        // preserved because handlers return promptly and run turns in the
+                        // background. Deliberate, accepted concurrency divergence.
                         for await message in conn.incoming() {
                             await router.handle(message, conn)
                         }
@@ -397,6 +619,10 @@ struct CodexDaemon {
                 exit(1)
             }
         case .off:
+            if webGatewayEnabled {
+                log.info("codexd app-server listen disabled; web gateway running")
+                while true { try? await Task.sleep(for: .seconds(3600)) }
+            }
             log.info("codexd listen disabled (--listen off)")
             return
         }

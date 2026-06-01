@@ -24,7 +24,7 @@ struct MockResponsesMain {
             for round in 1...2 {
                 let s = try await mock.stream(
                     Prompt(instructions: "demo", input: [.userText("go")]),
-                    ModelSettings(model: "gpt-5.1-codex", threadId: "thr_demo", turnState: "ts1"))
+                    ModelSettings(model: "gpt-5.5", threadId: "thr_demo", turnState: "ts1"))
                 print("--- round \(round) ---")
                 for try await ev in s.events { print(ev) }
             }

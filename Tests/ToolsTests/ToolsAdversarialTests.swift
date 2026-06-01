@@ -121,7 +121,9 @@ final class ToolsAdversarialTests: XCTestCase {
         XCTAssertTrue(r.truncated, "5 MB of output is head/tail bounded")
         XCTAssertLessThan(r.output.utf8.count, 200_000,
                           "tool output cannot exhaust memory")
-        XCTAssertTrue(r.output.contains("bytes elided"))
+        // Upstream token-policy truncation marker (utils/string/src/truncate.rs).
+        XCTAssertTrue(r.output.contains("tokens truncated"),
+                      "must use the upstream token-unit truncation marker")
     }
 
     func testShellNonFullAccessDeniedEvenWithMetacharacters() async throws {
@@ -191,7 +193,7 @@ final class ToolsAdversarialTests: XCTestCase {
             "*** Begin Patch\n*** Add File: ok.txt\n+done\n*** End Patch", root: root)
         XCTAssertEqual(ok.first?.kind, .add)
         XCTAssertEqual(try String(contentsOfFile: root + "/ok.txt", encoding: .utf8),
-                       "done")
+                       "done\n")
     }
 
     func testApplyPatchLargeFileBounded() throws {
@@ -204,6 +206,7 @@ final class ToolsAdversarialTests: XCTestCase {
         XCTAssertEqual(applied.first?.kind, .add)
         let content = try String(contentsOfFile: root + "/big.txt", encoding: .utf8)
         XCTAssertTrue(content.hasPrefix("line-0\n"))
-        XCTAssertTrue(content.hasSuffix("line-19999"))
+        // Upstream appends a trailing newline after the final added line.
+        XCTAssertTrue(content.hasSuffix("line-19999\n"))
     }
 }

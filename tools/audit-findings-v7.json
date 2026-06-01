@@ -1,0 +1,833 @@
+{
+ "totals": {
+  "critical": 0,
+  "major": 34,
+  "minor": 54
+ },
+ "units": {
+  "app-server-registry": [
+   {
+    "title": "Whole-method experimental requests not gated by ExperimentalGate.defaultMethods (goal/*, realtime/*, remoteControl/*, collaborationMode/list, fuzzyFileSearch/session*)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server-protocol/src/protocol/common.rs:497-510 (#[experimental(\"thread/goal/set\")], #[experimental(\"thread/goal/get\")], #[experimental(\"thread/goal/clear\")]); :747-772 (#[experimental(\"thread/realtime/start|appendAudio|appendText|stop|listVoices\")]); :803-823 (#[experimental(\"remoteControl/enable|disable|status/read\")], #[experimental(\"collaborationMode/list\")]); :1039-1052 (#[experimental(\"fuzzyFileSearch/sessionStart|sessionUpdate|sessionStop\")]). These produce Some(reason) from experimental_reason() (common.rs:41-54, 353-371), and message_processor.rs:792-796 rejects with invalid_request(experimental_required_message(reason)) when !session.experimental_api_enabled().",
+    "swiftStatus": "Sources/WireProtocol/ExperimentalGate.swift:71-87 defaultMethods is missing thread/goal/set, thread/goal/get, thread/goal/clear, thread/realtime/start, thread/realtime/appendAudio, thread/realtime/appendText, thread/realtime/stop, thread/realtime/listVoices, remoteControl/enable, remoteControl/disable, remoteControl/status/read, collaborationMode/list, fuzzyFileSearch/sessionStart, fuzzyFileSearch/sessionUpdate, fuzzyFileSearch/sessionStop. RequestRouter.swift:1378-1382 is the ONLY experimental-gating site and relies entirely on gate.rejectionDescriptor; there is no secondary gating in the goal/realtime/remoteControl/collaborationMode/fuzzy handlers (grep for 'experimentalApi' in RequestRouter.swift returns only line 1378-1380).",
+    "description": "Upstream rejects these methods with -32600 '<method> requires experimentalApi capability' when the connection did not negotiate experimentalApi. The Swift port omits them from the whole-method gate and performs no other capability check, so a non-experimental client can successfully invoke thread/goal/set, the realtime methods, remoteControl/*, collaborationMode/list, and the fuzzyFileSearch session methods, which upstream forbids.",
+    "fixRecommendation": "Add the missing wire strings to ExperimentalGate.defaultMethods in Sources/WireProtocol/ExperimentalGate.swift: thread/goal/set, thread/goal/get, thread/goal/clear, thread/realtime/start, thread/realtime/appendAudio, thread/realtime/appendText, thread/realtime/stop, thread/realtime/listVoices, remoteControl/enable, remoteControl/disable, remoteControl/status/read, collaborationMode/list, fuzzyFileSearch/sessionStart, fuzzyFileSearch/sessionUpdate, fuzzyFileSearch/sessionStop."
+   },
+   {
+    "title": "Unknown method returns -32601 (method_not_found) instead of upstream's -32600 (invalid_request)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server/src/message_processor.rs:536-541: process_request deserializes JSONRPCRequest into ClientRequest via serde_json::from_value, and an unrecognized method tag fails deserialization, mapped to invalid_request(format!(\"Invalid request: {err}\")) => code -32600 (error_code.rs:3 INVALID_REQUEST_ERROR_CODE). The dispatch match in handle_initialized_client_request (message_processor.rs:858-1322) is exhaustive over the ClientRequest enum with no catch-all, so unknown methods never reach a -32601 path. method_not_found (-32601) is only emitted by specific handlers for known-but-reserved operations (thread_processor.rs:623,3587,3713).",
+    "swiftStatus": "Sources/ProtocolModel/ClientRequest.swift:471-475 maps an unknown method to .unsupported; Sources/Supervisor/RequestRouter.swift:2093-2094 sends WireError.unsupported(id, method) which is code -32601 with message '<method> is not supported yet' (Sources/WireProtocol/WireErrors.swift:8,31-40). The comment at ClientRequest.swift:8 explicitly documents this as the intended -32601 case.",
+    "description": "For a genuinely unknown/typo'd method name, upstream returns JSON-RPC -32600 (Invalid Request) with message 'Invalid request: ...', whereas the Swift port returns -32601 (Method not found) with '<method> is not supported yet'. A client that branches on the JSON-RPC error code will observe a different code/message than the reference server for unknown methods.",
+    "fixRecommendation": "In RequestRouter.swift dispatch's `.unsupported` arm (line 2093-2094), return WireError.invalidRequest(id: id, \"Invalid request: ...\") (code -32600) to match upstream's deserialization-failure path, rather than WireError.unsupported (-32601). Alternatively reclassify .unsupported parsing to throw an invalid-request error at parse time."
+   },
+   {
+    "title": "thread/turns/items/list implemented in Swift but returns -32601 'not supported yet' upstream",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server/src/request_processors/thread_processor.rs:619-626 thread_turns_items_list returns Err(method_not_found(\"thread/turns/items/list is not supported yet\")) => -32601.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1548-1552 .threadTurnsItemsList returns a real {data, nextCursor, backwardsCursor} object populated from store.turnItems.",
+    "description": "Upstream stubs thread/turns/items/list as a -32601 'is not supported yet' error (and additionally gates it experimental). The Swift port implements it and returns actual items. A client relying on the upstream not-supported behavior would see a successful response instead. This is a forward-compatible enhancement rather than a regression, but it is a behavioral divergence from the reference server.",
+    "fixRecommendation": "If strict fidelity is required, return WireError.unsupported(id, method: \"thread/turns/items/list\") to mirror upstream's -32601 stub; otherwise document the intentional divergence."
+   },
+   {
+    "title": "thread/start emits -32001 overload with custom message; upstream has no thread/start capacity overload",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server/src/in_process.rs:548,632 OVERLOADED_ERROR_CODE (-32001) is used ONLY by the in-process embedder transport when its bounded mpsc queue is full, with messages 'in-process app-server request queue is full' / 'in-process server request queue is full'. The websocket dispatch path (lib.rs:906-920 -> process_request) has no at-capacity overload, and thread_processor ThreadStart has no -32001 path.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1405-1408 returns WireError.overload(id) for thread/start when supervisor.atCapacity(); WireErrors.swift:6-7,35-37 overloadCode=-32001, overloadMessage='Server overloaded; retry later.'",
+    "description": "The Swift port invents a thread/start-at-capacity overload that returns -32001 with 'Server overloaded; retry later.'. Upstream's -32001 only originates from the in-process queue-full path with different message text and is never produced for websocket thread/start. The code matches but the trigger and message are port-specific.",
+    "fixRecommendation": "If a capacity limit is desired in the port, keep -32001 but verify no frontend depends on the exact upstream message text; otherwise remove the capacity gate to match upstream's unbounded thread/start behavior on the websocket transport."
+   },
+   {
+    "title": "No per-connection request serialization scopes or concurrent handler spawn; all requests dispatched strictly serially per connection",
+    "severity": "minor",
+    "category": "ordering",
+    "rustEvidence": "app-server/src/message_processor.rs:804,831-840: each request computes serialization_scope(); when Some(scope) it enqueues into request_serialization_queues keyed by (connection_id, scope) (e.g. global(\"config\"), Thread{thread_id}); when None it tokio::spawns the handler concurrently. Scopes are declared per-method in common.rs (serialization: global(\"config\"), thread_id(...), etc.).",
+    "swiftStatus": "Sources/codexd/main.swift:411-413,426-428 processes messages with `for await message in conn.incoming() { await router.handle(message, conn) }` \u2014 fully awaiting each message before the next. RequestRouter.swift has no serialization-queue or concurrent-spawn logic (grep for 'serialization'/'enqueue'/'spawn' in Supervisor returns nothing).",
+    "description": "Upstream runs scope-free requests concurrently and serializes only requests that share a serialization scope. The Swift port serializes every request on a connection in receive order. Because handlers (thread/start, turn/start) return quickly and run turns in the background, wire correctness is preserved, but the concurrency model differs: long-running synchronous handlers would block subsequent requests on the same connection that upstream would run in parallel.",
+    "fixRecommendation": "Confirm all Swift request handlers return promptly (no in-handler blocking on turn completion). If any handler can block, mirror upstream by spawning scope-free requests and serializing scoped ones; otherwise document the deliberate serial-dispatch model as acceptable for this port."
+   }
+  ],
+  "app-server-events": [
+   {
+    "title": "turn/plan/updated is never emitted \u2014 update_plan publishes to a bus with no subscriber",
+    "severity": "major",
+    "category": "missing-notification",
+    "rustEvidence": "app-server/src/bespoke_event_handling.rs:1241-1260 handle_turn_plan_update builds TurnPlanUpdatedNotification { thread_id, turn_id, explanation, plan } and sends ServerNotification::TurnPlanUpdated on every update_plan tool call (common.rs:1469 maps TurnPlanUpdated => \"turn/plan/updated\").",
+    "swiftStatus": "ServerNotification.planUpdate exists (Events.swift:222, method string Events.swift:286 \"turn/plan/updated\", encode Events.swift:395) and UpdatePlanTool publishes parsed args to PlanUpdateBus (Tools/UpdatePlan.swift:101). But grep across Sources shows NO call to PlanUpdateBus.shared.subscribe (only ShellOutputBus/ApplyPatchDeltaBus/TerminalInteractionBus are subscribed in SessionEngine.swift:1970/1987/1998). The ShellTool.swift:749-751 comment claims 'SessionEngine subscribes to the matching PlanUpdateBus ... per turn' but no such subscription exists.",
+    "description": "A frontend that renders a live plan/checklist will never receive turn/plan/updated. Upstream emits it for every update_plan tool invocation; in Swift the tool returns 'Plan updated' and publishes to PlanUpdateBus, but nothing consumes the bus, so the notification is dropped entirely.",
+    "fixRecommendation": "In SessionEngine.swift, alongside the ShellOutputBus subscription for a dispatched tool call (around line 1970), subscribe to PlanUpdateBus.shared for the callId, parse the published JSON into PlanItemArg list, and emit(.planUpdate(threadId:turnId:explanation:plan:)). Unsubscribe when the dispatch resolves. Mirror the existing ShellOutputBus pattern."
+   },
+   {
+    "title": "item/plan/delta (PlanDelta) notification not modeled or emitted",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "common.rs:1478 PlanDelta => \"item/plan/delta\" (v2::PlanDeltaNotification); event_mapping.rs:355-360 maps EventMsg::PlanDelta to PlanDeltaNotification { thread_id, turn_id, item_id, delta }; emitted via item_event_to_server_notification in bespoke_event_handling.rs:838/842.",
+    "swiftStatus": "ABSENT. No 'item/plan/delta' string, no .planDelta case in ServerNotification (Events.swift), and no streaming event produces a plan delta (grep for planDelta/plan/delta in Sources returns nothing outside comments).",
+    "description": "Upstream streams experimental plan-item text deltas via item/plan/delta. The Swift model has no case for it, so if the model emits streaming plan deltas they are silently lost. Upstream marks this EXPERIMENTAL, so impact on a current frontend is low.",
+    "fixRecommendation": "If plan streaming is desired, add a .planDelta(threadId:turnId:itemId:delta:) case to ServerNotification with method \"item/plan/delta\" and payload {threadId,turnId,itemId,delta}, and surface a streaming reasoning/plan delta event from the model client. Otherwise document as intentionally unsupported."
+   },
+   {
+    "title": "rawResponseItem/completed notification absent from the model",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "common.rs:1475 RawResponseItemCompleted => \"rawResponseItem/completed\" (v2::RawResponseItemCompletedNotification); payload {thread_id, turn_id, item: ResponseItem} (v2/item.rs:1145-1149); emitted unconditionally for every EventMsg::RawResponseItem (bespoke_event_handling.rs:1030-1044, 1386-1399).",
+    "swiftStatus": "ABSENT. No 'rawResponseItem/completed' string and no .rawResponseItemCompleted case anywhere in Sources (grep returns nothing).",
+    "description": "Upstream forwards each raw ResponseItem as rawResponseItem/completed. Upstream comments mark this internal-only (used by Codex Cloud), so a normal CodexApp frontend is unlikely to depend on it; flagged for completeness.",
+    "fixRecommendation": "Only needed if the Cloud/internal consumer path is targeted: add a ServerNotification.rawResponseItemCompleted(threadId:turnId:item:) with method \"rawResponseItem/completed\" emitting the raw response item. Otherwise leave unimplemented and note it as internal-only."
+   },
+   {
+    "title": "item/autoApprovalReview/started + /completed defined but never emitted (guardian feature unwired)",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "common.rs:1471-1472 map ItemGuardianApprovalReviewStarted/Completed => \"item/autoApprovalReview/started\"|\"completed\"; emitted from EventMsg::GuardianAssessment via guardian_auto_approval_review_notification (bespoke_event_handling.rs:238-294). Payloads ItemGuardianApprovalReviewStarted/CompletedNotification in v2/item.rs:1073-1128.",
+    "swiftStatus": "ServerNotification.autoApprovalReviewStarted/Completed cases and encode bodies exist (Events.swift:177-192, 363-378, 507-560) with correct camelCase keys (reviewId, targetItemId, decisionSource, review, action). But grep shows NO emit(.autoApprovalReviewStarted/Completed) anywhere in Sources outside Events.swift \u2014 there is no GuardianAssessment event source.",
+    "description": "The guardian auto-approval review pipeline is not implemented, so these notifications never fire. Upstream marks the payloads [UNSTABLE] ('shape is expected to change soon'), so a frontend should not yet depend on them; impact is low.",
+    "fixRecommendation": "If/when the guardian auto-approval feature is ported, wire a GuardianAssessment-equivalent event source to emit autoApprovalReviewStarted on InProgress and autoApprovalReviewCompleted on terminal status, matching guardian_auto_approval_review_notification. Otherwise leave as-is and document as unsupported."
+   },
+   {
+    "title": "Item lifecycle startedAtMs/completedAtMs stamped at serialize time instead of event time",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "event_mapping.rs:391-392 and 399-400 carry started_at_ms / completed_at_ms directly from the originating core event (item_started_event.started_at_ms / item_completed_event.completed_at_ms); ExecCommandBegin/End similarly use exec_command_begin_event.started_at_ms / completed_at_ms (lines 416, 445).",
+    "swiftStatus": "Events.swift:333 itemStarted uses startedAtMs: ServerNotification.nowMs() and Events.swift:362 itemCompleted uses completedAtMs: ServerNotification.nowMs(), i.e. the timestamp is computed when the envelope is serialized, not when the item lifecycle actually began/ended.",
+    "description": "Upstream's startedAtMs/completedAtMs reflect the true lifecycle instant carried in the core event; Swift substitutes the serialize-time clock. Values are plausible but not the real start/complete instants, which can skew client-side duration computation. Field name/casing are correct.",
+    "fixRecommendation": "Thread the true lifecycle timestamp from the producing site (turn/tool start and completion) into the .itemStarted/.itemCompleted cases and pass it through to ItemStartedEnvelope.startedAtMs / ItemCompletedEnvelope.completedAtMs instead of calling nowMs() at encode time."
+   }
+  ],
+  "session-turn-loop": [
+   {
+    "title": "codexErrorInfo serialized as free-form PascalCase string instead of upstream camelCase externally-tagged CodexErrorInfo enum",
+    "severity": "major",
+    "category": "wrong-casing",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/shared.rs:68-112 \u2014 `#[serde(rename_all = \"camelCase\")] pub enum CodexErrorInfo { ContextWindowExceeded, UsageLimitExceeded, ServerOverloaded, ... HttpConnectionFailed { httpStatusCode }, ActiveTurnNotSteerable { turnKind }, Other }`. Simple variants serialize as a bare string `\"contextWindowExceeded\"`; data variants serialize as `{\"httpConnectionFailed\":{\"httpStatusCode\":...}}`. This enum is the type of `TurnError.codex_error_info` (thread_data.rs:193) and is what rides in both `turn/completed` and the `error` notification.",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift:6 \u2014 `public var codexErrorInfo: String?` (a plain optional string). SessionEngine.swift emits PascalCase literals: `\"ContextWindowExceeded\"` (1849,2177), `\"ModelError\"`, `\"StreamError\"`, `\"LoopGuard\"`, `\"DeadlineExceeded\"`, `\"HookBlocked\"`, `\"DurabilityError\"`, `\"Overloaded\"`, `\"PersistenceError\"`, `\"Interrupted\"`, `\"ActiveTurnNotSteerable\"`. Casing diverges (`ContextWindowExceeded` vs upstream `contextWindowExceeded`) and most of these are not valid CodexErrorInfo variants (upstream would emit `\"other\"`).",
+    "description": "A frontend that switches on `turn.error.codexErrorInfo` to detect e.g. context-window-exceeded or usage-limit errors will never match: upstream sends `\"contextWindowExceeded\"`, Swift sends `\"ContextWindowExceeded\"`. Codes like `ModelError`/`StreamError`/`LoopGuard`/`DeadlineExceeded`/`HookBlocked`/`DurabilityError`/`Overloaded`/`PersistenceError`/`Interrupted` have no upstream analogue at all (upstream collapses them to `other`).",
+    "fixRecommendation": "Model `codexErrorInfo` as an enum mirroring upstream CodexErrorInfo with camelCase external tagging: simple variants encode as bare strings (`contextWindowExceeded`, `usageLimitExceeded`, `serverOverloaded`, `internalServerError`, `unauthorized`, `badRequest`, `sandboxError`, `other`, etc.); data variants encode as single-key objects. Map the Swift internal reasons (ModelError, StreamError, LoopGuard, DeadlineExceeded, HookBlocked, DurabilityError, PersistenceError, Interrupted, Overloaded\u2192serverOverloaded) onto the closest upstream variant, defaulting to `other`. Apply in Sources/ProtocolModel/Events.swift (ErrorBody) and the SessionEngine.swift emit sites."
+   },
+   {
+    "title": "ActiveTurnNotSteerable loses its turnKind payload and is delivered as a notification instead of a JSON-RPC error response",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server/src/request_processors/turn_processor.rs:677-721 \u2014 on a non-steerable active turn the app-server returns a JSON-RPC error RESPONSE to `turn/steer`: `invalid_request(message)` with `error.data = serde_json::to_value(TurnError{ codex_error_info: Some(CodexErrorInfo::ActiveTurnNotSteerable{ turn_kind }), .. })`. The variant carries `turnKind` (review|compact, shared.rs:104-110).",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:511-517 (startSpecial) emits `.error(threadId:, turnId:nil, willRetry:false, ErrorBody(message:\"a turn is already in progress\", codexErrorInfo:\"ActiveTurnNotSteerable\"))` as a server NOTIFICATION; no `turnKind` is carried, and there is no association to the originating request id.",
+    "description": "Upstream surfaces ActiveTurnNotSteerable as a request-scoped error (so the caller's `turn/steer`/`turn/start` promise rejects with structured data including which kind of non-steerable turn \u2014 review vs compact). The Swift engine emits a broadcast `error` notification with a bare string and no turnKind, so a client cannot correlate it to the rejected request nor learn whether the blocking turn is a review or compact.",
+    "fixRecommendation": "Route steer/start-while-busy failures back through the request/response layer (Supervisor/RequestRouter) as a JSON-RPC error whose `data` is the serialized TurnError carrying `codexErrorInfo: {activeTurnNotSteerable:{turnKind:...}}`, rather than emitting a fire-and-forget `error` notification. Add a turnKind (review/compact/manual) to the engine's busy-guard so the data variant can be populated."
+   },
+   {
+    "title": "ErrorNotification turnId/threadId are optional in Swift but required in upstream",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/notification.rs:41-48 \u2014 `pub struct ErrorNotification { error: TurnError, will_retry: bool, thread_id: String, turn_id: String }`; both ids are required (no Option), always present on the `error` notification wire.",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift:635-640 \u2014 `struct ErrorNotification { var error; var willRetry; var threadId: ThreadId?; var turnId: TurnId? }` with default Codable, so a nil `turnId` (and/or `threadId`) is OMITTED from the JSON. The engine emits such errors with `turnId: nil` for steer-cap/ActiveTurnNotSteerable/governor rejections (SessionEngine.swift:478,485,513).",
+    "description": "Upstream's `error` notification always carries `turnId` and `threadId`; a client decoding the upstream TS type would treat them as required. The Swift surface omits them for out-of-turn errors. In-turn error emits do pass turnId so the common path is fine; the gap is the out-of-turn errors that upstream would not emit as notifications at all (see the ActiveTurnNotSteerable finding).",
+    "fixRecommendation": "After fixing the steer-error routing, in-turn `error` notifications always have a turnId; ensure threadId is always encoded (it always exists). If any error notification can still be emitted without a turnId, reconsider whether it should be a notification at all to match upstream's required-field contract."
+   },
+   {
+    "title": "turn/started omits the always-present itemsView field",
+    "severity": "minor",
+    "category": "wrong-default",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/thread_data.rs:153-172 \u2014 `Turn.items_view` has `#[serde(default)]` but NO `skip_serializing_if`, so it is always serialized. bespoke_event_handling.rs:160,168 sets `items_view: TurnItemsView::NotLoaded` explicitly for the TurnStarted notification, so `turn/started` always includes `\"itemsView\":\"notLoaded\"` and `\"items\":[]`.",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:1609-1611 builds `TurnObject(id:, status:.inProgress, startedAt:)` with `itemsView` defaulting to nil; TurnObject.encode (Events.swift:111) uses `encodeIfPresent(itemsView)`, so `itemsView` is omitted from the `turn/started` payload (the `runUserShell`/`runReview`/`runCompactTask` turnStarted emits at lines 2306/2325/2366 likewise omit it). The terminal `turn/completed` emit (line 2586) DOES set `.notLoaded`, so only turn/started is affected.",
+    "description": "Upstream's turn/started payload always contains `itemsView:\"notLoaded\"`; the Swift turn/started omits it. A strict client decoding the required-ish field (it has a default in Rust, so decode is tolerant) is unaffected, but byte-for-byte payload parity is broken on every turn start.",
+    "fixRecommendation": "Pass `itemsView: .notLoaded` in the four `turnStarted` TurnObject constructions in SessionEngine.swift (lines ~1610, 2307, 2326, 2367) to match upstream's always-emitted NotLoaded value."
+   }
+  ],
+  "model-client": [
+   {
+    "title": "SSE parser drops Reasoning output items (encrypted_content), defeating the requested include field",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/client.rs:722-726 sets include = vec![\"reasoning.encrypted_content\"] whenever reasoning.is_some(); codex-api/src/sse/responses.rs:267-274,376-383 deserialize EVERY item in response.output_item.done/.added into a full ResponseItem (Reasoning, WebSearchCall, ToolSearchCall, LocalShellCall, etc.) and emit OutputItemDone/OutputItemAdded(ResponseItem). attach_item_ids (requests/responses.rs:20-26) and get_formatted_input show Reasoning items with encrypted content are meant to be replayed back into the next turn's input.",
+    "swiftStatus": "Sources/ModelClient/OpenAIResponsesClient.swift:525-567 and Sources/ModelClient/URLSessionResponsesClient.swift:292-321 only handle item.type == message / function_call / custom_tool_call in output_item.done; any other type (reasoning, web_search_call, tool_search_call, local_shell_call) silently falls through and is discarded. buildRequestBody (OpenAIResponsesClient.swift:130-152) still sends include:[\"reasoning.encrypted_content\"] (lines 251-253) but PromptInput (ModelClient.swift:9-12) has only userText/developerText/assistantText/toolOutput \u2014 no reasoning item to replay.",
+    "description": "Upstream requests encrypted reasoning content AND captures the returned Reasoning items so they can be fed back into the next turn's input (reasoning continuity for o-series/gpt-5 reasoning models). Swift requests the encrypted content but throws away every reasoning output item, so the encrypted reasoning is never preserved or replayed. Reasoning-capable models will lose chain-of-thought context across turns.",
+    "fixRecommendation": "In both HTTP SSE parsers, surface a generic reasoning output item (and ideally other ResponseItem variants) from output_item.done \u2014 add a ResponseEvent case carrying the raw reasoning item (id + encrypted_content + summary), add a corresponding PromptInput.reasoning case in ModelClient.swift, persist it in SessionEngine, and re-serialize it into the input array in buildRequestBody so encrypted reasoning round-trips like upstream."
+   },
+   {
+    "title": "serverModel event never emitted: openai-model header and per-event response.headers ignored on HTTP transports",
+    "severity": "major",
+    "category": "missing-notification",
+    "rustEvidence": "codex-api/src/sse/responses.rs:41-45,65-67 emit ResponseEvent::ServerModel from the OPENAI_MODEL_HEADER (\"openai-model\") response header before the stream body; responses.rs:170-208,448-459 additionally emit ServerModel from per-event response.headers/top-level headers (openai-model / x-openai-model), deduped against last_server_model. This reports the backend safety-routed model which can differ from the requested model.",
+    "swiftStatus": "Sources/ModelClient/ModelClient.swift:243-245 declares case serverModel(String) but grep shows it is never produced: URLSessionResponsesClient.swift and OpenAIResponsesClient.swift never read the openai-model response header nor parse response.headers from SSE frames; SessionEngine.swift:1934 explicitly drops .serverModel ('recorded elsewhere') but nothing records it.",
+    "description": "The server-effective model (backend safety routing) is part of the streaming contract a frontend uses to show which model actually answered. Upstream emits it from both the response header and per-event headers; Swift surfaces it from neither, so the case is dead and the frontend can never learn the routed model.",
+    "fixRecommendation": "In URLSessionResponsesClient.readSSE, read the 'openai-model' header off the HTTPURLResponse and yield .serverModel before the body loop; additionally inspect each SSE frame's response.headers/top-level headers for openai-model/x-openai-model and emit .serverModel on change (dedup like upstream). Mirror in OpenAIResponsesClient via the -D header dump."
+   },
+   {
+    "title": "x-codex-turn-state response header not read on HTTP transports, breaking sticky-routing round-trip",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-api/src/sse/responses.rs:55-62 reads the 'x-codex-turn-state' response header and stores it into the turn_state OnceLock; core/src/client.rs:1651-1666 (build_responses_headers) reads turn_state.get() and sends it back as the x-codex-turn-state request header on the next request, giving a response\u2192OnceLock\u2192next-request sticky-routing loop.",
+    "swiftStatus": "Sources/ModelClient/URLSessionResponsesClient.swift:84-85 and OpenAIResponsesClient.swift:400-402 only SEND settings.turnState as the request header; neither parses x-codex-turn-state out of the response headers/SSE, so the value is never refreshed from the server. grep finds no response-side turn-state capture on either HTTP client.",
+    "description": "Upstream maintains turn-state stickiness by echoing the server-assigned x-codex-turn-state back on subsequent requests within a turn. Swift sends whatever was passed in settings but never captures the server's value, so HTTP-transport requests cannot follow the server's routing token across requests in a turn.",
+    "fixRecommendation": "Capture the 'x-codex-turn-state' response header in readSSE (and the curl -D dump) and feed it back to the session/turn loop (e.g. via UsageTracker/LastResponseBox or a turn-state box) so the next stream() call sends the updated value, matching upstream's OnceLock round-trip."
+   },
+   {
+    "title": "ModelVerifications, X-Models-Etag, and X-Reasoning-Included stream signals not surfaced",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "codex-api/src/common.rs:72-111 defines ResponseEvent::ModelVerifications, ModelsEtag, and ServerReasoningIncluded; sse/responses.rs:36-78 emit ModelsEtag (X-Models-Etag header), ServerReasoningIncluded (x-reasoning-included header present), and responses.rs:186-195,460-467 emit ModelVerifications from response.metadata.openai_verification_recommendation == 'trusted_access_for_cyber'.",
+    "swiftStatus": "Sources/ModelClient/ModelClient.swift:220-246 ResponseEvent has no equivalent cases (no modelVerifications / modelsEtag / serverReasoningIncluded). Neither HTTP client reads X-Models-Etag, x-reasoning-included, nor parses response.metadata.openai_verification_recommendation.",
+    "description": "These three lower-traffic stream signals (account-verification recommendation, models catalog ETag, server-side reasoning-token accounting flag) are part of upstream's ResponseEvent contract but are entirely absent in the Swift port. A frontend relying on verification prompts or reasoning-token reconciliation would not receive them.",
+    "fixRecommendation": "Add ResponseEvent cases for modelVerifications([String]), modelsEtag(String), and serverReasoningIncluded(Bool); emit them in readSSE from the X-Models-Etag / x-reasoning-included headers and from response.metadata.openai_verification_recommendation frames (kind == 'response.metadata')."
+   },
+   {
+    "title": "HTTP request body sends previous_response_id and forces store:true, diverging from upstream's HTTP REST shape",
+    "severity": "minor",
+    "category": "wrong-default",
+    "rustEvidence": "core/src/client.rs:746-758 build_responses_request sets store = provider.is_azure_responses_endpoint() (false for normal OpenAI) and never sets previous_response_id on the REST ResponsesApiRequest; previous_response_id is only set on the WebSocket path (client.rs:1058-1062, prepare_websocket_request) using incremental items, never on HTTP.",
+    "swiftStatus": "Sources/ModelClient/OpenAIResponsesClient.swift:175,186-188 set effectiveStore = previousResponseId != nil ? true : settings.store and unconditionally emit body[\"previous_response_id\"] on the HTTP body when settings.previousResponseId is set (shared by URLSessionResponsesClient via buildRequestBody).",
+    "description": "Upstream's HTTP/REST Responses request never carries previous_response_id (it relies on prompt_cache_key + full transcript replay) and keeps store=false for OpenAI. Swift chains via previous_response_id over HTTP and forces store=true, which is a deliberate, documented design choice (see the long comment at OpenAIResponsesClient.swift:157-174) but produces a wire body that differs from upstream's HTTP path.",
+    "fixRecommendation": "Intentional/documented divergence \u2014 flag only for awareness. If exact upstream HTTP wire-fidelity is required, restrict previous_response_id+store:true to the WebSocket transport (as upstream does) and rely on prompt_cache_key + transcript replay on the HTTP path."
+   }
+  ],
+  "tools-router": [
+   {
+    "title": "exec_command marked serial but is parallel-safe upstream",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/handlers/unified_exec/exec_command.rs:88-90 supports_parallel_tool_calls returns true.",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:845 `public let parallelSafe = false` on ExecCommandTool.",
+    "description": "Upstream allows exec_command to run concurrently with other parallel-safe tools (takes the read side of the per-turn RwLock). Swift takes the exclusive write side, serializing exec_command against all other tool calls in a turn, changing turn execution semantics and reducing concurrency.",
+    "fixRecommendation": "Set ExecCommandTool.parallelSafe = true in Sources/Tools/UnifiedExec.swift to match upstream's supports_parallel_tool_calls()=true."
+   },
+   {
+    "title": "shell_command marked serial but is parallel-safe in normal (ShellCommand) mode upstream",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/handlers/shell/shell_command.rs:144-146 supports_parallel_tool_calls returns self.options.is_some(); spec_plan.rs:357-365 registers the model-visible shell_command via ShellCommandHandler::new(options) (options=Some) in ShellCommand mode, so the advertised shell_command is parallel-safe.",
+    "swiftStatus": "Sources/Tools/ShellTool.swift:724 registers ShellTool(name:\"shell_command\", parallelSafe:false ...); ShellTool default parallelSafe=false (ShellTool.swift:202).",
+    "description": "Upstream's model-visible shell_command is parallel-safe (read side of the gate) in the default ShellCommand shell mode; only the hidden UnifiedExec-mode fallback handler (ShellCommandHandler::from, options=None, spec()=None) is serial. Swift makes shell_command serial, so concurrent shell_command calls that upstream would run in parallel are serialized.",
+    "fixRecommendation": "Register shell_command with parallelSafe:true in Sources/Tools/ShellTool.swift (DefaultTools.register) to match upstream options.is_some()=true for the model-visible shell_command."
+   },
+   {
+    "title": "Swift exposes all shell families simultaneously; upstream selects exactly one by shell_type",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/spec_plan.rs:343-366: UnifiedExec mode registers exec_command + write_stdin (+ hidden shell_command fallback); ShellCommand/Default/Local mode registers only shell_command; Disabled registers none. The model never sees exec_command/write_stdin and shell_command as model-visible tools at the same time.",
+    "swiftStatus": "Sources/Tools/ShellTool.swift:724-737 unconditionally registers shell_command, unified_exec, exec_command, and write_stdin all at once (DefaultTools.register).",
+    "description": "Upstream gates the shell tool family on ConfigShellToolType so the model is offered one coherent interface. Swift advertises shell_command, exec_command, write_stdin AND a legacy unified_exec tool together, presenting tools (and a unified_exec tool that does not exist in this upstream revision) the upstream contract never exposes simultaneously.",
+    "fixRecommendation": "Gate shell-family registration on a shell_type equivalent: register exec_command+write_stdin for UnifiedExec mode, shell_command for the default mode, and drop the standalone unified_exec tool (no upstream counterpart in this revision) unless intentionally retained behind config."
+   },
+   {
+    "title": "Standalone unified_exec tool has no upstream counterpart and uses a stale schema (process_id/input)",
+    "severity": "major",
+    "category": "wrong-field",
+    "rustEvidence": "spec_plan.rs:343-353 registers only ExecCommandHandler (\"exec_command\") and WriteStdinHandler (\"write_stdin\") for the UnifiedExec shell type; there is no model-visible tool named \"unified_exec\". exec_command uses cmd/workdir/... and write_stdin uses session_id/chars (shell_spec.rs:81-145).",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:581-598 UnifiedExecTool name=\"unified_exec\" with schema properties command, process_id, input, yield_time_ms, max_output_tokens; registered at ShellTool.swift:727.",
+    "description": "Swift advertises a model-visible 'unified_exec' tool with a process_id/input/command schema that matches an older Codex revision, not the current upstream which splits this into exec_command (session_id-returning) + write_stdin (session_id/chars). This tool name and schema are not part of the audited upstream contract.",
+    "fixRecommendation": "Remove the standalone UnifiedExecTool registration (or gate it off) and rely on exec_command+write_stdin to match the current upstream contract; if kept for back-compat, do not advertise it in specs()."
+   },
+   {
+    "title": "ToolSpec cannot represent upstream hosted tool wire variants (web_search/image_generation/tool_search/namespace)",
+    "severity": "major",
+    "category": "missing-type",
+    "rustEvidence": "tools/src/tool_spec.rs:15-64 ToolSpec enum has variants Function(type:\"function\"), Namespace(type:\"namespace\"), ToolSearch(type:\"tool_search\" with execution/description/parameters), ImageGeneration(type:\"image_generation\"), WebSearch(type:\"web_search\" with external_web_access/filters/user_location/search_context_size/search_content_types), Freeform(type:\"custom\"). hosted_spec.rs:14-50 emits web_search as ToolSpec::WebSearch and image_generation as ToolSpec::ImageGeneration.",
+    "swiftStatus": "Sources/ModelClient/ModelClient.swift:26-49 ToolSpec only carries name/description/parametersJSON/outputSchemaJSON/freeformFormat; serialization (OpenAIResponsesClient.swift:192-203) emits only type:\"custom\" or type:\"function\". web_search is implemented as a local function tool (Sources/Tools/WebSearch.swift / FileTools.swift:841).",
+    "description": "Swift can only serialize function and custom tool wire types, so it cannot emit the server-side hosted web_search/image_generation specs nor a tool_search spec with execution=client or namespace specs. web_search is therefore a locally-executed JSON function rather than the upstream hosted type:\"web_search\" object; image_generation and namespace grouping are absent. If parity with the Responses-API hosted tools is required, the wire output diverges.",
+    "fixRecommendation": "If hosted-tool parity is intended, extend ModelClient.ToolSpec and the Responses-API serialization to emit type:\"web_search\" (with external_web_access/filters/user_location/search_context_size/search_content_types), type:\"image_generation\", type:\"tool_search\" (execution), and type:\"namespace\". Otherwise document the local-execution divergence explicitly."
+   },
+   {
+    "title": "Abort-message special-casing set diverges (includes exec_command, missing namespace check)",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/parallel.rs:179-190 abort_message uses the \"Wall time: {secs:.1} seconds\\naborted by user\" format ONLY when tool_name.namespace.is_none() && name in {\"shell_command\",\"unified_exec\"}; otherwise \"aborted by user after {secs:.1}s\".",
+    "swiftStatus": "Sources/Tools/ToolRouter.swift:361-368 abortMessage emits the Wall-time form for {\"shell_command\",\"unified_exec\",\"exec_command\"}.",
+    "description": "Swift includes exec_command in the Wall-time abort group, but upstream restricts that format to shell_command and unified_exec only; an aborted exec_command upstream yields \"aborted by user after Xs\". Swift also keys on bare name without the namespace==None guard upstream applies.",
+    "fixRecommendation": "Remove \"exec_command\" from the Wall-time branch in ToolRouter.abortMessage so only shell_command and unified_exec produce the \"Wall time: ...\" form."
+   },
+   {
+    "title": "Unknown/unsupported tool-call error text diverges",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/registry.rs:560-565 unsupported_tool_call_message returns \"unsupported custom tool call: {tool_name}\" for a Custom payload, else \"unsupported call: {tool_name}\".",
+    "swiftStatus": "Sources/Tools/ToolRouter.swift:176-179 returns output \"unknown tool: \\(call.name)\" with success:false.",
+    "description": "The model-facing message for an unrecognized tool name differs from upstream. A frontend or model heuristic keyed on the upstream phrasing (\"unsupported call:\"/\"unsupported custom tool call:\") will not match Swift's \"unknown tool:\".",
+    "fixRecommendation": "Emit \"unsupported call: <name>\" (and \"unsupported custom tool call: <name>\" for custom_tool_call inputs) in ToolRouter.dispatch to match registry.rs."
+   },
+   {
+    "title": "MultiAgent.swift registers non-upstream tool names (agent_spawn/agent_wait/agent_message/agent_close/agent_list)",
+    "severity": "minor",
+    "category": "wrong-casing",
+    "rustEvidence": "core/src/tools/handlers/multi_agents_spec.rs:51,125,200,213,245,263 define the multi-agent v1 tool names as spawn_agent, send_input, resume_agent, wait_agent, list_agents, close_agent (and v2 adds send_message/followup_task). No tool is named agent_spawn/agent_wait/agent_message/agent_close/agent_list.",
+    "swiftStatus": "Sources/HarnessCore/MultiAgent.swift:290,324,353,378,401 define tools named agent_spawn, agent_wait, agent_message, agent_close, agent_list (registered at MultiAgent.swift:444-448). A separate, correctly-named set exists in Sources/Tools/MultiAgentTools.swift (spawn_agent/wait_agent/close_agent/send_input/resume_agent).",
+    "description": "The MultiAgent.swift subsystem exposes a parallel multi-agent toolset under names that do not exist in the upstream contract (verb/noun order reversed). If these are ever advertised to the model alongside or instead of the upstream-named MultiAgentTools set, a model following the upstream prompt will not find spawn_agent/wait_agent etc.",
+    "fixRecommendation": "Either rename the MultiAgent.swift tools to the upstream names (spawn_agent/wait_agent/send_input or send_message/close_agent/list_agents) or confirm this subsystem is internal-only and never registered into the model-visible ToolRouter; ensure only the MultiAgentTools.swift set is advertised."
+   },
+   {
+    "title": "write_stdin missing output_schema and uses integer where upstream uses number for session_id",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "core/src/tools/handlers/shell_spec.rs:103-145 create_write_stdin_tool: session_id is JsonSchema::number, chars/yield_time_ms/max_output_tokens, required=[\"session_id\"], output_schema=Some(unified_exec_output_schema).",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:1004-1006 WriteStdinTool schema: session_id type \"integer\", chars, yield_time_ms (\"number\"), max_output_tokens (\"number\"), plus a non-upstream \"terminate\" boolean; required=[\"session_id\"]; no output_schema.",
+    "description": "Swift types session_id as integer where upstream uses number, omits the declared structured output_schema, and adds a non-upstream 'terminate' field. These are low-impact since the model generally tolerates integer-vs-number, but they diverge from the exact advertised contract.",
+    "fixRecommendation": "Change session_id type to \"number\" (or accept the integer-vs-number divergence as benign), optionally declare the unified_exec output_schema, and consider whether 'terminate' should be advertised given upstream lacks it."
+   }
+  ],
+  "exec-unified-shell": [
+   {
+    "title": "exec_command tool schema drops/renames upstream parameters seen by the model",
+    "severity": "major",
+    "category": "wrong-field",
+    "rustEvidence": "core/src/tools/handlers/shell_spec.rs:23-100 create_exec_command_tool_with_environment_id defines properties cmd, workdir, shell, tty, yield_time_ms, max_output_tokens (+ optional login, environment_id, sandbox_permissions, justification, prefix_rule, additional_permissions) with additionalProperties:false; required=[cmd]. unified_exec.rs:29-51 ExecCommandArgs binds cmd/workdir/shell/login/tty/yield_time_ms/max_output_tokens/sandbox_permissions/additional_permissions/justification/prefix_rule.",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:856 jsonSchema only declares cmd, cwd, timeout_ms, yield_time_ms, max_output_tokens (required [cmd], additionalProperties:false). Uses `cwd` not upstream `workdir` (accepted only as a decode alias at :899) and is missing `shell`, `tty`, `login`, `environment_id`, `sandbox_permissions`, `justification`, `prefix_rule`; adds a non-upstream `timeout_ms`. Registered at ShellTool.swift:733.",
+    "description": "Upstream advertises `workdir` (not `cwd`), plus `shell`, `tty`, and the approval params; Swift advertises `cwd`+`timeout_ms` and omits the rest. The model is trained on the upstream field names; a model emitting `workdir`, `shell`, or `tty` either has the field silently dropped (tty/shell ignored) or only works because of an undocumented decode alias. The `tty` parameter being absent means the model cannot request a PTY allocation, and `shell` selection is impossible.",
+    "fixRecommendation": "In Sources/Tools/UnifiedExec.swift ExecCommandTool.jsonSchema, advertise `workdir` (not `cwd`) and add `shell`, `tty`, `yield_time_ms`, `max_output_tokens` with the upstream descriptions verbatim, plus the approval params when enabled; decode and honor `tty`/`shell`. Match upstream description string \"Runs a command in a PTY, returning output or a session ID for ongoing interaction.\""
+   },
+   {
+    "title": "Default environment policy diverges from upstream ShellEnvironmentPolicy algorithm",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "protocol/src/config_types.rs:218-223 Default ShellEnvironmentPolicy = { inherit: All, ignore_default_excludes: true } => by default the FULL parent env is inherited with NO scrubbing. protocol/src/shell_environment.rs:56-107 populate_env: inherit strategy (All/None/Core with UNIX_CORE_ENV_VARS = PATH,SHELL,TMPDIR,TEMP,TMP,HOME,LANG,LC_ALL,LC_CTYPE,LOGNAME,USER), default excludes are case-INSENSITIVE substring patterns *KEY*/*SECRET*/*TOKEN* applied only when ignore_default_excludes=false, then custom exclude, set overrides, include_only, then inject CODEX_THREAD_ID.",
+    "swiftStatus": "Sources/Sandbox/SpawnEnvironment.swift:24-167 SandboxEnvironmentPolicy uses a fixed allowExact list + allowPrefixes (CODEX_) gated by deny suffix/prefix/exact lists; default `.default` (:63-140) only lets through an explicit allowlist (PATH/HOME/USER/locale/etc.) and strips everything else. This is allowlist-by-default, the inverse of upstream's inherit-All default; uses suffix/prefix matching (e.g. *_KEY) not upstream's case-insensitive substring *KEY*; never injects CODEX_THREAD_ID; has no inherit/include_only/set/exclude knobs.",
+    "description": "Upstream's default leaks the full environment (deliberately) and only applies the *KEY*/*SECRET*/*TOKEN* substring filter when a non-default policy sets ignore_default_excludes=false. Swift instead always applies a restrictive allowlist. While defensible as security hardening, it is a behavioral divergence from the documented ShellEnvironmentPolicy: variables upstream would pass (e.g. arbitrary project vars, FOO_TOKEN-but-not-matching, vars containing 'key' mid-word) are dropped or kept differently, the matching semantics differ (suffix vs case-insensitive substring), and CODEX_THREAD_ID is never injected into the child env.",
+    "fixRecommendation": "Implement the upstream ShellEnvironmentPolicy/populate_env algorithm (inherit All/None/Core with the UNIX_CORE_ENV_VARS list, case-insensitive *KEY*/*SECRET*/*TOKEN* substring default-excludes gated on ignore_default_excludes, custom exclude, set, include_only, then CODEX_THREAD_ID injection) and drive scrubbing from the configured policy; if the restrictive allowlist must stay for security, make it an explicit opt-in rather than the silent default and still inject CODEX_THREAD_ID."
+   },
+   {
+    "title": "exec_command / write_stdin tool descriptions are not the upstream verbatim text",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "shell_spec.rs:89-90 exec_command description = \"Runs a command in a PTY, returning output or a session ID for ongoing interaction.\"; :133-135 write_stdin description = \"Writes characters to an existing unified exec session and returns recent output.\"",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:846-854 ExecCommandTool description is a long custom paragraph (\"Open a NEW interactive PTY session...\"); :999-1003 WriteStdinTool description is \"Continue an interactive PTY session opened by `exec_command`...\". Neither matches upstream.",
+    "description": "Tool descriptions are part of the prompt the model is conditioned on. Upstream uses short, specific strings; Swift substitutes longer custom prose, diverging from the trained tool contract.",
+    "fixRecommendation": "Replace the toolDescription strings in ExecCommandTool and WriteStdinTool with the exact upstream text from shell_spec.rs."
+   },
+   {
+    "title": "shell_command tool description and parameter descriptions diverge from upstream verbatim text",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "shell_spec.rs:147-215 create_shell_command_tool: description (non-Windows) = \"Runs a shell command and returns its output.\\n- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.\"; property descriptions \"The shell script to execute in the user's default shell\", \"The working directory to execute the command in\", \"The timeout for the command in milliseconds\"; required=[command], additionalProperties:false; adds login + approval params when enabled.",
+    "swiftStatus": "Sources/Tools/ShellTool.swift:171-187: description is a custom multi-sentence paragraph about setsid/process-group reaping; property descriptions are reworded; schema uses additionalProperties:true and omits login/sandbox_permissions/justification/prefix_rule.",
+    "description": "Field names (command/workdir/timeout_ms) match, but the description text and per-property descriptions are model-facing prompt text that differs from upstream, and additionalProperties is true vs upstream false. The login and approval params are not advertised.",
+    "fixRecommendation": "Use the upstream verbatim description and property descriptions in ShellTool.jsonSchema/toolDescription, set additionalProperties:false, and add login/approval params when the corresponding features are enabled."
+   },
+   {
+    "title": "Non-upstream `unified_exec` tool exposed to the model",
+    "severity": "minor",
+    "category": "missing-tool",
+    "rustEvidence": "Upstream exposes only `exec_command` and `write_stdin` to the model (shell_spec.rs:82,132; unified_exec/exec_command.rs:75 ToolName::plain(\"exec_command\")). The string \"unified_exec\" appears upstream ONLY as an internal approval-cache key (tools/runtimes/unified_exec.rs:176) and a parallel-category label (tools/parallel.rs:183) \u2014 never as a model-facing ToolSpec name.",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:597 UnifiedExecTool advertises name \"unified_exec\" with params command/process_id/input; registered at ShellTool.swift:727 alongside exec_command/write_stdin.",
+    "description": "The Swift port presents an extra `unified_exec` function tool (with a different command/process_id/input schema) to the model. The model is not trained on this tool name or its schema; presenting it can cause the model to call a non-standard tool and diverges from the upstream tool inventory.",
+    "fixRecommendation": "Remove the UnifiedExecTool registration in DefaultTools.register (ShellTool.swift:727) so only exec_command + write_stdin + shell_command are exposed, matching upstream; keep the shared UnifiedExecManager."
+   },
+   {
+    "title": "exec_command/write_stdin structured output omits the always-present \"Chunk ID\" line",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/context.rs:400-426 response_text() pushes \"Chunk ID: {chunk_id}\" as the FIRST section whenever chunk_id is non-empty. process_manager.rs:461,581 and :668,725 always set chunk_id = generate_chunk_id() (6 hex chars) in the success paths of exec_command and write_stdin, so the line is always present.",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:812-834 renderExecJSON builds Wall time / exited / running / Original token count / Output sections and never emits a \"Chunk ID:\" line; called without any chunk id at :972 and :1086.",
+    "description": "Upstream's model-facing exec output always begins with a \"Chunk ID: <hex>\" section; the Swift output omits it entirely. The remaining sections and ordering otherwise match. Low impact (chunk_id is informational) but it is a verbatim divergence in the text the model sees.",
+    "fixRecommendation": "Generate a 6-hex-char chunk id per call (parity with generate_chunk_id) and prepend \"Chunk ID: <id>\" in renderExecJSON to match context.rs:403-404 ordering."
+   },
+   {
+    "title": "write_stdin advertises a non-upstream `terminate` parameter",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "core/src/tools/handlers/unified_exec/write_stdin.rs:20-30 WriteStdinArgs has only session_id, chars, yield_time_ms, max_output_tokens; shell_spec.rs:103-145 create_write_stdin_tool advertises only those four. There is no terminate/EOF flag.",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:1005 schema declares a `terminate` boolean (\"close the session after writing (sends EOF + SIGHUP)\"); handled at :1062-1064 by appending Ctrl-D.",
+    "description": "Swift adds a `terminate` parameter not present upstream. The model isn't trained on it, and it changes write semantics (injecting EOT into the byte stream) when set. Additive divergence from the upstream write_stdin contract.",
+    "fixRecommendation": "Remove the `terminate` property from WriteStdinTool.jsonSchema and the EOT-append logic, or gate it off by default, to match upstream write_stdin."
+   },
+   {
+    "title": "Exec-server client missing http/request, http/request/bodyDelta, and fs/copy methods",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "exec-server/src/protocol.rs:22-32 declares FS_COPY_METHOD=\"fs/copy\", HTTP_REQUEST_METHOD=\"http/request\", HTTP_REQUEST_BODY_DELTA_METHOD=\"http/request/bodyDelta\"; FsCopyParams (:248-255) and HttpRequestParams/HttpRequestResponse/HttpRequestBodyDeltaNotification (:276-340) are part of the exec-server wire contract.",
+    "swiftStatus": "Sources/Tools/RemoteExecServerTools.swift implements process/start,read,write,terminate and fs/readFile,writeFile,createDirectory,getMetadata,readDirectory,remove (grep over file). No request(method:\"fs/copy\"), \"http/request\", or \"http/request/bodyDelta\" exists anywhere in the exec-server client; the only fs/copy in Sources/ is the unrelated app-server v2 handler in RequestRouter.swift.",
+    "description": "The Swift exec-server client never issues fs/copy or the http/request family. fs/copy omission means remote copy operations fall back to read+write (or are unsupported); the http/request transport (used upstream for executor-side HTTP probes / Streamable HTTP / OAuth discovery) has no client path at all. These are low-traffic for a basic shell port but are part of the exec-server protocol contract.",
+    "fixRecommendation": "Add fs/copy (FsCopyParams: sourcePath, destinationPath, recursive, sandbox) and, if remote HTTP is needed, http/request + http/request/bodyDelta handling to the RemoteExecServerJSONClient, mirroring exec-server/src/protocol.rs field names/casing."
+   }
+  ],
+  "sandbox-safety-policy": [
+   {
+    "title": "Auto-approve safe-command allowlist widened far beyond upstream is_known_safe_command",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/shell-command/src/command_safety/is_safe_command.rs:71-101 \u2014 is_safe_to_call_with_exec auto-approves ONLY: cat, cd, cut, echo, expr, false, grep, head, id, ls, nl, paste, pwd, rev, seq, stat, tail, tr, true, uname, uniq, wc, which, whoami (plus numfmt/tac on Linux), and the arg-gated base64/find/rg/sed/git. No `sort`, `printf`, `diff`, `less`, `more`, `ps`, `du`, `df`, `tree`, `date`, `file`, `printenv`, `realpath`, `sleep`, etc.",
+    "swiftStatus": "Sources/Tools/CommandSafety.swift:18-33 \u2014 alwaysSafePrograms adds (explicitly labelled 'codex-swift extensions'): file, date, hostname, printenv, type, basename, dirname, realpath, readlink, sleep, sort, uniq, od, xxd, sha256sum, md5sum, cksum, du, df, tree, egrep, fgrep, ag, diff, cmp, comm, column, fold, expand, less, more, ps, groups, tty, locale, printf. These are classified .safe and (via SessionEngine.swift:731-732) skip the approval prompt under unlessTrusted/onRequest.",
+    "description": "Upstream prompts (or relies on the sandbox without auto-trusting) for any command not on its narrow safelist; Swift auto-trusts ~35 additional programs. A frontend relying on parity will see commands like `sort`, `diff`, `printf`, `ps`, `less` run without the approval prompt upstream would surface (e.g. under approval_policy=unless-trusted). Although some are read-only, `less`/`more` can invoke shell escapes and `sort -o`/`tee`-like redirection is not gated here, widening the auto-approve attack surface relative to upstream.",
+    "fixRecommendation": "In Sources/Tools/CommandSafety.swift trim alwaysSafePrograms to exactly upstream's is_safe_to_call_with_exec set (cat, cd, cut, echo, expr, false, grep, head, id, ls, nl, paste, pwd, rev, seq, stat, tail, tr, true, uname, uniq, wc, which, whoami, plus numfmt/tac). Move any program needing arg inspection (e.g. sort -o) into argDependentPrograms with an unsafe-option check, and drop the rest so they fall through to the prompt path."
+   },
+   {
+    "title": "Unmatched non-dangerous command decision diverges from render_decision_for_unmatched_command for restricted on-request/granular",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/core/src/exec_policy.rs render_decision_for_unmatched_command: for a non-dangerous, unmatched command the tail returns Decision::Allow for AskForApproval::Never|OnFailure, and for OnRequest/Granular with FileSystemSandboxKind::Restricted returns Allow unless sandbox_permissions.requests_sandbox_override() (then Prompt). Only UnlessTrusted prompts an unmatched non-safelisted command.",
+    "swiftStatus": "Sources/Tools/ExecPolicy.swift:524-529 classifyExact returns `.needsApproval` for any unmatched non-dangerous command not on the known-safe allowlist; SessionEngine.swift:733-742 then forces safety=unsafe and ApprovalPolicyEngine.decideCommand (Approvals.swift:59-61) returns .requestThenEscalate (PROMPT) for onRequest/granular. UnmatchedApprovalPolicy only models .never/.prompt (ExecPolicy.swift:190-195), with no 'allow and rely on sandbox' branch.",
+    "description": "Current upstream does NOT prompt for an unmatched, non-dangerous command in a restricted on-request/granular sandbox (it allows it and relies on the sandbox to contain it, unless the model explicitly requested a sandbox override). The Swift port prompts in that case. Net effect: a frontend on the current protocol sees extra approval prompts for ordinary commands that upstream would silently run sandboxed. (Note: for Never/OnFailure the end-to-end result still matches because decideCommand never prompts there.) This reflects the port tracking the older assess_command_safety model.",
+    "fixRecommendation": "Extend ExecPolicy.UnmatchedApprovalPolicy / classify to encode the full unmatched-command truth table: for restricted sandbox under onRequest/granular, return .safe (allow, rely on sandbox) when the model has NOT requested a sandbox override, and .needsApproval only when an override is requested; keep UnlessTrusted prompting. Thread the sandbox-override flag from SessionEngine into the classify call."
+   },
+   {
+    "title": "ExecPolicy loads non-upstream rule file locations and extensions",
+    "severity": "minor",
+    "category": "other",
+    "rustEvidence": "codex-rs/core/src/exec_policy.rs:49-51 (RULES_DIR_NAME=\"rules\", RULE_EXTENSION=\"rules\", DEFAULT_POLICY_FILE=\"default.rules\") and :1028 \u2014 collect_policy_files only accepts files whose extension == \"rules\" inside each layer's `rules/` dir. There is no `.codexpolicy` extension and no top-level CODEX_HOME `exec_policy.*` file.",
+    "swiftStatus": "Sources/Tools/ExecPolicy.swift:259-274 rulesFiles additionally reads CODEX_HOME/exec_policy.rules, CODEX_HOME/exec_policy.codexpolicy, CODEX_HOME/exec_policy.json (loadStrict:236-241), and treats `.codexpolicy` files in rules/ as policy files.",
+    "description": "Swift loads a superset of rule sources upstream never reads. A stray `*.codexpolicy` or top-level `exec_policy.*` file would be honored by the Swift server but ignored by real codex, producing divergent policy between the two binaries for the same CODEX_HOME.",
+    "fixRecommendation": "Restrict ExecPolicy.rulesFiles to only `rules/*.rules` (drop `.codexpolicy` and the top-level exec_policy.* / .json shims), or gate the shims behind an explicit opt-in flag so default behavior matches upstream's `rules/*.rules`-only discovery."
+   },
+   {
+    "title": "Seatbelt profile inlines writable-root paths instead of using -D parameter substitution",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/sandboxing/src/seatbelt.rs build_seatbelt_access_policy emits `(subpath (param \"WRITABLE_ROOT_0\"))` and passes the concrete path out-of-band as a `-DWRITABLE_ROOT_0=/path` argv entry (create_seatbelt_command_args: `format!(\"-D{key}={value}\", ...)`).",
+    "swiftStatus": "Sources/Sandbox/Sandbox.swift:383-389 emits the path directly inline: `(allow file-write* (subpath \\(sbplStringLiteral(canonical))))`, and sandboxedInvocation (498-509) passes only `[sandboxExec, \"-p\", profile] + argv` with no `-D` definitions.",
+    "description": "Functionally close (paths are SBPL-escaped via sbplStringLiteral), but it departs from upstream's parameterized profile. Edge cases where the inline escaping and `-D` substitution diverge (paths with characters SBPL string literals treat specially) could produce a different effective policy than upstream for the same writable root. Low traffic because most workspace roots are simple paths.",
+    "fixRecommendation": "Mirror upstream by emitting `(subpath (param \"WRITABLE_ROOT_n\"))` clauses and appending matching `-DWRITABLE_ROOT_n=<path>` entries to the sandbox-exec argv, instead of inlining the path into the profile text."
+   },
+   {
+    "title": "buildSeatbeltProfile danger-full-access branch produces an over-restrictive (unused) profile",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/sandboxing/src/seatbelt.rs create_seatbelt_command_args: when file_system_sandbox_policy.has_full_disk_write_access() it emits `(allow file-write* (regex #\"^/\"))` (whole-disk write).",
+    "swiftStatus": "Sources/Sandbox/Sandbox.swift:373-422 \u2014 for .dangerFullAccess it enters the workspace-write branch and emits only per-root + cwd `(allow file-write* (subpath ...))` clauses (no whole-disk grant). This profile is not actually applied because sandboxedInvocation:500 returns `.run(argv)` directly for .dangerFullAccess, so it is dead for the launch path but wrong if buildSeatbeltProfile is invoked for danger-full-access (e.g. in tests/other callers).",
+    "description": "The static profile generator does not reproduce upstream's whole-disk write grant for full-access mode. Harmless at runtime today because full access bypasses the profile, but any caller that renders the profile for danger-full-access (or a future change that applies it) would get a profile far more restrictive than upstream's `(allow file-write* (regex #\"^/\"))`.",
+    "fixRecommendation": "In buildSeatbeltProfile, special-case .dangerFullAccess to emit `(allow file-write* (regex #\"^/\"))` (matching upstream's full-disk-write branch) rather than per-root subpaths."
+   }
+  ],
+  "apply-patch": [
+   {
+    "title": "Add File errors on existing target instead of overwriting",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/lib.rs:397-417 \u2014 Hunk::AddFile reads read_optional_file_text_for_delta (overwritten_content) then unconditionally write_file_with_missing_parent_retry; no existence check, no error. Confirmed by grep: no 'already exists'/exists() guard in the AddFile path.",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:126-128 \u2014 `case .add:` does `if fm.fileExists(atPath: full) { throw ApplyPatchError.targetExists(f.path) }` before writing.",
+    "description": "Upstream Add File overwrites a pre-existing file (capturing its prior content as overwritten_content for the applied delta). The Swift applier instead aborts the whole patch with targetExists. A model emitting `*** Add File:` over an existing path succeeds upstream but fails in Swift. Note the Swift PatchedFile.oldContents doc-comment even claims to carry 'overwritten content' for an Add, so the model layer expects overwrite support that the applier never reaches.",
+    "fixRecommendation": "In ApplyPatch.swift `case .add`, remove the targetExists throw; if the file exists, read its prior contents into oldContents (overwrittenContent) and overwrite. Mirror lib.rs:397-417."
+   },
+   {
+    "title": "Update-with-Move errors when destination exists instead of overwriting",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/lib.rs:465-486 \u2014 for move_path it reads overwritten_move_content via read_optional_file_text_for_delta then write_file_with_missing_parent_retry unconditionally to dest; no existence guard.",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:167-169 \u2014 `if fm.fileExists(atPath: moveFull) { throw ApplyPatchError.targetExists(move) }`. Also mirrored in RemoteExecServerTools.swift:962-965.",
+    "description": "Upstream allows an Update File with `*** Move to:` to overwrite the destination (recording overwritten_move_content). Swift throws targetExists, breaking renames onto an existing path. The PatchedFile.overwrittenMoveContents field exists to carry exactly this, but the applier never populates it because it throws first.",
+    "fixRecommendation": "In ApplyPatch.swift Update/move branch, drop the targetExists throw; capture moveFull's prior contents into overwrittenMoveContents and overwrite. Apply the same change in RemoteExecServerTools.swift:962-965."
+   },
+   {
+    "title": "Renamed-file summary prints original path instead of move destination",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/parser.rs:92-106 Hunk::path() returns move_path for a rename; lib.rs:394 `let affected_path = hunk.path()` and lib.rs:524 `modified.push(affected_path)`; print_summary (lib.rs:859-861) emits `M <move destination>`.",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:519-521 and RemoteExecServerTools.swift:993-995 build the M line from `$0.path`, which for an Update-with-move is the original path (set at ApplyPatch.swift:181-187 `path: f.path`).",
+    "description": "For `*** Update File: a *** Move to: b`, upstream's success summary line is `M b` (destination); Swift emits `M a` (original). The model/history sees a different summary for renames.",
+    "fixRecommendation": "When building the M lines, use `$0.movePath ?? $0.path` instead of `$0.path` in both ToolRouter.swift:520 and RemoteExecServerTools.swift:994."
+   },
+   {
+    "title": "Context-mismatch error text collapses two distinct upstream messages",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "apply-patch/src/lib.rs:714-718 `Failed to find context '{ctx_line}' in {path}` (change_context miss) and lib.rs:771-775 `Failed to find expected lines in {path}:\\n{old_lines joined}` (old_lines miss).",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:602 and 635 both throw `ApplyPatchError.contextMismatch(\"\\(path): hunk context not found\")` \u2014 one generic message, omitting the offending context line / the expected line block.",
+    "description": "Upstream surfaces the specific missing context line or the full block of expected lines to the model so it can re-author the patch. Swift emits a single uninformative string and never includes the missing content. This degrades the model's ability to self-correct a fuzzy-match failure.",
+    "fixRecommendation": "In computeReplacements use distinct messages: for the change_context miss, `Failed to find context '\\(ctx)' in \\(path)`; for the old_lines miss, `Failed to find expected lines in \\(path):\\n\\(chunk.oldLines.joined(separator: \"\\n\"))`."
+   },
+   {
+    "title": "Absolute paths and '..' rejected at parse, but accepted upstream",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/parser.rs:729-771 test_parse_patch_accepts_relative_and_absolute_hunk_paths \u2014 absolute Delete/Update paths parse into PathBuf verbatim; resolve_path (parser.rs:84-90) resolves relative against cwd and leaves absolute as-is. No '..' rejection in parser or applier.",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:222-227 validateRelativePath throws unsafePath for any leading '/', any '..' component, or empty path; called for every Add/Delete/Update/Move path during parse (lines 327,344,351,358) and apply (121).",
+    "description": "Swift adds a path-safety layer that rejects absolute paths and traversal that upstream's apply-patch crate does not. Upstream relies on the sandbox boundary, not path-string rejection, and accepts absolute hunk paths. A patch with an absolute path (which gpt models occasionally emit, and which upstream resolves) fails in Swift with unsafePath. This is intentional hardening but a behavioral divergence from the audited unit; flagged so it is a conscious decision rather than an accidental incompatibility.",
+    "fixRecommendation": "If strict upstream fidelity is required, relax validateRelativePath to allow absolute paths (resolved against root) and rely on assertContained for containment; otherwise document this as an intentional security deviation. Lower priority since the macOS sandbox provides the real boundary."
+   },
+   {
+    "title": "Empty-patch error differs from upstream 'No files were modified.'",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "apply-patch/src/parser.rs:623-632 a patch with only Begin/End markers parses to `hunks: Vec::new()`; lib.rs:371-373 apply_hunks_to_files then `anyhow::bail!(\"No files were modified.\")` which is written to stderr.",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:400-401 throws at parse time `malformed(\"patch contains no hunks\")`; surfaced to the model as `apply_patch failed: malformed(...)`.",
+    "description": "For an empty (hunk-less) patch, upstream's user/model-facing message is 'No files were modified.'; Swift emits a different message and at a different stage. Low traffic but the text the model sees differs verbatim.",
+    "fixRecommendation": "Optionally align the message to 'No files were modified.' to match upstream stderr text, or leave as-is if exact text is not relied upon."
+   }
+  ],
+  "persistence-rollout": [
+   {
+    "title": "Rollout filename embeds non-UUID ThreadId (thr_<uuid>), unparseable by upstream listing",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "rollout/src/list.rs:930-945 parse_timestamp_uuid_from_filename: strips 'rollout-'/'.jsonl', then scans from the right for a '-' whose suffix parses as a bare Uuid (`Uuid::parse_str(&core[i+1..])`). list.rs:399 documents layout `rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl`. Filesystem discovery (list.rs:888-922) and find_thread_path_by_id_str depend on this.",
+    "swiftStatus": "Sources/ProtocolModel/Ids.swift:9 `ThreadId.generate()` returns `thr_<uuid lowercased>`; Sources/Persistence/ThreadStore.swift:120 builds `.../rollout-<stamp>-\\(id.raw).jsonl`. The `thr_` prefix means the final filename segment is `thr_5973b6c0-...` which `Uuid::parse_str` rejects, so upstream cannot parse the timestamp/uuid \u2192 the thread is skipped by every upstream filesystem scan and id lookup.",
+    "description": "Upstream requires the id portion of the rollout filename to be a bare RFC-4122 UUID. Swift writes a prefixed, underscore-containing id, so any real codex-rs tool (CLI list, resume-by-id, archived discovery) scanning the shared ~/.codex/sessions tree will silently ignore Swift-created rollouts. The Swift app-server itself works because it resolves paths via its own SQLite `rollout_path` column, but the on-disk artifact is not interoperable.",
+    "fixRecommendation": "Either make the rollout filename use a bare UUID segment (store the `thr_`-prefixed id only inside session_meta `id`, and derive the filename UUID separately), or change ThreadId.generate() to a bare lowercased UUID. The filename's trailing segment after `rollout-<ts>-` must satisfy Uuid::parse_str. Edit ThreadStore.swift:110-121 (rolloutPath) and/or Ids.swift:9."
+   },
+   {
+    "title": "turn_context line omits upstream-required fields (approval_policy, sandbox_policy, summary)",
+    "severity": "major",
+    "category": "missing-type",
+    "rustEvidence": "protocol/src/protocol.rs:2824-2860 TurnContextItem: `cwd`, `approval_policy: AskForApproval`, `sandbox_policy: SandboxPolicy`, `model: String`, and `summary: ReasoningSummaryConfig` are all NON-optional (no #[serde(default)]/skip). recorder.rs:842-869 load_rollout_items parses each line via serde_json::from_value::<RolloutLine>; a missing required field makes the line fail to parse (counted as parse_errors and dropped).",
+    "swiftStatus": "Sources/Persistence/Rollout.swift:620-638 (`.turnContext` rustRolloutLine) emits only `cwd`, `model`, `turn_id`, and optional `current_date`/`timezone`/`realtime_active`. The comment at 626-629 explicitly admits approval_policy/sandbox_policy/summary are 'deferred to a follow-up parity item'.",
+    "description": "Because approval_policy, sandbox_policy and summary are required for upstream TurnContextItem deserialization, upstream codex-rs cannot deserialize the Swift-emitted turn_context line; it is dropped during resume. This defeats the very purpose the Swift comment cites for the record (resume CWD matching and previous-turn-settings recovery via reconstruct_history_from_rollout, which reads TurnContext at rollout_reconstruction.rs to populate previous_turn_settings/reference_context_item).",
+    "fixRecommendation": "Populate approval_policy, sandbox_policy, and summary (ReasoningSummaryConfig) in the turn_context payload in Rollout.swift:620-638, sourced from SessionConfig, using the upstream serde wire strings (AskForApproval/SandboxPolicy/ReasoningSummaryConfig casing). Until then the record is non-interoperable with upstream resume."
+   },
+   {
+    "title": "Compaction replay collapses history to a single summary message and ignores replacement_history",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/session/rollout_reconstruction.rs: on a Compacted item with `replacement_history`, upstream does `history.replace(replacement_history.to_vec())` and then replays the suffix forward (record_items), preserving the full post-compaction model-visible history vector; legacy compaction without replacement_history rebuilds via compact::build_compacted_history over collected user messages.",
+    "swiftStatus": "Sources/Persistence/ThreadStore.swift:260-261 itemsFrom: `case .compacted: items = [.agentMessage(id: ItemId.generate(\"compact\"), text: summary)]` \u2014 replaces the entire reconstructed item list with ONE agent message containing only the summary, discarding the decoded `replacementHistory` (which the reader does hydrate at Rollout.swift:887-901). turnsFrom (ThreadStore.swift:356-357) similarly appends only the summary.",
+    "description": "On resume after a compaction, the Swift port loses the post-compaction baseline history that upstream reconstructs from replacement_history; it presents only a single summary message. This diverges from upstream context-fidelity semantics and means resumed threads have materially different model-visible history than upstream would produce from the same rollout file.",
+    "fixRecommendation": "In ThreadStore.itemsFrom/turnsFrom, when a `.compacted` record carries `replacementHistory`, reset the accumulated items to that history vector (mapped to ThreadItem) and continue replaying subsequent records, instead of substituting a single agentMessage. Mirror rollout_reconstruction.rs replace-then-replay."
+   },
+   {
+    "title": "Compaction sidecar emits a non-existent EventMsg type 'auto_compacted'",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "protocol/src/protocol.rs:1302-1303 the compaction EventMsg variant is `ContextCompacted(ContextCompactedEvent)` (protocol.rs:1960 ContextCompactedEvent is a UNIT struct, no fields), serialized as `{type:\"context_compacted\"}`. EventMsg (protocol.rs:1269-1273, tag=type snake_case) has NO `auto_compacted` variant and is not #[serde(other)].",
+    "swiftStatus": "Sources/Persistence/Rollout.swift:424-441 sidecarLines emits `{type:\"event_msg\",payload:{type:\"auto_compacted\",turn_id,phase,reason,tokens_before,tokens_after,tokens_saved}}`.",
+    "description": "There is no `auto_compacted` EventMsg upstream; the canonical compaction event is `context_compacted` (a fieldless unit). Upstream load_rollout_items will fail to deserialize the sidecar line and drop it (parse_errors++). The real compaction signal (the `compacted` RolloutItem line) is emitted faithfully, so this sidecar is purely additive noise, but it is not a real upstream wire type and the extra fields (phase/reason/tokens_*) have no upstream analog on that event.",
+    "fixRecommendation": "Either drop the sidecar entirely (the `compacted` RolloutItem already records compaction) or change the sidecar to the upstream-valid `{type:\"context_compacted\"}` unit event. Edit Rollout.swift:424-441."
+   },
+   {
+    "title": "Native (non-Rust-shaped) rollout lines are unreadable by upstream for structured item types",
+    "severity": "minor",
+    "category": "missing-type",
+    "rustEvidence": "rollout/src/policy.rs:67-83 should_persist_response_item: upstream persists LocalShellCall/FunctionCall/ToolSearchCall/FunctionCallOutput/CustomToolCall(+Output)/WebSearchCall/ImageGenerationCall/Compaction/ContextCompaction as RolloutItem::ResponseItem lines (OpenAI item shape).",
+    "swiftStatus": "Sources/Persistence/Rollout.swift:639-656: only `.agentMessage` and `.reasoning` ThreadItems are emitted as upstream `response_item`; all other `.item` variants (commandExecution, fileChange, contextMessage, contextCompaction, unknown) and `.environmentRebound`, non-text `.userInput`, etc. fall through to the native `{\"t\":\"item\",...}` Codable encoding (encode/decode at Rollout.swift:149-303) which upstream cannot parse.",
+    "description": "Tool-call / file-change / command-execution history is persisted only in the Swift-native line shape, so upstream codex-rs replay drops these items (they are not response_item lines). For a frontend that only talks to the Swift app-server this is fine (Swift reads its own native lines), but the rollout file is not a faithful reproduction of upstream's model-visible history for these item types, breaking cross-impl resume fidelity of tool/exec history.",
+    "fixRecommendation": "If cross-impl rollout interop is a goal, extend threadItemToResponseItem + rustRolloutLine to emit commandExecution/fileChange as the upstream FunctionCall/LocalShellCall/CustomToolCallOutput response_item shapes. Otherwise document that Swift rollouts are not upstream-replayable for these item types."
+   },
+   {
+    "title": "session_meta omits forked_from_id and uses non-upstream originator/source identifiers",
+    "severity": "minor",
+    "category": "wrong-default",
+    "rustEvidence": "rollout/src/recorder.rs (RolloutRecorderParams::Create) and protocol.rs:2720-2751 SessionMeta: `forked_from_id` (skip_if_none) is written for forked threads; `originator` comes from default_client originator (e.g. codex_cli_rs); default `source` is VSCode but the app-server path maps app-server\u2192Mcp (protocol.rs:2624 from_startup_arg: 'mcp'|'appserver'|'app-server'|'app_server' => Mcp).",
+    "swiftStatus": "Sources/Persistence/ThreadStore.swift:194-217 sessionMetaRecord hardcodes originator=`codex-swift/0.1.0`, cli_version=`0.1.0`, source=`vscode`, model_provider=`openai`, and never sets forked_from_id; RolloutRecord.sessionMeta (Rollout.swift:44-54) has no forked_from_id field at all.",
+    "description": "forked_from_id is structurally absent from the Swift session_meta record type, so a forked Swift thread loses the upstream fork-provenance field. The originator/source values are Swift-specific and differ from real codex identifiers; source `vscode` for an app-server host diverges from upstream's `mcp` mapping. These are tolerated by deserializers (extra/missing optionals) but are not faithful values.",
+    "fixRecommendation": "Add an optional forked_from_id to RolloutRecord.sessionMeta and the payload (Rollout.swift:44-54, 560-588), populate it from fork creation. Consider plumbing a real per-host source (mcp for app-server) and an originator override rather than the hardcoded codex-swift string."
+   }
+  ],
+  "config": [
+   {
+    "title": "config/read.config returns raw merged TOML instead of the typed v2 Config projection",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server/src/config_manager_service.rs:127-139 \u2014 `let effective = layers.effective_config(); let effective_config_toml: ConfigToml = effective.try_into()?; let json_value = serde_json::to_value(&effective_config_toml)?; let config: ApiConfig = serde_json::from_value(json_value)?` where ApiConfig = codex_app_server_protocol::Config (config.rs:246-285). The v2 Config struct fields (model, review_model, model_context_window, model_auto_compact_token_limit, model_provider, approval_policy, sandbox_mode, sandbox_workspace_write, web_search, profile, instructions, developer_instructions, compact_prompt, service_tier, analytics, \u2026) have NO skip_serializing_if, so absent values serialize as explicit `null`. ConfigToml has no `#[serde(flatten)] additional`, so unknown TOML keys are DROPPED during `try_into::<ConfigToml>()`.",
+    "swiftStatus": "Sources/Config/Config.swift:214 `func configObjectJSON() -> [String: ConfigValue] { merged }`; RequestRouter.swift:1745 `var configJSON = effectiveConfig.configObjectJSON().mapValues(toJSON)`. Swift emits the raw deep-merged map: it includes arbitrary unknown keys upstream would drop, and omits known-but-unset fields (e.g. model/review_model/sandbox_workspace_write are simply absent rather than `null`).",
+    "description": "Upstream config/read.config is a strongly-typed projection: every known ConfigToml field appears (null when unset) and any non-schema key is stripped. Swift returns the raw merged TOML, so the field set and null-vs-absent semantics differ. A client that reads typed fields (e.g. config.model === null vs undefined) or that does not expect extra keys sees a different shape.",
+    "fixRecommendation": "In RequestRouter config/read handling, build the response `config` by projecting the merged map onto the known v2 Config field list: emit each known snake_case field with its merged value or explicit `.null`, and drop keys not in the v2 Config schema (preserving the `additional`-flatten keys upstream keeps only after ConfigToml round-trips, i.e. none of the unknown top-level keys). Add a ConfigToml field whitelist mirroring config_toml.rs ConfigToml + v2 Config."
+   },
+   {
+    "title": "config/read.layers emitted in wrong order and with wrong membership",
+    "severity": "major",
+    "category": "ordering",
+    "rustEvidence": "app-server/src/config_manager_service.rs:141-150 \u2014 `layers: params.include_layers.then(|| layers.get_layers(ConfigLayerStackOrdering::HighestPrecedenceFirst, /*include_disabled*/ true).iter().map(|layer| layer.as_layer()).collect())`. Upstream returns layers HIGHEST precedence first and INCLUDES disabled layers; as_layer() (state.rs:170-177) emits every layer including ones with empty config tables.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1752-1760 \u2014 layers are taken from `effectiveConfig.layers` (composed lowest-first in ConfigLoader.load(): defaults, system, toml, profile-v2, project, env, override) and emitted in that LOWEST-first order, additionally filtered by `guard let src = layer.source, !layer.values.isEmpty` which drops the synthetic defaults layer (acceptable) but also drops any real layer whose file exists yet is empty.",
+    "description": "The includeLayers array is reversed relative to upstream (Swift lowest\u2192highest, upstream highest\u2192lowest) and omits empty layers upstream would include. A frontend that indexes layers[0] as the top/effective layer, or that counts layers, gets different results.",
+    "fixRecommendation": "Reverse the emitted layer array to highest-precedence-first and stop filtering on `!layer.values.isEmpty` (only exclude the synthetic defaults layer that has no `source`). Match upstream get_layers(HighestPrecedenceFirst, include_disabled: true)."
+   },
+   {
+    "title": "Project-local denylist wrongly applied to the system (/etc/codex/config.toml) layer",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "config/src/loader/mod.rs:198-212 loads the System layer via `ConfigLayerEntry::new(ConfigLayerSource::System{file}, config_toml)` with NO sanitization. `sanitize_project_config` (mod.rs:877-890, applying PROJECT_LOCAL_CONFIG_DENYLIST) is called ONLY for project layers at mod.rs:1203. The denylist comment (mod.rs:57-60) explicitly states these settings are still supported from user, SYSTEM, managed, and runtime layers.",
+    "swiftStatus": "Sources/Config/Config.swift:520-529 `loadSystemLayer()` calls `ConfigLoader.applyDenylist(&root)` (line 522) on the system config, stripping openai_base_url, chatgpt_base_url, model_provider, model_providers, notify, profile, profiles, otel, etc. The doc comment at lines 286-299 even claims system configs should be denied, contradicting upstream.",
+    "description": "An administrator's /etc/codex/config.toml that sets model_provider, model_providers, base URLs, notify, profile(s), or otel is silently dropped by the Swift port but is honored by upstream. This changes effective config and config/read output for any managed deployment.",
+    "fixRecommendation": "Remove `ConfigLoader.applyDenylist(&root)` from `loadSystemLayer()` in Sources/Config/Config.swift; keep it only in `loadProjectLocalLayers`. Update the misleading denylist doc comment accordingly."
+   },
+   {
+    "title": "MDM / managed-preferences config layer absent (macOS)",
+    "severity": "minor",
+    "category": "missing-type",
+    "rustEvidence": "app-server-protocol v2/config.rs:25-31 defines ConfigLayerSource::Mdm { domain, key } (precedence 0); config/src/loader/mod.rs reads managed preferences (managed_preferences_base64, target_os=macos) and emits Mdm/LegacyManagedConfigTomlFromMdm layers (mod.rs:139-369).",
+    "swiftStatus": "ConfigLayerSource.swift:10-11 declares the .mdm and .legacyManagedConfigTomlFromMdm cases and their JSON, but ConfigLoader.load() (Config.swift:640-740) never constructs them \u2014 no managed-preferences/MDM source is read on macOS, so these layers can never appear in config/read.origins or layers.",
+    "description": "On macOS, enterprise MDM-delivered managed preferences form the highest-priority-floor config layer upstream. The Swift port never loads them, so MDM-managed settings and their origins are missing. Lower impact for non-managed installs but a real gap for enterprise parity.",
+    "fixRecommendation": "If MDM parity is required, read the macOS managed-preferences domain in ConfigLoader.load() and prepend an `.mdm`/`.legacyManagedConfigTomlFromMdm` layer at the lowest precedence; otherwise document the omission explicitly."
+   }
+  ],
+  "prompts": [
+   {
+    "title": "request_permissions tool section emitted by default (upstream default-disabled), adding extra preamble text + granular category",
+    "severity": "major",
+    "category": "wrong-default",
+    "rustEvidence": "features/src/lib.rs:849-854 `Feature::RequestPermissionsTool { key: \"request_permissions_tool\", stage: UnderDevelopment, default_enabled: false }`. permissions_instructions.rs:171-200 only appends `request_permissions_tool_prompt_section()` (\"# request_permissions Tool ...\") to unless-trusted/on-failure/on-request when `request_permissions_tool_enabled` is true; granular_instructions (262-288) only adds the `request_permissions` category when the flag is true.",
+    "swiftStatus": "Sources/Prompts/Permissions.swift:45 `defaultRequestPermissionsToolEnabled = true`. SessionEngine.swift:208-213 constructs `PermissionsInstructions(...)` WITHOUT passing requestPermissionsToolEnabled, so the default `true` applies. Result: withRequestPermissionsTool (Permissions.swift:169) always appends the `# request_permissions Tool` section to unless-trusted/on-failure/on-request preambles, and granularInstructions (Permissions.swift:233) always includes the `request_permissions` category.",
+    "description": "Because the Swift default is `true` while upstream's feature flag defaults to `false`, the developer/permissions instruction block produced by codex-swift in the out-of-the-box configuration contains an extra `# request_permissions Tool` section (and, under granular policy, an extra `request_permissions` bullet) that upstream would not emit. This is a non-trivial divergence in the verbatim system/developer prompt text for the common default session.",
+    "fixRecommendation": "Change `defaultRequestPermissionsToolEnabled` to `false` to match Feature::RequestPermissionsTool's default_enabled, and/or plumb the actual feature/config flag from SessionConfig into the PermissionsInstructions(...) call in SessionEngine.swift:208 so it reflects the session's resolved feature state."
+   },
+   {
+    "title": "on-request approval preamble never switches to rule-request-permission variant or emits approved-prefix list",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "permissions_instructions.rs:178-194 `on_request_instructions()`: picks `APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION` (on_request_rule_request_permission.md) instead of `APPROVAL_POLICY_ON_REQUEST_RULE` (on_request.md) when `exec_permission_approvals_enabled`; and appends an `## Approved command prefixes\\nThe following prefix rules have already been approved: {prefixes}` section when the exec policy has allow-prefixes.",
+    "swiftStatus": "Sources/Prompts/Permissions.swift:184-186 the `.onRequest` arm always uses `approvalOnRequest` (= on_request.md), wrapped only by withRequestPermissionsTool. There is no exec_permission_approvals_enabled branch and no approved-command-prefixes section (acknowledged in the comment at Permissions.swift:206-213).",
+    "description": "Under approval_policy on-request with exec-permission-approvals enabled, upstream serves the on_request_rule_request_permission.md body and can append an approved-prefixes section; the Swift port always serves on_request.md and never appends approved prefixes. Diverges only when those features are enabled (both currently unsurfaced in SessionConfig), so low traffic, but it is a prompt-text gap if/when exec-policy allow rules or exec-permission-approvals are wired.",
+    "fixRecommendation": "Plumb exec_permission_approvals_enabled and the exec-policy allowed-prefixes into PermissionsInstructions; in the .onRequest / .granular arms select on_request_rule_request_permission.md when enabled and append the `## Approved command prefixes` section, matching permissions_instructions.rs:178-194 and 325-329."
+   }
+  ],
+  "mcp": [
+   {
+    "title": "Model-visible tool-name collision resolution and 64-char hashing not reproduced",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/codex-mcp/src/tools.rs:144-235 normalize_tools_for_model + :349-375 unique_callable_parts + :297-347 append_hash_suffix/fit_callable_parts_with_hash: colliding or >64-byte model names are disambiguated by appending a 12-hex-char SHA1 suffix (CALLABLE_NAME_HASH_LEN=12) and truncating to MAX_TOOL_NAME_LENGTH=64, guaranteeing every model-visible tool name is unique and <=64 bytes; duplicate raw identities are skipped with warn!(\"skipping duplicated tool ...\").",
+    "swiftStatus": "Sources/MCP/McpManager.swift:30-32 McpToolProxy builds name = \"mcp__<server>__<tool>\" then String(raw.prefix(64)) with no hash and no dedup; Sources/Tools/ToolRouter.swift:127 register does tools[tool.name] = tool, which silently overwrites on any name collision.",
+    "description": "Upstream guarantees unique, length-fitted tool names via SHA1 hash suffixes; Swift merely prefix-truncates to 64 and lets the ToolRouter overwrite duplicates. Two MCP tools whose sanitized names collide (e.g. names differing only past the 64-char cap, or differing only by characters that sanitize to '_') will clobber each other in Swift, so the model loses access to one tool and may route a call to the wrong one. Upstream would expose both with distinct hashed names.",
+    "fixRecommendation": "In Sources/MCP (a new normalization pass invoked by McpManager.startAll before router.register), port normalize_tools_for_model: detect callable-name collisions across servers/tools, append \"_\"+first-12-hex-of-SHA1(raw_identity) suffix, and fit to 64 bytes via the fit_callable_parts_with_hash algorithm (truncate tool portion, then namespace). Skip exact-duplicate raw identities with a warning instead of overwriting."
+   },
+   {
+    "title": "CallToolResult flattened to plain text; structuredContent, _meta, and non-text content blocks dropped",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/codex-mcp/src/connection_manager.rs:602-616 preserves the full content Vec (each block serialized to JSON), structured_content, is_error, and meta; core/src/mcp_tool_call.rs:790-806 forwards the whole content array to the model (converting image blocks to a placeholder text block) plus structured_content and meta.",
+    "swiftStatus": "Sources/MCP/McpClient.swift:731-739 and Sources/MCP/McpHttpClient.swift:729-738 build McpCallResult by concatenating only o[\"text\"] from content items and reading isError; McpCallResult (McpClient.swift:318-321) has only text+isError, so structuredContent, request/result _meta, and image/audio/resource content blocks are discarded.",
+    "description": "Upstream surfaces the complete MCP tool result (all content blocks, structuredContent, meta) to the model and persists it; image blocks become an explicit placeholder. Swift collapses everything to the concatenated text fields, so a tool returning structuredContent-only, image content, or resource-link content yields empty or lossy output to the model, diverging from upstream behavior the model and UI depend on.",
+    "fixRecommendation": "Extend McpCallResult to carry the raw content array (as JSONLite/JSONValue), structuredContent, and meta; in callTool keep the full content blocks (converting type==\"image\" to the upstream placeholder text \"<image content omitted because you do not support image input>\") instead of only summing text, and thread structuredContent/meta through McpToolProxy.run output."
+   },
+   {
+    "title": "resources/list and resources/templates/list pagination (next_cursor) not implemented",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "codex-rs/codex-mcp/src/connection_manager.rs:447-509 list_all_resources and :511-579 list_all_resource_templates loop sending PaginatedRequestParams { cursor: Some(next) } until next_cursor is None, accumulating across pages and erroring on a duplicate cursor (\"resources/list returned duplicate cursor\").",
+    "swiftStatus": "Sources/MCP/McpClient.swift:688-699 listResources/listResourceTemplates issue a single request with empty params and return only r[\"resources\"]/r[\"resourceTemplates\"] from the first page; nextCursor is never read. McpHttpClient has no listResources/listResourceTemplates at all.",
+    "description": "A server that paginates its resource list (returns nextCursor) will have all but the first page silently dropped by the Swift client. Upstream walks every page. Low traffic because tool calls are the hot path, but resource discovery is incomplete for large servers.",
+    "fixRecommendation": "In McpClient/McpHttpClient add a pagination loop: pass {\"cursor\": next} in params, append page resources, stop when nextCursor absent, and guard against a repeated cursor. Mirror the same for resources/templates/list and add the methods to McpHttpClient."
+   },
+   {
+    "title": "Non-object tool-call arguments silently coerced to {} instead of erroring",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/rmcp-client/src/rmcp_client.rs:553-561 call_tool returns Err(anyhow!(\"MCP tool arguments must be a JSON object, got {other}\")) when arguments is Some(non-object); :562-570 likewise rejects non-object _meta.",
+    "swiftStatus": "Sources/MCP/McpClient.swift:718-724 and McpHttpClient.swift:712-718: if JSONSerialization.jsonObject fails or yields a non-object, argsObject = [String:Any]() (empty object) and the call proceeds silently.",
+    "description": "Upstream rejects malformed (non-object) tool arguments with a clear error; Swift swallows the malformed input and sends an empty arguments object, which can cause the server to run with no arguments rather than failing fast. Edge-case but a behavioral divergence in error surfacing.",
+    "fixRecommendation": "In callTool, if argumentsJSON is non-empty but does not parse to a JSON object, throw McpError.server/transport (\"MCP tool arguments must be a JSON object\") instead of defaulting to {}; only an empty/absent argumentsJSON should map to no arguments."
+   },
+   {
+    "title": "MCP server-name validation regex not enforced",
+    "severity": "minor",
+    "category": "missing-error-code",
+    "rustEvidence": "codex-rs/codex-mcp/src/rmcp_client.rs:448-457 validate_mcp_server_name rejects any server name not matching ^[a-zA-Z0-9_-]+$ before the client is started, surfacing \"Invalid MCP server name ...\".",
+    "swiftStatus": "No equivalent in Sources/MCP/; McpManager.makeConfig/startAll accept any name. grep for validate/regex on server name in Sources/MCP returned nothing.",
+    "description": "Upstream fails startup early for an invalid server name; Swift accepts arbitrary names and only sanitizes them for the model-visible tool prefix. Low impact (the name is later sanitized for the Responses API), but the startup-time validation/error is absent, so misconfigured names fail later/differently.",
+    "fixRecommendation": "Add a startup check in McpManager.startAll (or McpClient.start) that validates cfg.name against ^[A-Za-z0-9_-]+$ and marks the server failed with the upstream-style error message when it does not match."
+   },
+   {
+    "title": "stdio reader silently terminates the connection when a frame exceeds maxFrameBytes",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/rmcp-client/src/rmcp_client.rs (stdio transport via rmcp serve_client) imposes no hard newline-frame size cap that kills the session; large frames are delivered to the JSON-RPC layer.",
+    "swiftStatus": "Sources/MCP/McpClient.swift:483-486: when a partial line buffer exceeds cap (default 16MB) with no newline, the reader loop breaks, calls continuation.finish(), and failAllPending(\"server stdout closed\"), tearing down the whole client.",
+    "description": "A single oversized stdio frame (e.g. a large tool result) above 16MB causes the Swift client to drop the entire connection and fail all in-flight requests, whereas upstream keeps the session alive. Edge case but a hard divergence in resilience.",
+    "fixRecommendation": "Treat an oversized frame as a per-frame error (skip/clear the buffer and log) rather than breaking the reader loop and finishing the stream; only EOF (empty availableData) should tear down the connection."
+   }
+  ],
+  "hooks": [
+   {
+    "title": "HookRunSummary.id format diverges from upstream run_id()",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/engine/mod.rs:55-62 run_id() = format!(\"{}:{}:{}\", event_name_label(), display_order, source_path.display()); event_name_label() returns kebab strings (mod.rs:64-75, e.g. \"pre-tool-use\"). Test fixture confirms shape: core/src/hook_runtime.rs:736 id = \"stop:0:/tmp/hooks.json\" (event:order:path).",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:872 \u2014 let id = \"\\(def.source):\\(def.eventName.rawValue):\\(order)\" \u2192 e.g. \"user:preToolUse:0\". Uses source (not event) first, camelCase event name, and omits the source_path entirely.",
+    "description": "Upstream serializes the HookRunSummary.id as `<kebab-event-name>:<display_order>:<source_path>` (e.g. `pre-tool-use:0:/Users/x/.codex/hooks.json`). The Swift engine emits `<source>:<camelEvent>:<order>` (e.g. `user:preToolUse:0`). This id is carried verbatim on every `hook/started` / `hook/completed` notification's `run.id`, and Stop continuation fragments key off it upstream. A frontend correlating started/completed rows by id, or matching upstream's documented id grammar, sees a different and non-path-bearing string.",
+    "fixRecommendation": "In Sources/HarnessCore/Hooks.swift fire(), build id as `\"\\(def.eventName.wire):\\(order):\\(def.sourcePath)\"` (wire = kebab form, displayOrder = order, then sourcePath). Confirm displayOrder/order indexing matches upstream display_order."
+   },
+   {
+    "title": "Hook additionalContext output is never injected into the conversation",
+    "severity": "major",
+    "category": "missing-notification",
+    "rustEvidence": "core/src/hook_runtime.rs:447-467 record_additional_contexts() maps each additional context through HookAdditionalContext \u2192 a developer-role ResponseItem and calls sess.record_conversation_items(); invoked for SessionStart (l.135), PreToolUse (l.176), PostToolUse (outcome.additional_contexts), and UserPromptSubmit (run_context_injecting_hook). Test l.626-656 asserts each becomes a separate ordered developer message.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift parses additionalContext into HookOutcome.additionalContext (l.1114, 1161-1168, 1173) and into a `context` HookOutputEntry (l.903-905), but SessionEngine.swift never reads it: fireSessionStartHook (l.2624 `_ =`), firePostToolHook (l.2802 `_ =`), userPromptHookBlocks (l.2673 returns only a block reason). grep for `.additionalContext` outside Hooks.swift returns nothing.",
+    "description": "Upstream's central hook feature is that SessionStart / UserPromptSubmit / PreToolUse / PostToolUse hooks can emit `hookSpecificOutput.additionalContext` (or bare-text stdout) which is injected as developer-role messages into the model's next turn. Swift parses and surfaces this only inside the `hook/completed` entries list; it never records it into conversation history, so the model never sees hook-provided context. This silently drops a load-bearing behavior real hooks depend on.",
+    "fixRecommendation": "In SessionEngine, after each hooks.fire for sessionStart/userPromptSubmit/preToolUse/postToolUse, collect non-empty outcome.additionalContext values (in declaration order) and record them as developer-role conversation items, mirroring record_additional_contexts/additional_context_messages."
+   },
+   {
+    "title": "hook/started and hook/completed notifications are interleaved per-hook instead of batched",
+    "severity": "major",
+    "category": "ordering",
+    "rustEvidence": "core/src/hook_runtime.rs run_pre_tool_use_hooks (l.165-175): emit_hook_started_events(preview_runs) emits started for ALL matched hooks first; then hooks.run_pre_tool_use(request) runs them; then emit_hook_completed_events(hook_events) emits completed for all. Same pattern for permission_request (l.225-232), post_tool_use (l.267-271), compact (l.289-293), and run_context_injecting_hook (l.428-431).",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift fire() l.870-892 loops per hook: builds `started`, runs the command (await runCommand), builds `completed`, appends the pair; SessionEngine.emitHookRuns (l.2641-2644) then emits started+completed for each record sequentially. With 2 matched hooks the order is started(A),completed(A),started(B),completed(B).",
+    "description": "Upstream guarantees all `hook/started` notifications for a matched hook set are emitted before any `hook/completed` (started(A),started(B),...,completed(A),completed(B)). Swift emits them as started/completed pairs, so a frontend rendering live hook rows sees a different notification order than upstream produces. (Upstream also runs the matched set concurrently via FuturesUnordered while Swift runs sequentially; the ordering of the observable notifications is the wire-relevant part.)",
+    "fixRecommendation": "Split fire() into a preview pass that records+emits all `started` summaries first, then runs each command, then emits all `completed` summaries \u2014 or have emitHookRuns drain in two phases (all starteds, then all completeds)."
+   },
+   {
+    "title": "continue:false is treated as a hard block for non-Stop events (PreToolUse etc.)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/engine/output_parser.rs:319-329 unsupported_pre_tool_use_universal: `!continue_processing` \u2192 invalid_reason \"PreToolUse hook returned unsupported continue:false\"; parse_pre_tool_use l.125-142 sets block_reason=None whenever invalid_reason is Some. So continue:false on PreToolUse does NOT block the tool (same for PermissionRequest l.331-341).",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift runCommand l.1269-1276: `if let cont = obj[\"continue\"] as? Bool, cont == false { decision = .block; if eventName==.stop {...} }` \u2014 sets decision=.block for ALL events. runPreToolHook (SessionEngine l.2731) then blocks the tool when aggregate==.block.",
+    "description": "For PreToolUse and PermissionRequest, upstream treats `continue:false` as an unsupported/invalid output that is ignored (no block, run marked Failed). The Swift engine maps `continue:false` to HookDecision.block for every event, so a PreToolUse hook emitting `{\"continue\":false}` will erroneously block the tool call with 'blocked by hook'. Only the Stop event should honor continue:false as a terminator.",
+    "fixRecommendation": "In runCommand, restrict the `continue:false \u2192 .block / shouldStop` mapping to req.eventName == .stop (and the stop/user-prompt-submit semantics upstream defines). For PreToolUse/PermissionRequest, do not block on continue:false; optionally surface it via outputSchemaError to match the upstream Failed status."
+   },
+   {
+    "title": "PreToolUse block message text differs from upstream verbatim strings",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "core/src/hook_runtime.rs:188-199 produces, for Bash/apply_patch: \"Command blocked by PreToolUse hook: {reason}. Command: {command}\"; otherwise: \"Tool call blocked by PreToolUse hook: {reason}. Tool: {tool_name}\".",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:621,633 returns the tool output as \"blocked by hook: \\(reason)\" for both the PreToolUse block and PermissionRequest deny paths; runPreToolHook (l.2727,2732) returns the bare reason.",
+    "description": "When a PreToolUse hook blocks a tool, upstream feeds a specific message back to the model as the tool's function-call output ('Command blocked by PreToolUse hook: \u2026. Command: \u2026' / 'Tool call blocked by PreToolUse hook: \u2026. Tool: \u2026'). Swift feeds 'blocked by hook: <reason>'. This is model-facing text (affects model recovery behavior) rather than a JSON-RPC field, hence minor, but it is not byte-faithful.",
+    "fixRecommendation": "In SessionEngine.toolPreflight, format the PreToolUse block output using upstream's two templates, branching on tool name (Bash/apply_patch include the command, else include the tool name)."
+   },
+   {
+    "title": "UserPromptSubmit/Stop/PostToolUse decision:block-without-reason not marked Failed",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/engine/output_parser.rs:315-317 invalid_block_message; parse_user_prompt_submit l.243-251 and parse_post_tool_use l.197-202 emit \"<Event> hook returned decision:block without a non-empty reason\" and suppress the block; events/user_prompt_submit.rs:359-387 test asserts status=Failed and NOT blocked.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift runCommand l.1252-1256 maps any `decision:block` to .block regardless of reason for non-Stop events (Stop is handled separately at l.1282-1292 with the non-empty-reason rule). userPromptHookBlocks (SessionEngine l.2686) blocks on aggregate==.block even with an empty/missing reason.",
+    "description": "Upstream requires decision:block to carry a non-empty reason for UserPromptSubmit, PostToolUse, and Stop; otherwise the run is HookRunStatus::Failed and does NOT block. Swift enforces this only for Stop (l.1282-1292). For UserPromptSubmit and PostToolUse a `{\"decision\":\"block\"}` with no reason still blocks, and the run summary reports status=blocked rather than failed.",
+    "fixRecommendation": "Extend the non-empty-reason gate in runCommand to UserPromptSubmit and PostToolUse: only set .block / shouldBlock when the trimmed reason is non-empty; otherwise set outputSchemaError and leave decision=.allow so summarize() reports failed."
+   },
+   {
+    "title": "UserPromptSubmit bare-text stdout is not injected as additionalContext",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/events/user_prompt_submit.rs:197-210: when exit 0 and stdout is non-empty but not JSON (looks_like_json false), the trimmed stdout is appended as additional_context for the model.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift runCommand only parses additionalContext when stdout starts with '{' and is a JSON object (l.1248-1318); a non-JSON stdout falls through to `return HookOutcome(decision: .allow, reason: nil, raw: raw)` (l.1354) with no additionalContext.",
+    "description": "Upstream treats a UserPromptSubmit hook's plain-text stdout (non-JSON, exit 0) as additional context injected into the model turn. Swift discards it. This compounds with the additionalContext-not-injected finding but is independently a parsing gap for the bare-text convenience path.",
+    "fixRecommendation": "In runCommand, when eventName is userPromptSubmit (and arguably sessionStart per upstream), exit code 0, stdout non-empty and not JSON, populate additionalContext with the trimmed stdout."
+   }
+  ],
+  "auth": [
+   {
+    "title": "account/read fabricates empty email / \"unknown\" plan instead of returning MissingChatgptAccountDetails error",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "model-provider/src/provider.rs:216-223 \u2014 for a ChatGPT auth, `match (email, plan_type) { (Some(email), Some(plan_type)) => Ok(ProviderAccount::Chatgpt{..}), _ => Err(ProviderAccountError::MissingChatgptAccountDetails) }`; account_processor.rs:818-824 maps that error to `invalid_request(\"email and plan type are required for chatgpt authentication\")`. provider.rs:59-62 confirms the display string.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:3662-3676 `accountJSON(for:)` returns `{type:\"chatgpt\", email: claims?.email ?? \"\", planType: claims?.planType ?? \"unknown\"}` \u2014 it never errors, fabricating an empty email and a literal \"unknown\" plan when JWT claims are missing.",
+    "description": "Upstream account/read returns a JSON-RPC error (invalid_request \"email and plan type are required for chatgpt authentication\") when a ChatGPT-authenticated token lacks email OR plan_type claims. The Swift port instead returns a successful GetAccountResponse with a chatgpt account whose email is \"\" and planType is \"unknown\". A frontend that expects the error (or expects a well-formed account) receives a malformed account object instead.",
+    "fixRecommendation": "In RequestRouter.getAccountResponse / accountJSON: when tokenType is bearer/chatgpt and either email or plan_type is absent from the JWT claims, send WireError.invalidRequest(id, \"email and plan type are required for chatgpt authentication\") instead of substituting \"\"/\"unknown\"."
+   },
+   {
+    "title": "Token refresh sent as form-encoded body; upstream uses JSON",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "login/src/auth/manager.rs:815-834 `request_chatgpt_token_refresh` posts `.header(\"Content-Type\", \"application/json\").json(&RefreshRequest{ client_id, grant_type:\"refresh_token\", refresh_token })` to https://auth.openai.com/oauth/token (manager.rs:94). Note the auth-CODE exchange (server.rs:738) intentionally uses x-www-form-urlencoded, but refresh uses JSON.",
+    "swiftStatus": "Sources/Auth/OAuthPKCE.swift:268-273 CurlTokenExchanger.refresh calls `post(cfg.tokenEndpoint, form: [grant_type, refresh_token, client_id])`; post (OAuthPKCE.swift:183-196) sets `Content-Type: application/x-www-form-urlencoded`.",
+    "description": "Upstream refreshes ChatGPT OAuth tokens with a JSON request body (application/json). The Swift production exchanger (CurlTokenExchanger, the AuthManager default) sends the refresh as application/x-www-form-urlencoded. If the OpenAI /oauth/token refresh path only accepts the JSON shape upstream uses, token refresh will fail against the real backend, breaking the refresh + coalescing flow this unit depends on.",
+    "fixRecommendation": "Give CurlTokenExchanger.refresh a JSON path mirroring upstream: POST application/json {\"client_id\":..,\"grant_type\":\"refresh_token\",\"refresh_token\":..} (reuse the existing postJSON helper). Keep the authorization_code exchange on form encoding."
+   },
+   {
+    "title": "Rate-limit snapshot always emits credits=null; upstream maps backend credits",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "backend-client/src/client.rs:498 `credits: Self::map_credits(credits)` and 557-563 `map_credits` builds CreditsSnapshot{ has_credits, unlimited, balance } from the payload's credits; app-server-protocol/src/protocol/v2/account.rs:358-362 defines CreditsSnapshot{ has_credits, unlimited, balance } on the primary RateLimitSnapshot.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1219 `\"credits\": .null` is hardcoded in rateLimitSnapshot(), and emptyRateLimitSnapshot() (line 840) likewise; the backend usage body is never inspected for a credits object.",
+    "description": "Upstream populates the primary snapshot's `credits` field (has_credits/unlimited/balance) from the backend usage payload. The Swift port hardcodes credits to null for every snapshot, so a frontend reading rateLimits.credits never sees real credit balance/unlimited data.",
+    "fixRecommendation": "In rateLimitSnapshot, read the backend usage payload's credit-status object (the field consumed by upstream map_credits / CreditStatusDetails) and emit `credits: {hasCredits, unlimited, balance}` for the primary snapshot when present, falling back to null only when absent."
+   },
+   {
+    "title": "forced_login_method guards not implemented on account/login/start",
+    "severity": "minor",
+    "category": "missing-error-code",
+    "rustEvidence": "app-server/src/request_processors/account_processor.rs:259-266 (API key login rejected with invalid_request \"API key login is disabled. Use ChatGPT login instead.\" when forced_login_method==Chatgpt), 314-318 (ChatGPT login rejected \"ChatGPT login is disabled. Use API key login instead.\" when forced==Api), 556-563 (external chatgptAuthTokens rejected \"External ChatGPT auth is disabled...\"), plus 245-249/255-258 external_auth_active guard.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1918-2040 handles all login types with no forced_login_method check and no is_external_chatgpt_auth_active guard; grep for forcedLogin/ForcedLoginMethod across Sources/ returns nothing.",
+    "description": "Upstream rejects mismatched login methods when config.forced_login_method is set, and rejects API-key / browser / device-code login while external chatgpt auth is active, with specific invalid_request error strings. The Swift port performs no such validation, so a client configured with a forced login method (or with external auth active) would be allowed to start a disallowed login flow instead of receiving the upstream error.",
+    "fixRecommendation": "Thread forced_login_method (and an is-external-auth-active check) from config into the account/login/start handler and return WireError.invalidRequest with the upstream messages for the disallowed combinations."
+   },
+   {
+    "title": "account/rateLimits/read emits an account/rateLimits/updated notification not sent by upstream",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "account_processor.rs:833-849 get_account_rate_limits_response only returns GetAccountRateLimitsResponse; the AccountRateLimitsUpdated notification is sent exclusively from turn/token-usage events (app-server/src/bespoke_event_handling.rs:1573), not from the read handler.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1791-1793 \u2014 after replying to account/rateLimits/read, it additionally sends `ServerNotification.accountRateLimitsUpdated(rateLimits: snapshot)`.",
+    "description": "The Swift handler for account/rateLimits/read pushes an extra account/rateLimits/updated notification on every read, which upstream does not do (upstream only emits that notification from in-turn rate-limit events). A frontend that treats the notification as an out-of-band signal could double-process or misattribute the update.",
+    "fixRecommendation": "Remove the accountRateLimitsUpdated notification send from the getAccountRateLimits case (RequestRouter.swift:1792-1793); only emit it from the in-turn rate-limit event path that mirrors bespoke_event_handling.rs."
+   }
+  ],
+  "protocol-wire-types": [
+   {
+    "title": "ServerNotification.requestUserInput / .requestPermissions emit non-upstream method strings",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "common.rs:1317-1333 \u2014 these are SERVER REQUESTS, not notifications: ToolRequestUserInput => \"item/tool/requestUserInput\" and PermissionsRequestApproval => \"item/permissions/requestApproval\". There is no \"item/requestUserInput\" or \"item/requestPermissions\" notification anywhere in server_notification_definitions! (common.rs:1449-1541).",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift:287-288 \u2014 case .requestUserInput returns \"item/requestUserInput\" and case .requestPermissions returns \"item/requestPermissions\". These ServerNotification cases are never constructed in the harness (the real flow uses ServerRequest in ServerRequest.swift), so they are dead, but if ever emitted they would put invalid method strings on the wire.",
+    "description": "Upstream models user-input/permission requests as server->client REQUESTS (item/tool/requestUserInput, item/permissions/requestApproval) requiring a correlated response. The Swift ServerNotification enum additionally carries notification cases that map to fabricated method strings (item/requestUserInput, item/requestPermissions) that do not exist in the protocol. Currently latent (unused), but a fidelity hazard.",
+    "fixRecommendation": "Remove the .requestUserInput and .requestPermissions cases from the ServerNotification enum in Sources/ProtocolModel/Events.swift (and their method/toMessage arms), since user-input/permission prompts must flow through ServerRequest, not a notification."
+   },
+   {
+    "title": "Required Option fields emitted as omitted rather than JSON null (systematic null-vs-omit)",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "thread_data.rs:160-171 Turn.error/started_at/completed_at/duration_ms are Option with NO skip_serializing_if (started_at/completed_at/duration_ms even carry #[ts(type=\"number | null\")]) so serde emits them as null; thread_data.rs:158 items_view has #[serde(default)] and is always serialized; thread.rs:1089-1090 ThreadTokenUsage.model_context_window Option with no skip (#[ts(type=\"number | null\")]); thread.rs:1170-1175 ThreadNameUpdatedNotification.thread_name DOES have skip_serializing_if; notification.rs:46-47 ErrorNotification.thread_id/turn_id are required String (not Option).",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift:107-117 TurnObject.encode uses encodeIfPresent for itemsView/error/startedAt/completedAt/durationMs (omits when nil); Events.swift:611-616 TokenUsageBody.encode uses encodeIfPresent for modelContextWindow; Events.swift:638-639 ErrorNotification.threadId/turnId are ThreadId?/TurnId? (optional) and would encode null when nil.",
+    "description": "Upstream serde emits these fields with explicit JSON null (or always, for #[serde(default)] items_view); the Swift custom encoders omit the keys entirely when the value is nil. A strict TS deserializer that destructures `turn.startedAt`/`tokenUsage.modelContextWindow`/`turn.itemsView` as `number | null` / always-present will see `undefined` instead of `null`. For ErrorNotification, upstream guarantees threadId/turnId are present strings; Swift may emit null, which a strict decoder rejects.",
+    "fixRecommendation": "In Sources/ProtocolModel/Events.swift switch the relevant encoders from encodeIfPresent to encode(...) so nil serializes as null: TurnObject error/startedAt/completedAt/durationMs and always-encode itemsView (defaulting to .full); TokenUsageBody modelContextWindow; and make ErrorNotification threadId/turnId non-optional (always provide them) to match upstream's required String fields."
+   },
+   {
+    "title": "ModelContextWindow / itemsView default not honored on encode",
+    "severity": "minor",
+    "category": "wrong-default",
+    "rustEvidence": "thread_data.rs:174-185 TurnItemsView derives Default with #[default] Full; thread_data.rs:158-159 Turn.items_view #[serde(default)] pub items_view: TurnItemsView \u2014 always serialized (no skip), so a Turn always carries itemsView (e.g. \"full\").",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift:69 var itemsView: TurnItemsView? is optional and Events.swift:111 encodeIfPresent omits it when nil; the default \"full\" is therefore not emitted when the harness leaves itemsView nil.",
+    "description": "Upstream always includes itemsView on a Turn payload (defaulting to full). Swift omits it whenever the field is nil, so turn/started and turn/completed notifications can ship a Turn object without the itemsView key that upstream guarantees.",
+    "fixRecommendation": "Default TurnObject.itemsView to .full and always encode it (drop the optionality / encodeIfPresent) in Sources/ProtocolModel/Events.swift."
+   },
+   {
+    "title": "Deprecated legacy v1 server-request approvals not modeled",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "common.rs:1352-1364 server_request_definitions! includes ApplyPatchApproval { params: v1::ApplyPatchApprovalParams } and ExecCommandApproval { params: v1::ExecCommandApprovalParams } (camelCase methods applyPatchApproval / execCommandApproval) used for legacy SendUserTurn/SendUserMessage turns.",
+    "swiftStatus": "Sources/ProtocolModel/ServerRequest.swift:126-156 ServerRequest enum models only the 8 v2 server requests; applyPatchApproval and execCommandApproval are absent (reconstruct() at :202-223 also does not handle them).",
+    "description": "The two deprecated legacy approval server-requests are not represented. Only relevant if a client drives turns via the legacy v1 SendUserTurn/SendUserMessage path; the v2 turn/start path uses item/commandExecution/requestApproval and item/fileChange/requestApproval which ARE modeled.",
+    "fixRecommendation": "If legacy v1 turn APIs are in scope, add applyPatchApproval/execCommandApproval cases to ServerRequest in Sources/ProtocolModel/ServerRequest.swift with their v1 param shapes; otherwise document that legacy v1 approval flow is intentionally unsupported."
+   },
+   {
+    "title": "CommandExecution item omits process_id / source / duration_ms fields",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "item.rs:248-270 ThreadItem::CommandExecution carries process_id: Option<String>, source: CommandExecutionSource (#[serde(default)], always serialized), and duration_ms: Option<i64> (#[ts(type=\"number | null\")], no skip -> emitted as null) in addition to command/cwd/status/command_actions/aggregated_output/exit_code.",
+    "swiftStatus": "Sources/ProtocolModel/Items.swift:29-31 and 196-211 the commandExecution case and its encoder emit only id/command/cwd/status/commandActions/aggregatedOutput/exitCode; processId, source, and durationMs are not modeled or emitted.",
+    "description": "item/started and item/completed notifications for command executions lack the upstream processId, source (defaults to \"agent\"), and durationMs fields. A frontend rendering execution provenance/timing or correlating terminalInteraction by processId will not receive them.",
+    "fixRecommendation": "Add source (default \"agent\"), processId (optional), and durationMs (number|null) to the commandExecution case and its Codable encoder in Sources/ProtocolModel/Items.swift."
+   },
+   {
+    "title": "Extra non-upstream method 'plugin/installed' in known-method registry",
+    "severity": "minor",
+    "category": "other",
+    "rustEvidence": "common.rs:623-728 client_request_definitions! defines plugin/list, plugin/read, plugin/skill/read, plugin/install, plugin/uninstall, plugin/share/* etc. There is NO plugin/installed method anywhere in the upstream protocol.",
+    "swiftStatus": "Sources/ProtocolModel/V2.swift:26 Method.all includes \"plugin/installed\". This makes the router treat an unknown method as .generic (default response) instead of returning -32601.",
+    "description": "plugin/installed is not a real Codex method. Its presence in Method.all means a client calling it would get a generic success-style response rather than the correct method_not_found (-32601). Low impact (no real client calls it), but it weakens the -32601 contract for that one string.",
+    "fixRecommendation": "Remove \"plugin/installed\" from the Method.all set in Sources/ProtocolModel/V2.swift so unknown plugin methods correctly return -32601."
+   }
+  ],
+  "context-compaction": [
+   {
+    "title": "Post-compaction warning notification omits threadId field",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "app-server/src/bespoke_event_handling.rs:220-227 maps EventMsg::Warning to WarningNotification { thread_id: Some(conversation_id.to_string()), message }. The wire method is \"warning\" (app-server-protocol/src/protocol/common.rs:1509) with payload WarningNotification { thread_id: Option<String>, message: String } rename_all=camelCase (v2/notification.rs:21-26) \u2192 JSON {threadId, message}. compact.rs:290-293 emits this warning after every successful compaction.",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:1584-1585 emits the heads-up warning via .raw(method: \"warning\", params: .object([\"message\": .string(Compaction.headsUpWarning)])) \u2014 only a message key, no threadId. Note ProtocolModel/Events.swift:237,290,409-410 already has a proper .warning(threadId:message:) case that serializes {threadId, message}; the compaction flow bypasses it by hand-rolling .raw.",
+    "description": "Upstream always includes threadId (= conversation id) in the warning notification payload; the Swift compaction-flow warning omits it. A client keying warnings by thread will not get the thread association on the compaction heads-up warning.",
+    "fixRecommendation": "In SessionEngine.swift:1584, replace the .raw(method:\"warning\",...) emit with emit(.warning(threadId: config.threadId, message: Compaction.headsUpWarning)) so it routes through the existing Events.swift Warning encoder that includes threadId."
+   },
+   {
+    "title": "Config-level model_auto_compact_token_limit min() not implemented",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "protocol/src/openai_models.rs:322-333 auto_compact_token_limit() = if context_limit present, Some(config_limit.map_or(context_limit, |l| min(l, context_limit))) else config_limit. i.e. the trigger limit is min(model_auto_compact_token_limit, (window*9)/10). config/mod.rs:527 defines model_auto_compact_token_limit: Option<i64>, threaded into session at session/session.rs:726.",
+    "swiftStatus": "Sources/Tokenizer/ModelCatalog.swift:43-45 autoCompactTokenLimit returns only max(1,(contextWindow*9)/10); the ModelCatalog comment (lines 41-42) claims the config min is applied by the SessionEngine-constructing caller, but Sources/codexd/main.swift:255 and Sources/codex-session/main.swift:272 pass ModelCatalog.default.autoCompactLimit(for:) verbatim with no min, and grep finds no model_auto_compact/modelAutoCompact key read anywhere in Sources/Config or the daemons. ABSENT.",
+    "description": "A user-configured model_auto_compact_token_limit that is lower than the 90% window value would lower the trigger upstream but is ignored by the Swift port (always uses the window-derived value). Defaulting config is None, so this only affects users who set the override.",
+    "fixRecommendation": "Read [model_auto_compact_token_limit] (or equivalent) from Config and, in codexd/main.swift:255 and codex-session/main.swift:272, compute autoCompact = configLimit.map{ min($0, catalogLimit) } ?? catalogLimit before passing to SessionEngine; or fold the min into ModelCatalog.autoCompactLimit(for:configOverride:)."
+   },
+   {
+    "title": "Boundary-message truncation marker differs from upstream",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "build_compacted_history_with_limit (compact.rs:497) calls truncate_text(message, TruncationPolicy::Tokens(remaining)) \u2192 truncate_middle_with_token_budget (utils/string/src/truncate.rs:15) whose middle marker is format!(\"\u2026{removed_count} tokens truncated\u2026\") (truncate.rs:131-137) \u2014 no surrounding newlines, unit = tokens.",
+    "swiftStatus": "Sources/HarnessCore/Compaction.swift:56-62 truncateToTokens uses HeadTailBuffer, whose rendered() marker (Sources/InfraPrimitives/Rings.swift:182) is \"\\n\u2026 \\(elided) bytes elided \u2026\\n\" \u2014 leading/trailing newlines and unit = bytes, not tokens.",
+    "description": "The single user message that lands exactly on the COMPACT_USER_MESSAGE_MAX_TOKENS budget boundary is truncated with a different elision marker (different text, units, and newlines) than upstream. Only affects content of one boundary message in the compacted replacement history; not a structural/wire element.",
+    "fixRecommendation": "If exact parity is desired, make Compaction.truncateToTokens emit a middle-truncation marker matching upstream (\"\u2026N tokens truncated\u2026\", token count via approx_tokens_from_byte_count of removed bytes, no surrounding newlines). Otherwise document as an accepted approximation."
+   },
+   {
+    "title": "insertInitialContext lacks the last-compaction-item fallback insertion point",
+    "severity": "minor",
+    "category": "ordering",
+    "rustEvidence": "insert_initial_context_before_last_real_user_or_summary (compact.rs:419-464) computes insertion_index = last_real_user_index.or(last_user_or_summary_index).or(last_compaction_index), where last_compaction_index finds the last ResponseItem::Compaction / ContextCompaction so initial context is inserted before a trailing compaction item when no user/summary message exists (remote compaction may return only compaction items).",
+    "swiftStatus": "Sources/HarnessCore/Compaction.swift:102-119 insertInitialContext only tracks lastUserOrSummary and lastRealUser; if both are nil it appends to the end. It never searches for a trailing .contextCompaction item.",
+    "description": "When a (remote) compacted history contains no user/summary message but does contain a trailing compaction item, upstream inserts initial context BEFORE that item (keeping the compaction item last); Swift would append after it. In practice the Swift remote path (SessionEngine.swift:1485-1501) only emits .userMessage/.agentMessage and never .contextCompaction, so this fallback cannot currently trigger \u2014 latent divergence only.",
+    "fixRecommendation": "Add a last-compaction-item fallback in insertInitialContext (search for trailing .contextCompaction and insert before it) to match upstream's three-tier insertion_index chain, hardening the function against remote outputs that carry compaction items."
+   },
+   {
+    "title": "ContextWindowExceeded terminal path does not fill token gauge to full",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "compact.rs:223-237: when ContextWindowExceeded and turn_input_len <= 1 (cannot trim further), upstream calls sess.set_total_tokens_full(turn_context) before emitting the Error event and returning Err \u2014 setting the token-usage gauge to the full context window.",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:1394-1424: when looksContextWindow but history.count <= 1, the code falls through to return ErrorBody(message:e.message, codexErrorInfo:\"ModelError\") without any equivalent of set_total_tokens_full / recomputeTokenUsage-to-window. No token gauge update on this terminal branch.",
+    "description": "On unrecoverable context-window-exceeded during compaction, upstream pins the token-usage gauge to the context window so the UI reflects a full context; the Swift port skips this, leaving the last-reported gauge value. Affects only the displayed token gauge on a terminal compaction failure.",
+    "fixRecommendation": "In the terminal context-window branch (history.count <= 1) of runCompactionFlow, set the token gauge to the model context window (e.g. ctx.setLastServerTotalTokens(modelContextWindow(...)) and emit tokenUsageUpdated) before returning the error, mirroring set_total_tokens_full."
+   }
+  ]
+ }
+}

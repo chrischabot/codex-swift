@@ -42,6 +42,31 @@ public struct NotificationSink: Sendable {
     }
 }
 
+/// Per-thread runtime facts mirroring upstream `RuntimeFacts`
+/// (app-server/src/thread_status.rs:421-427). The derived `ThreadStatus`
+/// follows `loaded_thread_status` exactly: a loaded thread is `Active` while a
+/// turn is running or any approval/user-input request is outstanding (carrying
+/// the corresponding `activeFlags`), `systemError` when flagged, otherwise
+/// `idle`; an unloaded thread is `notLoaded`.
+private struct ThreadRuntimeFacts: Equatable {
+    var isLoaded = false
+    var running = false
+    var pendingPermissionRequests = 0
+    var pendingUserInputRequests = 0
+    var hasSystemError = false
+
+    /// Mirror of upstream `loaded_thread_status`.
+    var status: ThreadStatus {
+        guard isLoaded else { return .notLoaded }
+        var flags: [ThreadActiveFlag] = []
+        if pendingPermissionRequests > 0 { flags.append(.waitingOnApproval) }
+        if pendingUserInputRequests > 0 { flags.append(.waitingOnUserInput) }
+        if running || !flags.isEmpty { return .active(activeFlags: flags) }
+        if hasSystemError { return .systemError }
+        return .idle
+    }
+}
+
 public actor SessionSupervisor {
     private let factory: WorkerFactory
     private var workers: [ThreadId: WorkerHandle] = [:]
@@ -51,6 +76,10 @@ public actor SessionSupervisor {
     /// current binding.
     private var boundConfigs: [ThreadId: SessionConfig] = [:]
     private var subscribers: [ThreadId: [NotificationSink]] = [:]
+    /// The last subscriber(s) seen before a thread went subscriber-less, kept
+    /// only to deliver a final `thread/closed` on idle-unload (upstream
+    /// ThreadClosedNotification). Cleared on re-subscribe or teardown.
+    private var formerSubscribers: [ThreadId: [NotificationSink]] = [:]
     private var relays: [ThreadId: Task<Void, Never>] = [:]
     private var nextSinkId: UInt64 = 0
     private let maxSessions: Int
@@ -63,6 +92,19 @@ public actor SessionSupervisor {
     private var idleUnloadTasks: [ThreadId: Task<Void, Never>] = [:]
     private var quiescingWorkers: Set<ThreadId> = []
     private var pendingServerRequests: [String: ThreadId] = [:]
+    /// The typed `RequestId` for each outstanding server request, keyed by its
+    /// string form. Retained so resolution/abort can broadcast a faithful
+    /// `serverRequest/resolved` notification (which carries a `RequestId`).
+    private var pendingServerRequestIds: [String: RequestId] = [:]
+    /// The `ThreadActiveFlag` (if any) each outstanding server request
+    /// contributes to the thread's status, so resolution can decrement the
+    /// correct runtime counter. Approval-class requests map to
+    /// `.waitingOnApproval`, user-input/elicitation requests to
+    /// `.waitingOnUserInput`; status-neutral requests (attestation, dynamic
+    /// tool call, auth-token refresh) are absent.
+    private var pendingServerRequestFlags: [String: ThreadActiveFlag] = [:]
+    /// Per-thread runtime facts driving `thread/status/changed` emission.
+    private var statusFacts: [ThreadId: ThreadRuntimeFacts] = [:]
     private var pendingMcpResponses: [String: CheckedContinuation<WorkerMcpResponse, Never>] = [:]
     private var mcpResponseTimeouts: [String: Task<Void, Never>] = [:]
 
@@ -98,6 +140,7 @@ public actor SessionSupervisor {
             NotificationSink(id: sinkId, requestAttestation: requestAttestation,
                              deliver: onNotification,
                              onServerRequest: onServerRequest))
+        formerSubscribers[config.threadId] = nil
 
         idleUnloadTasks.removeValue(forKey: config.threadId)?.cancel()
 
@@ -127,9 +170,11 @@ public actor SessionSupervisor {
                     if threadId == tid { self.recordHeartbeat(tid) }
                     continue
                 case .notification(let n):
+                    self.applyStatusEffect(n, tid)
                     for s in self.subscribersFor(tid) { s.deliver(n) }
                 case .serverRequest(let req):
                     self.recordPending(req.id.description, tid)
+                    self.noteServerRequestIssued(req, tid)
                     let sinks = self.subscribersFor(tid)
                     if case .attestationGenerate = req {
                         if let sink = sinks.first(where: { $0.requestAttestation }) {
@@ -153,6 +198,7 @@ public actor SessionSupervisor {
             self.clearThread(tid)
         }
         boundConfigs[config.threadId] = config
+        markThreadLoaded(config.threadId)
         handle.link.sendToWorker(.bind(config))
         if handle.pid != nil {
             applyResourceControl(.normal(memoryLimitBytes: limits.ledgerHardMemoryBytes),
@@ -171,7 +217,12 @@ public actor SessionSupervisor {
         lastHeartbeats[tid] = nil
         idleUnloadTasks.removeValue(forKey: tid)?.cancel()
         quiescingWorkers.remove(tid)
+        // Resolve outstanding server requests and emit the final notLoaded
+        // status while subscribers are still attached.
+        resolveAllServerRequests(for: tid)
+        removeStatusFacts(tid)
         subscribers[tid] = nil
+        formerSubscribers[tid] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != tid }
         resolveMcpResponsesForClosedThread(tid)
     }
@@ -189,8 +240,11 @@ public actor SessionSupervisor {
     public func deliverServerResponse(_ requestId: String,
                                       result: JSONValue?,
                                       failed: Bool = false) {
-        guard let tid = pendingServerRequests.removeValue(forKey: requestId),
-              let w = workers[tid] else { return }
+        guard let tid = pendingServerRequests.removeValue(forKey: requestId) else { return }
+        // Notify subscribers the prompt is gone (upstream
+        // resolve_pending_server_request) and roll back the status flag.
+        resolveServerRequest(requestId, tid)
+        guard let w = workers[tid] else { return }
         w.link.sendToWorker(.serverResponse(WorkerServerResponse(
             requestId: requestId, result: result, failed: failed)))
     }
@@ -231,8 +285,13 @@ public actor SessionSupervisor {
     }
 
     public func unsubscribe(_ threadId: ThreadId, _ sinkId: UInt64) {
+        let removed = (subscribers[threadId] ?? []).first { $0.id == sinkId }
         subscribers[threadId]?.removeAll { $0.id == sinkId }
         if subscribers[threadId]?.isEmpty == true {
+            // Retain the (former) subscriber so an eventual idle-unload can
+            // deliver thread/closed to it (upstream notifies connections
+            // subscribed to the thread). Cleared on re-subscribe or teardown.
+            if let removed { formerSubscribers[threadId] = [removed] }
             subscribers[threadId] = nil
             scheduleIdleUnload(threadId)
         }
@@ -243,6 +302,124 @@ public actor SessionSupervisor {
     /// flow through the engine event stream. No-op when no subscribers.
     public func broadcast(_ threadId: ThreadId, _ notification: ServerNotification) {
         for s in subscribers[threadId] ?? [] { s.deliver(notification) }
+    }
+
+    // MARK: - thread/status/changed tracking (upstream ThreadWatchManager)
+
+    /// Mutate a thread's runtime facts and, if the derived `ThreadStatus`
+    /// transitions, broadcast `thread/status/changed`. Only emits on a real
+    /// change (parity with upstream `status_changed_notification`'s
+    /// previous-vs-current comparison).
+    private func updateStatusFacts(_ tid: ThreadId,
+                                   _ mutate: (inout ThreadRuntimeFacts) -> Void) {
+        var facts = statusFacts[tid] ?? ThreadRuntimeFacts()
+        let previous = facts.status
+        mutate(&facts)
+        let next = facts.status
+        statusFacts[tid] = facts
+        guard previous != next else { return }
+        broadcast(tid, .threadStatusChanged(threadId: tid, status: next))
+    }
+
+    /// Mark a thread loaded (worker bound). Mirrors upstream `upsert_thread`:
+    /// a freshly loaded, quiescent thread transitions `notLoaded` → `idle`.
+    private func markThreadLoaded(_ tid: ThreadId) {
+        updateStatusFacts(tid) { $0.isLoaded = true }
+    }
+
+    /// Drop a thread's status tracking and, if it was previously a loaded
+    /// status, emit a final `notLoaded` transition (upstream `remove_thread`).
+    private func removeStatusFacts(_ tid: ThreadId) {
+        guard let facts = statusFacts.removeValue(forKey: tid) else { return }
+        let previous = facts.status
+        guard previous != .notLoaded else { return }
+        broadcast(tid, .threadStatusChanged(threadId: tid, status: .notLoaded))
+    }
+
+    /// The active flag a server request contributes to thread status, or `nil`
+    /// for status-neutral requests. Mirrors upstream's guard selection in
+    /// bespoke_event_handling.rs (approval-class → permission/`waitingOnApproval`;
+    /// user-input/elicitation → `waitingOnUserInput`).
+    private static func statusFlag(for req: ServerRequest) -> ThreadActiveFlag? {
+        switch req {
+        case .commandApproval, .patchApproval, .permissionsApproval,
+             .mcpElicitation, .applyPatchApproval, .execCommandApproval:
+            return .waitingOnApproval
+        case .toolRequestUserInput:
+            return .waitingOnUserInput
+        case .dynamicToolCall, .chatgptAuthTokensRefresh, .attestationGenerate:
+            return nil
+        }
+    }
+
+    /// Note a server request was issued: track its id/flag and bump the
+    /// corresponding runtime counter (driving `thread/status/changed`).
+    private func noteServerRequestIssued(_ req: ServerRequest, _ tid: ThreadId) {
+        let key = req.id.description
+        pendingServerRequestIds[key] = req.id
+        guard let flag = Self.statusFlag(for: req) else { return }
+        pendingServerRequestFlags[key] = flag
+        updateStatusFacts(tid) { facts in
+            switch flag {
+            case .waitingOnApproval: facts.pendingPermissionRequests += 1
+            case .waitingOnUserInput: facts.pendingUserInputRequests += 1
+            }
+        }
+    }
+
+    /// Resolve a single outstanding server request id: drop its bookkeeping,
+    /// decrement the runtime counter, broadcast `serverRequest/resolved` to the
+    /// thread's subscribers, and emit any resulting `thread/status/changed`.
+    private func resolveServerRequest(_ key: String, _ tid: ThreadId) {
+        if let rid = pendingServerRequestIds.removeValue(forKey: key) {
+            broadcast(tid, .serverRequestResolved(threadId: tid, requestId: rid))
+        }
+        guard let flag = pendingServerRequestFlags.removeValue(forKey: key) else { return }
+        updateStatusFacts(tid) { facts in
+            switch flag {
+            case .waitingOnApproval:
+                facts.pendingPermissionRequests = Swift.max(0, facts.pendingPermissionRequests - 1)
+            case .waitingOnUserInput:
+                facts.pendingUserInputRequests = Swift.max(0, facts.pendingUserInputRequests - 1)
+            }
+        }
+    }
+
+    /// Abort/resolve every outstanding server request for a thread (turn
+    /// boundaries / teardown). Upstream `abort_pending_server_requests`.
+    private func resolveAllServerRequests(for tid: ThreadId) {
+        let keys = pendingServerRequests.filter { $0.value == tid }.map(\.key)
+        for key in keys {
+            pendingServerRequests.removeValue(forKey: key)
+            resolveServerRequest(key, tid)
+        }
+    }
+
+    /// Apply a thread-scoped notification's effect on tracked runtime status
+    /// before it is relayed to subscribers (turn start/complete, error).
+    private func applyStatusEffect(_ n: ServerNotification, _ tid: ThreadId) {
+        switch n {
+        case .turnStarted:
+            // A new turn begins; cancel any stale pending server requests
+            // (upstream aborts them on turn transition) then mark running.
+            resolveAllServerRequests(for: tid)
+            updateStatusFacts(tid) { $0.running = true; $0.hasSystemError = false }
+        case .turnCompleted:
+            resolveAllServerRequests(for: tid)
+            updateStatusFacts(tid) { $0.running = false }
+        case .error(_, _, let willRetry, _):
+            // Parity with upstream `bespoke_event_handling.rs:883-942`: only the
+            // TERMINAL `EventMsg::Error` (willRetry == false) calls
+            // `note_system_error` (running=false, has_system_error=true). The
+            // transient `EventMsg::StreamError` handler (willRetry == true)
+            // explicitly does NOT touch thread status — they are intermediate
+            // retry states, so the thread stays Active across retries.
+            if !willRetry {
+                updateStatusFacts(tid) { $0.running = false; $0.hasSystemError = true }
+            }
+        default:
+            break
+        }
     }
 
     /// Rebinds the running worker for `threadId` to a new `SessionConfig`,
@@ -274,9 +451,11 @@ public actor SessionSupervisor {
                     if threadId == tid { self.recordHeartbeat(tid) }
                     continue
                 case .notification(let n):
+                    self.applyStatusEffect(n, tid)
                     for s in self.subscribersFor(tid) { s.deliver(n) }
                 case .serverRequest(let req):
                     self.recordPending(req.id.description, tid)
+                    self.noteServerRequestIssued(req, tid)
                     let sinks = self.subscribersFor(tid)
                     if case .attestationGenerate = req {
                         if let sink = sinks.first(where: { $0.requestAttestation }) {
@@ -300,6 +479,7 @@ public actor SessionSupervisor {
             self.clearThread(tid)
         }
         boundConfigs[threadId] = newConfig
+        markThreadLoaded(threadId)
         handle.link.sendToWorker(.bind(newConfig))
         if handle.pid != nil {
             applyResourceControl(.normal(memoryLimitBytes: limits.ledgerHardMemoryBytes),
@@ -354,7 +534,10 @@ public actor SessionSupervisor {
         lastHeartbeats[threadId] = nil
         idleUnloadTasks.removeValue(forKey: threadId)?.cancel()
         quiescingWorkers.remove(threadId)
+        resolveAllServerRequests(for: threadId)
+        removeStatusFacts(threadId)
         subscribers[threadId] = nil
+        formerSubscribers[threadId] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != threadId }
         resolveMcpResponsesForClosedThread(threadId)
     }
@@ -457,6 +640,9 @@ public actor SessionSupervisor {
         lastHeartbeats[tid] = nil
         idleUnloadTasks.removeValue(forKey: tid)?.cancel()
         quiescingWorkers.remove(tid)
+        resolveAllServerRequests(for: tid)
+        removeStatusFacts(tid)
+        formerSubscribers[tid] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != tid }
         resolveMcpResponsesForClosedThread(tid)
     }
@@ -475,7 +661,20 @@ public actor SessionSupervisor {
         lastHeartbeats[tid] = nil
         idleUnloadTasks.removeValue(forKey: tid)?.cancel()
         quiescingWorkers.remove(tid)
-        if clearSubscribers { subscribers[tid] = nil }
+        // Resolve outstanding requests and emit the notLoaded status transition
+        // while subscribers are still attached.
+        resolveAllServerRequests(for: tid)
+        removeStatusFacts(tid)
+        if clearSubscribers {
+            // Idle-unload teardown: tell the former subscribers the thread was
+            // unloaded and must be resumed before the next turn (upstream
+            // ThreadClosedNotification). The rebind path keeps subscribers and
+            // re-binds a fresh worker, so it must NOT emit thread/closed.
+            let recipients = subscribers[tid] ?? formerSubscribers[tid] ?? []
+            for s in recipients { s.deliver(.threadClosed(threadId: tid)) }
+            subscribers[tid] = nil
+        }
+        formerSubscribers[tid] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != tid }
         resolveMcpResponsesForClosedThread(tid)
     }

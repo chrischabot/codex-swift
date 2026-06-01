@@ -23,6 +23,7 @@ public enum PromptAssembly {
         public var developerInstructions: String?
         public var baseInstructionsOverride: String?
         public var multiAgentEnabled: Bool
+        public var model: String
         public var sandboxMode: String
         public var approvalPolicy: String
         public var networkAccess: Bool
@@ -35,6 +36,7 @@ public enum PromptAssembly {
                     developerInstructions: String? = nil,
                     baseInstructionsOverride: String? = nil,
                     multiAgentEnabled: Bool = false,
+                    model: String = "",
                     sandboxMode: String = "workspace-write",
                     approvalPolicy: String = "on-request",
                     networkAccess: Bool = false,
@@ -47,6 +49,7 @@ public enum PromptAssembly {
             self.developerInstructions = developerInstructions
             self.baseInstructionsOverride = baseInstructionsOverride
             self.multiAgentEnabled = multiAgentEnabled
+            self.model = model
             self.sandboxMode = sandboxMode
             self.approvalPolicy = approvalPolicy
             self.networkAccess = networkAccess
@@ -62,7 +65,8 @@ public enum PromptAssembly {
         PromptComposer(personality: o.personality,
                        developerInstructions: o.developerInstructions,
                        baseInstructionsOverride: o.baseInstructionsOverride,
-                       multiAgentEnabled: o.multiAgentEnabled)
+                       multiAgentEnabled: o.multiAgentEnabled,
+                       model: o.model)
     }
 
     /// The stable Responses `instructions` (Codex
@@ -82,30 +86,16 @@ public enum PromptAssembly {
     /// instructions + collab hint (developer message), environment context
     /// (contextual-user), then skills/connectors. The goal is NOT included
     /// here (it is a per-turn injection).
-    public static func initialContextText(config: SessionConfig, _ options: Options) -> String {
-        let c = composer(options)
-        var sections: [String] = []
-        if options.multiAgentEnabled {
-            sections.append(Templates.collabExperimentalPrompt)
-        }
-        if let dev = options.developerInstructions, !dev.isEmpty {
-            sections.append("# Developer instructions\n\n\(dev)")
-        }
-        sections.append(c.environmentMessage(.init(
-            cwd: config.cwd, model: config.model,
-            sandboxMode: options.sandboxMode, approvalPolicy: options.approvalPolicy,
-            networkAccess: options.networkAccess, writableRoots: options.writableRoots,
-            shell: options.shell)))
-        if let s = c.skillsMessage(options.skills) { sections.append(s) }
-        if let conn = c.connectorsMessage(options.connectors) { sections.append(conn) }
-        return sections.joined(separator: "\n\n")
-    }
-
-    /// The per-turn goal injection (Codex `GoalRuntime` → goals/*).
-    public static func goalText(_ options: Options) -> String? {
-        guard let g = options.goal else { return nil }
-        return PromptComposer(personality: options.personality).goalMessage(g)
-    }
+    // persistence-rollout findings 5 & 6: the former `initialContextText`
+    // (which called `PromptComposer.skillsMessage` / `connectorsMessage`) and
+    // `goalText` (which called `PromptComposer.goalMessage`) were DEAD on the
+    // live path — the engine assembles the initial context via the
+    // `SkillInstructions` / environment fragments and the per-turn goal via
+    // `GoalPrompts` (which correctly emit the upstream wire formats). These
+    // wrappers were the only callers of the now-removed PromptComposer
+    // formatters, which emitted a NON-upstream `<available_skills>` shape and a
+    // wrong "unlimited" budget placeholder ("none"/"unbounded" upstream). They
+    // are removed so no future caller can reintroduce the divergent format.
 
     /// Build a turn prompt. `instructions` is the stable model prompt;
     /// `input` is the projected conversation history plus any caller-supplied

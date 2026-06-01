@@ -59,7 +59,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
                 if case .turnCompleted = $0 { return true }; return false
             }
         }
-        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
         _ = await collector.value
 
         let caps = await model.capturedRequests()
@@ -68,6 +68,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
             case .toolOutput(_, let s): return s
+        case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
         // Config user_instructions threaded through:
@@ -100,18 +101,94 @@ final class SkillsAgentsMdParityTests: XCTestCase {
                 if case .turnCompleted = $0 { return true }; return false
             }
         }
-        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
         _ = await collector.value
         let caps = await model.capturedRequests()
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
             case .toolOutput(_, let s): return s
+        case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
         XCTAssertFalse(allInput.contains(
             "Files called AGENTS.md commonly appear in many places"),
             "hierarchical message must not appear when childEnabled = false")
+    }
+
+    /// prompts finding C: the engine must honour `config.projectDocMaxBytes`
+    /// when invoking the AgentsMdManager. A value of 0 fully disables AGENTS.md
+    /// discovery (upstream `agents_md.rs:150-154`), so the AGENTS.md content is
+    /// dropped from the prompt even though the file exists.
+    func testProjectDocMaxBytesZeroDisablesAgentsMd() async throws {
+        let (store, home) = try makeStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let cwd = tmp(); defer { try? FileManager.default.removeItem(atPath: cwd) }
+        try? FileManager.default.createDirectory(atPath: cwd + "/.git",
+                                                  withIntermediateDirectories: true)
+        try? "AGENTS-DOC-MARKER".write(toFile: cwd + "/AGENTS.md",
+                                       atomically: true, encoding: .utf8)
+        let tid = ThreadId.generate()
+        // projectDocMaxBytes = 0 → AGENTS.md fully disabled.
+        let cfg = SessionConfig(threadId: tid, cwd: cwd, projectDocMaxBytes: 0)
+        _ = try await store.create(cfg)
+        let model = RecordingModelClient(MockModelClient([.hello("ok")]))
+        let engine = SessionEngine(config: cfg, model: model, store: store,
+                                   router: ToolRouter(limits: Limits()), limits: Limits())
+        await engine.start()
+        let collector = Task {
+            await collectHC(engine) {
+                if case .turnCompleted = $0 { return true }; return false
+            }
+        }
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
+        _ = await collector.value
+        let caps = await model.capturedRequests()
+        let allInput = caps[0].prompt.input.compactMap { p -> String? in
+            switch p {
+            case .userText(let s), .developerText(let s), .assistantText(let s): return s
+            case .toolOutput(_, let s): return s
+            case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
+            }
+        }.joined(separator: "\n")
+        XCTAssertFalse(allInput.contains("AGENTS-DOC-MARKER"),
+                       "projectDocMaxBytes=0 must disable AGENTS.md discovery")
+    }
+
+    /// prompts finding C control: a positive `projectDocMaxBytes` still reads
+    /// AGENTS.md (proving the disable above is the budget, not a missing file).
+    func testProjectDocMaxBytesPositiveReadsAgentsMd() async throws {
+        let (store, home) = try makeStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let cwd = tmp(); defer { try? FileManager.default.removeItem(atPath: cwd) }
+        try? FileManager.default.createDirectory(atPath: cwd + "/.git",
+                                                  withIntermediateDirectories: true)
+        try? "AGENTS-DOC-MARKER".write(toFile: cwd + "/AGENTS.md",
+                                       atomically: true, encoding: .utf8)
+        let tid = ThreadId.generate()
+        let cfg = SessionConfig(threadId: tid, cwd: cwd, projectDocMaxBytes: 32 * 1024)
+        _ = try await store.create(cfg)
+        let model = RecordingModelClient(MockModelClient([.hello("ok")]))
+        let engine = SessionEngine(config: cfg, model: model, store: store,
+                                   router: ToolRouter(limits: Limits()), limits: Limits())
+        await engine.start()
+        let collector = Task {
+            await collectHC(engine) {
+                if case .turnCompleted = $0 { return true }; return false
+            }
+        }
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
+        _ = await collector.value
+        let caps = await model.capturedRequests()
+        let allInput = caps[0].prompt.input.compactMap { p -> String? in
+            switch p {
+            case .userText(let s), .developerText(let s), .assistantText(let s): return s
+            case .toolOutput(_, let s): return s
+            case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
+            }
+        }.joined(separator: "\n")
+        XCTAssertTrue(allInput.contains("AGENTS-DOC-MARKER"),
+                      "positive projectDocMaxBytes must read AGENTS.md")
     }
 
     /// C9: when the user input contains `$SkillName`, the engine must read
@@ -143,7 +220,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
             }
         }
         await engine.submit(.startTurn(
-            input: [TurnInput(text: "please run $foo on the codebase")], model: nil))
+            input: [TurnInput(text: "please run $foo on the codebase")], model: nil, turnId: nil))
         _ = await collector.value
         let caps = await model.capturedRequests()
         XCTAssertFalse(caps.isEmpty)
@@ -151,6 +228,7 @@ final class SkillsAgentsMdParityTests: XCTestCase {
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
             case .toolOutput(_, let s): return s
+        case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
         XCTAssertTrue(allInput.contains("<skill>"),
@@ -205,13 +283,14 @@ final class SkillsAgentsMdParityTests: XCTestCase {
         // Note: `$PATH` is a common env var → must NOT trigger any injection
         // even if a skill happened to be called `PATH`.
         await engine.submit(.startTurn(
-            input: [TurnInput(text: "please look at $PATH; no real skill")], model: nil))
+            input: [TurnInput(text: "please look at $PATH; no real skill")], model: nil, turnId: nil))
         _ = await collector.value
         let caps = await model.capturedRequests()
         let allInput = caps[0].prompt.input.compactMap { p -> String? in
             switch p {
             case .userText(let s), .developerText(let s), .assistantText(let s): return s
             case .toolOutput(_, let s): return s
+        case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
         XCTAssertFalse(allInput.contains("DETAILED-FOO-BODY-MARKER"),

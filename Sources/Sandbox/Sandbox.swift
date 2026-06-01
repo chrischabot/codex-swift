@@ -121,6 +121,16 @@ public protocol Sandbox: Sendable {
     var spawnEnvironmentPolicy: SandboxEnvironmentPolicy { get }
     /// Exec policy (absolute-path requirement, optional allowlist).
     var spawnExecPolicy: SandboxExecPolicy { get }
+    /// Effective sandbox mode. Used by tool-registration sites to derive
+    /// `fullAccess` so that `dangerFullAccess` sessions skip checks intended
+    /// only for sandboxed execution (e.g. bare-name exec rejection). Default
+    /// returns `.workspaceWrite` for any conformer that does not override
+    /// this — the safe choice if the actual mode is unknown.
+    var mode: SandboxPolicy.Mode { get }
+}
+
+public extension Sandbox {
+    var mode: SandboxPolicy.Mode { .workspaceWrite }
 }
 
 public extension Sandbox {
@@ -158,10 +168,34 @@ public struct WorkspaceSandbox: Sandbox {
         // kernel sandbox is bypassed. Callers that genuinely need a raw env
         // can pass an opt-in `SandboxEnvironmentPolicy` that empties the
         // deny lists.
-        policy.environmentPolicy
+        var env = policy.environmentPolicy
+        // Sandboxing env vars (upstream `core/src/spawn.rs:78-80` +
+        // `core/src/sandboxing/mod.rs:133-142`). These are injected post-scrub
+        // by `SandboxEnvironmentPolicy.scrub()`.
+        //
+        // `CODEX_SANDBOX_NETWORK_DISABLED=1` is set whenever the network sandbox
+        // policy is not enabled (`!network_sandbox_policy.is_enabled()`). In the
+        // port the network gate is `policy.networkAllowed`.
+        //
+        // `CODEX_SANDBOX="seatbelt"` is set only when the macOS Seatbelt sandbox
+        // is actually applied: a non-`dangerFullAccess` mode (full-access
+        // bypasses confinement → upstream `SandboxType::None`) running on macOS
+        // with the `sandbox-exec` backend available.
+        if !policy.networkAllowed {
+            env.networkDisabled = true
+        }
+        #if os(macOS)
+        if policy.mode != .dangerFullAccess,
+           case .sandboxExec = backendResolver.resolve() {
+            env.injectedSandboxType = SandboxEnvironmentPolicy.macosSeatbeltSandboxTag
+        }
+        #endif
+        return env
     }
 
     public var spawnExecPolicy: SandboxExecPolicy { policy.execPolicy }
+
+    public var mode: SandboxPolicy.Mode { policy.mode }
 
     static func canonicalPath(_ path: String) -> String {
         if let resolved = path.withCString({ realpath($0, nil) }) {
@@ -350,10 +384,49 @@ public struct WorkspaceSandbox: Sandbox {
     /// `confinementProfile` instance method gates this to macOS at runtime.
     /// Mirrors upstream `codex_rs/sandboxing/src/seatbelt.rs` in spirit.
     static func buildSeatbeltProfile(policy: SandboxPolicy, cwd: String) -> String {
-        var lines = ["(version 1)", "(deny default)",
-                     "(allow process-fork)", "(allow process-exec)",
-                     "(allow file-read*)"]
-        if policy.mode == .workspaceWrite || policy.mode == .dangerFullAccess {
+        buildSeatbeltProfileWithParams(policy: policy, cwd: cwd).profile
+    }
+
+    /// Like ``buildSeatbeltProfile(policy:cwd:)`` but also returns the
+    /// out-of-band `-D` parameter definitions that the profile's
+    /// `(param "WRITABLE_ROOT_n")` references resolve against. Mirrors upstream
+    /// `create_seatbelt_command_args`, which emits the writable roots as
+    /// `(subpath (param "WRITABLE_ROOT_n"))` clauses and passes each concrete
+    /// path out-of-band as a `-DWRITABLE_ROOT_n=<path>` argv entry
+    /// (`seatbelt.rs:731-737`), instead of inlining the SBPL-escaped path into
+    /// the profile text. The returned `params` are `(key, value)` pairs;
+    /// callers append `-D<key>=<value>` entries to the sandbox-exec argv.
+    static func buildSeatbeltProfileWithParams(policy: SandboxPolicy, cwd: String)
+        -> (profile: String, params: [(String, String)])
+    {
+        // Upstream `seatbelt.rs` ALWAYS prepends `MACOS_SEATBELT_BASE_POLICY`,
+        // which supplies `(version 1)`, `(deny default)`, process-exec/fork,
+        // intra-sandbox signals/process-info, the permitted sysctl set, IOKit,
+        // opendirectoryd/cfprefsd mach-lookups, POSIX sem/shm, pty, and
+        // user-preference reads. Without it, a `(deny default)` child cannot
+        // run real commands (git/python/interactive shells break). We then add
+        // the broad read grant and the writable-root rules on top.
+        var lines = [SeatbeltPolicy.base, "(allow file-read*)"]
+        var params: [(String, String)] = []
+
+        // Parity F-5 / upstream `create_seatbelt_command_args` (seatbelt.rs:616-622):
+        // full-disk write access (danger-full-access with no excluded subpaths)
+        // grants a single whole-disk write rule rather than per-root subpaths.
+        // Although `sandboxedInvocation` bypasses the profile entirely for
+        // `.dangerFullAccess` today, the static generator must still match
+        // upstream so any caller that renders the profile (tests / future
+        // callers) gets the correct, non-over-restrictive policy.
+        if policy.mode == .dangerFullAccess {
+            lines.append(#"(allow file-write* (regex #"^/"))"#)
+            if policy.networkAllowed {
+                lines.append("(allow network-outbound)")
+                lines.append("(allow network-inbound)")
+                lines.append(SeatbeltPolicy.network)
+            }
+            return (lines.joined(separator: "\n"), params)
+        }
+
+        if policy.mode == .workspaceWrite {
             // Deduplicate writable roots after canonicalisation so we don't
             // emit redundant deny clauses for cwd ⊆ writableRoots.
             var seenRoots = Set<String>()
@@ -362,14 +435,18 @@ public struct WorkspaceSandbox: Sandbox {
                 let canonical = canonicalPath(r)
                 if seenRoots.insert(canonical).inserted {
                     orderedRoots.append(canonical)
+                    let key = "WRITABLE_ROOT_\(params.count)"
+                    params.append((key, canonical))
+                    lines.append("(allow file-write* (subpath (param \"\(key)\")))")
                 }
-                lines.append("(allow file-write* (subpath \(sbplStringLiteral(canonical))))")
             }
             let canonicalCwd = canonicalPath(cwd)
             if seenRoots.insert(canonicalCwd).inserted {
                 orderedRoots.append(canonicalCwd)
+                let key = "WRITABLE_ROOT_\(params.count)"
+                params.append((key, canonicalCwd))
+                lines.append("(allow file-write* (subpath (param \"\(key)\")))")
             }
-            lines.append("(allow file-write* (subpath \(sbplStringLiteral(canonicalCwd))))")
 
             // Parity H-23: even inside a writable root, the top-level
             // `.git`, `.codex`, and `.agents` directories must remain
@@ -383,6 +460,18 @@ public struct WorkspaceSandbox: Sandbox {
             // time the user (or another sandboxed process) runs `git commit`,
             // or to rewrite `.codex/config.toml` to disable the sandbox for
             // future invocations.
+            //
+            // INTENTIONAL DIVERGENCE (sandbox-safety-policy Finding 6, minor):
+            // upstream `protected_metadata_names_for_writable_root`
+            // (sandboxing/src/seatbelt.rs:406-422) only protects a metadata
+            // name when `!can_write_path_with_cwd(root/name, cwd)`, i.e. a
+            // profile that EXPLICITLY grants write to `.git`/`.codex`/`.agents`
+            // keeps it writable. The Swift `SandboxPolicy` cannot express such
+            // a per-root explicit metadata write grant, so the protected-
+            // metadata deny is UNCONDITIONAL here. For the default profile
+            // (which always protects these) the behaviour is identical; this is
+            // a deliberate always-protect hardening, only diverging for the
+            // unsupported explicit-metadata-write-grant case.
             if policy.mode == .workspaceWrite {
                 for root in orderedRoots {
                     for name in protectedMetadataNames {
@@ -403,19 +492,100 @@ public struct WorkspaceSandbox: Sandbox {
                 }
             }
         }
-        if policy.networkAllowed { lines.append("(allow network*)") }
-        return lines.joined(separator: "\n")
+        if policy.networkAllowed {
+            // Upstream emits `(allow network-outbound)`/`(allow network-inbound)`
+            // and then appends `MACOS_SEATBELT_NETWORK_POLICY` (the restricted
+            // AF_SYSTEM system-socket grant + SecurityServer/networkd/ocspd/
+            // trustd/DNS mach-lookups + net.routetable sysctls). This is both
+            // broader where needed (TLS/DNS resolution under `(deny default)`)
+            // and tighter than a blanket `(allow network*)` (which would permit
+            // raw system sockets upstream denies).
+            //
+            // INTENTIONAL SUBSYSTEM GAP (audit sandbox-safety-policy, Finding 2):
+            // upstream `dynamic_network_policy_for_network`
+            // (sandboxing/src/seatbelt.rs:257-319) ALSO has a *restricted*,
+            // proxy-routed branch that the Swift port does not reproduce because
+            // it has no managed-network / NetworkProxy subsystem. When a proxy
+            // is configured (loopback ports / has_proxy_config /
+            // enforce_managed_network) upstream instead emits:
+            //   (a) an optional `(allow network-bind (local ip "*:*"))`
+            //       loopback-bind grant,
+            //   (b) per-port loopback allows
+            //       `(allow network-outbound (remote ip "localhost:<port>"))`,
+            //   (c) a DNS carveout `*:53`,
+            //   (d) unix-socket subpath rules,
+            // and FAILS CLOSED (returns an empty network policy → no network
+            // grant) when a proxy is configured but no loopback endpoint can be
+            // inferred. Only the no-proxy enabled case emits the broad
+            // `(allow network-outbound)`/`(allow network-inbound)` reproduced
+            // here, which is correct for the non-proxy-managed modes the port
+            // supports today. When/if the managed-network proxy is ported in a
+            // future wave, extend this branch to reproduce that restricted
+            // policy (a)-(d) + fail-closed behaviour.
+            lines.append("(allow network-outbound)")
+            lines.append("(allow network-inbound)")
+            lines.append(SeatbeltPolicy.network)
+        }
+
+        // Parity with upstream `seatbelt.rs:708,718-720`: when the filesystem
+        // policy requests the `:minimal` readable special-path, append the
+        // platform-defaults SBPL fragment (system framework/dylib read+map,
+        // /tmp scratch, dev nodes, logging/trust mach services). Gated on
+        // `includePlatformDefaults(policy:)`, which mirrors upstream
+        // `FileSystemSandboxPolicy::include_platform_defaults()`
+        // (protocol/src/permissions.rs:635-646). The Swift `SandboxPolicy.Mode`
+        // enum cannot express `:minimal` today, so this is currently inert; the
+        // fragment + wiring are reproduced so the grants match upstream exactly
+        // once a `:minimal` readable-root concept is introduced.
+        if includePlatformDefaults(policy: policy) {
+            lines.append(SeatbeltPolicy.restrictedReadOnlyPlatformDefaults)
+        }
+        return (lines.joined(separator: "\n"), params)
     }
 
-    /// macOS Seatbelt profile (SBPL). This is the real profile text Codex's
+    /// Mirrors upstream `FileSystemSandboxPolicy::include_platform_defaults()`
+    /// (protocol/src/permissions.rs:635-646): true iff the filesystem policy is
+    /// `Restricted`, does NOT grant full-disk read, AND has at least one
+    /// readable entry whose special path is `:minimal`.
+    ///
+    /// The Swift `SandboxPolicy.Mode` enum (`readOnly`/`workspaceWrite`/
+    /// `dangerFullAccess`) has no `:minimal` readable special-path, so the
+    /// "any readable `:minimal` entry" predicate is never satisfied and this
+    /// returns false for every mode the port can express. It is wired through
+    /// `buildSeatbeltProfileWithParams` so that introducing a `:minimal`
+    /// readable-root concept automatically pulls in the platform-default grants
+    /// exactly as upstream does. `dangerFullAccess` is also excluded as a
+    /// full-disk-read mode (matching `has_full_disk_read_access()`).
+    static func includePlatformDefaults(policy: SandboxPolicy) -> Bool {
+        // `dangerFullAccess` == unrestricted reads → upstream's
+        // `has_full_disk_read_access()` is true → no platform defaults.
+        if policy.mode == .dangerFullAccess { return false }
+        // No `SandboxPolicy` representation expresses a `:minimal` readable
+        // special-path entry, so the upstream `any(... Minimal && can_read)`
+        // predicate is unsatisfiable for the modes the port supports today.
+        return false
+    }
+
+    /// macOS Seatbelt profile (SBPL) plus the `-D` parameter definitions it
+    /// references. This is the real profile text Codex's
     /// `sandboxing/seatbelt.rs` emits in spirit; applying it to the child is
     /// the platform-completion step.
-    public func confinementProfile(cwd: String) -> String? {
+    public func confinementProfileWithParams(cwd: String)
+        -> (profile: String, params: [(String, String)])?
+    {
         #if os(macOS)
-        return Self.buildSeatbeltProfile(policy: policy, cwd: cwd)
+        return Self.buildSeatbeltProfileWithParams(policy: policy, cwd: cwd)
         #else
         return nil
         #endif
+    }
+
+    /// Convenience wrapper returning just the SBPL profile text. NOTE: the
+    /// profile references `(param "WRITABLE_ROOT_n")` which must be resolved by
+    /// the matching `-D` definitions from
+    /// ``confinementProfileWithParams(cwd:)`` when invoking sandbox-exec.
+    public func confinementProfile(cwd: String) -> String? {
+        confinementProfileWithParams(cwd: cwd)?.profile
     }
 
     /// Build the bwrap argv for a given policy. Exposed as a static helper so
@@ -475,10 +645,22 @@ public struct WorkspaceSandbox: Sandbox {
         #if os(macOS)
         switch backend {
         case .sandboxExec(let sandboxExec):
-            guard let profile = confinementProfile(cwd: cwd) else {
+            guard let (profile, params) = confinementProfileWithParams(cwd: cwd) else {
                 return .deny("macOS Seatbelt profile unavailable; refusing to run unsandboxed under \(policy.mode.rawValue) policy")
             }
-            return .run([sandboxExec, "-p", profile] + argv)
+            // Mirror upstream `create_seatbelt_command_args`
+            // (seatbelt.rs:731-739): `-p <policy>` followed by one
+            // `-DWRITABLE_ROOT_n=<path>` entry per writable-root param, then
+            // `--` and the command. Passing the path out-of-band via `-D`
+            // (rather than inlining the SBPL-escaped path in the profile)
+            // avoids escaping-divergence edge cases for unusual paths.
+            var invocation = [sandboxExec, "-p", profile]
+            for (key, value) in params {
+                invocation.append("-D\(key)=\(value)")
+            }
+            invocation.append("--")
+            invocation.append(contentsOf: argv)
+            return .run(invocation)
         case .unavailable(let reason):
             return .deny(reason + " under \(policy.mode.rawValue) policy")
         case .bubblewrap:

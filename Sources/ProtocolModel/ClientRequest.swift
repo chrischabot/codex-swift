@@ -1,6 +1,22 @@
 import Foundation
 import WireProtocol
 
+/// Upstream `v1::ClientInfo` (app-server-protocol/src/protocol/v1.rs:37-41):
+/// `{ name: String, title: Option<String>, version: String }` — `version` is a
+/// REQUIRED (non-Option) field upstream, so a strictly-conformant server
+/// rejects an `initialize` whose `clientInfo` omits `version`.
+///
+/// DELIBERATE PORT DIVERGENCE (Finding 3, protocol-wire-types): the Swift port
+/// keeps `version` OPTIONAL here. This is decode laxness only — a conformant
+/// client always sends `version`, and the field is never re-emitted by the
+/// server (the server reflects only `clientInfo.name` into `InitializeResult`).
+/// Making it required would reject `initialize` for the large body of in-tree
+/// integration/E2E clients that intentionally probe the handshake with a
+/// minimal `{"clientInfo":{"name":"…"}}` (RequestRouter rejects a failed
+/// `initialize` parse with `invalid_request`, leaving the connection
+/// uninitialized — every downstream request then fails). The port treats the
+/// missing-version handshake as tolerated rather than fatal; tightening it is a
+/// no-fidelity-gain, high-regression change, so it is documented here instead.
 public struct ClientInfo: Sendable, Codable, Equatable {
     public var name: String
     public var title: String?
@@ -44,9 +60,10 @@ public struct ThreadSummary: Sendable, Codable, Equatable {
     public var status: JSONValue
     public var turns: [JSONValue]
     public var gitInfo: JSONValue?
+    public var pinned: Bool
     enum CodingKeys: String, CodingKey {
         case id, sessionId, preview, modelProvider, cliVersion, cwd, createdAt,
-             updatedAt, ephemeral, name, source, status, turns, gitInfo
+             updatedAt, ephemeral, name, source, status, turns, gitInfo, pinned
     }
     public init(id: ThreadId, preview: String = "", modelProvider: String = "openai",
                 createdAt: Int64, updatedAt: Int64? = nil, ephemeral: Bool = false,
@@ -54,7 +71,7 @@ public struct ThreadSummary: Sendable, Codable, Equatable {
                 sessionId: String? = nil, cliVersion: String = "CodexKit/0.1",
                 source: JSONValue = .string("appServer"),
                 status: JSONValue = .object(["type": .string("idle")]),
-                turns: [JSONValue] = [], gitInfo: JSONValue? = nil) {
+                turns: [JSONValue] = [], gitInfo: JSONValue? = nil, pinned: Bool = false) {
         self.id = id; self.sessionId = sessionId ?? id.raw
         self.preview = preview; self.modelProvider = modelProvider
         self.cliVersion = cliVersion; self.cwd = cwd
@@ -63,6 +80,7 @@ public struct ThreadSummary: Sendable, Codable, Equatable {
         self.name = name
         self.source = source; self.status = status; self.turns = turns
         self.gitInfo = gitInfo
+        self.pinned = pinned
     }
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -81,6 +99,7 @@ public struct ThreadSummary: Sendable, Codable, Equatable {
             ?? .object(["type": .string("idle")])
         turns = try c.decodeIfPresent([JSONValue].self, forKey: .turns) ?? []
         gitInfo = try c.decodeIfPresent(JSONValue.self, forKey: .gitInfo)
+        pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
     }
 }
 
@@ -102,11 +121,62 @@ public struct ThreadStartParams: Sendable, Codable, Equatable {
     public var config: JSONValue?
     public var sandbox: String?
     public var serviceName: String?
-    public var serviceTier: String?
+    /// Upstream `ThreadStartParams.service_tier: Option<Option<String>>`
+    /// (app-server-protocol/v2/thread.rs:106) with `deserialize_double_option`
+    /// / `serialize_double_option` + `skip_serializing_if = Option::is_none`.
+    /// Three-state: `.none` = field absent (inherit), `.some(nil)` = explicit
+    /// `null` (clear/override to no tier), `.some(value)` = set tier.
+    public var serviceTier: String??
     public var sessionStartSource: String?
     public var threadSource: String?
     public init(cwd: String? = nil, model: String? = nil, ephemeral: Bool? = nil) {
         self.cwd = cwd; self.model = model; self.ephemeral = ephemeral
+    }
+    enum CodingKeys: String, CodingKey {
+        case cwd, environments, model, modelProvider, ephemeral, personality,
+             developerInstructions, baseInstructions, approvalPolicy,
+             approvalsReviewer, config, sandbox, serviceName, serviceTier,
+             sessionStartSource, threadSource
+    }
+    public init(from d: any Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        environments = try c.decodeIfPresent([EnvironmentParams].self, forKey: .environments)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        modelProvider = try c.decodeIfPresent(String.self, forKey: .modelProvider)
+        ephemeral = try c.decodeIfPresent(Bool.self, forKey: .ephemeral)
+        personality = try c.decodeIfPresent(String.self, forKey: .personality)
+        developerInstructions = try c.decodeIfPresent(String.self, forKey: .developerInstructions)
+        baseInstructions = try c.decodeIfPresent(String.self, forKey: .baseInstructions)
+        approvalPolicy = try c.decodeIfPresent(JSONValue.self, forKey: .approvalPolicy)
+        approvalsReviewer = try c.decodeIfPresent(String.self, forKey: .approvalsReviewer)
+        config = try c.decodeIfPresent(JSONValue.self, forKey: .config)
+        sandbox = try c.decodeIfPresent(String.self, forKey: .sandbox)
+        serviceName = try c.decodeIfPresent(String.self, forKey: .serviceName)
+        if c.contains(.serviceTier) {
+            serviceTier = .some(try c.decodeIfPresent(String.self, forKey: .serviceTier))
+        } else { serviceTier = .none }
+        sessionStartSource = try c.decodeIfPresent(String.self, forKey: .sessionStartSource)
+        threadSource = try c.decodeIfPresent(String.self, forKey: .threadSource)
+    }
+    public func encode(to e: any Encoder) throws {
+        var c = e.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(cwd, forKey: .cwd)
+        try c.encodeIfPresent(environments, forKey: .environments)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(modelProvider, forKey: .modelProvider)
+        try c.encodeIfPresent(ephemeral, forKey: .ephemeral)
+        try c.encodeIfPresent(personality, forKey: .personality)
+        try c.encodeIfPresent(developerInstructions, forKey: .developerInstructions)
+        try c.encodeIfPresent(baseInstructions, forKey: .baseInstructions)
+        try c.encodeIfPresent(approvalPolicy, forKey: .approvalPolicy)
+        try c.encodeIfPresent(approvalsReviewer, forKey: .approvalsReviewer)
+        try c.encodeIfPresent(config, forKey: .config)
+        try c.encodeIfPresent(sandbox, forKey: .sandbox)
+        try c.encodeIfPresent(serviceName, forKey: .serviceName)
+        if case .some(let v) = serviceTier { try c.encode(v, forKey: .serviceTier) }
+        try c.encodeIfPresent(sessionStartSource, forKey: .sessionStartSource)
+        try c.encodeIfPresent(threadSource, forKey: .threadSource)
     }
 }
 public struct ThreadResumeParams: Sendable, Codable, Equatable {
@@ -121,7 +191,49 @@ public struct ThreadResumeParams: Sendable, Codable, Equatable {
     public var modelProvider: String?
     public var personality: String?
     public var sandbox: String?
-    public var serviceTier: String?
+    /// Upstream `ThreadResumeParams.service_tier: Option<Option<String>>`
+    /// (app-server-protocol/v2/thread.rs:267) with `deserialize_double_option`
+    /// / `serialize_double_option` + `skip_serializing_if = Option::is_none`.
+    /// Three-state: `.none` = absent (inherit), `.some(nil)` = explicit `null`
+    /// (clear/override), `.some(value)` = set tier.
+    public var serviceTier: String??
+    enum CodingKeys: String, CodingKey {
+        case threadId, approvalPolicy, approvalsReviewer, baseInstructions,
+             config, cwd, developerInstructions, model, modelProvider,
+             personality, sandbox, serviceTier
+    }
+    public init(from d: any Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        threadId = try c.decode(ThreadId.self, forKey: .threadId)
+        approvalPolicy = try c.decodeIfPresent(JSONValue.self, forKey: .approvalPolicy)
+        approvalsReviewer = try c.decodeIfPresent(String.self, forKey: .approvalsReviewer)
+        baseInstructions = try c.decodeIfPresent(String.self, forKey: .baseInstructions)
+        config = try c.decodeIfPresent(JSONValue.self, forKey: .config)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        developerInstructions = try c.decodeIfPresent(String.self, forKey: .developerInstructions)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        modelProvider = try c.decodeIfPresent(String.self, forKey: .modelProvider)
+        personality = try c.decodeIfPresent(String.self, forKey: .personality)
+        sandbox = try c.decodeIfPresent(String.self, forKey: .sandbox)
+        if c.contains(.serviceTier) {
+            serviceTier = .some(try c.decodeIfPresent(String.self, forKey: .serviceTier))
+        } else { serviceTier = .none }
+    }
+    public func encode(to e: any Encoder) throws {
+        var c = e.container(keyedBy: CodingKeys.self)
+        try c.encode(threadId, forKey: .threadId)
+        try c.encodeIfPresent(approvalPolicy, forKey: .approvalPolicy)
+        try c.encodeIfPresent(approvalsReviewer, forKey: .approvalsReviewer)
+        try c.encodeIfPresent(baseInstructions, forKey: .baseInstructions)
+        try c.encodeIfPresent(config, forKey: .config)
+        try c.encodeIfPresent(cwd, forKey: .cwd)
+        try c.encodeIfPresent(developerInstructions, forKey: .developerInstructions)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(modelProvider, forKey: .modelProvider)
+        try c.encodeIfPresent(personality, forKey: .personality)
+        try c.encodeIfPresent(sandbox, forKey: .sandbox)
+        if case .some(let v) = serviceTier { try c.encode(v, forKey: .serviceTier) }
+    }
 }
 public struct ThreadListParams: Sendable, Codable, Equatable {
     public var cursor: String?
@@ -186,7 +298,55 @@ public struct TurnInput: Sendable, Codable, Equatable {
     public var url: String?
     public var path: String?
     public var name: String?
-    public init(text: String) { self.type = "text"; self.text = text }
+    /// Image fidelity for the `image` / `localImage` variants
+    /// (upstream `UserInput::Image/LocalImage { detail: Option<ImageDetail> }`,
+    /// `#[serde(default)]` + `#[ts(optional)]`). Threaded through to the model
+    /// input builder; omitted from the wire when absent and never present on
+    /// the `text` variant.
+    public var detail: ImageDetail?
+    /// UI-defined spans within `text` (upstream `UserInput::Text {
+    /// text_elements: Vec<TextElement> }`, `#[serde(default)]`). Present only
+    /// on the `text` variant; defaults to `[]` on decode.
+    public var textElements: [TextElement]
+    public init(text: String) {
+        self.type = "text"; self.text = text; self.textElements = []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type, text, url, path, name, detail
+        // Upstream `UserInput::Text { text_elements }` keeps snake_case on the
+        // wire (struct-variant field; enum `rename_all` does not touch it) —
+        // generated TS binding `text_elements: Array<TextElement>`.
+        case textElements = "text_elements"
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(type, forKey: .type)
+        try c.encodeIfPresent(text, forKey: .text)
+        try c.encodeIfPresent(url, forKey: .url)
+        try c.encodeIfPresent(path, forKey: .path)
+        try c.encodeIfPresent(name, forKey: .name)
+        // Upstream only the `Text` variant carries `text_elements` (always
+        // emitted, never skipped). Other variants omit it. `detail` lives
+        // only on the image / localImage variants (`#[ts(optional)]` →
+        // omitted when absent).
+        if type == "text" {
+            try c.encode(textElements, forKey: .textElements)
+        } else {
+            try c.encodeIfPresent(detail, forKey: .detail)
+        }
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = try c.decode(String.self, forKey: .type)
+        self.text = try c.decodeIfPresent(String.self, forKey: .text)
+        self.url = try c.decodeIfPresent(String.self, forKey: .url)
+        self.path = try c.decodeIfPresent(String.self, forKey: .path)
+        self.name = try c.decodeIfPresent(String.self, forKey: .name)
+        // `text_elements` is `#[serde(default)]` upstream → default [] when absent.
+        self.textElements = (try? c.decodeIfPresent([TextElement].self, forKey: .textElements)) ?? [] ?? []
+        self.detail = try? c.decodeIfPresent(ImageDetail.self, forKey: .detail) ?? nil
+    }
 }
 public struct TurnStartParams: Sendable, Codable, Equatable {
     public struct EnvironmentParams: Sendable, Codable, Equatable {
@@ -204,8 +364,77 @@ public struct TurnStartParams: Sendable, Codable, Equatable {
     public var effort: String?
     public var outputSchema: JSONValue?
     public var sandboxPolicy: JSONValue?
-    public var serviceTier: String?
+    /// Upstream `TurnStartParams.service_tier: Option<Option<String>>`
+    /// (app-server-protocol/v2/turn.rs:103) with `deserialize_double_option`
+    /// / `serialize_double_option` + `skip_serializing_if = Option::is_none`.
+    /// Three-state: `.none` = absent (inherit), `.some(nil)` = explicit `null`
+    /// (clear/override), `.some(value)` = set tier.
+    public var serviceTier: String??
     public var summary: String?
+    /// Optional turn-scoped Responses API client metadata. Experimental wire
+    /// field `turn/start.responsesapiClientMetadata` (upstream
+    /// v2/turn.rs:50-57). Round-tripped so it survives decode/re-encode even
+    /// though the engine does not yet honor the override.
+    public var responsesapiClientMetadata: [String: String]?
+    /// Replace the thread's runtime workspace roots for this turn. Experimental
+    /// wire field `turn/start.runtimeWorkspaceRoots` (upstream v2/turn.rs:67-71).
+    public var runtimeWorkspaceRoots: [String]?
+    /// Named permissions-profile selection for this turn. Experimental wire
+    /// field `turn/start.permissions` (upstream v2/turn.rs:85-92), serialized as
+    /// `string | null`.
+    public var permissions: String?
+    /// Pre-set collaboration mode. Experimental wire field
+    /// `turn/start.collaborationMode` (upstream v2/turn.rs:118-125). Modeled as
+    /// a raw JSON value for round-tripping.
+    public var collaborationMode: JSONValue?
+    enum CodingKeys: String, CodingKey {
+        case threadId, input, environments, model, personality, approvalPolicy,
+             approvalsReviewer, cwd, effort, outputSchema, sandboxPolicy,
+             serviceTier, summary, responsesapiClientMetadata,
+             runtimeWorkspaceRoots, permissions, collaborationMode
+    }
+    public init(from d: any Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        threadId = try c.decode(ThreadId.self, forKey: .threadId)
+        input = try c.decode([TurnInput].self, forKey: .input)
+        environments = try c.decodeIfPresent([EnvironmentParams].self, forKey: .environments)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        personality = try c.decodeIfPresent(String.self, forKey: .personality)
+        approvalPolicy = try c.decodeIfPresent(JSONValue.self, forKey: .approvalPolicy)
+        approvalsReviewer = try c.decodeIfPresent(String.self, forKey: .approvalsReviewer)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        effort = try c.decodeIfPresent(String.self, forKey: .effort)
+        outputSchema = try c.decodeIfPresent(JSONValue.self, forKey: .outputSchema)
+        sandboxPolicy = try c.decodeIfPresent(JSONValue.self, forKey: .sandboxPolicy)
+        if c.contains(.serviceTier) {
+            serviceTier = .some(try c.decodeIfPresent(String.self, forKey: .serviceTier))
+        } else { serviceTier = .none }
+        summary = try c.decodeIfPresent(String.self, forKey: .summary)
+        responsesapiClientMetadata = try c.decodeIfPresent([String: String].self, forKey: .responsesapiClientMetadata)
+        runtimeWorkspaceRoots = try c.decodeIfPresent([String].self, forKey: .runtimeWorkspaceRoots)
+        permissions = try c.decodeIfPresent(String.self, forKey: .permissions)
+        collaborationMode = try c.decodeIfPresent(JSONValue.self, forKey: .collaborationMode)
+    }
+    public func encode(to e: any Encoder) throws {
+        var c = e.container(keyedBy: CodingKeys.self)
+        try c.encode(threadId, forKey: .threadId)
+        try c.encode(input, forKey: .input)
+        try c.encodeIfPresent(environments, forKey: .environments)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(personality, forKey: .personality)
+        try c.encodeIfPresent(approvalPolicy, forKey: .approvalPolicy)
+        try c.encodeIfPresent(approvalsReviewer, forKey: .approvalsReviewer)
+        try c.encodeIfPresent(cwd, forKey: .cwd)
+        try c.encodeIfPresent(effort, forKey: .effort)
+        try c.encodeIfPresent(outputSchema, forKey: .outputSchema)
+        try c.encodeIfPresent(sandboxPolicy, forKey: .sandboxPolicy)
+        if case .some(let v) = serviceTier { try c.encode(v, forKey: .serviceTier) }
+        try c.encodeIfPresent(summary, forKey: .summary)
+        try c.encodeIfPresent(responsesapiClientMetadata, forKey: .responsesapiClientMetadata)
+        try c.encodeIfPresent(runtimeWorkspaceRoots, forKey: .runtimeWorkspaceRoots)
+        try c.encodeIfPresent(permissions, forKey: .permissions)
+        try c.encodeIfPresent(collaborationMode, forKey: .collaborationMode)
+    }
 }
 public struct TurnInterruptParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId
@@ -214,7 +443,19 @@ public struct TurnInterruptParams: Sendable, Codable, Equatable {
 public struct TurnSteerParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId
     public var input: [TurnInput]
+    /// Optional turn-scoped Responses API client metadata. Experimental wire
+    /// field `turn/steer.responsesapiClientMetadata` (gated when the connection
+    /// did not negotiate `experimentalApi`). Omitted from the wire when nil.
+    public var responsesapiClientMetadata: [String: String]?
+    /// Required active-turn-id precondition. The request fails when it does not
+    /// match the currently active turn.
     public var expectedTurnId: TurnId
+}
+/// Mirrors upstream `TurnSteerResponse { turn_id }` (v2/turn.rs:155). Encodes
+/// to `{"turnId": "<id>"}`.
+public struct TurnSteerResponse: Sendable, Codable, Equatable {
+    public var turnId: TurnId
+    public init(turnId: TurnId) { self.turnId = turnId }
 }
 public struct ReviewStartParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId
@@ -227,19 +468,131 @@ public struct ReviewStartParams: Sendable, Codable, Equatable {
         return object["instructions"]?.stringValue
     }
 
-    public var reviewInput: [TurnInput] {
-        if let instructions = reviewInstructions {
-            return [TurnInput(text: instructions)]
-        }
-        return [TurnInput(text: "Review target: \(target)")]
+    /// True when `target` is a custom review whose instructions are
+    /// missing/empty/whitespace-only. Upstream `review_prompt`
+    /// (review_prompts.rs:88-94) `anyhow::bail!("Review prompt cannot be
+    /// empty")` for this case; the router rejects the request with
+    /// `-32600` rather than silently substituting another prompt.
+    public var customReviewIsEmpty: Bool {
+        guard case .object(let o) = target,
+              o["type"]?.stringValue == "custom" else { return false }
+        let trimmed = (o["instructions"]?.stringValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty
     }
+
+    /// The user-facing hint describing the review TARGET (not the model
+    /// prompt). Faithful port of upstream `review_prompts::user_facing_hint`
+    /// (core/src/review_prompts.rs:107-121): "current changes" for
+    /// uncommitted-changes; "changes against '<branch>'" for a base-branch
+    /// review; "commit <7-char-sha>[: <title>]" for a commit review; the
+    /// trimmed instructions for a custom review. Used as the
+    /// `EnteredReviewMode` item's `review` field, matching
+    /// `bespoke_event_handling.rs:944-951`
+    /// (`user_facing_hint.unwrap_or_else(|| review_prompts::user_facing_hint(target))`).
+    public var userFacingHint: String {
+        guard case .object(let o) = target else { return "current changes" }
+        switch o["type"]?.stringValue {
+        case "baseBranch":
+            let branch = o["branch"]?.stringValue ?? ""
+            return "changes against '\(branch)'"
+        case "commit":
+            let sha = o["sha"]?.stringValue ?? ""
+            let shortSha = String(sha.prefix(7))
+            if let title = o["title"]?.stringValue, !title.isEmpty {
+                return "commit \(shortSha): \(title)"
+            }
+            return "commit \(shortSha)"
+        case "custom":
+            return (o["instructions"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        case "uncommittedChanges", .none:
+            return "current changes"
+        default:
+            return "current changes"
+        }
+    }
+
+    /// Resolve the review-task USER PROMPT from the `ReviewTarget`
+    /// (upstream `review_prompt()` in core/src/review_prompts.rs). The
+    /// base-branch case prefers the primary merge-base-SHA prompt when the host
+    /// has resolved a merge base (`mergeBaseSha`), and otherwise renders the
+    /// BACKUP template (which tells the model to compute the merge base
+    /// itself), exactly mirroring `review_prompt`'s `merge_base_with_head`
+    /// branch. Falls back to the uncommitted-changes prompt for an
+    /// unknown/missing target type — never a JSON debug dump.
+    public var reviewInput: [TurnInput] {
+        [TurnInput(text: resolvedReviewPrompt)]
+    }
+
+    /// The base-branch name when `target` is a base-branch review, else nil.
+    /// Lets the host (RequestRouter) decide whether to resolve a merge base
+    /// before rendering the prompt.
+    public var baseBranchTarget: String? {
+        guard case .object(let o) = target,
+              o["type"]?.stringValue == "baseBranch" else { return nil }
+        return o["branch"]?.stringValue ?? ""
+    }
+
+    public var resolvedReviewPrompt: String {
+        reviewPrompt(mergeBaseSha: nil)
+    }
+
+    /// Render the review prompt. When `target` is a base-branch review and a
+    /// `mergeBaseSha` is supplied (host resolved `git merge-base HEAD <branch>`
+    /// successfully), render the primary `BASE_BRANCH_PROMPT` with the SHA
+    /// substituted; otherwise render the BACKUP form. Mirrors upstream
+    /// `review_prompt` (core/src/review_prompts.rs:60-73).
+    public func reviewPrompt(mergeBaseSha: String?) -> String {
+        guard case .object(let o) = target else { return Self.uncommittedPrompt }
+        switch o["type"]?.stringValue {
+        case "custom":
+            // Upstream `review_prompt` (review_prompts.rs:88-94) trims the
+            // custom instructions and `anyhow::bail!`s on an empty/whitespace
+            // result. This non-throwing accessor returns the trimmed string;
+            // emptiness is surfaced to the caller via `customReviewIsEmpty`
+            // (the router rejects the request before submitting a turn).
+            return (o["instructions"]?.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        case "baseBranch":
+            let branch = o["branch"]?.stringValue ?? ""
+            if let sha = mergeBaseSha, !sha.isEmpty {
+                return Self.baseBranchPrompt
+                    .replacingOccurrences(of: "{{base_branch}}", with: branch)
+                    .replacingOccurrences(of: "{{merge_base_sha}}", with: sha)
+            }
+            return Self.baseBranchBackupPrompt.replacingOccurrences(of: "{{branch}}", with: branch)
+        case "commit":
+            let sha = o["sha"]?.stringValue ?? ""
+            if let title = o["title"]?.stringValue, !title.isEmpty {
+                return "Review the code changes introduced by commit \(sha) (\"\(title)\"). Provide prioritized, actionable findings."
+            }
+            return "Review the code changes introduced by commit \(sha). Provide prioritized, actionable findings."
+        case "uncommittedChanges", .none:
+            return Self.uncommittedPrompt
+        default:
+            return Self.uncommittedPrompt
+        }
+    }
+
+    static let uncommittedPrompt =
+        "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings."
+    static let baseBranchBackupPrompt =
+        "Review the code changes against the base branch '{{branch}}'. Start by finding the merge diff between the current branch and {{branch}}'s upstream e.g. (`git merge-base HEAD \"$(git rev-parse --abbrev-ref \"{{branch}}@{upstream}\")\"`), then run `git diff` against that SHA to see what changes we would merge into the {{branch}} branch. Provide prioritized, actionable findings."
+    /// Upstream primary `BASE_BRANCH_PROMPT` (review_prompts.rs): used once the
+    /// host has resolved the merge-base SHA via `git merge-base HEAD <branch>`.
+    static let baseBranchPrompt =
+        "Review the code changes against the base branch '{{base_branch}}'. The merge base commit for this comparison is {{merge_base_sha}}. Run `git diff {{merge_base_sha}}` to inspect the changes relative to {{base_branch}}. Provide prioritized, actionable findings."
 }
 
 /// The complete typed client-request union. Every Codex app-server method is
 /// represented: high-traffic / harness-backed methods are typed; the
 /// peripheral & experimental long-tail is carried by `.generic` (still
 /// dispatched with a wire-correct response — never `-32601`). `.unsupported`
-/// is reserved for methods that are not part of the Codex protocol at all.
+/// is reserved for methods that are not part of the Codex protocol at all;
+/// the router answers those with `-32600` (Invalid request), mirroring
+/// upstream's `serde_json::from_value::<ClientRequest>` deserialization
+/// failure (app-server/src/message_processor.rs:536-541) — NOT `-32601`.
 public enum ClientRequest: Sendable {
     case initialize(RequestId, InitializeParams)
     case threadStart(RequestId, ThreadStartParams)
@@ -249,6 +602,9 @@ public enum ClientRequest: Sendable {
     case threadUnarchive(RequestId, ThreadUnarchiveParams)
     case threadUnsubscribe(RequestId, ThreadUnsubscribeParams)
     case threadSetName(RequestId, ThreadSetNameParams)
+    case threadPinSet(RequestId, ThreadPinSetParams)
+    case gitAction(RequestId, GitActionParams)
+    case automationAction(RequestId, AutomationActionParams)
     case threadList(RequestId, ThreadListParams)
     case threadLoadedList(RequestId, ThreadLoadedListParams)
     case threadRead(RequestId, ThreadReadParams)
@@ -281,13 +637,16 @@ public enum ClientRequest: Sendable {
     /// A known Codex method with no dedicated typed handler yet; the router
     /// answers it with a wire-correct default response for that method.
     case generic(RequestId, method: String, params: JSONValue?)
-    /// Not a Codex protocol method at all → exact `-32601`.
+    /// Not a Codex protocol method at all. The router rejects it with
+    /// `-32600` (Invalid request), matching upstream's deserialization-failure
+    /// path; upstream emits `-32601` only from specific known-but-reserved
+    /// handlers, never for unknown method tags.
     case unsupported(RequestId, method: String)
 
     public static let typedMethods: Set<String> = [
         "initialize",
         "thread/start", "thread/resume", "thread/fork", "thread/archive",
-        "thread/unarchive", "thread/unsubscribe", "thread/name/set",
+        "thread/unarchive", "thread/unsubscribe", "thread/name/set", "thread/pin/set", "git/action", "automation/action",
         "thread/list", "thread/loaded/list", "thread/read",
         "thread/turns/list", "thread/turns/items/list", "thread/inject_items",
         "thread/rollback", "thread/compact/start", "thread/shellCommand",
@@ -304,7 +663,7 @@ public enum ClientRequest: Sendable {
         switch self {
         case .initialize(let i, _), .threadStart(let i, _), .threadResume(let i, _),
              .threadFork(let i, _), .threadArchive(let i, _), .threadUnarchive(let i, _),
-             .threadUnsubscribe(let i, _), .threadSetName(let i, _), .threadList(let i, _),
+             .threadUnsubscribe(let i, _), .threadSetName(let i, _), .threadPinSet(let i, _), .gitAction(let i, _), .automationAction(let i, _), .threadList(let i, _),
              .threadLoadedList(let i, _), .threadRead(let i, _), .threadTurnsList(let i, _),
              .threadTurnsItemsList(let i, _), .threadInjectItems(let i, _),
              .threadRollback(let i, _), .threadCompactStart(let i, _),
@@ -333,6 +692,9 @@ public enum ClientRequest: Sendable {
         case .threadUnarchive: return "thread/unarchive"
         case .threadUnsubscribe: return "thread/unsubscribe"
         case .threadSetName: return "thread/name/set"
+        case .threadPinSet: return "thread/pin/set"
+        case .gitAction: return "git/action"
+        case .automationAction: return "automation/action"
         case .threadList: return "thread/list"
         case .threadLoadedList: return "thread/loaded/list"
         case .threadRead: return "thread/read"
@@ -378,6 +740,9 @@ public enum ClientRequest: Sendable {
         case "thread/unarchive": return .threadUnarchive(r.id, try p(ThreadUnarchiveParams.self))
         case "thread/unsubscribe": return .threadUnsubscribe(r.id, try p(ThreadUnsubscribeParams.self))
         case "thread/name/set": return .threadSetName(r.id, try p(ThreadSetNameParams.self))
+        case "thread/pin/set": return .threadPinSet(r.id, try p(ThreadPinSetParams.self))
+        case "git/action": return .gitAction(r.id, try p(GitActionParams.self))
+        case "automation/action": return .automationAction(r.id, try p(AutomationActionParams.self))
         case "thread/list":
             return .threadList(r.id, try JSONBridge.paramsAllowingEmpty(
                 ThreadListParams.self, from: r.params, default: ThreadListParams()))

@@ -105,15 +105,46 @@ final class TOMLTests: XCTestCase {
         // Root `profile = "dev"` selected.
         let cfg = loader.load(env: [:])
         XCTAssertEqual(cfg.profileName, "dev")
+        // SESSION-TIME resolution (`value`/typed accessors) still applies the
+        // selected inline `[profiles.dev]` overlay on top of the base config.
         XCTAssertEqual(cfg.string("server.host"), "base-host")
-        XCTAssertEqual(cfg.int("server.port"), 9000, "profile overlay wins")
-        XCTAssertNil(cfg.value("profiles"), "raw profiles map not surfaced")
+        XCTAssertEqual(cfg.int("server.port"), 9000, "profile overlay wins at session time")
+
+        // CONFIG-LAYER / `config/read` view is loaded RAW (upstream
+        // `load_user_config_layer(profile: None)`): the base config is NOT
+        // profile-overlaid and the `[profiles]` map IS surfaced.
+        let merged = cfg.configObjectJSON()
+        XCTAssertEqual(merged["model"], .string("base-model"),
+                       "base config is NOT profile-overlaid in the config-layer view")
+        if case .object(let server)? = merged["server"] {
+            XCTAssertEqual(server["port"], .int(1),
+                           "base server.port is NOT profile-overlaid in the config-layer view")
+        } else {
+            XCTFail("expected server table in merged config")
+        }
+        // `[profiles]` is retained in the user layer and surfaces in the
+        // projection (was previously stripped → always {}).
+        let projection = cfg.configProjectionJSON()
+        guard case .object(let profiles)? = projection["profiles"] else {
+            return XCTFail("config/read projection must surface the [profiles] map")
+        }
+        XCTAssertNotNil(profiles["dev"], "profiles.dev surfaced in config/read")
+        XCTAssertNotNil(profiles["prod"], "profiles.prod surfaced in config/read")
+        if case .object(let prod)? = profiles["prod"] {
+            XCTAssertEqual(prod["model"], .string("prod-model"))
+        } else {
+            XCTFail("expected profiles.prod table")
+        }
         XCTAssertEqual(cfg.origins["server"], "toml")
 
-        // env CODEX_CFG_PROFILE beats root profile.
+        // env CODEX_CFG_PROFILE beats root profile (session-time model resolves
+        // to the prod profile's override).
         let cfg2 = loader.load(env: ["CODEX_CFG_PROFILE": "prod"])
         XCTAssertEqual(cfg2.profileName, "prod")
-        XCTAssertEqual(cfg2.string("model"), "prod-model")
+        XCTAssertEqual(cfg2.string("model"), "prod-model",
+                       "session-time model reflects the selected profile overlay")
+        XCTAssertEqual(cfg2.configObjectJSON()["model"], .string("base-model"),
+                       "config-layer view stays un-overlaid regardless of selected profile")
 
         // explicit override beats env + root.
         let cfg3 = loader.load(env: ["CODEX_CFG_PROFILE": "prod"],

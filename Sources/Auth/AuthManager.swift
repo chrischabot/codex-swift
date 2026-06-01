@@ -51,15 +51,20 @@ public actor AuthManager {
     /// API-key and ChatGPT-managed code paths. Mirrors the
     /// `OPENAI_API_KEY` field in upstream's auth.json.
     private var mintedAPIKey: String?
-    /// D1: env-precedence overlay (CODEX_API_KEY > OPENAI_API_KEY >
-    /// CODEX_ACCESS_TOKEN), snapshotted at construction. When set,
-    /// this beats the persistent store for the lifetime of the process.
-    /// Mirrors upstream `load_auth` (manager.rs:731).
+    /// D1: env-precedence overlay snapshotted at construction. Holds only the
+    /// gated `CODEX_API_KEY` (when `enableCodexApiKeyEnv`) credential — the
+    /// `CODEX_ACCESS_TOKEN` agent identity is applied separately, AFTER the
+    /// ephemeral store, to mirror upstream `load_auth` ordering (manager.rs:
+    /// 731-768). `OPENAI_API_KEY` is not an auth-overlay source.
     private let envOverlay: AuthDotJson?
-    /// Snapshot of the env vars used to detect overlay shadow on writes.
-    /// Held separately from `envOverlay` so we can report the *specific*
-    /// shadowing var to callers ("CODEX_API_KEY" vs "OPENAI_API_KEY").
+    /// Snapshot of the env vars used to detect overlay shadow on writes and to
+    /// resolve the `CODEX_ACCESS_TOKEN` agent identity after the ephemeral
+    /// store. Held separately from `envOverlay` so we can report the specific
+    /// shadowing var to callers.
     private let envSnapshot: [String: String]
+    /// Gate for the `CODEX_API_KEY` env overlay. Defaults to `false` to match
+    /// the app-server, which never enables it (lib.rs:470,685,775).
+    private let enableCodexApiKeyEnv: Bool
     /// D2: optional auth.json path for guarded-reload codepath. nil =
     /// single-process mode (keychain etc.); reload is a no-op.
     private let authJsonPath: String?
@@ -74,6 +79,7 @@ public actor AuthManager {
                 apiKeyExchanger: (any APIKeyExchanger)? = nil,
                 revoker: (any TokenRevoker)? = nil,
                 env: [String: String] = [:],
+                enableCodexApiKeyEnv: Bool = false,
                 authJsonPath: String? = nil,
                 now: @escaping @Sendable () -> Int64 = {
                     Int64(Date().timeIntervalSince1970)
@@ -88,7 +94,18 @@ public actor AuthManager {
         self.apiKeyExchanger = apiKeyExchanger
         self.revoker = revoker
         self.nowProvider = now
-        self.envOverlay = EnvAuth.loadFromEnv(env: env)
+        self.enableCodexApiKeyEnv = enableCodexApiKeyEnv
+        // `envOverlay` holds ONLY the gated CODEX_API_KEY credential so it can
+        // be resolved at the very top of `effectiveTokens()` precedence. The
+        // CODEX_ACCESS_TOKEN agent identity is applied separately, AFTER the
+        // ephemeral store, mirroring upstream `load_auth` ordering. Hence we do
+        // NOT keep the CODEX_ACCESS_TOKEN fallback that `loadFromEnv` would
+        // otherwise return.
+        if enableCodexApiKeyEnv, let key = env["CODEX_API_KEY"], !key.isEmpty {
+            self.envOverlay = AuthDotJson(openaiAPIKey: key)
+        } else {
+            self.envOverlay = nil
+        }
         self.envSnapshot = env
         if let authJsonPath {
             self.authJsonPath = authJsonPath
@@ -99,6 +116,9 @@ public actor AuthManager {
             self.authJsonPath = fs.path
         } else if let mig = store as? MigratingTokenStore,
                   let fs = mig.legacy as? FileTokenStore {
+            self.authJsonPath = fs.path
+        } else if let auto = store as? AutoTokenStore,
+                  let fs = auto.file as? FileTokenStore {
             self.authJsonPath = fs.path
         } else {
             self.authJsonPath = nil
@@ -166,8 +186,16 @@ public actor AuthManager {
         pending = nil
         refreshFailures.removeAll()
         refreshFailureReasons.removeAll()
+        // Upstream `AuthDotJson::from_external_tokens` (manager.rs:936-958)
+        // parses the ChatGPT JWT claims out of the supplied `access_token` and
+        // stores them in the `id_token` slot of `TokenData` (which is what
+        // `get_account_email` / `account_plan_type` later read). For external
+        // tokens the access_token IS the claim-bearing JWT, so we mirror that
+        // by populating `idToken` with it — keeping the account/read claim
+        // source canonical (id_token only) per Finding #3.
         let tokens = AuthTokens(accessToken: accessToken,
                                 refreshToken: nil,
+                                idToken: accessToken,
                                 tokenType: "BearerExternal",
                                 expiresAtUnix: AuthTokens.neverExpires,
                                 accountId: accountId)
@@ -283,7 +311,8 @@ public actor AuthManager {
     /// diagnostic ("your change won't be visible to this process").
     private func throwIfEnvShadowed(
         _ op: LoginShadowedByEnvError.Operation) throws {
-        if let varname = LoginShadowedByEnvError.shadowingVar(env: envSnapshot) {
+        if let varname = LoginShadowedByEnvError.shadowingVar(
+            env: envSnapshot, enableCodexApiKeyEnv: enableCodexApiKeyEnv) {
             throw LoginShadowedByEnvError(operation: op, shadowingVar: varname)
         }
     }
@@ -300,17 +329,27 @@ public actor AuthManager {
 
     public func storedTokens() -> AuthTokens? { effectiveTokens() }
 
-    /// Effective tokens after applying overlays. Precedence (mirrors
-    /// upstream `load_auth`, manager.rs:731):
-    ///   1. env overlay (CODEX_API_KEY > OPENAI_API_KEY > CODEX_ACCESS_TOKEN)
+    /// Effective tokens after applying overlays. Precedence mirrors upstream
+    /// `load_auth` (manager.rs:731-768) EXACTLY:
+    ///   1. CODEX_API_KEY env overlay (only when `enableCodexApiKeyEnv`)
     ///   2. ephemeral host-app-injected ChatGPT tokens
-    ///   3. persistent token store (file / keychain)
+    ///   3. CODEX_ACCESS_TOKEN agent-identity env
+    ///   4. persistent token store (file / keychain)
+    /// External ChatGPT (ephemeral) tokens therefore take precedence over a
+    /// CODEX_ACCESS_TOKEN when both are present, matching upstream.
     private func effectiveTokens() -> AuthTokens? {
         if let envOverlay,
            let tokens = AuthTokens.fromAuthDotJson(envOverlay) {
             return tokens
         }
         if let ephemeralStore, let t = ephemeralStore.load() { return t }
+        if let accessToken = envSnapshot["CODEX_ACCESS_TOKEN"],
+           !accessToken.isEmpty,
+           let tokens = AuthTokens.fromAuthDotJson(
+            AuthDotJson(openaiAPIKey: nil,
+                        tokens: AuthDotJson.Tokens(accessToken: accessToken))) {
+            return tokens
+        }
         return store.load()
     }
 
@@ -322,6 +361,12 @@ public actor AuthManager {
         if let envOverlay { return envOverlay }
         if let ephemeralStore, let t = ephemeralStore.load() {
             return t.toAuthDotJson()
+        }
+        if let accessToken = envSnapshot["CODEX_ACCESS_TOKEN"],
+           !accessToken.isEmpty {
+            return AuthDotJson(
+                openaiAPIKey: nil,
+                tokens: AuthDotJson.Tokens(accessToken: accessToken))
         }
         if let path = authJsonPath,
            let data = AuthFileLock.readContentsLocked(path: path),

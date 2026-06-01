@@ -15,6 +15,7 @@ import Observability
 import Connectors
 import IPC
 import Tools
+import Prompts
 import ModelClient
 
 private struct SimpleError: Error, LocalizedError {
@@ -33,6 +34,33 @@ struct AccountNudgeEmailHTTPStatusError: Error, LocalizedError {
 /// complete Codex app-server method surface to the store and the per-thread
 /// worker. It owns the single wire-schema source (port-eval §2.5 / rework
 /// §6.2).
+///
+/// ACCEPTED DIVERGENCE — per-scope request serialization (app-server-registry/finding-1).
+/// Upstream `app-server` attaches a `serialization:` scope to every method
+/// (app-server-protocol/src/protocol/common.rs:445-1056 — e.g.
+/// `thread_id(params.thread_id)`, `global("config")`, `global("account-auth")`,
+/// `command_process_id`, `fs_watch_id`) and message_processor.rs:804,831-840
+/// enqueues handlers via `RequestSerializationQueueKey::from_scope`, so
+/// same-scope requests run strictly serially while different scopes — and
+/// `serialization: None` methods — run concurrently.
+///
+/// This Swift port INTENTIONALLY OMITS the scope-keyed serialization queue.
+/// `RequestRouter` is a single `actor`, which serializes request ENTRY but
+/// yields at every `await`, so two in-flight same-scope requests (e.g.
+/// concurrent `config/value/write`, or two `turn/start` on one thread) can
+/// interleave at await points. The defense-in-depth that makes this acceptable:
+///   1. actor entry-serialization means contention is rare for low-traffic
+///      scopes (`global("account-auth")`, `global("mcp-registry")`,
+///      `global("windows-sandbox-setup")`); and
+///   2. config writes carry an `expectedVersion` optimistic-concurrency check
+///      (see `RequestRouter.swift` config-write handling, ~line 1973 and the
+///      version-compare helper ~line 6121-6168) that prevents silent data loss.
+/// The combination is adequate for the corruption-prevention goal. Strict
+/// wire-shape ordering parity (if ever required, e.g. by a request-ordering
+/// test harness) would require introducing a per-connection
+/// `ClientRequestSerializationScope` analogue (thread_id / global(name) /
+/// command_process_id / fs_watch_id / fuzzy_session_id) so same-scope handlers
+/// await each other while None-scope methods stay concurrent.
 public actor RequestRouter {
     private static let remoteControlSegmentTargetBytes = 100 * 1024
     private static let remoteControlSegmentMaxBytes = 150 * 1024
@@ -754,14 +782,23 @@ public actor RequestRouter {
         let ptyMaster: FileHandle?
         let stdinCloseable: Bool
         let outputTasks: [Task<Void, Never>]
+        /// Per-stream output buffer + cap tracker. In streaming mode the bytes
+        /// are forwarded via `process/outputDelta` and not retained; in
+        /// buffered mode they are captured and emitted on `process/exited`.
+        let output: CommandExecOutputBuffer
+        let streamOutput: Bool
         init(process: Process, stdin: FileHandle?, ptyMaster: FileHandle? = nil,
              stdinCloseable: Bool = true,
-             outputTasks: [Task<Void, Never>] = []) {
+             outputTasks: [Task<Void, Never>] = [],
+             output: CommandExecOutputBuffer,
+             streamOutput: Bool) {
             self.process = process
             self.stdin = stdin
             self.ptyMaster = ptyMaster
             self.stdinCloseable = stdinCloseable
             self.outputTasks = outputTasks
+            self.output = output
+            self.streamOutput = streamOutput
         }
     }
     private var processSessions: [ProcessSessionKey: ProcessSession] = [:]
@@ -806,6 +843,27 @@ public actor RequestRouter {
         }
     }
 
+    /// ACCEPTED DIVERGENCE — per-connection RPC gate (app-server-registry/finding-2).
+    /// Upstream `app-server` defines `ConnectionRpcGate`
+    /// (app-server/src/connection_rpc_gate.rs:11-48) whose `shutdown()` flips
+    /// `accepting=false`, closes the TaskTracker, and awaits in-flight handlers;
+    /// message_processor.rs:706 calls `session_state.rpc_gate.shutdown()` here in
+    /// `connection_closed` so queued-but-not-started handlers are dropped while
+    /// started ones finish before teardown completes.
+    ///
+    /// This Swift port INTENTIONALLY SIMPLIFIES that gate. There is no
+    /// `accepting` flag checked at the top of `dispatch`, nor a drain/await of
+    /// in-flight request `Task`s. Instead we rely on:
+    ///   1. the actor finishing its current continuation naturally — a handler
+    ///      that already started completes (no partial execution); and
+    ///   2. `conn.send` to a closed connection being a no-op — a late
+    ///      response/notification produces no wire-visible garbage to any client.
+    /// Per-feature cleanup below (file/skills watchers, login flows, fuzzy /
+    /// command-exec / process sessions) covers the resources that matter. The
+    /// upstream gate is defensive hardening; this approach is sufficient for the
+    /// single-user-client scenarios this port targets. Strict parity would add a
+    /// per-connection accepting-flag checked at the top of `dispatch` plus a
+    /// drain/await of in-flight request Tasks here, mirroring `ConnectionRpcGate`.
     public func connectionClosed(_ conn: any ClientConnection) async {
         await fileWatchManager.connectionClosed(conn: conn)
         await skillsChangeWatchManager.connectionClosed(conn: conn)
@@ -1177,12 +1235,23 @@ public actor RequestRouter {
         #endif
     }
 
+    /// Test hook exposing the backend-usage → wire-snapshot mapping
+    /// (credits, plan type, rate-limit windows) without spinning up an HTTP
+    /// server. Mirrors the production parse performed by `fetchAccountRateLimits`.
+    static func _rateLimitResponseForTesting(from body: [String: JSONValue]) -> JSONValue {
+        rateLimitResponse(from: body)
+    }
+
     private static func rateLimitResponse(from body: [String: JSONValue]) -> JSONValue {
         let planType = body["plan_type"]?.stringValue
+        // Only the primary ("codex") snapshot carries credits, sourced from the
+        // backend usage payload's top-level `credits` object; additional rate
+        // limits pass no credits (backend-client/src/client.rs:455-475).
         let primary = rateLimitSnapshot(
             limitId: "codex",
             limitName: nil,
             rateLimit: body["rate_limit"],
+            credits: body["credits"],
             planType: planType,
             reachedType: body["rate_limit_reached_type"])
         var byLimit: [String: JSONValue] = ["codex": primary]
@@ -1196,6 +1265,7 @@ public actor RequestRouter {
                 limitId: limitId,
                 limitName: object["limit_name"]?.stringValue,
                 rateLimit: object["rate_limit"],
+                credits: nil,
                 planType: planType,
                 reachedType: object["rate_limit_reached_type"])
         }
@@ -1208,6 +1278,7 @@ public actor RequestRouter {
     private static func rateLimitSnapshot(limitId: String,
                                           limitName: String?,
                                           rateLimit: JSONValue?,
+                                          credits: JSONValue?,
                                           planType: String?,
                                           reachedType: JSONValue?) -> JSONValue {
         let rate = rateLimit?.objectValue ?? [:]
@@ -1216,28 +1287,107 @@ public actor RequestRouter {
             "limitName": limitName.map(JSONValue.string) ?? .null,
             "primary": rateLimitWindow(rate["primary_window"]),
             "secondary": rateLimitWindow(rate["secondary_window"]),
-            "credits": .null,
-            "planType": planType.map(JSONValue.string) ?? .null,
+            "credits": creditsSnapshot(credits),
+            // Canonicalize the backend `plan_type` through the AccountPlanType
+            // enum before emitting, matching upstream `map_plan_type`
+            // (backend-client/src/client.rs:567-589): education->edu and
+            // guest/free_workspace/quorum/k12/unknown/unrecognized -> "unknown".
+            "planType": planType.map { AccountPlanType.normalize(rawValue: $0).wireValue }
+                .map(JSONValue.string) ?? .null,
             "rateLimitReachedType": normalizedRateLimitReachedType(reachedType),
         ])
     }
 
-    private static func rateLimitWindow(_ value: JSONValue?) -> JSONValue {
+    /// Maps the backend usage payload's `credits` object (snake_case
+    /// `has_credits`/`unlimited`/`balance`) to the camelCase CreditsSnapshot
+    /// shape, falling back to null when the object is absent. Mirrors
+    /// upstream `Client::map_credits` (backend-client/src/client.rs:557-564)
+    /// and CreditsSnapshot{hasCredits,unlimited,balance}
+    /// (app-server-protocol/src/protocol/v2/account.rs:355-362).
+    private static func creditsSnapshot(_ value: JSONValue?) -> JSONValue {
+        guard let object = value?.objectValue else { return .null }
+        return .object([
+            "hasCredits": .bool(object["has_credits"]?.boolValue ?? false),
+            "unlimited": .bool(object["unlimited"]?.boolValue ?? false),
+            "balance": object["balance"].flatMap { $0.isNull ? nil : $0 } ?? .null,
+        ])
+    }
+
+    /// Mirrors Rust `http::HeaderValue::from_str` validity: a string is a valid
+    /// HTTP header value iff every byte is visible ASCII (`0x21..=0x7E`), a
+    /// space (`0x20`), or a horizontal tab (`0x09`). All other control bytes
+    /// (`0x00..=0x1F` except tab), DEL (`0x7F`), and non-ASCII (`>= 0x80`) bytes
+    /// are rejected. Empty strings are accepted (an empty HeaderValue is Ok).
+    /// Used by `initialize` to validate `clientInfo.name`
+    /// (initialize_processor.rs:88-92).
+    static func isValidHTTPHeaderValue(_ s: String) -> Bool {
+        for byte in s.utf8 {
+            let ok = (byte >= 0x20 && byte <= 0x7E) || byte == 0x09
+            if !ok { return false }
+        }
+        return true
+    }
+
+    static func rateLimitWindow(_ value: JSONValue?) -> JSONValue {
         guard let object = value?.objectValue else { return .null }
         let seconds = object["limit_window_seconds"]?.intValue
+        // Upstream `window_minutes_from_seconds` (backend-client/src/client.rs:592-598)
+        // returns `None` for `seconds <= 0` and otherwise CEILING-divides to
+        // minutes via `(seconds + 59) / 60` (e.g. 90s -> 2 min). Mirror exactly:
+        // floor division (`$0 / 60`) under-reports any non-multiple-of-60 window.
+        let windowMins: JSONValue = seconds.flatMap { secs in
+            secs > 0 ? .int((secs + 59) / 60) : nil
+        } ?? .null
+        // Upstream `RateLimitWindow.used_percent` is an `i32`; `RateLimitWindow::from`
+        // (account.rs:347) always `.round()`s the backend float. Mirror that here so
+        // the synchronous read response agrees with the updated-notification path
+        // (ModelProvider.asNotificationJSON line 407) and never leaks a JSON float.
+        func asDouble(_ v: JSONValue?) -> Double? {
+            switch v {
+            case .double(let d): return d
+            case .int(let i): return Double(i)
+            default: return nil
+            }
+        }
+        let usedPercent: JSONValue = asDouble(object["used_percent"])
+            .map { .int(Int64($0.rounded())) } ?? .null
         return .object([
-            "usedPercent": object["used_percent"] ?? .null,
-            "windowDurationMins": seconds.map { .int($0 / 60) } ?? .null,
+            "usedPercent": usedPercent,
+            "windowDurationMins": windowMins,
             "resetsAt": object["reset_at"] ?? .null,
         ])
     }
 
     private static func normalizedRateLimitReachedType(_ value: JSONValue?) -> JSONValue {
         guard let type = value?["type"]?.stringValue else { return .null }
-        return .string(type)
+        // Upstream `map_rate_limit_reached_type` (backend-client/src/client.rs:504-525)
+        // maps the five known backend kinds 1:1 and collapses
+        // BackendRateLimitReachedKind::Unknown -> None (wire null). The backend
+        // kind uses `#[serde(rename="unknown", other)]`, so any unrecognized
+        // value also deserializes to Unknown and surfaces as null.
+        switch type {
+        case "rate_limit_reached",
+             "workspace_owner_credits_depleted",
+             "workspace_member_credits_depleted",
+             "workspace_owner_usage_limit_reached",
+             "workspace_member_usage_limit_reached":
+            return .string(type)
+        default:
+            return .null
+        }
     }
 
     private static func jwtStringClaim(_ token: String?, keys: [String]) -> String? {
+        guard let object = decodeJWTPayload(token) else { return nil }
+        for key in keys {
+            if let value = object[key] as? String { return value }
+        }
+        return nil
+    }
+
+    /// Base64URL-decodes the payload segment of a JWT and parses it as a JSON
+    /// object. Returns nil when the token is malformed.
+    private static func decodeJWTPayload(_ token: String?) -> [String: Any]? {
         guard let token else { return nil }
         let parts = token.split(separator: ".")
         guard parts.count >= 2 else { return nil }
@@ -1249,10 +1399,31 @@ public actor RequestRouter {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        for key in keys {
-            if let value = object[key] as? String { return value }
+        return object
+    }
+
+    /// Resolves the ChatGPT plan type from an id_token. Upstream
+    /// (`codex_login::token_data::parse_chatgpt_jwt_claims` /
+    /// `AuthClaims::chatgpt_plan_type`) reads the plan exclusively from the
+    /// nested `https://api.openai.com/auth` claim object, then canonicalizes it
+    /// via the two-stage `PlanType::from_raw_value` -> account `PlanType`
+    /// mapping (`AccountPlanType.normalize`): aliases like `hc` -> `enterprise`,
+    /// `education` -> `edu`, and any unrecognized value -> `unknown` (never
+    /// leaked verbatim). Real ChatGPT id_tokens carry the plan only at this
+    /// nested path; a legacy flat-key fallback is retained for resilience.
+    /// Returns `nil` only when the claim is absent entirely; callers default an
+    /// absent plan to `"unknown"`.
+    static func chatgptPlanType(_ token: String?) -> String? {
+        guard let object = decodeJWTPayload(token) else { return nil }
+        if let auth = object["https://api.openai.com/auth"] as? [String: Any],
+           let plan = auth["chatgpt_plan_type"] as? String {
+            return AccountPlanType.normalize(rawValue: plan).wireValue
         }
-        return nil
+        // Legacy flat-key fallback for resilience.
+        let flat = object["https://api.openai.com/plan_type"] as? String
+            ?? object["plan_type"] as? String
+            ?? object["planType"] as? String
+        return flat.map { AccountPlanType.normalize(rawValue: $0).wireValue }
     }
 
     private func finishDeviceCodeLogin(loginId: String, auth: AuthManager,
@@ -1269,9 +1440,7 @@ public actor RequestRouter {
         switch result {
         case .success:
             let tokens = await auth.storedTokens()
-            let planType = Self.jwtStringClaim(
-                tokens?.idToken,
-                keys: ["https://api.openai.com/plan_type", "plan_type"])
+            let planType = Self.chatgptPlanType(tokens?.idToken)
             await conn.send(ServerNotification.accountLoginCompleted(
                 loginId: loginId, success: true, error: nil).toMessage())
             await conn.send(ServerNotification.accountUpdated(
@@ -1290,6 +1459,7 @@ public actor RequestRouter {
             return .failure("Login is no longer pending.")
         }
         pending.timeoutTask.cancel()
+        let streamlined = pending.server.codexStreamlinedLogin
         pending.server.stop()
         let connection = ObjectIdentifier(conn as AnyObject)
         if pendingLoginIds[connection] == loginId {
@@ -1309,19 +1479,28 @@ public actor RequestRouter {
         switch result {
         case .success:
             let tokens = await auth.storedTokens()
-            let planType = Self.jwtStringClaim(
-                tokens?.idToken,
-                keys: ["https://api.openai.com/plan_type", "plan_type"])
+            let planType = Self.chatgptPlanType(tokens?.idToken)
             await conn.send(ServerNotification.accountLoginCompleted(
                 loginId: loginId, success: true, error: nil).toMessage())
             await conn.send(ServerNotification.accountUpdated(
                 authMode: "chatgpt", planType: planType).toMessage())
-            return .success
+            return .success(streamlined: streamlined)
         case .failure(let error):
             await conn.send(ServerNotification.accountLoginCompleted(
-                loginId: loginId, success: false, error: "\(error)").toMessage())
+                loginId: loginId, success: false,
+                error: Self.browserLoginCompletionError(error)).toMessage())
             return .failure("\(error)")
         }
+    }
+
+    /// Builds the `account/login/completed` notification error text for a
+    /// failed browser login. Upstream's browser background task maps the
+    /// login-server result `Ok(Err(err))` to `Some(format!("Login server
+    /// error: {err}"))` (account_processor.rs:397-398), so the wire error is
+    /// always prefixed "Login server error: " for browser-login failures
+    /// (matching the cancelled-browser-login path). Internal for testability.
+    static func browserLoginCompletionError(_ error: AuthError) -> String {
+        "Login server error: \(error)"
     }
 
     private func timeoutBrowserLogin(loginId: String, conn: any ClientConnection) async {
@@ -1353,6 +1532,18 @@ public actor RequestRouter {
                 await conn.send(WireError.invalidRequest(id: raw.id, "invalid initialize"))
                 return
             }
+            // Audit app-server-registry/finding-2: upstream validates
+            // `clientInfo.name` is a valid HTTP header value BEFORE committing
+            // session state (initialize_processor.rs:88-92,
+            // `if HeaderValue::from_str(&name).is_err()`). A name containing
+            // control chars (newlines, etc.) or non-ASCII bytes is invalid as a
+            // header value and the connection must NOT become initialized.
+            if !Self.isValidHTTPHeaderValue(p.clientInfo.name) {
+                await conn.send(WireError.invalidRequest(
+                    id: raw.id,
+                    "Invalid clientInfo.name: '\(p.clientInfo.name)'. Must be a valid HTTP header value."))
+                return
+            }
             initialized = true
             caps = p.capabilities ?? ClientCapabilities()
             let res = InitializeResult(
@@ -1369,10 +1560,23 @@ public actor RequestRouter {
             return
         }
 
-        if let tidVal = raw.params?["threadId"], let s = tidVal.stringValue,
-           !ThreadId(s).isWellFormed {
-            await conn.send(WireError.invalidRequest(id: raw.id, "invalid threadId"))
-            return
+        // Audit app-server-registry/finding-3 (ordering parity): upstream
+        // deserializes the `ClientRequest` FIRST (message_processor.rs:536-541,
+        // `Invalid request: <serde error>` on failure) and only then derives the
+        // experimental rejection from the typed request via `experimental_reason()`
+        // (dispatch_initialized_client_request, message_processor.rs:792-796).
+        // The threadId well-formedness check likewise happens inside the typed
+        // processors after deserialization. So parse before gating: a
+        // malformed-params request to an experimental method (or one carrying a
+        // malformed threadId) must surface the deserialization error, not the
+        // experimental/threadId message. Well-formed requests are unaffected
+        // (they parse, then hit the same checks with identical messages).
+        let parsed: ClientRequest
+        do { parsed = try ClientRequest.parse(raw) }
+        catch ProtocolError.invalidParams(let m) {
+            await conn.send(WireError.invalidRequest(id: raw.id, m)); return
+        } catch {
+            await conn.send(WireError.invalidRequest(id: raw.id, "\(error)")); return
         }
 
         if let desc = gate.rejectionDescriptor(
@@ -1381,18 +1585,28 @@ public actor RequestRouter {
             return
         }
 
+        // Audit app-server-registry/finding-3: upstream has NO generic
+        // dispatch-level threadId well-formedness check; each processor parses
+        // its own `threadId` AFTER the experimental gate
+        // (message_processor.rs:792-796 gates first; then e.g.
+        // turn_processor.rs:192 / thread_processor.rs:669 emit
+        // `invalid_request("invalid thread id: {err}")`). So this generic
+        // precheck must run AFTER the experimental gate above (an experimental
+        // method called by a non-experimental connection with a malformed
+        // threadId surfaces the capability error, not the threadId error) and
+        // must match upstream's "invalid thread id: <error>" message form.
+        if let tidVal = raw.params?["threadId"], let s = tidVal.stringValue,
+           !ThreadId(s).isWellFormed {
+            await conn.send(WireError.invalidRequest(
+                id: raw.id, "invalid thread id: malformed thread id"))
+            return
+        }
+
         if await validateRemoteEnvironmentSelection(
             id: raw.id, method: raw.method, params: raw.params, conn: conn) {
             return
         }
 
-        let parsed: ClientRequest
-        do { parsed = try ClientRequest.parse(raw) }
-        catch ProtocolError.invalidParams(let m) {
-            await conn.send(WireError.invalidRequest(id: raw.id, m)); return
-        } catch {
-            await conn.send(WireError.invalidRequest(id: raw.id, "\(error)")); return
-        }
         await dispatch(parsed, conn)
     }
 
@@ -1403,6 +1617,15 @@ public actor RequestRouter {
 
         // MARK: thread lifecycle
         case .threadStart(let id, let p):
+            // NOTE (audit app-server-registry/finding-4): upstream's websocket
+            // `thread/start` path has no capacity overload (-32001 originates
+            // ONLY from the in-process embedder's bounded mpsc queue,
+            // app-server/src/in_process.rs:548,632). The port DELIBERATELY
+            // diverges here: it retains thread/start admission control as a
+            // DoS-safety hardening, covered by
+            // AuthGatingAdversarialTests.testSessionFloodAdmissionControl.
+            // Removing it would let an unauthenticated flood spawn unbounded
+            // worker sessions. Kept as an accepted, test-backed divergence.
             if await supervisor.atCapacity() {
                 await conn.send(WireError.overload(id: id)); return
             }
@@ -1411,20 +1634,57 @@ public actor RequestRouter {
                 ?? p.cwd
                 ?? FileManager.default.currentDirectoryPath
             let latestConfig = ConfigLoader(codexHome: codexHome).load()
+            // prompts finding A/B/C: thread the AGENTS.md knobs from live config
+            // into SessionConfig so the model actually sees the global
+            // (~/.codex/AGENTS.override.md / AGENTS.md) instructions, honours
+            // configured fallback filenames + custom root markers, and obeys the
+            // configured project_doc_max_bytes budget (0 disables AGENTS.md).
+            let agentsMd = Self.agentsMdConfig(latestConfig, codexHome: codexHome, cwd: cwd)
             let cfg = SessionConfig(
                 threadId: ThreadId.generate(),
                 cwd: cwd,
-                model: p.model ?? "gpt-5.1-codex",
+                model: p.model ?? "gpt-5.5",
                 ephemeral: p.ephemeral ?? false,
                 personality: p.personality,
                 developerInstructions: p.developerInstructions,
                 baseInstructions: p.baseInstructions,
                 approvalPolicy: Self.approvalPolicy(from: p.approvalPolicy,
-                                                     default: .never),
+                                                     default: Self.approvalPolicyFallback(from: latestConfig)),
                 approvalsReviewer: p.approvalsReviewer ?? "user",
-                sandboxMode: SandboxModeKind(fromOptional: p.sandbox),
+                sandboxMode: Self.sandboxMode(from: p.sandbox,
+                                              fallbackConfig: latestConfig),
                 notify: Self.notifyArgv(from: latestConfig),
-                remoteEnvironment: environment)
+                remoteEnvironment: environment,
+                agentsMdUserInstructions: agentsMd.userInstructions,
+                agentsMdFilenames: agentsMd.filenames,
+                agentsMdProjectRootMarkers: agentsMd.projectRootMarkers,
+                agentsMdChildEnabled: agentsMd.childEnabled,
+                projectDocMaxBytes: agentsMd.projectDocMaxBytes,
+                reasoningEffort: latestConfig.value("model_reasoning_effort")?.stringValue,
+                textVerbosity: latestConfig.value("model_verbosity")?.stringValue,
+                // persistence-rollout finding 5: gate the interrupted-turn
+                // history marker on `config.agents.interrupt_message` (upstream
+                // `agent_interrupt_message_enabled`, default true).
+                agentInterruptMessageEnabled: latestConfig.agentInterruptMessageEnabled,
+                // model-client finding 1: thread the persistent installation id
+                // (upstream `installation_id.rs::resolve_installation_id`) into
+                // the session so the Responses request BODY carries
+                // `client_metadata={"x-codex-installation-id": …}` on every
+                // request, not just the HTTP header (`client.rs:760-763`).
+                installationId: CodexClientIdentity.resolveInstallationId(
+                    codexHome: codexHome),
+                // persistence-rollout finding 1: thread the client-supplied
+                // session start source (`ThreadStartParams.sessionStartSource`)
+                // into the config so it flows into the persisted
+                // `session_meta.source`. When the client omits it, the store
+                // defaults to the app-server default "vscode" (NOT the prior
+                // hardcoded "mcp", which upstream's interactive-source filter
+                // would have dropped).
+                sessionStartSource: p.sessionStartSource)
+            // F01 / F-REASONING: log resolved knobs so parity tests can verify
+            // each value propagated from `config.toml`. Drop once confirmed in
+            // field tests.
+            FileHandle.standardError.write(Data("[thread/start] sandbox=\(cfg.sandboxMode.rawValue) approvalPolicy=\(cfg.approvalPolicy.wireValue) reasoning=\(cfg.reasoningEffort ?? "nil") verbosity=\(cfg.textVerbosity ?? "nil")\n".utf8))
             let summary = (try? await store.create(cfg))
                 ?? ThreadSummary(id: cfg.threadId, createdAt: 0, ephemeral: cfg.ephemeral,
                                  cwd: cfg.cwd)
@@ -1447,8 +1707,22 @@ public actor RequestRouter {
                 await conn.send(WireError.overload(id: id)); return
             }
             let rebuilt = try? await store.reconstruct(p.threadId)
-            let cfg = rebuilt?.config ?? SessionConfig(
+            var cfg = rebuilt?.config ?? SessionConfig(
                 threadId: p.threadId, cwd: FileManager.default.currentDirectoryPath)
+            // prompts finding A/B/C: the AGENTS.md knobs are LIVE-config-derived
+            // (upstream reconstructs `Config` fresh on resume — `user_instructions`
+            // and the discovery knobs are NOT persisted in the rollout). Re-derive
+            // them from the current config + the reconstructed cwd so a resumed
+            // thread sees the same global AGENTS.md / fallbacks / root markers /
+            // ChildAgentsMd / project_doc_max_bytes as a fresh thread/start.
+            let resumeConfig = ConfigLoader(codexHome: codexHome).load()
+            let resumeAgentsMd = Self.agentsMdConfig(
+                resumeConfig, codexHome: codexHome, cwd: cfg.cwd)
+            cfg.agentsMdUserInstructions = resumeAgentsMd.userInstructions
+            cfg.agentsMdFilenames = resumeAgentsMd.filenames
+            cfg.agentsMdProjectRootMarkers = resumeAgentsMd.projectRootMarkers
+            cfg.agentsMdChildEnabled = resumeAgentsMd.childEnabled
+            cfg.projectDocMaxBytes = resumeAgentsMd.projectDocMaxBytes
             await bindAndSubscribe(cfg, conn)
             let summary = ThreadSummary(
                 id: p.threadId, createdAt: Int64(Date().timeIntervalSince1970),
@@ -1462,7 +1736,7 @@ public actor RequestRouter {
             let cfg = SessionConfig(
                 threadId: ThreadId.generate(),
                 cwd: p.cwd ?? src?.config.cwd ?? FileManager.default.currentDirectoryPath,
-                model: p.model ?? src?.config.model ?? "gpt-5.1-codex",
+                model: p.model ?? src?.config.model ?? "gpt-5.5",
                 ephemeral: p.ephemeral ?? false,
                 notify: src?.config.notify)
             let summary = (try? await store.create(cfg))
@@ -1512,6 +1786,45 @@ public actor RequestRouter {
             try? await store.setName(p.threadId, p.name)
             await supervisor.broadcast(p.threadId, .threadNameUpdated(threadId: p.threadId, name: p.name))
             await reply(conn, id, EmptyResponse())
+        case .threadPinSet(let id, let p):
+            try? await store.setPinned(p.threadId, p.pinned)
+            await reply(conn, id, EmptyResponse())
+        case .gitAction(let id, let p):
+            let cwd = await supervisor.currentBoundConfig(p.threadId)?.cwd
+                ?? FileManager.default.currentDirectoryPath
+            let outcome = await GitDiffRail.perform(
+                action: p.action, cwd: cwd, message: p.message, title: p.title, body: p.body)
+            await reply(conn, id, outcome)
+        case .automationAction(let id, let p):
+            guard let astore = AutomationStoreHolder.shared.current() else {
+                await reply(conn, id, ["automations": [Automation]()]); break
+            }
+            switch p.action {
+            case "create", "update":
+                let aid = p.id ?? UUID().uuidString
+                let existing = await astore.get(aid)
+                let a = Automation(
+                    id: aid, name: p.name ?? existing?.name ?? "Automation",
+                    schedule: p.schedule ?? existing?.schedule ?? "manual",
+                    prompt: p.prompt ?? existing?.prompt ?? "",
+                    enabled: p.enabled ?? existing?.enabled ?? true,
+                    cwd: p.cwd ?? existing?.cwd, model: p.model ?? existing?.model,
+                    lastRunAt: existing?.lastRunAt, lastThreadId: existing?.lastThreadId)
+                await astore.upsert(a)
+                await reply(conn, id, ["automation": a])
+            case "delete":
+                if let aid = p.id { await astore.delete(aid) }
+                await reply(conn, id, EmptyResponse())
+            case "run":
+                if let aid = p.id, let a = await astore.get(aid) {
+                    let tid = await runAutomation(a, supervisor: supervisor, store: store,
+                                                  defaultCwd: FileManager.default.currentDirectoryPath)
+                    await astore.markRan(aid, threadId: tid, at: Int64(Date().timeIntervalSince1970))
+                    await reply(conn, id, ["threadId": tid])
+                } else { await reply(conn, id, EmptyResponse()) }
+            default:
+                await reply(conn, id, ["automations": await astore.list()])
+            }
         case .threadList(let id, let p):
             let list = (try? await store.list(archived: p.archived ?? false,
                                                limit: p.limit ?? 50)) ?? []
@@ -1539,6 +1852,15 @@ public actor RequestRouter {
                 "data": .array(turns.map(Self.turnJSON)),
                 "nextCursor": .null, "backwardsCursor": .null]))
         case .threadTurnsItemsList(let id, let p):
+            // NOTE (audit app-server-registry/finding-3): upstream stubs this as
+            // -32601 "thread/turns/items/list is not supported yet"
+            // (thread_processor.rs:619-626). The port DELIBERATELY diverges and
+            // returns real items from the store — a forward-compatible enhancement.
+            // The method is still gated experimental (ExperimentalGate.defaultMethods),
+            // so only experimentalApi clients can reach it; no upstream-fidelity
+            // client depends on the -32601 stub. Covered by
+            // EndToEndTests.testFullStreamedTurnEndToEnd (asserts a success
+            // response carrying real `data` items for thread/turns/items/list).
             let items = (try? await store.turnItems(p.threadId, turn: p.turnId)) ?? []
             let data = items.compactMap { try? JSONBridge.value($0) }
             await reply(conn, id, .object(["data": .array(data),
@@ -1651,8 +1973,17 @@ public actor RequestRouter {
                     }
                 }
             }
-            let turn = TurnObject(id: TurnId.generate(), status: .inProgress)
-            guard await supervisor.submit(p.threadId, .startTurn(input: p.input, model: p.model)) else {
+            // Allocate the turn id HERE, before submit, and thread it into the
+            // engine op so `startSpecial`/`runTurn` use it verbatim as the
+            // engine turn/submission id. This makes the `turn/start` response
+            // `turn.id` equal the id carried by every subsequent turn/started,
+            // turn/completed, and item/* notification — and the id the client
+            // echoes in `turn/steer.expectedTurnId` / `turn/interrupt.turnId`.
+            // Previously this allocated an UNRELATED id while the engine
+            // generated its own, so the response id correlated with nothing.
+            let allocatedTurnId = TurnId.generate()
+            let turn = TurnObject(id: allocatedTurnId, status: .inProgress)
+            guard await supervisor.submit(p.threadId, .startTurn(input: p.input, model: p.model, turnId: allocatedTurnId)) else {
                 await conn.send(WireError.overload(id: id))
                 return
             }
@@ -1664,11 +1995,33 @@ public actor RequestRouter {
             }
             await reply(conn, id, EmptyResponse())
         case .turnSteer(let id, let p):
+            // Synchronous request validation (upstream `turn_steer_inner`,
+            // turn_processor.rs:621-723). The empty-`expectedTurnId` guard
+            // (invalid_request, -32600) and the v2 input-length guard
+            // (invalid_params, -32602) both fire before the steer op is
+            // submitted. The state-dependent steer errors — NoActiveTurn,
+            // ExpectedTurnMismatch, EmptyInput, and the review/compact-only
+            // ActiveTurnNotSteerable (upstream `Session::steer_input`,
+            // session/mod.rs:3112) — are produced by the engine (SessionEngine
+            // `.steer` handler) and surfaced as `.error` notifications, since
+            // the live turn state resides in the (possibly out-of-process)
+            // worker and is not readable here for a synchronous JSON-RPC reply.
+            if p.expectedTurnId.raw.isEmpty {
+                await conn.send(WireError.invalidRequest(id: id, "expectedTurnId must not be empty"))
+                return
+            }
+            // `text_char_count`: count Unicode scalar values (Rust `char`s)
+            // across all text input items; non-text items contribute 0.
+            let actualChars = p.input.reduce(0) { $0 + ($1.text?.unicodeScalars.count ?? 0) }
+            if actualChars > WireError.maxUserInputTextChars {
+                await conn.send(WireError.inputTooLargeV2(id: id, actualChars: actualChars))
+                return
+            }
             guard await supervisor.submit(p.threadId, .steer(input: p.input, expectedTurnId: p.expectedTurnId)) else {
                 await conn.send(WireError.overload(id: id))
                 return
             }
-            await reply(conn, id, ["turnId": p.expectedTurnId])
+            await reply(conn, id, TurnSteerResponse(turnId: p.expectedTurnId))
         case .threadCompactStart(let id, let p):
             guard await supervisor.submit(p.threadId, .compactNow) else {
                 await conn.send(WireError.overload(id: id))
@@ -1687,9 +2040,35 @@ public actor RequestRouter {
             }
             await reply(conn, id, EmptyResponse())
         case .reviewStart(let id, let p):
+            // For base-branch reviews, pre-resolve the merge-base SHA with git
+            // (using the thread's cwd) so the model receives the primary
+            // `BASE_BRANCH_PROMPT` with a directly runnable `git diff <sha>`
+            // instruction, mirroring upstream `review_prompt` →
+            // `merge_base_with_head`. When git access fails (or there is no
+            // base-branch target) we fall through to the BACKUP form.
+            // Upstream `review_prompt` bails when a custom review target has
+            // empty/whitespace-only instructions ("Review prompt cannot be
+            // empty"); reject before submitting a turn rather than silently
+            // falling back to the uncommitted-changes prompt.
+            if p.customReviewIsEmpty {
+                await conn.send(WireError.invalidRequest(id: id, "Review prompt cannot be empty"))
+                return
+            }
+            let reviewInput: [TurnInput]
+            if let branch = p.baseBranchTarget {
+                let reviewCwd = (try? await store.reconstruct(p.threadId))?.config.cwd
+                    ?? FileManager.default.currentDirectoryPath
+                let sha = branch.isEmpty
+                    ? nil
+                    : await GitUtils(cwd: reviewCwd).mergeBaseWithHead(branch)
+                reviewInput = [TurnInput(text: p.reviewPrompt(mergeBaseSha: sha))]
+            } else {
+                reviewInput = p.reviewInput
+            }
             guard await supervisor.submit(p.threadId, .review(
-                input: p.reviewInput,
-                prompt: p.reviewInstructions)) else {
+                input: reviewInput,
+                prompt: p.reviewInstructions,
+                userFacingHint: p.userFacingHint)) else {
                 await conn.send(WireError.overload(id: id))
                 return
             }
@@ -1712,31 +2091,92 @@ public actor RequestRouter {
         case .modelProviderCapabilitiesRead(let id):
             await reply(conn, id, ModelProviderCapabilitiesReadResponse(
                 namespaceTools: true, imageGeneration: false, webSearch: true))
-        case .configRead(let id, _):
-            let latestConfig = ConfigLoader(codexHome: codexHome).load()
-            let effectiveConfig = latestConfig
-            func toJSON(_ v: ConfigValue) -> JSONValue {
-                switch v {
-                case .null: return .null
-                case .bool(let b): return .bool(b)
-                case .int(let i): return .int(i)
-                case .double(let d): return .double(d)
-                case .string(let s): return .string(s)
-                case .array(let a): return .array(a.map(toJSON))
-                case .object(let o):
-                    return .object(o.mapValues(toJSON))
-                }
+        case .configRead(let id, let params):
+            let toJSON = Self.configValueToJSON
+            // Honor `cwd`: resolve project (`.codex/`) layers as seen from that
+            // directory (upstream `ConfigReadParams.cwd`).
+            let effectiveConfig = ConfigLoader(codexHome: codexHome,
+                                               cwdOverride: params.cwd).load()
+            // A fatal load error (e.g. a profile-v2 name colliding with a
+            // legacy `[profiles.<name>]`) is `io::ErrorKind::InvalidData`
+            // upstream (loader/mod.rs:227-243); surface it as invalidRequest
+            // instead of returning a partially-applied config.
+            if let loadError = effectiveConfig.loadError {
+                await conn.send(WireError.invalidRequest(id: id, loadError))
+                return
             }
-            var configJSON = effectiveConfig.configObjectJSON().mapValues(toJSON)
+            // Project the merged map onto upstream's typed v2 `Config` wire
+            // shape: drop unknown (non-ConfigToml) top-level keys and emit every
+            // named v2 field explicitly (null when unset). Mirrors upstream's
+            // `try_into::<ConfigToml>()` → `from_value::<Config>()` round-trip
+            // (config_manager_service.rs:127-139).
+            var configJSON = effectiveConfig.configProjectionJSON().mapValues(toJSON)
             configJSON["features"] = runtimeFeaturesJSON(base: configJSON["features"],
                                                          config: effectiveConfig)
-            await reply(conn, id, .object([
+            // Honor `includeLayers`: emit the ordered `ConfigLayer` stack
+            // (each `{name: ConfigLayerSource, version, config}`) HIGHEST
+            // precedence first and INCLUDING empty real layers, matching
+            // upstream `get_layers(HighestPrecedenceFirst, include_disabled:
+            // true)` (config_manager_service.rs:141-150). Only the synthetic
+            // `defaults` layer (no `source`) is excluded — upstream never
+            // surfaces it as a layer.
+            // Emit a `configWarning` notification for each project-local
+            // ignored-config-keys warning collected during load (upstream
+            // app-server/src/lib.rs:582-593 turns each `startup_warnings` entry
+            // into a `configWarning`). The loader is sink-less, so the warnings
+            // ride out on the `Config` value and are fanned out here.
+            for w in effectiveConfig.configWarnings {
+                await conn.send(ServerNotification.configWarning(
+                    summary: w.summary, details: w.details, path: w.path).toMessage())
+            }
+            var replyObj: [String: JSONValue] = [
                 "config": .object(configJSON),
                 "origins": .object(effectiveConfig.originsJSON().mapValues(toJSON)),
-                "layers": .null]))
+            ]
+            // Upstream `ConfigReadResponse.layers` carries
+            // `#[serde(skip_serializing_if = "Option::is_none")]`
+            // (app-server-protocol/v2/config.rs:374-375), so the `layers` key is
+            // ABSENT (not null) when `includeLayers` is false.
+            if params.includeLayers == true {
+                replyObj["layers"] = .array(
+                    effectiveConfig.layers.reversed().compactMap { layer -> JSONValue? in
+                    guard let src = layer.source else { return nil }
+                    // Upstream computes each layer's `version` via
+                    // `version_for_toml` over the RAW TOML value it was loaded
+                    // from (config/src/state.rs:107-117), not over the
+                    // alias-normalized/projected layer map. Hash the raw file
+                    // content so the user-layer version reported here matches
+                    // the one `config/value/write` compares `expectedVersion`
+                    // against (see `userLayerVersion`).
+                    let version = Self.rawLayerVersion(source: src, fallback: layer.values)
+                    var layerObj: [String: JSONValue] = [
+                        "name": toJSON(src.toJSON()),
+                        "version": .string(version),
+                        "config": .object(layer.values.mapValues(toJSON)),
+                    ]
+                    // Upstream `ConfigLayer.disabled_reason` carries
+                    // `#[serde(skip_serializing_if = "Option::is_none")]`
+                    // (v2/config.rs:302-303): present only for a DISABLED
+                    // (untrusted) project layer, absent otherwise.
+                    if let reason = layer.disabledReason {
+                        layerObj["disabledReason"] = .string(reason)
+                    }
+                    return JSONValue.object(layerObj)
+                })
+            }
+            await reply(conn, id, .object(replyObj))
         case .getAccount(let id, let params):
-            await reply(conn, id, await getAccountResponse(
-                refreshToken: params.refreshToken ?? false))
+            do {
+                await reply(conn, id, try await getAccountResponse(
+                    refreshToken: params.refreshToken ?? false))
+            } catch is MissingChatgptAccountDetails {
+                await conn.send(WireError.invalidRequest(
+                    id: id,
+                    "email and plan type are required for chatgpt authentication"))
+            } catch {
+                await conn.send(WireError.invalidRequest(
+                    id: id, "\(error)"))
+            }
         case .getAccountRateLimits(let id):
             guard let auth else {
                 await conn.send(WireError.invalidRequest(
@@ -1756,12 +2196,18 @@ public actor RequestRouter {
             do {
                 let result = try await accountRateLimitsFetcher(
                     tokens, Self.chatGPTBaseURL(codexHome: codexHome))
-                let snapshot = result["rateLimits"] ?? Self.emptyRateLimitSnapshot()
+                // Upstream's get_account_rate_limits_response only returns the
+                // GetAccountRateLimitsResponse; the AccountRateLimitsUpdated
+                // notification is emitted exclusively from in-turn
+                // token-usage events (bespoke_event_handling.rs:1573), never
+                // from this read handler.
                 await reply(conn, id, result)
-                await conn.send(ServerNotification.accountRateLimitsUpdated(
-                    rateLimits: snapshot).toMessage())
             } catch {
-                await conn.send(WireError.invalidRequest(
+                // Upstream maps a backend fetch failure / empty snapshots to
+                // `internal_error` (-32603) (account_processor.rs:927,929), not
+                // invalid_request. The auth-precondition rejections above keep
+                // invalid_request to match upstream.
+                await conn.send(WireError.internalError(
                     id: id, "failed to fetch codex rate limits: \(error.localizedDescription)"))
             }
         case .skillsList(let id, let p):
@@ -1772,7 +2218,7 @@ public actor RequestRouter {
                 SkillSummary(name: $0.name, description: $0.description, path: $0.path)
             }))
         case .mcpServerStatusList(let id, _):
-            await ensureMcpServersStarted()
+            await ensureMcpServersStarted(conn: conn)
             await reply(conn, id, await mcpStatusListResponse())
         case .collaborationModeList(let id):
             await reply(conn, id, Self.collaborationModeListResponse())
@@ -1886,8 +2332,26 @@ public actor RequestRouter {
                 switch method {
                 case "account/login/start":
                     let loginType = params?["type"]?.stringValue ?? "chatgpt"
+                    // forced_login_method / external-auth guards, mirroring
+                    // account_processor.rs:251-266, 309-318, 556-563.
+                    let forcedLoginMethod = ConfigLoader(codexHome: codexHome)
+                        .load().string("forced_login_method")?.lowercased()
+                    let externalAuthActive = (await auth.storedTokens())?.tokenType
+                        .caseInsensitiveCompare("BearerExternal") == .orderedSame
                     switch loginType {
                     case "apiKey":
+                        if externalAuthActive {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "External auth is active. Use account/login/start (chatgptAuthTokens) to update it or account/logout to clear it."))
+                            return
+                        }
+                        if forcedLoginMethod == "chatgpt" {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "API key login is disabled. Use ChatGPT login instead."))
+                            return
+                        }
                         guard let apiKey = params?["apiKey"]?.stringValue, !apiKey.isEmpty else {
                             await conn.send(WireError.invalidRequest(
                                 id: id, "account/login/start apiKey requires apiKey"))
@@ -1901,10 +2365,19 @@ public actor RequestRouter {
                             await conn.send(ServerNotification.accountUpdated(
                                 authMode: "apikey", planType: nil).toMessage())
                         } catch {
-                            await conn.send(WireError.invalidRequest(
+                            // Upstream maps a persistence failure here to
+                            // `internal_error` (-32603) (account_processor.rs:285),
+                            // not invalid_request.
+                            await conn.send(WireError.internalError(
                                 id: id, "failed to save api key: \(error.localizedDescription)"))
                         }
                     case "chatgptAuthTokens":
+                        if forcedLoginMethod == "api" {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "External ChatGPT auth is disabled. Use API key login instead."))
+                            return
+                        }
                         guard let accessToken = params?["accessToken"]?.stringValue,
                               !accessToken.isEmpty,
                               let accountId = params?["chatgptAccountId"]?.stringValue,
@@ -1914,7 +2387,25 @@ public actor RequestRouter {
                                 "account/login/start chatgptAuthTokens requires accessToken and chatgptAccountId"))
                             return
                         }
-                        let planType = params?["chatgptPlanType"]?.stringValue ?? "unknown"
+                        // Enforce `forced_chatgpt_workspace_id`
+                        // (account_processor.rs:573-579): when configured, an
+                        // external ChatGPT token whose workspace/account id is
+                        // not in the allow-list is rejected before persisting,
+                        // with the verbatim upstream message.
+                        if let expected = Self.forcedChatgptWorkspaceIds(codexHome: codexHome),
+                           !expected.contains(accountId) {
+                            let listDebug = "[" + expected
+                                .map { "\"\($0)\"" }.joined(separator: ", ") + "]"
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "External auth must use one of workspace(s) \(listDebug), but received \"\(accountId)\"."))
+                            return
+                        }
+                        // Upstream (`from_external_tokens`) canonicalizes the
+                        // client-supplied plan via `PlanType::from_raw_value`,
+                        // defaulting to "unknown" when absent.
+                        let planType = AccountPlanType.wireValue(
+                            forRawClaim: params?["chatgptPlanType"]?.stringValue)
                         do {
                             try await auth.loginWithExternalChatGPTTokens(
                                 accessToken: accessToken, accountId: accountId)
@@ -1924,10 +2415,26 @@ public actor RequestRouter {
                             await conn.send(ServerNotification.accountUpdated(
                                 authMode: "chatgptAuthTokens", planType: planType).toMessage())
                         } catch {
-                            await conn.send(WireError.invalidRequest(
-                                id: id, "failed to save ChatGPT auth tokens: \(error.localizedDescription)"))
+                            // Upstream `login_with_chatgpt_auth_tokens` maps a
+                            // failure to `internal_error` (-32603) with the message
+                            // prefix "failed to set external auth:"
+                            // (account_processor.rs:587).
+                            await conn.send(WireError.internalError(
+                                id: id, "failed to set external auth: \(error.localizedDescription)"))
                         }
                     case "chatgpt":
+                        if externalAuthActive {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "External auth is active. Use account/login/start (chatgptAuthTokens) to update it or account/logout to clear it."))
+                            return
+                        }
+                        if forcedLoginMethod == "api" {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "ChatGPT login is disabled. Use API key login instead."))
+                            return
+                        }
                         let connection = ObjectIdentifier(conn as AnyObject)
                         if let oldLoginId = pendingLoginIds[connection],
                            let oldPending = pendingDeviceLogins.removeValue(forKey: oldLoginId) {
@@ -1939,8 +2446,17 @@ public actor RequestRouter {
                             oldPending.server.stop()
                         }
                         let loginId = UUID().uuidString.lowercased()
+                        // codex_streamlined_login (default false) only changes
+                        // the in-browser post-callback success page, not the
+                        // JSON-RPC auth_url. Threaded into the callback server
+                        // mirroring account_processor.rs:320-329 and
+                        // login/src/server.rs:887-889.
+                        let codexStreamlinedLogin =
+                            params?["codexStreamlinedLogin"]?.boolValue ?? false
                         do {
-                            let server = try ChatGPTLoginCallbackServer { [weak self] values in
+                            let server = try ChatGPTLoginCallbackServer(
+                                codexStreamlinedLogin: codexStreamlinedLogin
+                            ) { [weak self] values in
                                 guard let self else {
                                     return .failure("Login server stopped.", status: 503)
                                 }
@@ -1970,6 +2486,18 @@ public actor RequestRouter {
                                 id: id, "failed to start login server: \(error)"))
                         }
                     case "chatgptDeviceCode":
+                        if externalAuthActive {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "External auth is active. Use account/login/start (chatgptAuthTokens) to update it or account/logout to clear it."))
+                            return
+                        }
+                        if forcedLoginMethod == "api" {
+                            await conn.send(WireError.invalidRequest(
+                                id: id,
+                                "ChatGPT login is disabled. Use API key login instead."))
+                            return
+                        }
                         switch await auth.deviceCodeStart() {
                         case .success(let challenge):
                             let loginId = UUID().uuidString.lowercased()
@@ -2001,7 +2529,19 @@ public actor RequestRouter {
                                 "verificationUrl": .string(challenge.verificationURL),
                                 "userCode": .string(challenge.userCode)]))
                         case .failure(let error):
-                            await conn.send(WireError.invalidRequest(id: id, "\(error)"))
+                            // Mirror login_chatgpt_device_code_start_error
+                            // (account_processor.rs:344-351): a NotFound
+                            // condition (device-code login not enabled, HTTP 404)
+                            // maps to invalid_request with the error's own
+                            // message; any other failure is a transient
+                            // internal_error prefixed "failed to request device
+                            // code:".
+                            if case .deviceCodeNotEnabled(let message) = error {
+                                await conn.send(WireError.invalidRequest(id: id, message))
+                            } else {
+                                await conn.send(WireError.internalError(
+                                    id: id, "failed to request device code: \(error)"))
+                            }
                         }
                     default:
                         await conn.send(WireError.invalidRequest(
@@ -2013,6 +2553,14 @@ public actor RequestRouter {
                     let connection = ObjectIdentifier(conn as AnyObject)
                     let loginId = requestedLoginId ?? pendingLoginIds[connection]
                     var canceled = false
+                    // Tracks whether the cancelled login was a browser login. The
+                    // completion notification's error text differs by login kind:
+                    // a browser login-server shutdown wraps the io::Error as
+                    // "Login server error: Login was not completed"
+                    // (account_processor.rs:397-398 over login/server.rs:195-196),
+                    // whereas device-code cancellation emits the bare
+                    // "Login was not completed" (account_processor.rs:466-468).
+                    var canceledBrowser = false
                     if let loginId,
                        let pending = pendingDeviceLogins[loginId],
                        pending.connection == connection {
@@ -2033,6 +2581,7 @@ public actor RequestRouter {
                         }
                         await auth.loginCancel()
                         canceled = true
+                        canceledBrowser = true
                     } else if let loginId,
                               pendingLoginIds[connection] == loginId {
                         await auth.loginCancel()
@@ -2042,8 +2591,21 @@ public actor RequestRouter {
                     await reply(conn, id, .object([
                         "status": .string(canceled ? "canceled" : "notFound")]))
                     if canceled, let loginId {
+                        // Upstream emits AccountLoginCompletedNotification on a
+                        // cancelled login. Device-code cancellation carries the
+                        // bare "Login was not completed" (account_processor.rs:466-468),
+                        // while a cancelled BROWSER login surfaces the login-server
+                        // io::Error ("Login was not completed", login/server.rs:195-196)
+                        // wrapped by the browser background task as
+                        // "Login server error: {err}" (account_processor.rs:397-398).
+                        // The cancel *response* status remains "canceled" /
+                        // "notFound" (above); only this notification carries the text.
+                        let completionError = canceledBrowser
+                            ? "Login server error: Login was not completed"
+                            : "Login was not completed"
                         await conn.send(ServerNotification.accountLoginCompleted(
-                            loginId: loginId, success: false, error: "canceled").toMessage())
+                            loginId: loginId, success: false,
+                            error: completionError).toMessage())
                     }
                     return
                 case "account/logout":
@@ -2060,7 +2622,14 @@ public actor RequestRouter {
 
         // MARK: not a Codex method at all
         case .unsupported(let id, let method):
-            await conn.send(WireError.unsupported(id: id, method: method))
+            // Upstream deserializes JSONRPCRequest into the ClientRequest enum;
+            // an unrecognized method tag fails deserialization and is mapped to
+            // `invalid_request(format!("Invalid request: {err}"))` => -32600
+            // (app-server/src/message_processor.rs:536-541). The dispatch match
+            // is exhaustive with no catch-all, so unknown methods never reach a
+            // -32601 path. Mirror that here (NOT WireError.unsupported/-32601).
+            await conn.send(WireError.invalidRequest(
+                id: id, "Invalid request: unknown method `\(method)`"))
         }
     }
 
@@ -2131,6 +2700,89 @@ public actor RequestRouter {
         guard case .array(let values)? = config?.value("notify") else { return nil }
         let argv = values.compactMap(\.stringValue)
         return argv.isEmpty ? nil : argv
+    }
+
+    /// Resolved AGENTS.md knobs for a new (or resumed) thread, mirroring
+    /// upstream's `Config.user_instructions` (loaded from the global
+    /// `~/.codex/AGENTS.override.md` / `AGENTS.md`) plus the
+    /// `project_doc_fallback_filenames` / `project_root_markers` /
+    /// `project_doc_max_bytes` config knobs and the `ChildAgentsMd` feature.
+    struct AgentsMdConfig {
+        var userInstructions: String?
+        var filenames: [String]
+        var projectRootMarkers: [String]?
+        var childEnabled: Bool
+        var projectDocMaxBytes: Int
+    }
+
+    /// prompts finding A/B/C: gather the AGENTS.md inputs from live config so
+    /// `thread/start` seeds the model-visible user-instructions section with
+    /// the global instructions and honours the configured discovery knobs.
+    /// Upstream loads global instructions via
+    /// `AgentsMdManager::load_global_instructions(codex_home)`
+    /// (`core/src/config/mod.rs:2349`) and reads the fallback filenames / root
+    /// markers / `project_doc_max_bytes` from the merged config. A
+    /// A `project_doc_max_bytes` of 0 disables *discovered project AGENTS.md
+    /// docs* (`read_agents_md` short-circuit, `agents_md.rs:150-154`), but the
+    /// GLOBAL override (`~/.codex/AGENTS.override.md` / `AGENTS.md`) is loaded
+    /// UNCONDITIONALLY into `Config.user_instructions` (`config/mod.rs:2349`)
+    /// and prepended every turn regardless of the budget
+    /// (`user_instructions_with_fs`, `agents_md.rs:98-100`). So we always load
+    /// the global override here; the zero-budget gate only affects the project
+    /// docs (honoured downstream via `projectDocMaxBytes`).
+    static func agentsMdConfig(_ config: Config, codexHome: String, cwd: String)
+    -> AgentsMdConfig {
+        let maxBytes = Int(config.projectDocMaxBytes)
+        let markers = config.projectRootMarkers
+        let filenames = config.projectDocFallbackFilenames
+        let childEnabled = config.isFeatureEnabled("child_agents_md")
+        let userInstructions = AgentsMdManager(
+            codexHome: codexHome, cwd: cwd,
+            projectDocMaxBytes: maxBytes,
+            projectRootMarkers: markers ?? AgentsMdManager.DEFAULT_PROJECT_ROOT_MARKERS,
+            fallbackFilenames: filenames,
+            childAgentsMdEnabled: childEnabled
+        ).loadGlobalInstructions()?.contents
+        return AgentsMdConfig(
+            userInstructions: userInstructions,
+            filenames: filenames,
+            projectRootMarkers: markers,
+            childEnabled: childEnabled,
+            projectDocMaxBytes: maxBytes)
+    }
+
+    /// Resolve the sandbox mode for a new thread. Priority:
+    ///   1) explicit `p.sandbox` in `thread/start` params,
+    ///   2) `sandbox_mode` from the loaded `config.toml`,
+    ///   3) `.workspaceWrite` (built-in fallback).
+    ///
+    /// Without step (2), a client driving `thread/start` over the JSON-RPC
+    /// protocol without passing `sandbox` would silently fall back to
+    /// `workspaceWrite` even when `~/.codex/config.toml` set
+    /// `sandbox_mode = "danger-full-access"`. Fixes F01 in the parity audit.
+    private static func sandboxMode(from value: String?,
+                                    fallbackConfig: Config?) -> SandboxModeKind {
+        if let raw = value, !raw.isEmpty {
+            return SandboxModeKind(fromOptional: raw)
+        }
+        if let raw = fallbackConfig?.sandboxMode {
+            return SandboxModeKind(fromOptional: raw)
+        }
+        return .workspaceWrite
+    }
+
+    /// Resolve the default approval policy from the loaded config when the
+    /// client did not pass `approvalPolicy` in `thread/start` params. Fixes
+    /// the propagation half of F03 in the parity audit.
+    private static func approvalPolicyFallback(from config: Config?) -> ApprovalPolicy {
+        if let raw = config?.value("approval_policy")?.stringValue {
+            return ApprovalPolicy(fromOptional: raw)
+        }
+        // Effective runtime default when neither the request nor the config
+        // sets an approval policy. `on-request` is the port's intended default
+        // (previously supplied via a synthetic `defaults()` entry, now applied
+        // here so `config/read` can leave the field absent like upstream).
+        return .onRequest
     }
 
     private struct RealtimeSessionState {
@@ -2285,9 +2937,28 @@ public actor RequestRouter {
         if let voice, !realtimeVoicesV2.contains(voice) {
             throw SimpleError("thread/realtime/start voice is not supported")
         }
-        let prompt: String?
-        if params["prompt"]?.isNull == true { prompt = nil }
-        else { prompt = params["prompt"]?.stringValue }
+        // Realtime prompt selection (parity with upstream
+        // `prepare_realtime_backend_prompt`, core/src/realtime_prompt.rs). Model
+        // the request `prompt` as upstream `Option<Option<String>>`:
+        //   - key absent              → `nil`          → default backend prompt
+        //   - explicit `prompt: null` → `.some(.none)` → "" (no system prompt)
+        //   - `prompt: "..."`         → `.some(.some)` → verbatim
+        let requestPrompt: String??
+        if params["prompt"] == nil {
+            requestPrompt = nil
+        } else if params["prompt"]?.isNull == true {
+            requestPrompt = .some(.none)
+        } else {
+            requestPrompt = .some(params["prompt"]?.stringValue)
+        }
+        let resolvedPrompt = Templates.prepareRealtimeBackendPrompt(
+            requestPrompt: requestPrompt,
+            configPrompt: nil,
+            userFirstName: Self.currentUserFirstName())
+        // Empty resolved prompt → no system item is injected (matches the
+        // existing `!prompt.isEmpty` gate downstream and upstream's empty-string
+        // result for `Some(None)`).
+        let prompt: String? = resolvedPrompt.isEmpty ? nil : resolvedPrompt
         let sessionId = params["realtimeSessionId"]?.stringValue
             ?? "rt_\(threadId.raw)_\(UUID().uuidString)"
         let transport = params["transport"]?.objectValue ?? ["type": .string("websocket")]
@@ -2573,6 +3244,15 @@ public actor RequestRouter {
         guard method == "getAuthStatus" else { return false }
         let includeToken = params?["includeToken"]?.boolValue ?? false
         let refreshToken = params?["refreshToken"]?.boolValue ?? false
+        // Mirror upstream get_auth_status_response (account_processor.rs:751-758):
+        // when the active model provider does not require OpenAI auth, report
+        // authMethod:nil / authToken:nil / requiresOpenaiAuth:false without
+        // consulting the token store, matching account/read (getAccountResponse).
+        guard currentProviderRequiresOpenAIAuth() else {
+            await reply(conn, id, Self.authStatusJSON(
+                authMethod: nil, authToken: nil, requiresOpenaiAuth: false))
+            return true
+        }
         guard let auth else {
             await reply(conn, id, Self.authStatusJSON(
                 authMethod: nil, authToken: nil, requiresOpenaiAuth: true))
@@ -2593,6 +3273,16 @@ public actor RequestRouter {
 
         guard let tokens = await auth.storedTokens(),
               let authMethod = Self.authMethod(for: tokens) else {
+            await reply(conn, id, Self.authStatusJSON(
+                authMethod: nil, authToken: nil, requiresOpenaiAuth: true))
+            return true
+        }
+
+        // Mirror upstream's `get_token()` branch
+        // (account_processor.rs:776-787): an empty access token is treated as
+        // the no-token state (authMethod:nil), not a present-token state. This
+        // distinguishes a degenerate empty-token credential from a real one.
+        guard !tokens.accessToken.isEmpty else {
             await reply(conn, id, Self.authStatusJSON(
                 authMethod: nil, authToken: nil, requiresOpenaiAuth: true))
             return true
@@ -3340,6 +4030,21 @@ public actor RequestRouter {
         return state
     }
 
+    /// First name used for `{{ user_first_name }}` substitution in the realtime
+    /// backend prompt. Port of `realtime_prompt.rs::current_user_first_name`:
+    /// try the real name then the username, take the first whitespace-delimited
+    /// token of whichever is non-empty, else fall back to "there". On macOS
+    /// `NSFullUserName()` ≈ `whoami::realname()`, `NSUserName()` ≈ `whoami::username()`.
+    private static func currentUserFirstName() -> String {
+        for source in [NSFullUserName(), NSUserName()] {
+            if let first = source.split(whereSeparator: { $0.isWhitespace }).first,
+               !first.isEmpty {
+                return String(first)
+            }
+        }
+        return Templates.realtimeDefaultUserFirstName
+    }
+
     private static func localServerName() -> String {
         let candidates = [
             ProcessInfo.processInfo.environment["HOSTNAME"],
@@ -3535,7 +4240,7 @@ public actor RequestRouter {
         ])
     }
 
-    private func getAccountResponse(refreshToken: Bool) async -> GetAccountResponse {
+    private func getAccountResponse(refreshToken: Bool) async throws -> GetAccountResponse {
         let requiresOpenAIAuth = currentProviderRequiresOpenAIAuth()
         guard requiresOpenAIAuth else {
             return GetAccountResponse(account: nil, requiresOpenaiAuth: false)
@@ -3554,7 +4259,7 @@ public actor RequestRouter {
             return GetAccountResponse(account: nil, requiresOpenaiAuth: true)
         }
         return GetAccountResponse(
-            account: Self.accountJSON(for: tokens),
+            account: try Self.accountJSON(for: tokens),
             requiresOpenaiAuth: true)
     }
 
@@ -3594,15 +4299,35 @@ public actor RequestRouter {
         }
     }
 
-    private static func accountJSON(for tokens: AuthTokens) -> JSONValue? {
+    /// Signals that a ChatGPT-authenticated token is missing the `email` or
+    /// `plan_type` JWT claims. Upstream maps this to an `invalid_request`
+    /// error ("email and plan type are required for chatgpt authentication")
+    /// rather than fabricating an empty email / "unknown" plan.
+    /// (model-provider/src/provider.rs:216-223,
+    ///  account_processor.rs:818-824)
+    struct MissingChatgptAccountDetails: Error {}
+
+    private static func accountJSON(for tokens: AuthTokens) throws -> JSONValue? {
         switch tokens.tokenType.lowercased() {
         case "apikey":
             return .object(["type": .string("apiKey")])
         case "bearer", "bearerexternal":
-            let claims = tokenClaims(tokens.idToken) ?? tokenClaims(tokens.accessToken)
+            // Upstream sources email/plan EXCLUSIVELY from the id_token JWT
+            // claims (`AuthManager::get_account_email` / `account_plan_type`,
+            // manager.rs:357-388), never the access_token. Decoding the
+            // access_token as a fallback could surface a chatgpt account where
+            // upstream would treat the email as absent and reject.
+            let claims = tokenClaims(tokens.idToken)
+            // Upstream (`model-provider/src/provider.rs:216-223`) requires an
+            // email for ChatGPT auth, but the plan type defaults to "unknown"
+            // when the claim is absent (`AuthManager::account_plan_type` ->
+            // `AccountPlanType::Unknown`). Only a missing email is fatal.
+            guard let email = claims?.email else {
+                throw MissingChatgptAccountDetails()
+            }
             return .object([
                 "type": .string("chatgpt"),
-                "email": .string(claims?.email ?? ""),
+                "email": .string(email),
                 "planType": .string(claims?.planType ?? "unknown"),
             ])
         default:
@@ -3616,22 +4341,32 @@ public actor RequestRouter {
     }
 
     private static func tokenClaims(_ token: String?) -> TokenClaims? {
-        guard let token else { return nil }
-        let parts = token.split(separator: ".")
-        guard parts.count >= 2 else { return nil }
-        var payload = String(parts[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        while payload.count % 4 != 0 { payload += "=" }
-        guard let data = Data(base64Encoded: payload),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let object = decodeJWTPayload(token) else { return nil }
+        // Email may live at the top level or nested under the OpenAI profile
+        // claim (`https://api.openai.com/profile`), mirroring upstream
+        // `parse_chatgpt_jwt_claims` (`IdClaims::email.or(profile.email)`).
+        let email = object["email"] as? String
+            ?? (object["https://api.openai.com/profile"] as? [String: Any])?["email"] as? String
+        return TokenClaims(email: email, planType: chatgptPlanType(token))
+    }
+
+    /// Resolve `forced_chatgpt_workspace_id` from config as a normalized list,
+    /// mirroring upstream `Option<Vec<String>>` (config_toml.rs:234 accepts
+    /// either a single string or a TOML list). Returns nil when unset/empty so
+    /// the caller skips the allow-list check (upstream `if let Some(..)`).
+    static func forcedChatgptWorkspaceIds(codexHome: String) -> [String]? {
+        let value = ConfigLoader(codexHome: codexHome)
+            .load().value("forced_chatgpt_workspace_id")
+        let ids: [String]
+        switch value {
+        case .string(let s):
+            ids = [s]
+        case .array(let arr):
+            ids = arr.compactMap { $0.stringValue }
+        default:
             return nil
         }
-        let email = object["email"] as? String
-        let plan = object["https://api.openai.com/plan_type"] as? String
-            ?? object["plan_type"] as? String
-            ?? object["planType"] as? String
-        return TokenClaims(email: email, planType: plan?.lowercased())
+        return ids.isEmpty ? nil : ids
     }
 
     private static func authMethod(for tokens: AuthTokens) -> String? {
@@ -3856,7 +4591,7 @@ public actor RequestRouter {
         switch method {
         case "config/mcpServer/reload":
             await mcpManager.stopAll()
-            await ensureMcpServersStarted()
+            await ensureMcpServersStarted(conn: conn)
             await reply(conn, id, .object([:]))
             return true
         case "mcpServer/tool/call":
@@ -3890,9 +4625,20 @@ public actor RequestRouter {
         }
     }
 
-    private func ensureMcpServersStarted() async {
+    private func ensureMcpServersStarted(conn: (any ClientConnection)? = nil) async {
         let configs = McpManager.loadConfigs(codexHome: codexHome)
-        await mcpManager.startAll(configs)
+        // Stream per-server startup progress as `mcpServer/startupStatus/updated`
+        // notifications when a connection is available (upstream
+        // `EventMsg::McpStartupUpdate` → v2 `McpServerStatusUpdatedNotification`,
+        // bespoke_event_handling.rs:196-218).
+        var sink: McpManager.StartupStatusUpdate?
+        if let c = conn {
+            sink = { (server: String, status: McpServerStartupState, error: String?) in
+                await c.send(ServerNotification.mcpServerStatusUpdated(
+                    name: server, status: status, error: error).toMessage())
+            }
+        }
+        await mcpManager.startAll(configs, onStatusUpdate: sink)
     }
 
     private func mcpStatusListResponse() async -> JSONValue {
@@ -4023,8 +4769,29 @@ public actor RequestRouter {
             return try workerResult.get()
         }
         await ensureMcpServersStarted()
+        // Upstream parity (codex-mcp/src/elicitation.rs::make_sender): apply the
+        // elicitation policy before surfacing a prompt. Resolve the effective
+        // approval policy + sandbox from the loaded config (this direct
+        // `mcpServer/tool/call` path has no per-turn SessionConfig threaded in).
+        let elicitConfig = ConfigLoader(codexHome: codexHome).load()
+        let elicitPolicy = Self.approvalPolicyFallback(from: elicitConfig)
+        let elicitSandbox = Self.sandboxMode(from: nil, fallbackConfig: elicitConfig)
+        let elicitAutoApproved =
+            elicitPolicy == .never && elicitSandbox == .dangerFullAccess
         let handler: McpElicitationHandler = { [weak self, conn] requestId, serverName, params in
             guard let self else { return nil }
+            switch McpElicitationPolicy.decide(approvalPolicy: elicitPolicy,
+                                               autoDeny: false,
+                                               autoApproved: elicitAutoApproved,
+                                               params: params) {
+            case .decline:
+                return .object(["action": .string("decline")])
+            case .accept:
+                return .object(["action": .string("accept"),
+                                "content": .object([:])])
+            case .prompt:
+                break
+            }
             let appParams = Self.mcpElicitationParams(threadId: threadId,
                                                       serverName: serverName,
                                                       params: params)
@@ -4035,13 +4802,23 @@ public actor RequestRouter {
         let result = try await mcpManager.callTool(server: server, tool: tool,
                                                    argumentsJSON: argsJSON,
                                                    elicitationHandler: handler)
-        return .object([
-            "content": .array([
+        // Finding 2 (v7): surface the FULL MCP CallToolResult — the complete
+        // content block array, structuredContent, and result `_meta` — instead
+        // of collapsing everything to a single concatenated text block. Mirrors
+        // upstream `connection_manager.rs::call_tool` which preserves all of it.
+        let content: JSONValue
+        if result.content.isEmpty {
+            content = .array([
                 .object(["type": .string("text"), "text": .string(result.text)])
-            ]),
-            "structuredContent": .null,
+            ])
+        } else {
+            content = .array(result.content.map(Self.jsonLiteToValue(_:)))
+        }
+        return .object([
+            "content": content,
+            "structuredContent": result.structuredContent.map(Self.jsonLiteToValue(_:)) ?? .null,
             "isError": .bool(result.isError),
-            "_meta": .null,
+            "_meta": result.meta.map(Self.jsonLiteToValue(_:)) ?? .null,
         ])
     }
 
@@ -4132,7 +4909,7 @@ public actor RequestRouter {
             turnId: nil,
             serverName: serverName,
             mode: mode,
-            meta: params["_meta"] ?? .null,
+            meta: McpElicitationPolicy.scrubMeta(params["_meta"]),
             message: params["message"]?.stringValue ?? "",
             requestedSchema: params["requestedSchema"],
             url: params["url"]?.stringValue,
@@ -5678,41 +6455,223 @@ public actor RequestRouter {
         if let requested = params["filePath"]?.stringValue {
             let requestedPath = URL(fileURLWithPath: requested).standardizedFileURL.path
             guard requestedPath == configPath else {
-                await conn.send(WireError.invalidRequest(
-                    id: id, "Only writes to the user config are allowed"))
+                // Writes are only permitted to the user layer; any other target
+                // is a read-only layer (upstream `ConfigLayerReadonly`).
+                await conn.send(WireError.configWriteError(
+                    id: id, code: "configLayerReadonly",
+                    "Only writes to the user config are allowed"))
                 return true
             }
         }
+        // `expectedVersion` is compared against the USER layer's version — the
+        // same `sha256:<hex>` value `config/read` reports for that layer — so a
+        // read→write round-trip matches (upstream uses the active user layer's
+        // `version_for_toml`).
         if let expected = params["expectedVersion"]?.stringValue,
-           expected != Self.configVersion(path: configPath) {
-            await conn.send(WireError.invalidRequest(
-                id: id, "Configuration was modified since last read. Fetch latest version and retry."))
+           expected != Self.userLayerVersion(codexHome: codexHome) {
+            await conn.send(WireError.configWriteError(
+                id: id, code: "configVersionConflict",
+                "Configuration was modified since last read. Fetch latest version and retry."))
             return true
         }
 
         do {
             var root = try Self.readUserConfigTOML(path: configPath)
             var changed = false
+            var editedKeyPaths: [String] = []
             for (keyPath, value, strategy) in edits {
                 let segments = try Self.parseConfigKeyPath(keyPath)
+                editedKeyPaths.append(keyPath)
                 let configValue = Self.configValue(from: value)
                 changed = try Self.applyConfigEdit(
                     root: &root, segments: segments, value: configValue,
                     mergeStrategy: strategy) || changed
             }
+            // Upstream rejects writes whose resulting config would fail
+            // `try_into::<ConfigToml>()`: `validate_config(&user_config)` is run
+            // on the post-edit user config (config_manager_service.rs:274-279).
+            // A wrong scalar type or an invalid enum variant maps to
+            // `ConfigValidationError`. Mirror that by type/enum-checking the
+            // post-edit user root BEFORE persisting. (Upstream additionally
+            // validates the effective merged config; the only user-controlled
+            // input on this path is the user layer, which we validate here.)
+            try Self.validateConfigToml(root)
             if changed {
                 try loader.persistTOML(root)
             }
+            // Detect whether a higher-precedence layer (system/mdm/project)
+            // overrides any edited key after the write. Upstream returns
+            // `okOverridden` + `overriddenMetadata` in that case so the client
+            // knows its user-layer write is shadowed (config write
+            // `first_overridden_edit`).
+            let overridden = Self.firstOverriddenEdit(
+                codexHome: codexHome, editedKeyPaths: editedKeyPaths)
+            // `config/batchWrite` carries an optional `reloadUserConfig` flag
+            // (v2/config.rs:692-694). Upstream's single-process app-server hot-
+            // reloads the user-config layer into every in-process thread
+            // (config_processor.rs:308-310 → Session::reload_user_config_layer).
+            // In this port each thread runs as a SEPARATE `codex-session`
+            // worker process that loads config.toml fresh at spawn, so a
+            // worker's running turn loop owns its own immutable config snapshot
+            // and there is no in-process reference to hot-swap. Threads started
+            // AFTER this write already observe the new config (they re-read
+            // config.toml at spawn). Pushing a mid-session reload would require
+            // a new cross-process `EngineOp` and worker-side between-turn apply;
+            // that is the documented multi-process divergence (see audit
+            // finding "config/batchWrite reloadUserConfig flag ignored"). We
+            // read the flag so it is acknowledged rather than silently dropped.
+            // No-op for already-running worker processes (divergence above);
+            // newly spawned workers pick up the persisted config.
+            let _reloadRequested = method == "config/batchWrite"
+                && params["reloadUserConfig"]?.boolValue == true
+            _ = _reloadRequested
             await reply(conn, id, .object([
-                "status": .string("ok"),
-                "version": .string(Self.configVersion(path: configPath)),
+                "status": .string(overridden == nil ? "ok" : "okOverridden"),
+                "version": .string(Self.userLayerVersion(codexHome: codexHome)),
                 "filePath": .string(configPath),
-                "overriddenMetadata": .null,
+                "overriddenMetadata": overridden ?? .null,
             ]))
         } catch {
-            await conn.send(WireError.invalidRequest(id: id, error.localizedDescription))
+            // Parse/apply failures map to a validation error (upstream
+            // `ConfigValidationError`).
+            await conn.send(WireError.configWriteError(
+                id: id, code: "configValidationError", error.localizedDescription))
         }
         return true
+    }
+
+    /// Upstream `first_overridden_edit`: after a user-layer write, reload the
+    /// full config stack and return `OverriddenMetadata` for the first edited
+    /// key whose effective value now comes from a higher-precedence (non-user)
+    /// layer. Returns nil when the user write is the effective value.
+    static func firstOverriddenEdit(codexHome: String,
+                                    editedKeyPaths: [String],
+                                    loader: ConfigLoader? = nil) -> JSONValue? {
+        let cfg = (loader ?? ConfigLoader(codexHome: codexHome)).load()
+        for keyPath in editedKeyPaths {
+            // Effective layer = highest-precedence layer that provides a value
+            // at this path (subtree-aware, mirrors upstream `find_effective_layer`).
+            guard let meta = Self.effectiveLayerMeta(cfg, path: keyPath) else { continue }
+            if case .user = meta.name { continue }   // user write is effective
+            // Audit app-server-registry/finding-4: upstream
+            // `compute_override_metadata` (config_manager_service.rs:605-607)
+            // returns None when `user_value.is_some() && user_value ==
+            // effective_value` — i.e. when the highest-precedence layer carries
+            // the IDENTICAL value the user just wrote, the status stays `ok`
+            // (no override report). Keying solely on layer identity would
+            // mis-report a no-op-equivalent write as `okOverridden`. So before
+            // reporting, compare the active user-layer value at this path
+            // against the effective value and suppress the override when equal.
+            let effectiveValue = cfg.value(keyPath)
+            let userLayerValue: ConfigValue? = cfg.layers.first(where: {
+                if case .user = $0.source { return true } else { return false }
+            }).flatMap { Self.layerValueAtPath($0.values, path: keyPath) }
+            if let uv = userLayerValue, uv == effectiveValue { continue }
+            // A higher-precedence (system/mdm/project/…) layer shadows the write.
+            let effective = effectiveValue.map(Self.configValueToJSON) ?? .null
+            return .object([
+                "message": .string(Self.overrideMessage(meta.name)),
+                "overridingLayer": Self.configValueToJSON(meta.toJSON()),
+                "effectiveValue": effective,
+            ])
+        }
+        return nil
+    }
+
+    /// Upstream `override_message` (config_manager_service.rs:566-592): the
+    /// human-readable `OverriddenMetadata.message` text, distinct per overriding
+    /// layer type, embedding the domain/file path where upstream does. Reproduce
+    /// the exact strings so frontends that surface or match on the message see
+    /// the same text codex-rs emits.
+    static func overrideMessage(_ layer: ConfigLayerSource) -> String {
+        switch layer {
+        case .mdm(let domain, _):
+            return "Overridden by managed policy (MDM): \(domain)"
+        case .system(let file):
+            return "Overridden by managed config (system): \(file)"
+        case .project(let dotCodexFolder):
+            return "Overridden by project config: \(dotCodexFolder)/config.toml"
+        case .sessionFlags:
+            return "Overridden by session flags"
+        case .user(let file, _):
+            return "Overridden by user config: \(file)"
+        case .legacyManagedConfigTomlFromFile(let file):
+            return "Overridden by legacy managed_config.toml: \(file)"
+        case .legacyManagedConfigTomlFromMdm:
+            return "Overridden by legacy managed configuration from MDM"
+        }
+    }
+
+    /// Version (`sha256:<hex>`) of the active user layer (`$CODEX_HOME/config.toml`).
+    ///
+    /// Upstream computes the user layer's version via `version_for_toml` over
+    /// the RAW on-disk TOML value the user layer was loaded from
+    /// (`config/src/state.rs:107-117` via `load_user_config_layer`,
+    /// `loader/mod.rs:386-414`) — profiles intact, with no inline-profile
+    /// overlay folded in. The bytes actually read/written by config write are
+    /// that same raw file, so we must hash the raw root (not the `"toml"`
+    /// config layer, which has profiles stripped/overlaid for the projection
+    /// view). This keeps the `expectedVersion` round-trip in lock-step with the
+    /// on-disk file.
+    static func userLayerVersion(codexHome: String) -> String {
+        let loader = ConfigLoader(codexHome: codexHome)
+        let raw = (try? Self.readUserConfigTOML(path: loader.tomlPath)) ?? [:]
+        return ConfigCanonicalVersion.version(of: raw)
+    }
+
+    /// Compute a config layer's `version` over the RAW on-disk TOML it was
+    /// loaded from (upstream `version_for_toml` in `ConfigLayerEntry::new`),
+    /// falling back to the in-memory layer values for non-file-backed sources
+    /// (MDM/session-flags) which upstream also hashes from their raw value.
+    static func rawLayerVersion(source: ConfigLayerSource,
+                                fallback: [String: ConfigValue]) -> String {
+        let file: String?
+        switch source {
+        case .user(let f, _): file = f
+        case .system(let f): file = f
+        // Project layers: upstream builds the `ConfigLayerEntry` from the
+        // config AFTER `sanitize_project_config` (denylist removal),
+        // relative-path resolution and alias normalization, then hashes THAT
+        // via `version_for_toml` (loader/mod.rs:1203-1225, state.rs:107-117).
+        // So the reported version must be over the sanitized+normalized layer
+        // values (`fallback`), NOT the raw on-disk file (which would still
+        // carry denylisted keys / legacy aliases). Re-reading the raw file
+        // here would diverge from upstream whenever the project config.toml
+        // sets a denylisted key. Hash the in-memory layer values instead.
+        case .project: file = nil
+        case .legacyManagedConfigTomlFromFile(let f): file = f
+        case .mdm, .sessionFlags, .legacyManagedConfigTomlFromMdm: file = nil
+        }
+        if let file {
+            let raw = (try? Self.readUserConfigTOML(path: file)) ?? [:]
+            return ConfigCanonicalVersion.version(of: raw)
+        }
+        return ConfigCanonicalVersion.version(of: fallback)
+    }
+
+    /// Upstream `find_effective_layer`: the highest-precedence layer (by
+    /// `ConfigLayerSource.precedence`) that provides a value at `path`
+    /// (matching tables/arrays, not just scalars). Synthetic defaults excluded.
+    static func effectiveLayerMeta(_ cfg: Config, path: String) -> ConfigLayerMetadata? {
+        let candidates: [ConfigLayerMetadata] = cfg.layers.compactMap { layer in
+            guard let src = layer.source,
+                  Self.layerValueAtPath(layer.values, path: path) != nil else { return nil }
+            return ConfigLayerMetadata(
+                name: src, version: Self.rawLayerVersion(source: src, fallback: layer.values))
+        }
+        return candidates.max(by: { $0.name.precedence < $1.name.precedence })
+    }
+
+    /// Dotted-path lookup within a single layer's values (subtree-aware).
+    static func layerValueAtPath(_ values: [String: ConfigValue], path: String) -> ConfigValue? {
+        let parts = path.split(separator: ".").map(String.init)
+        guard let first = parts.first else { return nil }
+        var cur: ConfigValue? = values[first]
+        for p in parts.dropFirst() {
+            guard case .object(let o)? = cur else { return nil }
+            cur = o[p]
+        }
+        return cur
     }
 
     private func handleExternalAgentConfigRequest(id: RequestId, method: String,
@@ -5751,6 +6710,146 @@ public actor RequestRouter {
         let text = try String(contentsOfFile: path, encoding: .utf8)
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return [:] }
         return try TOML.parse(text)
+    }
+
+    /// Mirror of upstream `validate_config` (config_manager_service.rs:539-542),
+    /// which performs `let _: ConfigToml = value.clone().try_into()?;`. A
+    /// strict serde deserialize into `ConfigToml` rejects:
+    ///   - wrong scalar types (e.g. `model = 123`, `project_doc_max_bytes = "x"`)
+    ///   - unknown enum variants (e.g. `approval_policy = "bogus"`,
+    ///     `sandbox_mode = "full-write"`)
+    /// Rather than porting the full `ConfigToml` struct, this validates the
+    /// enum-valued keys against upstream's allowed variants and the typed
+    /// scalar fields against their expected JSON type, throwing on the first
+    /// violation. The caller maps any thrown error to `configValidationError`.
+    static func validateConfigToml(_ root: [String: ConfigValue]) throws {
+        // Strict type predicates: upstream's serde deserialize into `ConfigToml`
+        // does NOT coerce across types (a string is not a valid `i64`/`bool`),
+        // so these match the exact JSON kind rather than using the lenient
+        // `ConfigValue` accessors.
+        func isNullV(_ v: ConfigValue) -> Bool { if case .null = v { return true }; return false }
+        func strictString(_ v: ConfigValue) -> String? { if case .string(let s) = v { return s }; return nil }
+        func strictInt(_ v: ConfigValue) -> Bool {
+            switch v { case .int, .double: return true; default: return false }
+        }
+        func strictBool(_ v: ConfigValue) -> Bool { if case .bool = v { return true }; return false }
+
+        // Enum-valued keys: value (when present and non-null) must be one of
+        // the listed serde variants.
+        let enumKeys: [(String, Set<String>)] = [
+            ("sandbox_mode", ["read-only", "workspace-write", "danger-full-access"]),
+            ("model_reasoning_effort", ["none", "minimal", "low", "medium", "high", "xhigh"]),
+            ("model_reasoning_summary", ["auto", "concise", "detailed", "none"]),
+            ("model_verbosity", ["low", "medium", "high"]),
+            ("cli_auth_credentials_store", ["file", "keyring", "auto", "ephemeral"]),
+            ("mcp_oauth_credentials_store", ["auto", "file", "keyring"]),
+            ("forced_login_method", ["chatgpt", "api"]),
+            // WebSearchMode (config_types.rs:289-294).
+            ("web_search", ["disabled", "cached", "live"]),
+            // Personality (config_types.rs:278-282).
+            ("personality", ["none", "friendly", "pragmatic"]),
+            // plan_mode_reasoning_effort: ReasoningEffort (openai_models.rs:44-52).
+            ("plan_mode_reasoning_effort",
+             ["none", "minimal", "low", "medium", "high", "xhigh"]),
+        ]
+        for (key, allowed) in enumKeys {
+            guard let v = root[key], !isNullV(v) else { continue }
+            guard let s = strictString(v) else {
+                throw SimpleError("Invalid configuration: `\(key)` must be a string")
+            }
+            if !allowed.contains(s) {
+                throw SimpleError("Invalid configuration: unknown variant `\(s)` for `\(key)`")
+            }
+        }
+        // `approval_policy` (AskForApproval): kebab-case unit variant string or
+        // a `{ type = "granular", ... }` table (externally-untagged struct
+        // variant).
+        if let ap = root["approval_policy"], !isNullV(ap) {
+            switch ap {
+            case .string(let s):
+                let allowed: Set<String> = ["untrusted", "on-failure", "on-request", "never"]
+                if !allowed.contains(s) {
+                    throw SimpleError("Invalid configuration: unknown variant `\(s)` for `approval_policy`")
+                }
+            case .object:
+                break  // granular config table
+            default:
+                throw SimpleError("Invalid configuration: `approval_policy` must be a string or table")
+            }
+        }
+        // Typed scalar fields: each must be the listed JSON type when present
+        // and non-null.
+        let stringFields = [
+            "model", "review_model", "model_provider", "default_permissions",
+            "instructions", "developer_instructions", "compact_prompt",
+            "mcp_oauth_callback_url", "service_tier", "chatgpt_base_url",
+            "apps_mcp_product_sku", "openai_base_url", "oss_provider", "profile",
+        ]
+        for key in stringFields {
+            guard let v = root[key], !isNullV(v) else { continue }
+            if strictString(v) == nil {
+                throw SimpleError("Invalid configuration: `\(key)` must be a string")
+            }
+        }
+        let intFields = [
+            "model_context_window", "model_auto_compact_token_limit",
+            "project_doc_max_bytes", "tool_output_token_limit",
+            "background_terminal_max_timeout", "mcp_oauth_callback_port",
+        ]
+        for key in intFields {
+            guard let v = root[key], !isNullV(v) else { continue }
+            if !strictInt(v) {
+                throw SimpleError("Invalid configuration: `\(key)` must be an integer")
+            }
+        }
+        let boolFields = [
+            "allow_login_shell", "include_permissions_instructions",
+            "include_apps_instructions", "include_collaboration_mode_instructions",
+            "include_environment_context", "hide_agent_reasoning",
+            "show_raw_agent_reasoning", "model_supports_reasoning_summaries",
+            "suppress_unstable_features_warning", "check_for_update_on_startup",
+            "disable_paste_burst", "experimental_use_unified_exec_tool",
+        ]
+        for key in boolFields {
+            guard let v = root[key], !isNullV(v) else { continue }
+            if !strictBool(v) {
+                throw SimpleError("Invalid configuration: `\(key)` must be a boolean")
+            }
+        }
+        // `notify` / `project_doc_fallback_filenames`: arrays of strings.
+        for key in ["notify", "project_doc_fallback_filenames"] {
+            guard let v = root[key], !isNullV(v) else { continue }
+            guard case .array(let arr) = v else {
+                throw SimpleError("Invalid configuration: `\(key)` must be an array of strings")
+            }
+            if arr.contains(where: { strictString($0) == nil }) {
+                throw SimpleError("Invalid configuration: `\(key)` must be an array of strings")
+            }
+        }
+        // Nested objects with their own enum/typed leaves.
+        if let history = root["history"], !isNullV(history) {
+            guard case .object(let h) = history else {
+                throw SimpleError("Invalid configuration: `history` must be a table")
+            }
+            if let p = h["persistence"], !isNullV(p) {
+                guard let s = strictString(p), ["save-all", "none"].contains(s) else {
+                    throw SimpleError("Invalid configuration: unknown variant for `history.persistence`")
+                }
+            }
+            if let mb = h["max_bytes"], !isNullV(mb), !strictInt(mb) {
+                throw SimpleError("Invalid configuration: `history.max_bytes` must be an integer")
+            }
+        }
+        if let sep = root["shell_environment_policy"], !isNullV(sep) {
+            guard case .object(let s) = sep else {
+                throw SimpleError("Invalid configuration: `shell_environment_policy` must be a table")
+            }
+            if let inh = s["inherit"], !isNullV(inh) {
+                guard let str = strictString(inh), ["core", "all", "none"].contains(str) else {
+                    throw SimpleError("Invalid configuration: unknown variant for `shell_environment_policy.inherit`")
+                }
+            }
+        }
     }
 
     private static func applySkillConfigWrite(root: inout [String: ConfigValue],
@@ -5835,41 +6934,18 @@ public actor RequestRouter {
         }
     }
 
+    /// Parse a `config/value/write` keyPath into segments, mirroring upstream
+    /// `parse_key_path` EXACTLY (config_manager_service.rs:402-410): reject only
+    /// fully empty/whitespace input, otherwise plain `split('.')`. Quotes and
+    /// backslashes are LITERAL characters (no special parsing), and empty
+    /// segments are NOT rejected — `a..b` yields `["a", "", "b"]`. This keeps
+    /// the wire-facing keyPath round-trip in lock-step with upstream rather than
+    /// imposing a stricter (divergent) quote/escape mini-parser.
     private static func parseConfigKeyPath(_ path: String) throws -> [String] {
         guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw SimpleError("keyPath must not be empty")
         }
-        var segments: [String] = []
-        var segment = ""
-        var quoted = false
-        var iterator = path.makeIterator()
-        while let ch = iterator.next() {
-            switch ch {
-            case "\"" where segment.isEmpty && !quoted:
-                quoted = true
-            case "\"" where quoted:
-                quoted = false
-            case "\\" where quoted:
-                guard let escaped = iterator.next() else {
-                    throw SimpleError("unterminated escape in keyPath")
-                }
-                segment.append(escaped)
-            case "." where !quoted:
-                guard !segment.isEmpty else {
-                    throw SimpleError("keyPath segments must not be empty")
-                }
-                segments.append(segment)
-                segment = ""
-            case "\"":
-                throw SimpleError("invalid quoted keyPath segment")
-            default:
-                segment.append(ch)
-            }
-        }
-        guard !quoted else { throw SimpleError("unterminated quoted keyPath segment") }
-        guard !segment.isEmpty else { throw SimpleError("keyPath segments must not be empty") }
-        segments.append(segment)
-        return segments
+        return path.components(separatedBy: ".")
     }
 
     private static func applyConfigEdit(root: inout [String: ConfigValue],
@@ -7811,6 +8887,10 @@ public actor RequestRouter {
             (String(data: stdout, encoding: .utf8) ?? "",
              String(data: stderr, encoding: .utf8) ?? "")
         }
+
+        func capFlags() -> (stdout: Bool, stderr: Bool) {
+            (stdoutCapReached, stderrCapReached)
+        }
     }
 
     private func startCommandExecSession(id: RequestId,
@@ -8159,6 +9239,17 @@ public actor RequestRouter {
             return
         }
         let tty = params["tty"]?.boolValue == true
+        // `tty` implies `streamStdoutStderr` (upstream process.rs:40). Otherwise
+        // streaming is opt-in (`streamStdoutStderr`, default false → buffered).
+        let streamOutput = tty || params["streamStdoutStderr"]?.boolValue == true
+        // `outputBytesCap` is a double-option: omitted → server default (1 MiB);
+        // explicit JSON `null` → cap disabled. Mirror command/exec.
+        let outputCap: Int?
+        if let capValue = params["outputBytesCap"] {
+            outputCap = capValue.isNull ? nil : capValue.intValue.map(Int.init)
+        } else {
+            outputCap = 1_048_576
+        }
 
         let key = ProcessSessionKey(connection: ObjectIdentifier(conn as AnyObject),
                                     processHandle: processHandle)
@@ -8214,6 +9305,7 @@ public actor RequestRouter {
             exitContinuation.resolve(p.terminationStatus)
         }
 
+        let output = CommandExecOutputBuffer(cap: outputCap)
         do {
             try process.run()
             ptySlaves.forEach { try? $0.close() }
@@ -8221,17 +9313,20 @@ public actor RequestRouter {
             if let ptyMaster {
                 outputTasks.append(drainProcessOutput(
                     handle: ptyMaster, processHandle: processHandle,
-                    stream: "stdout", conn: conn))
+                    stream: "stdout", streamOutput: streamOutput,
+                    output: output, conn: conn))
             } else {
                 if let stdoutPipe {
                     outputTasks.append(drainProcessOutput(
                         pipe: stdoutPipe, processHandle: processHandle,
-                        stream: "stdout", conn: conn))
+                        stream: "stdout", streamOutput: streamOutput,
+                        output: output, conn: conn))
                 }
                 if let stderrPipe {
                     outputTasks.append(drainProcessOutput(
                         pipe: stderrPipe, processHandle: processHandle,
-                        stream: "stderr", conn: conn))
+                        stream: "stderr", streamOutput: streamOutput,
+                        output: output, conn: conn))
                 }
             }
             processSessions[key] = ProcessSession(
@@ -8239,7 +9334,9 @@ public actor RequestRouter {
                 stdin: tty ? ptyMaster : stdinPipe?.fileHandleForWriting,
                 ptyMaster: ptyMaster,
                 stdinCloseable: !tty,
-                outputTasks: outputTasks)
+                outputTasks: outputTasks,
+                output: output,
+                streamOutput: streamOutput)
         } catch {
             try? ptyMaster?.close()
             ptySlaves.forEach { try? $0.close() }
@@ -8261,28 +9358,41 @@ public actor RequestRouter {
     private func drainProcessOutput(pipe: Pipe,
                                     processHandle: String,
                                     stream: String,
+                                    streamOutput: Bool,
+                                    output: CommandExecOutputBuffer,
                                     conn: any ClientConnection) -> Task<Void, Never> {
         drainProcessOutput(handle: pipe.fileHandleForReading,
                            processHandle: processHandle,
                            stream: stream,
+                           streamOutput: streamOutput,
+                           output: output,
                            conn: conn)
     }
 
     private func drainProcessOutput(handle: FileHandle,
                                     processHandle: String,
                                     stream: String,
+                                    streamOutput: Bool,
+                                    output: CommandExecOutputBuffer,
                                     conn: any ClientConnection) -> Task<Void, Never> {
         Task.detached { [conn] in
             while true {
                 let data = (try? handle.read(upToCount: 65_536)) ?? Data()
                 if data.isEmpty { break }
-                await conn.send(.notification(JSONRPCNotification(
-                    method: "process/outputDelta",
-                    params: .object([
-                        "processHandle": .string(processHandle),
-                        "stream": .string(stream),
-                        "deltaBase64": .string(data.base64EncodedString()),
-                    ]))))
+                // Always feed the cap tracker so cap state is accurate; in
+                // buffered mode the bytes are retained for process/exited, in
+                // streaming mode they are forwarded and not retained.
+                let capReached = await output.append(data, stream: stream)
+                if streamOutput {
+                    await conn.send(.notification(JSONRPCNotification(
+                        method: "process/outputDelta",
+                        params: .object([
+                            "processHandle": .string(processHandle),
+                            "stream": .string(stream),
+                            "deltaBase64": .string(data.base64EncodedString()),
+                            "capReached": .bool(capReached),
+                        ]))))
+                }
             }
         }
     }
@@ -8298,11 +9408,23 @@ public actor RequestRouter {
                 await task.value
             }
         }
+        // Upstream ProcessExitedNotification always serializes stdout/stderr and
+        // their cap flags (non-Option). In streaming mode stdout/stderr are
+        // empty (bytes were delivered via outputDelta); in buffered mode they
+        // carry the captured output. Cap flags reflect the tracked state either
+        // way.
+        let rendered = await session?.output.rendered() ?? (stdout: "", stderr: "")
+        let caps = await session?.output.capFlags() ?? (stdout: false, stderr: false)
+        let streamed = session?.streamOutput ?? true
         await conn.send(.notification(JSONRPCNotification(
             method: "process/exited",
             params: .object([
                 "processHandle": .string(processHandle),
                 "exitCode": .int(Int64(exitCode)),
+                "stdout": .string(streamed ? "" : rendered.stdout),
+                "stdoutCapReached": .bool(caps.stdout),
+                "stderr": .string(streamed ? "" : rendered.stderr),
+                "stderrCapReached": .bool(caps.stderr),
             ]))))
     }
 
@@ -8571,7 +9693,59 @@ public actor RequestRouter {
 
     private func presentFields(_ params: JSONValue?) -> [String] {
         guard let obj = params?.objectValue else { return [] }
-        return Array(obj.keys)
+        var fields = Array(obj.keys)
+        // Upstream's `ExperimentalApi::experimental_reason` recurses through the
+        // entire typed params structure (common.rs `inspect_params: true`), so
+        // an `AskForApproval::Granular` variant anywhere — top-level
+        // `approvalPolicy`, inside `config.approvalPolicy`, inside any
+        // `config.profiles.*.approvalPolicy`, or inside a
+        // `configRequirements.allowedApprovalPolicies[]` element — is gated with
+        // the fixed reason `askForApproval.granular`
+        // (app-server-protocol/src/protocol/v2/shared.rs:168, tests.rs:1481-1745).
+        // Emit the `"askForApproval=granular"` enum-variant marker whenever the
+        // granular variant is present so the gate fires for non-experimental
+        // connections instead of silently dropping the granular value.
+        if Self.containsGranularApprovalPolicy(params) {
+            fields.append("askForApproval=granular")
+        }
+        return fields
+    }
+
+    /// Recursively detects an `AskForApproval::Granular` variant carried by any
+    /// `approvalPolicy` / `askForApproval` field (top-level or nested under
+    /// `config` / `profiles` / `allowedApprovalPolicies`). The granular variant
+    /// serialises externally-tagged as `{"granular": {…}}`; the port also
+    /// accepts a bare `"granular"` string for the same variant
+    /// (ProtocolModel/Approvals.swift), so both forms are treated as granular.
+    static func containsGranularApprovalPolicy(_ value: JSONValue?) -> Bool {
+        guard let value else { return false }
+        switch value {
+        case .object(let obj):
+            for (key, child) in obj {
+                if key == "approvalPolicy" || key == "askForApproval",
+                   isGranularVariant(child) {
+                    return true
+                }
+                if containsGranularApprovalPolicy(child) { return true }
+            }
+            return false
+        case .array(let arr):
+            for child in arr where containsGranularApprovalPolicy(child) { return true }
+            return false
+        default:
+            return false
+        }
+    }
+
+    /// True when `value` is the `AskForApproval::Granular` variant, in either
+    /// the externally-tagged object form `{"granular": …}` or the bare-string
+    /// convenience form `"granular"`.
+    private static func isGranularVariant(_ value: JSONValue) -> Bool {
+        switch value {
+        case .string(let s): return s == "granular"
+        case .object(let o): return o["granular"] != nil
+        default: return false
+        }
     }
     private func platformFamily() -> String {
         #if os(macOS)

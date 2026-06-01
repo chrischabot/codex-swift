@@ -151,6 +151,25 @@ public struct SkillInstructions: ContextualUserFragment, Sendable, Equatable {
     }
 }
 
+// MARK: - WorkflowReminder (dynamic-workflows trigger-word opt-in)
+
+/// Injected as a user-role context message when the "workflow"/"workflows"
+/// keyword appears in a turn's input — the codex analog of Claude's
+/// trigger-word reminder that surfaces the `workflow` tool.
+public struct WorkflowReminder: ContextualUserFragment, Sendable, Equatable {
+    public static let role = "user"
+    public static let startMarker = "<workflow_reminder>"
+    public static let endMarker = "</workflow_reminder>"
+    public init() {}
+    public func body() -> String {
+        "\nThe user mentioned \"workflow\". When a task benefits from fanning out work across many "
+            + "sub-agents — being comprehensive, gathering independent perspectives, or handling more "
+            + "than one context can hold — use the `workflow` tool: author a JavaScript orchestration "
+            + "script (or invoke a predefined one via `name`) that calls agent()/parallel()/pipeline()/"
+            + "phase()/log(). It runs in the background; observe it via `workflow_status`/`workflow_list`.\n"
+    }
+}
+
 // MARK: - GoalContext (context/goal_context.rs)
 
 public struct GoalContext: ContextualUserFragment, Sendable, Equatable {

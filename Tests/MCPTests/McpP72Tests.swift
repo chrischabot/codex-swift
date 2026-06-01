@@ -305,10 +305,16 @@ final class McpP72Tests: XCTestCase {
         let resultObj = first["result"] as? [String: Any] ?? [:]
         XCTAssertEqual(resultObj["action"] as? String, "decline",
             "nil-handler reply must carry action=decline")
-        XCTAssertTrue(resultObj["content"] is NSNull,
-            "content must be JSON null for an auto-decline")
-        XCTAssertTrue(resultObj["_meta"] is NSNull,
-            "_meta must be JSON null for an auto-decline")
+        // mcp Finding 4: upstream `CreateElicitationResultWithMeta` serializes
+        // `content`/`_meta` with `skip_serializing_if = Option::is_none`, so a
+        // decline emits `{"action":"decline"}` ONLY — the fields are OMITTED,
+        // not written as JSON null.
+        XCTAssertNil(resultObj["content"],
+            "content must be omitted (not null) for an auto-decline")
+        XCTAssertNil(resultObj["_meta"],
+            "_meta must be omitted (not null) for an auto-decline")
+        XCTAssertEqual(resultObj.count, 1,
+            "decline reply must carry only the action field")
     }
 
     // MARK: - Test stub server

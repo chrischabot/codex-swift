@@ -122,9 +122,11 @@ final class WebSearchTests: XCTestCase {
         let home = NSTemporaryDirectory() + "/codex-websearch-policy-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: home) }
+        try FileManager.default.createDirectory(atPath: home + "/rules",
+                                                withIntermediateDirectories: true)
         try """
         network_rule(host = "api.openai.com", protocol = "https", decision = "deny")
-        """.write(toFile: home + "/exec_policy.rules", atomically: true, encoding: .utf8)
+        """.write(toFile: home + "/rules/default.rules", atomically: true, encoding: .utf8)
 
         let policy = try ExecPolicy.loadStrict(codexHome: home)
         let domains = policy.compiledNetworkDomains()

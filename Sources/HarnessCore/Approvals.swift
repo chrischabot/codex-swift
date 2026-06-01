@@ -103,4 +103,33 @@ public enum ApprovalPolicyEngine {
     public static func prefixKey(command argv: [String]) -> String {
         argv.prefix(2).joined(separator: " ")
     }
+
+    // Upstream rejection-reason constants (`core/src/exec_policy.rs:43-48`).
+    public static let promptConflictReason =
+        "approval required by policy, but AskForApproval is set to Never"
+    public static let rejectSandboxApprovalReason =
+        "approval required by policy, but AskForApproval::Granular.sandbox_approval is false"
+    public static let rejectRulesApprovalReason =
+        "approval required by policy rule, but AskForApproval::Granular.rules is false"
+
+    /// Port of `prompt_is_rejected_by_policy` (`core/src/exec_policy.rs:175-198`):
+    /// returns a rejection reason when `policy` disallows surfacing the current
+    /// prompt to the user. `promptIsRule` distinguishes a policy-RULE prompt
+    /// (gated by `Granular.rules`) from a sandbox/escalation prompt (gated by
+    /// `Granular.sandbox_approval`); under `Never` any prompt is rejected.
+    public static func promptRejectedByPolicy(
+        policy: ApprovalPolicy, promptIsRule: Bool
+    ) -> String? {
+        switch policy {
+        case .never:
+            return promptConflictReason
+        case .onFailure, .onRequest, .unlessTrusted:
+            return nil
+        case .granular(let cfg):
+            if promptIsRule {
+                return cfg.allowsRulesApproval ? nil : rejectRulesApprovalReason
+            }
+            return cfg.allowsSandboxApproval ? nil : rejectSandboxApprovalReason
+        }
+    }
 }

@@ -139,7 +139,10 @@ final class MCPTests: XCTestCase {
         let client = McpClient(McpServerConfig(name: "srv", command: "/bin/true"))
         let proxy = McpToolProxy(server: "srv", tool: "do_thing", client: client)
         XCTAssertEqual(proxy.name, "mcp__srv__do_thing")
-        XCTAssertTrue(proxy.parallelSafe)
+        // Upstream always serializes MCP tool calls: the production rmcp client
+        // sets supports_parallel_tool_calls=false (rmcp_client.rs:378), so the
+        // proxy is serial (exclusive gate). Audit tools-router v13 finding 1.
+        XCTAssertFalse(proxy.parallelSafe)
     }
 
     /// End-to-end stdio JSON-RPC against a scripted mock MCP server. The mock
@@ -190,6 +193,100 @@ final class MCPTests: XCTestCase {
         let r = try await client.callTool("echo", argumentsJSON: "{\"x\":1}")
         XCTAssertEqual(r.text, "pong")
         XCTAssertFalse(r.isError)
+        await client.stop()
+    }
+
+    /// Finding 3: `resources/list` walks every page until `nextCursor` is
+    /// absent, accumulating across pages. A single-page client would only see
+    /// the first resource.
+    func testResourcesListPaginationWalksAllPages() async throws {
+        let dir = NSTemporaryDirectory() + "mcppage-" + UUID().uuidString
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let script = dir + "/server.py"
+        // Three pages: cursor None→"c1"→"c2"→done. Each page has one resource.
+        let body = #"""
+        import sys, json
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                msg = json.loads(s)
+            except Exception:
+                continue
+            m = msg.get("method"); i = msg.get("id")
+            p = msg.get("params") or {}
+            if m == "initialize":
+                print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18"}}), flush=True)
+            elif m == "notifications/initialized":
+                pass
+            elif m == "resources/list":
+                cur = p.get("cursor")
+                if cur is None:
+                    print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"resources":[{"uri":"file:///a","name":"a"}],"nextCursor":"c1"}}), flush=True)
+                elif cur == "c1":
+                    print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"resources":[{"uri":"file:///b","name":"b"}],"nextCursor":"c2"}}), flush=True)
+                elif cur == "c2":
+                    print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"resources":[{"uri":"file:///c","name":"c"}]}}), flush=True)
+                else:
+                    print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"resources":[]}}), flush=True)
+        """#
+        try body.write(toFile: script, atomically: true, encoding: .utf8)
+        let client = McpClient(McpServerConfig(name: "page", command: "python3",
+                                               args: [script]),
+                               requestTimeout: .seconds(10))
+        try await client.start()
+        try await client.initialize()
+        let resources = try await client.listResources()
+        XCTAssertEqual(resources.count, 3, "all three pages accumulated")
+        await client.stop()
+    }
+
+    /// Finding 3: a server returning the SAME cursor twice is detected and
+    /// surfaced as an error instead of looping forever.
+    func testResourcesListDuplicateCursorErrors() async throws {
+        let dir = NSTemporaryDirectory() + "mcpdup-" + UUID().uuidString
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let script = dir + "/server.py"
+        let body = #"""
+        import sys, json
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                msg = json.loads(s)
+            except Exception:
+                continue
+            m = msg.get("method"); i = msg.get("id")
+            if m == "initialize":
+                print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"protocolVersion":"2025-06-18"}}), flush=True)
+            elif m == "notifications/initialized":
+                pass
+            elif m == "resources/list":
+                # Always returns the same cursor -> duplicate-cursor guard.
+                print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"resources":[{"uri":"file:///x"}],"nextCursor":"loop"}}), flush=True)
+        """#
+        try body.write(toFile: script, atomically: true, encoding: .utf8)
+        let client = McpClient(McpServerConfig(name: "dup", command: "python3",
+                                               args: [script]),
+                               requestTimeout: .seconds(10))
+        try await client.start()
+        try await client.initialize()
+        do {
+            _ = try await client.listResources()
+            XCTFail("duplicate cursor must error")
+        } catch {
+            XCTAssertTrue("\(error)".contains("duplicate cursor"), "\(error)")
+        }
         await client.stop()
     }
 

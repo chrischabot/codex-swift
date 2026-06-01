@@ -40,19 +40,34 @@ public struct SandboxEnvironmentPolicy: Sendable, Equatable {
     /// promptly on macOS). The child sees these even if the same name is on
     /// `denyPrefixes/denySuffixes/denyExact` — they're injected post-scrub.
     public var extras: [String: String]
+    /// When non-nil, inject `CODEX_SANDBOX=<value>` into the child env
+    /// post-scrub. Upstream sets `CODEX_SANDBOX="seatbelt"` for every command
+    /// run under the macOS Seatbelt sandbox (`core/src/sandboxing/mod.rs:139-142`
+    /// / `core/src/spawn.rs:22-25`). The value is parameterised (rather than
+    /// hardcoded) so other backends can extend it without changing `scrub()`.
+    public var injectedSandboxType: String?
+    /// When true, inject `CODEX_SANDBOX_NETWORK_DISABLED="1"` into the child env
+    /// post-scrub. Upstream sets this whenever the network sandbox policy is not
+    /// enabled (`core/src/spawn.rs:78-80` and `core/src/sandboxing/mod.rs:133-138`)
+    /// so spawned commands can detect that network access is unavailable.
+    public var networkDisabled: Bool
 
     public init(allowExact: Set<String>,
                 allowPrefixes: [String],
                 denySuffixes: [String],
                 denyPrefixes: [String],
                 denyExact: Set<String>,
-                extras: [String: String]) {
+                extras: [String: String],
+                injectedSandboxType: String? = nil,
+                networkDisabled: Bool = false) {
         self.allowExact = allowExact
         self.allowPrefixes = allowPrefixes
         self.denySuffixes = denySuffixes
         self.denyPrefixes = denyPrefixes
         self.denyExact = denyExact
         self.extras = extras
+        self.injectedSandboxType = injectedSandboxType
+        self.networkDisabled = networkDisabled
     }
 
     /// Restrictive default policy. Allows the variables a typical UNIX child
@@ -162,11 +177,41 @@ public struct SandboxEnvironmentPolicy: Sendable, Equatable {
         for (k, v) in extras {
             out[k] = v
         }
+        // Upstream `populate_env` (protocol/src/shell_environment.rs:106) always
+        // injects `CODEX_THREAD_ID` last when the thread id is known. The harness
+        // sets it in its own process environment, so a present value is
+        // propagated to the child even under the restrictive allowlist (it is
+        // read-only run metadata, not a secret). Injected post-scrub so the
+        // deny rules cannot strip it.
+        if let threadId = parent[Self.codexThreadIdEnvVar] {
+            out[Self.codexThreadIdEnvVar] = threadId
+        }
+        // Sandboxing telemetry/behaviour env vars (upstream
+        // `core/src/spawn.rs:78-80` + `core/src/sandboxing/mod.rs:133-142`).
+        // Both are injected POST-scrub so the deny rules (`CODEX_*` is on the
+        // allow-prefix list but a future deny rule must not be able to strip
+        // these) cannot remove them, exactly as upstream sets them on the
+        // `Command`/exec env after assembling the rest of the environment.
+        if networkDisabled {
+            out[Self.codexSandboxNetworkDisabledEnvVar] = "1"
+        }
+        if let sandboxType = injectedSandboxType {
+            out[Self.codexSandboxEnvVar] = sandboxType
+        }
         return out
     }
 }
 
 public extension SandboxEnvironmentPolicy {
+    /// Upstream `shell_environment.rs::CODEX_THREAD_ID_ENV_VAR`.
+    static let codexThreadIdEnvVar = "CODEX_THREAD_ID"
+    /// Upstream `core/src/spawn.rs:25` `CODEX_SANDBOX_ENV_VAR`.
+    static let codexSandboxEnvVar = "CODEX_SANDBOX"
+    /// Upstream `core/src/spawn.rs:20` `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR`.
+    static let codexSandboxNetworkDisabledEnvVar = "CODEX_SANDBOX_NETWORK_DISABLED"
+    /// Upstream value for `SandboxType::MacosSeatbelt` (`sandboxing/mod.rs:141`).
+    static let macosSeatbeltSandboxTag = "seatbelt"
+
     /// Convenience: scrub the current process's environment. Centralised here
     /// so the two spawn sites (ShellTool, UnifiedExec) cannot drift.
     static func scrubbed(parent: [String: String] =
@@ -177,6 +222,129 @@ public extension SandboxEnvironmentPolicy {
         var env = policy.scrub(parent)
         for (k, v) in additionalExtras { env[k] = v }
         return env
+    }
+}
+
+/// Faithful port of upstream `ShellEnvironmentPolicy` + `populate_env`
+/// (`protocol/src/config_types.rs` and `protocol/src/shell_environment.rs`).
+///
+/// The codex-swift sandbox uses the restrictive allowlist
+/// (`SandboxEnvironmentPolicy.default`) as its silent default — a deliberate
+/// security hardening (children cannot read the harness's API keys via `env`).
+/// Upstream's documented algorithm is instead inherit-all-by-default with a
+/// case-insensitive `*KEY*`/`*SECRET*`/`*TOKEN*` substring scrub gated on
+/// `ignoreDefaultExcludes`. This type makes the upstream algorithm available as
+/// an explicit, opt-in policy (e.g. for hosts that mirror upstream's
+/// configuration surface) and computes the child env exactly as `populate_env`
+/// does, including the trailing `CODEX_THREAD_ID` injection.
+public struct ShellEnvironmentPolicyConfig: Sendable, Equatable {
+    /// Upstream `ShellEnvironmentPolicyInherit`.
+    public enum Inherit: Sendable, Equatable { case all, none, core }
+
+    public var inherit: Inherit
+    /// When false, the default `*KEY*`/`*SECRET*`/`*TOKEN*` excludes apply.
+    public var ignoreDefaultExcludes: Bool
+    /// Custom exclude glob patterns (`*`/`?`), case-insensitive — upstream
+    /// `WildMatchPattern<'*','?'>`.
+    public var exclude: [String]
+    /// Upstream `set`: forced overrides, applied after excludes.
+    public var set: [String: String]
+    /// Upstream `include_only`: when non-empty, keep only matching vars.
+    public var includeOnly: [String]
+
+    /// Upstream `ShellEnvironmentPolicy::default` (config_types.rs:218-223):
+    /// `inherit: All`, `ignore_default_excludes: true` — full inherit, no scrub.
+    public static let `default` = ShellEnvironmentPolicyConfig(
+        inherit: .all, ignoreDefaultExcludes: true,
+        exclude: [], set: [:], includeOnly: [])
+
+    public init(inherit: Inherit,
+                ignoreDefaultExcludes: Bool,
+                exclude: [String],
+                set: [String: String],
+                includeOnly: [String]) {
+        self.inherit = inherit
+        self.ignoreDefaultExcludes = ignoreDefaultExcludes
+        self.exclude = exclude
+        self.set = set
+        self.includeOnly = includeOnly
+    }
+
+    /// Upstream `UNIX_CORE_ENV_VARS` (shell_environment.rs:113-116).
+    static let unixCoreEnvVars: [String] = [
+        "PATH", "SHELL", "TMPDIR", "TEMP", "TMP", "HOME",
+        "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "USER",
+    ]
+
+    /// Verbatim port of `populate_env` (shell_environment.rs:46-108): inherit,
+    /// default-excludes, custom excludes, `set` overrides, `include_only`, then
+    /// the `CODEX_THREAD_ID` injection.
+    public func populateEnv(_ vars: [String: String],
+                            threadId: String?) -> [String: String] {
+        // Step 1 — inherit strategy.
+        var env: [String: String]
+        switch inherit {
+        case .all:
+            env = vars
+        case .none:
+            env = [:]
+        case .core:
+            env = vars.filter { (k, _) in
+                Self.unixCoreEnvVars.contains { $0.caseInsensitiveCompare(k) == .orderedSame }
+            }
+        }
+
+        func matchesAny(_ name: String, _ patterns: [String]) -> Bool {
+            patterns.contains { EnvPattern.matches(pattern: $0, name: name) }
+        }
+
+        // Step 2 — default excludes (case-insensitive substring), gated.
+        if !ignoreDefaultExcludes {
+            let defaultExcludes = ["*KEY*", "*SECRET*", "*TOKEN*"]
+            env = env.filter { (k, _) in !matchesAny(k, defaultExcludes) }
+        }
+        // Step 3 — custom excludes.
+        if !exclude.isEmpty {
+            env = env.filter { (k, _) in !matchesAny(k, exclude) }
+        }
+        // Step 4 — user-provided overrides.
+        for (k, v) in set { env[k] = v }
+        // Step 5 — include_only retains only matches.
+        if !includeOnly.isEmpty {
+            env = env.filter { (k, _) in matchesAny(k, includeOnly) }
+        }
+        // Step 6 — thread id injection.
+        if let threadId {
+            env[SandboxEnvironmentPolicy.codexThreadIdEnvVar] = threadId
+        }
+        return env
+    }
+}
+
+/// Minimal case-insensitive glob matcher for `*` / `?`, matching the semantics
+/// of upstream's `WildMatchPattern<'*','?'>` (the `wildmatch` crate) as used by
+/// `EnvironmentVariablePattern`. `*` matches any run (including empty), `?`
+/// matches exactly one character.
+enum EnvPattern {
+    static func matches(pattern: String, name: String) -> Bool {
+        let p = Array(pattern.lowercased())
+        let s = Array(name.lowercased())
+        // Iterative wildcard match with backtracking on `*`.
+        var pi = 0, si = 0
+        var star = -1, mark = 0
+        while si < s.count {
+            if pi < p.count, p[pi] == "?" || p[pi] == s[si] {
+                pi += 1; si += 1
+            } else if pi < p.count, p[pi] == "*" {
+                star = pi; mark = si; pi += 1
+            } else if star != -1 {
+                pi = star + 1; mark += 1; si = mark
+            } else {
+                return false
+            }
+        }
+        while pi < p.count, p[pi] == "*" { pi += 1 }
+        return pi == p.count
     }
 }
 

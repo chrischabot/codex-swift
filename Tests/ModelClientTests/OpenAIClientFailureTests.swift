@@ -150,7 +150,7 @@ private func cancellableSSEServer(_ dir: String, closedPath: String) -> (Process
         hdr = ("HTTP/1.1 200 OK\\r\\n"
                "Content-Type: text/event-stream\\r\\n"
                "Connection: close\\r\\n\\r\\n").encode()
-        c.sendall(hdr + b'data: {"type":"response.created"}\\n\\n')
+        c.sendall(hdr + b'data: {"type":"response.created","response":{"id":"r"}}\\n\\n')
         while True:
             time.sleep(0.1)
             try:
@@ -365,7 +365,7 @@ final class OpenAIClientFailureTests: XCTestCase {
         let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let requestPath = dir + "/request.bin"
         let evt = """
-        data: {"type":"response.created"}
+        data: {"type":"response.created","response":{"id":"resp_1"}}
 
         data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"HELLO"}
 
@@ -419,6 +419,282 @@ final class OpenAIClientFailureTests: XCTestCase {
                       "native request body preserves within-turn previous_response_id")
         XCTAssertTrue(req.contains("\"max_output_tokens\":7"),
                       "request body preserves max output limit")
+    }
+
+    // Finding: a `response.created` frame WITHOUT a `response` object must NOT
+    // emit `.created` (upstream responses.rs:307-311 gates Created on a
+    // present `response`). The terminal `response.completed` still completes
+    // the stream so the client returns cleanly.
+    func testURLSessionResponseCreatedWithoutResponseIsNotEmitted() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created"}
+
+        data: {"type":"response.output_text.delta","item_id":"m","delta":"HI"}
+
+        data: {"type":"response.completed","response":{"id":"r1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}
+
+        """
+        guard let (srv, port) = oneShotServer(dir, responseBody: evt) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertFalse(result.errored, result.message)
+        XCTAssertFalse(result.events.contains(.created),
+                       "bare response.created (no response object) must not emit .created")
+        XCTAssertTrue(result.events.contains(.agentDelta(itemId: "m", delta: "HI")),
+                      "subsequent frames must still be processed")
+    }
+
+    // Finding (v9): a reasoning-summary / reasoning-content delta frame that is
+    // MISSING its index must NOT be emitted (upstream responses.rs:291-305
+    // gates emission on both delta AND the index being present). A frame WITH
+    // the index is emitted normally.
+    func testURLSessionReasoningDeltaWithoutIndexIsDropped() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created","response":{"id":"r1"}}
+
+        data: {"type":"response.reasoning_summary_text.delta","item_id":"r","delta":"NOINDEX"}
+
+        data: {"type":"response.reasoning_summary_text.delta","item_id":"r","delta":"WITHINDEX","summary_index":2}
+
+        data: {"type":"response.reasoning_text.delta","item_id":"r","delta":"CNOINDEX"}
+
+        data: {"type":"response.reasoning_text.delta","item_id":"r","delta":"CWITHINDEX","content_index":1}
+
+        data: {"type":"response.completed","response":{"id":"r1","usage":{"total_tokens":1}}}
+
+        """
+        guard let (srv, port) = oneShotServer(dir, responseBody: evt) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertFalse(result.errored, result.message)
+        // The index-less summary delta must be dropped; the indexed one kept.
+        XCTAssertFalse(result.events.contains { ev in
+            if case .reasoningSummaryDelta(_, let d, _) = ev { return d == "NOINDEX" }
+            return false
+        }, "summary delta without summary_index must be dropped")
+        XCTAssertTrue(result.events.contains { ev in
+            if case .reasoningSummaryDelta(_, let d, let si) = ev {
+                return d == "WITHINDEX" && si == 2
+            }
+            return false
+        }, "summary delta with summary_index must be emitted")
+        XCTAssertFalse(result.events.contains { ev in
+            if case .reasoningContentDelta(_, let d, _) = ev { return d == "CNOINDEX" }
+            return false
+        }, "content delta without content_index must be dropped")
+        XCTAssertTrue(result.events.contains { ev in
+            if case .reasoningContentDelta(_, let d, let ci) = ev {
+                return d == "CWITHINDEX" && ci == 1
+            }
+            return false
+        }, "content delta with content_index must be emitted")
+    }
+
+    // Finding (v9): a `response.completed` frame whose `response` object lacks
+    // a string `id` is a fatal stream error (upstream responses.rs:358-374
+    // requires `id: String`); it must NOT silently default to "resp".
+    func testURLSessionResponseCompletedMissingIdErrors() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created","response":{"id":"r1"}}
+
+        data: {"type":"response.completed","response":{"usage":{"total_tokens":2}}}
+
+        """
+        guard let (srv, port) = oneShotServer(dir, responseBody: evt) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertTrue(result.errored,
+                      "response.completed without id must surface a stream error")
+        XCTAssertTrue(result.message.contains("ResponseCompleted"),
+                      "error message must reference the parse failure: \(result.message)")
+        XCTAssertFalse(result.events.contains { ev in
+            if case .completed = ev { return true }
+            return false
+        }, "no .completed must be emitted for a malformed completed frame")
+    }
+
+    // Finding (v9): a well-formed `response.completed` (with id) still
+    // completes normally — regression guard for the id-validation change.
+    func testURLSessionResponseCompletedWithIdSucceeds() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created","response":{"id":"r1"}}
+
+        data: {"type":"response.completed","response":{"id":"r1","usage":{"total_tokens":2}}}
+
+        """
+        guard let (srv, port) = oneShotServer(dir, responseBody: evt) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertFalse(result.errored, result.message)
+        XCTAssertTrue(result.events.contains { ev in
+            if case .completed(let rid, _, _, _) = ev { return rid == "r1" }
+            return false
+        })
+    }
+
+    // v10 finding: a stream that delivers frames but closes WITHOUT a
+    // response.completed/failed must surface a retryable stream error
+    // ("stream closed before response.completed"), not finish as success —
+    // matching upstream process_sse Ok(None) (responses.rs:422-428) and test
+    // error_when_missing_completed (responses.rs:701-727).
+    func testURLSessionStreamClosedBeforeCompletedIsRetryableError() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created","response":{"id":"r1"}}
+
+        data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}}
+
+        """
+        guard let (srv, port) = oneShotServer(dir, responseBody: evt) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainError(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertTrue(result.errored,
+                      "truncated stream must surface a terminal error")
+        XCTAssertTrue(result.retryable,
+                      "stream-closed-before-completed must be retryable")
+        XCTAssertEqual(result.message, "stream closed before response.completed",
+                       "must match upstream ApiError::Stream message exactly")
+    }
+
+    // v10 finding: a stray top-level `{"error":{...}}` data frame (no
+    // recognized `type`) must be IGNORED and the stream must continue, matching
+    // upstream's `_ =>` unhandled arm (responses.rs:266-394). The downstream
+    // response.completed still terminates the stream cleanly.
+    func testURLSessionTopLevelErrorFrameIsIgnored() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created","response":{"id":"r1"}}
+
+        data: {"error":{"message":"some transient provider noise"}}
+
+        data: {"type":"response.completed","response":{"id":"r1","usage":{"total_tokens":3}}}
+
+        """
+        guard let (srv, port) = oneShotServer(dir, responseBody: evt) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertFalse(result.errored,
+                       "top-level error frame must NOT abort the stream: \(result.message)")
+        XCTAssertTrue(result.events.contains { ev in
+            if case .completed(let rid, _, _, _) = ev { return rid == "r1" }
+            return false
+        }, "stream must reach response.completed despite the stray error frame")
+    }
+
+    // Finding (v9): the model client surfaces a `.rateLimits` event when the
+    // response carries the codex rate-limit header family, so the SessionEngine
+    // can forward `account/rateLimits/updated`
+    // (bespoke_event_handling.rs:1571-1579).
+    func testURLSessionEmitsRateLimitsEventFromHeaders() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.created","response":{"id":"r1"}}
+
+        data: {"type":"response.completed","response":{"id":"r1","usage":{"total_tokens":1}}}
+
+        """
+        let headers = "x-codex-primary-used-percent: 37\r\n"
+            + "x-codex-primary-window-minutes: 60\r\n"
+        guard let (srv, port) = oneShotServer(
+            dir, responseBody: evt, extraHeaders: headers) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertFalse(result.errored, result.message)
+        XCTAssertTrue(result.events.contains { ev in
+            if case .rateLimits(let snap) = ev {
+                return snap.limitId == "codex" && snap.primary?.usedPercent == 37
+            }
+            return false
+        }, "primary rate-limit snapshot must be surfaced as a .rateLimits event")
+    }
+
+    // v10 finding: pre-body header events must be emitted in upstream's order
+    // — ServerModel BEFORE RateLimits (then ModelsEtag, ServerReasoningIncluded)
+    // (spawn_response_stream, responses.rs:64-78).
+    func testURLSessionHeaderSignalsOrderServerModelBeforeRateLimits() async throws {
+        let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let evt = """
+        data: {"type":"response.completed","response":{"id":"r1","usage":{"total_tokens":1}}}
+
+        """
+        let headers = "openai-model: gpt-5-effective\r\n"
+            + "x-codex-primary-used-percent: 42\r\n"
+        guard let (srv, port) = oneShotServer(
+            dir, responseBody: evt, extraHeaders: headers) else {
+            return XCTFail("could not start local server")
+        }
+        defer { srv.terminate() }
+        let client = URLSessionResponsesClient(
+            apiKey: "k", endpoint: "http://127.0.0.1:\(port)/v1/responses",
+            limits: Limits())
+        guard let result = await withTimeout(seconds: 25, {
+            await drainEvents(client)
+        }) else { return XCTFail("client hung") }
+        XCTAssertFalse(result.errored, result.message)
+        let modelIdx = result.events.firstIndex { ev in
+            if case .serverModel = ev { return true }; return false
+        }
+        let rateIdx = result.events.firstIndex { ev in
+            if case .rateLimits = ev { return true }; return false
+        }
+        XCTAssertNotNil(modelIdx, "serverModel must be emitted")
+        XCTAssertNotNil(rateIdx, "rateLimits must be emitted")
+        if let m = modelIdx, let r = rateIdx {
+            XCTAssertLessThan(m, r, "ServerModel must precede RateLimits (upstream order)")
+        }
     }
 
     func testURLSessionResponsesClient429SurfacesRetryAfter() async throws {
@@ -516,7 +792,17 @@ final class OpenAIClientFailureTests: XCTestCase {
         XCTAssertTrue(r.isModelError, "surfaced as a clean ModelError: \(r.message)")
     }
 
-    func testSSEErrorEventSurfacesModelError() async throws {
+    // v10 finding: an SSE frame whose `type` is not recognized (here a
+    // top-level `{"type":"error","error":{...}}` frame, which has NO matching
+    // arm upstream) must be IGNORED — `process_responses_event` routes it to
+    // the `_ =>` unhandled arm and returns Ok(None) (responses.rs:266-394),
+    // the `ResponsesStreamEvent` struct has no `error` field, and genuine
+    // errors arrive only inside `response.failed`. The stream then closes with
+    // no terminal event, so the client surfaces the retryable
+    // "stream closed before response.completed" (responses.rs:422-428) rather
+    // than the frame's own message. This replaces the prior (divergent)
+    // behavior that aborted non-retryably on any top-level `error` key.
+    func testSSEUnhandledErrorFrameIsIgnoredThenStreamClosed() async throws {
         let dir = cfTmp(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let evt = "data: {\"type\":\"error\",\"error\":{\"message\":\"rate limited\"}}\n\n"
         guard let (srv, port) = oneShotServer(dir, responseBody: evt)
@@ -529,9 +815,12 @@ final class OpenAIClientFailureTests: XCTestCase {
         guard let r = await withTimeout(seconds: 25, { await drainClient(client) }) else {
             return XCTFail("client hung on SSE error event")
         }
+        XCTAssertTrue(r.errored, "stream closed without a terminal event must error")
         XCTAssertTrue(r.isModelError, "expected ModelError: \(r.message)")
-        XCTAssertTrue(r.message.contains("rate limited"),
-                      "the SSE error message is surfaced: \(r.message)")
+        XCTAssertEqual(r.message, "stream closed before response.completed",
+                       "unrecognized frame is ignored; truncated stream surfaces the upstream message")
+        XCTAssertFalse(r.message.contains("rate limited"),
+                       "the stray frame's message must NOT be surfaced as a hard failure")
     }
 
     func testImmediatelyClosedConnectionYieldsCleanModelError() async throws {

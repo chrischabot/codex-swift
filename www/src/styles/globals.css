@@ -1,0 +1,573 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * THEME TOKENS — single source of truth.
+ *
+ *   1. The base palette (`--color-{gray|blue|red|green|orange|yellow|purple}-N`)
+ *      is exposed via `@theme inline` below so Tailwind's color utilities
+ *      (`bg-gray-700`, `text-blue-400`) compile against it.
+ *   2. Semantic surface / text tokens (`--background`, `--foreground`,
+ *      `--popover`, `--sidebar*`, `--color-text-*`, `--color-surface-*`,
+ *      `--color-divider`) live under `:root` and `.dark`. EVERY component
+ *      reads them via `bg-background`/`text-foreground` (shadcn names) or
+ *      `bg-[color:var(--name)]`.
+ *   3. Elevation: `--shadow-{popover,dialog,card,card-hover,pill,fab}` —
+ *      all elevated surfaces use these.
+ *   4. Typography rhythm: `--text-{2xs..3xl}` — pixel sizes tuned to
+ *      Codex.app's scale. Existing inline `text-[12.5px]` calls still work;
+ *      new code should prefer `text-base` / `text-md` / etc.
+ *   5. Brand colours (Slack purple, Gmail red, Notion black, …) intentionally
+ *      remain raw hex in `domain/seed.ts` — they're brand identity, not
+ *      theme. The renderer reads them via `style={{ background: brand }}`
+ *      and pairs them with the themed `--color-on-brand` for foreground.
+ *
+ * To re-theme: change values under `:root` (light) and `.dark`, done.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* Codex base palette (extracted from CodexApp output/css) */
+@theme inline {
+  --color-gray-0: #ffffff;
+  --color-gray-50: #f9f9f9;
+  --color-gray-100: #ededed;
+  --color-gray-300: #afafaf;
+  --color-gray-500: #5d5d5d;
+  --color-gray-550: #4f4f4f;
+  --color-gray-600: #414141;
+  --color-gray-700: #303030;
+  --color-gray-750: #282828;
+  --color-gray-800: #212121;
+  --color-gray-900: #181818;
+  --color-gray-1000: #0d0d0d;
+
+  --color-blue-50: #e5f3ff;
+  --color-blue-100: #99ceff;
+  --color-blue-300: #339cff;
+  --color-blue-400: #0285ff;
+  --color-blue-900: #00284d;
+
+  --color-red-50: #ffd9d9;
+  --color-red-300: #ff6764;
+  --color-red-400: #fa423e;
+  --color-red-500: #e02e2a;          /* original Codex hue (restored). Small-text AA use --color-text-danger instead. */
+  --color-red-600: #ba2623;
+  --color-red-900: #4d100e;
+
+  --color-green-300: #40c977;
+  --color-green-400: #04b84c;
+  --color-green-500: #00a240;        /* original Codex hue (restored). Small-text AA use --color-text-success instead. */
+
+  --color-orange-50: #ffe7d9;
+  --color-orange-300: #ff8549;
+  --color-orange-400: #fb6a22;
+  --color-orange-500: #e25507;
+  --color-orange-700: #923b0f;
+  --color-orange-900: #4a2206;
+
+  --color-yellow-300: #ffd240;
+  --color-yellow-400: #ffc300;
+
+  --color-pink-400: #ff66ad;
+
+  --color-purple-300: #ad7bf9;
+  --color-purple-400: #924ff7;
+
+  /* shadcn tokens mapped to Codex palette */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Chart / status accent tokens (Codex `token-charts-*`) — drive status dots,
+     spinners, and small accent fills (ConnectionStatus, sandbox/sub-agent
+     pills). Mapped onto the base palette so `text-charts-green` etc. compile. */
+  --color-charts-green: var(--color-green-500);
+  --color-charts-red: var(--color-red-500);
+  --color-charts-blue: var(--color-blue-400);
+  --color-charts-orange: var(--color-orange-500);
+  --color-charts-purple: var(--color-purple-400);
+
+  /* Link foreground (Codex `token-text-link-foreground`). */
+  --color-text-link: var(--text-link);
+  /* Neutral code/editor surface (code-result, json, shell blocks). */
+  --color-code-surface: var(--code-surface);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter",
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* Typography rhythm — matches the Codex.app inline scale we tuned to.
+     Use Tailwind v4 `text-{name}` utilities (text-2xs / text-xs / text-sm /
+     text-base / text-md / text-lg / text-xl / text-2xl) instead of
+     `text-[12.5px]` everywhere. Existing arbitrary-px usages still work; new
+     code should prefer these. */
+  --text-2xs:  10.5px;
+  --text-xs:   11px;
+  --text-xs--line-height: 1.45;
+  --text-sm:   12px;
+  --text-sm--line-height: 1.5;
+  --text-base: 12.5px;
+  --text-base--line-height: 1.55;
+  --text-md:   13px;
+  --text-md--line-height: 1.55;
+  --text-lg:   14px;
+  --text-lg--line-height: 1.6;
+  --text-xl:   18px;
+  --text-xl--line-height: 1.4;
+  --text-2xl:  20px;
+  --text-2xl--line-height: 1.35;
+  --text-3xl:  22px;
+  --text-3xl--line-height: 1.3;
+}
+
+:root {
+  --radius: 0.5rem;
+
+  /* Light mode — matches Codex screenshots */
+  --background: #ffffff;
+  --foreground: #0d0d0d;
+
+  --card: #ffffff;
+  --card-foreground: #0d0d0d;
+
+  --popover: #ffffff;
+  --popover-foreground: #0d0d0d;
+
+  --primary: #0d0d0d;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f4f4f4;
+  --secondary-foreground: #0d0d0d;
+
+  --muted: #f4f4f4;
+  --muted-foreground: #6e6e6e;
+
+  --accent: #ededed;
+  --accent-foreground: #0d0d0d;
+
+  --destructive: #e02e2a;
+  --destructive-foreground: #ffffff;
+
+  --border: rgba(13, 13, 13, 0.08);
+  --input: rgba(13, 13, 13, 0.10);
+  --ring: rgba(13, 13, 13, 0.20);
+
+  /* Sidebar — slightly grey to differentiate from main */
+  --sidebar: #f7f7f7;
+  --sidebar-foreground: #0d0d0d;
+  --sidebar-primary: #0d0d0d;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(13, 13, 13, 0.06);
+  --sidebar-accent-foreground: #0d0d0d;
+  --sidebar-border: rgba(13, 13, 13, 0.06);
+  --sidebar-ring: rgba(13, 13, 13, 0.20);
+
+  /* Surfaces tuned to WCAG AA on white *and* on the sidebar (#f7f7f7).
+     For small (≤14px) text we need 4.5:1; large UI text needs 3:1. */
+  --color-text-primary: #0d0d0d;       /* AAA */
+  --color-text-secondary: #595959;     /* 7.1:1 on #fff, 6.7:1 on #f7f7f7 */
+  --color-text-tertiary: #6b6b6b;      /* 5.7:1 on #fff, 5.3:1 on #f7f7f7 */
+  --color-text-quaternary: #666666;    /* 5.9:1 on #fff, 5.5:1 on #f7f7f7; passes on diff +/− tints too */
+  /* Status text colours used for small inline +/- counters. The base greens
+     and reds in the palette are too light for 11–12 px text on #fff; these
+     are darker variants that pass AA. */
+  --color-text-success: #006e2a;       /* 5.5:1 */
+  --color-text-danger:  #b91c1c;       /* 5.5:1 */
+  --color-surface-hover: rgba(13, 13, 13, 0.04);
+  --color-surface-active: rgba(13, 13, 13, 0.07);
+  --color-divider: rgba(13, 13, 13, 0.08);
+
+  /* Dialog scrim — the original Electron overlay is a very faint #00000022
+     (≈13% black) with NO backdrop blur. */
+  --overlay: rgba(0, 0, 0, 0.13);
+
+  /* Scrollbar thumb — used by both the native ::-webkit-scrollbar and the
+     Radix ScrollArea so they stay visible in dark mode. */
+  --scrollbar-thumb: rgba(13, 13, 13, 0.18);
+  --scrollbar-thumb-hover: rgba(13, 13, 13, 0.30);
+
+  /* "Strong" popover surface — always-dark (tooltip, working-dir pill,
+     command palette). Inverted vs. the regular popover so it sits above the
+     fold regardless of light/dark theme. */
+  --popover-strong: #0d0d0d;
+  --popover-strong-hover: #1c1c1c;
+  --popover-strong-foreground: #ffffff;
+  --popover-strong-foreground-muted: rgba(255, 255, 255, 0.55);
+
+  /* Terminal-style pill (working-dir chip above the composer). Always dark —
+     a terminal surface that stays dark regardless of theme, like the original
+     Codex working-directory chip. */
+  --terminal-pill: #181818;
+  --terminal-pill-hover: #282828;
+  --terminal-pill-foreground: #ededed;
+  --terminal-pill-foreground-muted: rgba(237, 237, 237, 0.55);
+
+  /* Plugin / template tile fallback (no brand color provided). */
+  --color-tile-fallback: #ededed;
+  --color-tile-fallback-foreground: #0d0d0d;
+  /* Foreground colour to use on a *brand-coloured* surface (brand backgrounds
+     are assumed to be dark; this is the contrast text colour). */
+  --color-on-brand: #ffffff;
+
+  /* Approval risk tones — the icon/text colours used inside the approval card */
+  --color-risk-modify-text: #7a5c00;
+  --color-risk-modify-bg: rgba(255, 195, 0, 0.20);
+
+  /* Featured banner gradient (Plugins page) — themable via three stops */
+  --color-banner-from: #e6dcff;
+  --color-banner-via: #c5b3ff;
+  --color-banner-to:  #d6c8ff;
+  --color-banner-blob-a: #d6c8ff;
+  --color-banner-blob-b: #b9a8ff;
+
+  /* Elevation tokens — used by popovers, dropdowns, dialogs, cards. */
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.10), 0 2px 4px rgba(0, 0, 0, 0.05);
+  --shadow-dialog:  0 24px 48px rgba(0, 0, 0, 0.14), 0 4px 12px rgba(0, 0, 0, 0.06);
+  --shadow-card:    0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-card-hover: 0 4px 16px rgba(0, 0, 0, 0.05), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-pill:    0 8px 24px rgba(0, 0, 0, 0.18);
+  --shadow-fab:     0 4px 12px rgba(0, 0, 0, 0.08);
+
+  --color-diff-added-bg: rgba(0, 162, 64, 0.10);
+  --color-diff-added-gutter: rgba(0, 162, 64, 0.22);
+  --color-diff-deleted-bg: rgba(224, 46, 42, 0.10);
+  --color-diff-deleted-gutter: rgba(224, 46, 42, 0.22);
+
+  /* Link colour for inline markdown/chat links. */
+  --text-link: #0a6fcc;                /* AA on white */
+  /* Neutral code/editor surface — a touch greyer than the card. */
+  --code-surface: #f7f7f7;
+  /* Window titlebar tint behind the draggable top bar (app-header-tint). */
+  --codex-titlebar-tint: rgba(255, 255, 255, 0.72);
+  /* Max content width of the thread message/composer column. */
+  --thread-content-max-width: 720px;
+  /* Horizontal padding of page panels (px-panel utility). */
+  --panel-padding-x: 16px;
+}
+
+.dark {
+  --background: #181818;
+  --foreground: #ededed;
+  --card: #212121;
+  --card-foreground: #ededed;
+  --popover: #212121;
+  --popover-foreground: #ededed;
+  --primary: #ededed;
+  --primary-foreground: #0d0d0d;
+  --secondary: #303030;
+  --secondary-foreground: #ededed;
+  --muted: #282828;
+  --muted-foreground: #afafaf;
+  --accent: #303030;
+  --accent-foreground: #ededed;
+  --destructive: #fa423e;
+  --destructive-foreground: #ffffff;
+  --border: rgba(255, 255, 255, 0.08);
+  --input: rgba(255, 255, 255, 0.10);
+  --ring: rgba(255, 255, 255, 0.20);
+  --sidebar: #141414;
+  --sidebar-foreground: #ededed;
+  --sidebar-primary: #ededed;
+  --sidebar-primary-foreground: #0d0d0d;
+  --sidebar-accent: rgba(255, 255, 255, 0.06);
+  --sidebar-accent-foreground: #ededed;
+  --sidebar-border: rgba(255, 255, 255, 0.06);
+  --sidebar-ring: rgba(255, 255, 255, 0.20);
+
+  /* Dark mode contrast — symmetric to light. */
+  --color-text-primary: #ededed;       /* AAA on #181818 */
+  --color-text-secondary: #b8b8b8;     /* 8.2:1 */
+  --color-text-tertiary: #9d9d9d;      /* 5.6:1 */
+  --color-text-quaternary: #919191;    /* 4.7:1 — passes AA */
+  --color-text-success: #4ade80;       /* 8.3:1 */
+  --color-text-danger:  #f87171;       /* 6:1 */
+  --color-surface-hover: rgba(255, 255, 255, 0.05);
+  --color-surface-active: rgba(255, 255, 255, 0.08);
+  --color-divider: rgba(255, 255, 255, 0.08);
+
+  /* Dialog scrim is a touch heavier in dark mode so the dimming reads. */
+  --overlay: rgba(0, 0, 0, 0.40);
+
+  /* Scrollbar thumb — light translucent so it is visible on dark surfaces. */
+  --scrollbar-thumb: rgba(255, 255, 255, 0.18);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.30);
+
+  /* Strong popover inverts in dark mode so tooltips don't disappear. */
+  --popover-strong: #f7f7f7;
+  --popover-strong-hover: #e9e9e9;
+  --popover-strong-foreground: #0d0d0d;
+  --popover-strong-foreground-muted: rgba(13, 13, 13, 0.55);
+
+  /* Terminal pill stays dark in dark mode too (it's a terminal surface), but
+     lifts off the darker app background a touch for separation. */
+  --terminal-pill: #0d0d0d;
+  --terminal-pill-hover: #1c1c1c;
+  --terminal-pill-foreground: #ededed;
+  --terminal-pill-foreground-muted: rgba(237, 237, 237, 0.55);
+
+  --color-tile-fallback: #303030;
+  --color-tile-fallback-foreground: #ededed;
+  --color-on-brand: #ffffff;
+
+  --color-risk-modify-text: #ffd240;
+  --color-risk-modify-bg: rgba(255, 210, 64, 0.18);
+
+  --color-banner-from: #2a1f4a;
+  --color-banner-via:  #3a2d6a;
+  --color-banner-to:   #2a1f4a;
+  --color-banner-blob-a: #3a2d6a;
+  --color-banner-blob-b: #4a3a8a;
+
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.45), 0 2px 4px rgba(0, 0, 0, 0.25);
+  --shadow-dialog:  0 24px 48px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.30);
+  --shadow-card:    0 1px 2px rgba(0, 0, 0, 0.30);
+  --shadow-card-hover: 0 4px 16px rgba(0, 0, 0, 0.30), 0 1px 3px rgba(0, 0, 0, 0.30);
+  --shadow-pill:    0 8px 24px rgba(0, 0, 0, 0.55);
+  --shadow-fab:     0 4px 12px rgba(0, 0, 0, 0.40);
+
+  --color-diff-added-bg: rgba(64, 201, 119, 0.16);
+  --color-diff-added-gutter: rgba(64, 201, 119, 0.30);
+  --color-diff-deleted-bg: rgba(250, 66, 62, 0.16);
+  --color-diff-deleted-gutter: rgba(250, 66, 62, 0.30);
+
+  --text-link: #4aa3ff;                /* AA on #181818 */
+  --code-surface: #1c1c1c;
+  --codex-titlebar-tint: rgba(20, 20, 20, 0.72);
+  /* thread-content-max-width / panel-padding-x inherit from :root */
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    /* Original Codex leaves body font features at normal (app-main CSS :761) and
+       only opts into cv01/cv02/ss06 in specific scoped selectors. */
+    font-feature-settings: normal;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Scrollbar — thin, low-contrast like Codex */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-thumb-hover);
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .drag-region,
+  .draggable {
+    -webkit-app-region: drag;
+  }
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+
+  /* Window titlebar tint behind the draggable top bar (app-header-tint). */
+  .app-header-tint {
+    background: var(--codex-titlebar-tint);
+    backdrop-filter: saturate(1.8) blur(20px);
+    -webkit-backdrop-filter: saturate(1.8) blur(20px);
+  }
+
+  /* Horizontal page-panel padding (Codex `px-panel`). */
+  .px-panel {
+    padding-left: var(--panel-padding-x);
+    padding-right: var(--panel-padding-x);
+  }
+
+  /* Chat body text scale (Codex `text-size-chat`). */
+  .text-size-chat {
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  /* Shiki: keep the host shell, override block backgrounds so they match the
+     surrounding card. */
+  .shiki-host pre.shiki,
+  .shiki-host pre {
+    margin: 0;
+    padding: 8px 12px;
+    background: transparent !important;
+    overflow-x: auto;
+  }
+  .shiki-host code {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+
+  /* Thinking shimmer — cadenced one-shot sweep matching the CodexApp
+     thinking-shimmer (thinking-shimmer-83dxNCp_.css). The base text holds a
+     muted colour; a masked highlight span sweeps across once (1s, steps(48))
+     and is re-triggered on a ~4s cadence by the React component toggling the
+     `.codex-shimmer--active` class. Disabled under prefers-reduced-motion. */
+  .codex-shimmer {
+    color: color-mix(in oklab, var(--foreground) 55%, transparent);
+    position: relative;
+    -webkit-text-fill-color: currentColor;
+    text-fill-color: currentColor;
+  }
+  .codex-shimmer__sweep {
+    pointer-events: none;
+    width: 50%;
+    position: absolute;
+    inset: 0 auto 0 0;
+    overflow: hidden;
+    transform: translateX(-100%);
+    -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 40% 60%, transparent 100%);
+    mask-image: linear-gradient(90deg, transparent 0%, #000 40% 60%, transparent 100%);
+  }
+  .codex-shimmer__highlight {
+    width: 200%;
+    color: var(--foreground);
+    -webkit-text-fill-color: currentColor;
+    text-fill-color: currentColor;
+    display: block;
+    transform: translateX(50%);
+  }
+  .codex-shimmer--active .codex-shimmer__sweep,
+  .codex-shimmer--active .codex-shimmer__highlight {
+    animation-duration: 1s;
+    animation-timing-function: steps(48, end);
+    animation-iteration-count: 1;
+  }
+  .codex-shimmer--active .codex-shimmer__sweep {
+    animation-name: codex-shimmer-sweep;
+  }
+  .codex-shimmer--active .codex-shimmer__highlight {
+    animation-name: codex-shimmer-highlight;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .codex-shimmer--active .codex-shimmer__sweep,
+    .codex-shimmer--active .codex-shimmer__highlight {
+      animation: none;
+    }
+  }
+  @keyframes codex-shimmer-sweep {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(250%); }
+  }
+  @keyframes codex-shimmer-highlight {
+    0%   { transform: translateX(50%); }
+    100% { transform: translateX(-125%); }
+  }
+
+  /* Scroll-to-bottom working dots (scroll-to-bottom-buton-H4NGgmRi.css) */
+  @media (prefers-reduced-motion: no-preference) {
+    .codex-wave-dot {
+      animation-name: codex-working-dot-wave;
+      animation-duration: 1s;
+      animation-timing-function: ease-in-out;
+      animation-iteration-count: infinite;
+    }
+    .codex-wave-dot:nth-child(2) { animation-delay: 0.1s; }
+    .codex-wave-dot:nth-child(3) { animation-delay: 0.2s; }
+  }
+  @keyframes codex-working-dot-wave {
+    0%, 10%, 100% { transform: translateY(0); }
+    25% { transform: translateY(1.2px); }
+    55% { transform: translateY(-2px); }
+    70% { transform: translateY(0); }
+  }
+
+  /* Streaming caret — a blinking pill that follows the end of a streaming
+     markdown / thinking block to convey live token output. */
+  .codex-caret::after {
+    content: "";
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    margin-left: 2px;
+    vertical-align: -2px;
+    background: currentColor;
+    animation: codex-caret 900ms steps(2, end) infinite;
+  }
+  @keyframes codex-caret {
+    0%, 49%   { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+
+  /* Dialog enter — slides in from the top with a slight scale, matching the
+     original `codex-dialog-enter` keyframe (translateY(8px) scale(.98) -> 0/1,
+     transform-origin: top). The overlay fades. */
+  .codex-dialog-content[data-state="open"] {
+    animation: codex-dialog-enter 200ms cubic-bezier(0.16, 1, 0.3, 1);
+    transform-origin: top;
+    will-change: transform, opacity;
+  }
+  .codex-dialog-overlay[data-state="open"] {
+    animation: codex-dialog-overlay 200ms cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: opacity;
+  }
+  @keyframes codex-dialog-enter {
+    0%  { opacity: 0; transform: translateY(8px) scale(0.98); }
+    100% { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  @keyframes codex-dialog-overlay {
+    0%  { opacity: 0; }
+    100% { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .codex-dialog-content[data-state="open"],
+    .codex-dialog-overlay[data-state="open"] {
+      animation: none;
+    }
+  }
+}

@@ -14,14 +14,22 @@ public struct OAuthConfig: Sendable, Equatable {
     public var clientId: String
     public var redirectURI: String
     public var scopes: [String]
+    /// Upstream `originator()` value (login/src/auth/default_client.rs:36),
+    /// sent as the `originator` authorize param and the `originator` header.
+    public var originator: String
     public init(issuer: String = "https://auth.openai.com",
-                clientId: String = "app_codex",
+                // Upstream production CLIENT_ID (login/src/auth/manager.rs:928).
+                clientId: String = "app_EMoamEEZ73f0CkXaXp7hrann",
                 redirectURI: String = "http://localhost:1455/auth/callback",
-                scopes: [String] = ["openid", "profile", "email", "offline_access"]) {
+                // Upstream hardcoded scope set (login/src/server.rs:495-498).
+                scopes: [String] = ["openid", "profile", "email", "offline_access",
+                                    "api.connectors.read", "api.connectors.invoke"],
+                originator: String = "codex_cli_rs") {
         self.issuer = issuer
         self.clientId = clientId
         self.redirectURI = redirectURI
         self.scopes = scopes
+        self.originator = originator
     }
     public var authorizeEndpoint: String { issuer + "/oauth/authorize" }
     public var tokenEndpoint: String { issuer + "/oauth/token" }
@@ -62,6 +70,14 @@ public enum AuthError: Error, Sendable, Equatable, CustomStringConvertible {
     /// `RefreshTokenError::Permanent` + `RefreshTokenFailedError`
     /// (codex-rs/login/src/auth/manager.rs:843).
     case refreshFailed(reason: RefreshTokenFailedReason, underlying: String)
+    /// The device-code start endpoint returned HTTP 404, meaning device-code
+    /// login is not enabled for this Codex server. Mirrors the upstream
+    /// `io::ErrorKind::NotFound` condition raised in
+    /// `login/src/device_code_auth.rs:82-86`; the app-server maps this to a
+    /// JSON-RPC `invalid_request` (account_processor.rs:344-351). The associated
+    /// `message` is the verbatim upstream user-facing string so callers can
+    /// surface it via `description`.
+    case deviceCodeNotEnabled(String)
     public var description: String {
         switch self {
         case .transport(let s): return "auth transport: \(s)"
@@ -70,6 +86,7 @@ public enum AuthError: Error, Sendable, Equatable, CustomStringConvertible {
         case .notAuthenticated: return "auth: not authenticated"
         case .malformed(let s): return "auth: malformed (\(s))"
         case .refreshFailed(let r, _): return r.userFacingMessage
+        case .deviceCodeNotEnabled(let s): return s
         }
     }
 }
@@ -98,22 +115,33 @@ public struct PKCE: Sendable, Equatable {
 /// Builds the RFC 6749 / 7636 authorization-request URL.
 public enum AuthorizeURL {
     public static func build(_ cfg: OAuthConfig, challenge: String,
-                             state: String) -> String {
+                             state: String,
+                             forcedWorkspaceIds: [String] = []) -> String {
         func enc(_ s: String) -> String {
             var allowed = CharacterSet.alphanumerics
             allowed.insert(charactersIn: "-._~")
             return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
         }
-        let q = [
+        // Param set + order mirror upstream `build_authorize_url`
+        // (login/src/server.rs:491-518): the two ChatGPT flow flags precede
+        // `state`, and `originator` follows it. `allowed_workspace_id` is
+        // appended only when forced workspace ids are configured.
+        var q = [
             "response_type=code",
             "client_id=\(enc(cfg.clientId))",
             "redirect_uri=\(enc(cfg.redirectURI))",
             "scope=\(enc(cfg.scopes.joined(separator: " ")))",
             "code_challenge=\(enc(challenge))",
             "code_challenge_method=S256",
+            "id_token_add_organizations=true",
+            "codex_cli_simplified_flow=true",
             "state=\(enc(state))",
-        ].joined(separator: "&")
-        return cfg.authorizeEndpoint + "?" + q
+            "originator=\(enc(cfg.originator))",
+        ]
+        if !forcedWorkspaceIds.isEmpty {
+            q.append("allowed_workspace_id=\(enc(forcedWorkspaceIds.joined(separator: ",")))")
+        }
+        return cfg.authorizeEndpoint + "?" + q.joined(separator: "&")
     }
 }
 
@@ -170,11 +198,32 @@ public struct CurlTokenExchanger: TokenExchanger {
             }
             return "\(enc(k))=\(enc(v))"
         }.joined(separator: "&")
+        return await postRaw(
+            url, body: body,
+            contentType: "application/x-www-form-urlencoded")
+    }
+
+    /// Posts a JSON body to the token endpoint. Used by the ChatGPT OAuth
+    /// refresh path, which upstream sends as `application/json`
+    /// (`{"client_id":..,"grant_type":"refresh_token","refresh_token":..}`),
+    /// distinct from the authorization_code exchange (form-encoded).
+    /// (codex-rs/login/src/auth/manager.rs:815-834)
+    private func postJSON(_ url: String, fields: [String: String])
+    async -> Result<TokenEndpointResult, AuthError> {
+        let bodyData = (try? JSONSerialization.data(
+            withJSONObject: fields, options: [.sortedKeys])) ?? Data("{}".utf8)
+        return await postRaw(
+            url, body: String(decoding: bodyData, as: UTF8.self),
+            contentType: "application/json")
+    }
+
+    private func postRaw(_ url: String, body: String, contentType: String)
+    async -> Result<TokenEndpointResult, AuthError> {
         let box = ProcBox2()
         let p = box.p
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["curl", "-sS", "-X", "POST", url,
-                       "-H", "Content-Type: application/x-www-form-urlencoded",
+                       "-H", "Content-Type: \(contentType)",
                        "-H", "Accept: application/json",
                        "-w", "\n%{http_code}",
                        "--data-binary", "@-"]
@@ -246,11 +295,27 @@ public struct CurlTokenExchanger: TokenExchanger {
         }
     }
 
+    /// Resolve the refresh-token POST endpoint. Mirrors upstream
+    /// `refresh_token_endpoint()` (codex-rs/login/src/auth/manager.rs:930-933):
+    /// honor `CODEX_REFRESH_TOKEN_URL_OVERRIDE` when set (independent of the
+    /// configured issuer), otherwise fall back to the issuer-derived
+    /// `<issuer>/oauth/token`. Upstream's non-override constant is the fixed
+    /// `https://auth.openai.com/oauth/token`, which is the default
+    /// `cfg.tokenEndpoint`.
+    static func refreshTokenEndpoint(cfg: OAuthConfig) -> String {
+        if let override = ProcessInfo.processInfo.environment[
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE"], !override.isEmpty {
+            return override
+        }
+        return cfg.tokenEndpoint
+    }
+
     public func refresh(refreshToken: String,
                         cfg: OAuthConfig) async -> Result<AuthTokens, AuthError> {
-        switch await post(cfg.tokenEndpoint, form: [
-            "grant_type": "refresh_token", "refresh_token": refreshToken,
+        switch await postJSON(Self.refreshTokenEndpoint(cfg: cfg), fields: [
             "client_id": cfg.clientId,
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
         ]) {
         case .success(let r):
             if (200..<300).contains(r.status), let obj = r.json {
@@ -298,13 +363,25 @@ private struct JWTClaims {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return JWTClaims()
         }
+        // Real ChatGPT id_tokens nest account/plan claims under the
+        // `https://api.openai.com/auth` object (upstream
+        // `codex_login::token_data::AuthClaims`). Read those first, then fall
+        // back to legacy flat keys for resilience.
+        // The raw plan claim is canonicalized via the two-stage
+        // `PlanType::from_raw_value` -> account `PlanType` mapping
+        // (`AccountPlanType.normalize`): aliases like `hc` -> `enterprise`,
+        // `education` -> `edu`, and any unrecognized value -> `unknown`
+        // (never leaked verbatim).
+        let auth = object["https://api.openai.com/auth"] as? [String: Any]
+        let rawPlan = (auth?["chatgpt_plan_type"] as? String)
+            ?? (object["https://api.openai.com/plan_type"] as? String)
+            ?? (object["plan_type"] as? String)
         return JWTClaims(
-            accountId: object["https://api.openai.com/auth"] as? String
+            accountId: auth?["chatgpt_account_id"] as? String
                 ?? object["chatgpt_account_id"] as? String
                 ?? object["account_id"] as? String
                 ?? object["workspace_id"] as? String,
-            planType: object["https://api.openai.com/plan_type"] as? String
-                ?? object["plan_type"] as? String)
+            planType: rawPlan.map { AccountPlanType.normalize(rawValue: $0).wireValue })
     }
 }
 
@@ -368,7 +445,11 @@ public struct CurlDeviceCodeClient: DeviceCodeClient {
         let bodyText = parts.dropLast().joined(separator: "\n")
         if !(200..<300).contains(status) {
             if status == 404 && deviceCodeStart {
-                return .failure(.server("device code login is not enabled for this Codex server. Use the browser login or verify the server URL."))
+                // HTTP 404 on the device-code start endpoint maps to upstream's
+                // `io::ErrorKind::NotFound` (device_code_auth.rs:82-86), which the
+                // app-server reports as `invalid_request` rather than the
+                // `internal_error` used for transient device-code failures.
+                return .failure(.deviceCodeNotEnabled("device code login is not enabled for this Codex server. Use the browser login or verify the server URL."))
             }
             return .failure(.server("device auth failed with status \(status)"))
         }

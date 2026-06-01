@@ -39,10 +39,24 @@ public struct PermissionsInstructions: ContextualUserFragment, Sendable, Equatab
     /// `core/src/context/permissions_instructions.rs`). When `false`, the
     /// `request_permissions` category is dropped from the granular listing —
     /// even when the underlying `GranularConfig.requestPermissions` flag is
-    /// set — because there is no tool to gate. Default is `true` to preserve
-    /// current rendering behaviour for callers that have not yet plumbed the
-    /// flag through `SessionConfig`.
-    public static let defaultRequestPermissionsToolEnabled = true
+    /// set — because there is no tool to gate, and the `# request_permissions
+    /// Tool` preamble section is suppressed for unless-trusted / on-failure /
+    /// on-request.
+    ///
+    /// Default is `false`, matching upstream `Feature::RequestPermissionsTool`
+    /// (`features/src/lib.rs`: `stage: UnderDevelopment, default_enabled:
+    /// false`). The session plumbs the resolved feature flag through to the
+    /// constructor; out of the box the section is not emitted.
+    public static let defaultRequestPermissionsToolEnabled = false
+
+    /// Whether exec-permission approvals are enabled for the session. Mirrors
+    /// upstream's `exec_permission_approvals_enabled` flag. When `true`, the
+    /// on-request preamble switches to the
+    /// `on_request_rule_request_permission.md` body (rather than
+    /// `on_request.md`), and under granular policy the inline
+    /// shell-permission-request guidance is emitted when sandbox approvals can
+    /// still prompt. Default `false`, matching the upstream feature default.
+    public static let defaultExecPermissionApprovalsEnabled = false
 
     public enum NetworkAccess: String, Sendable { case enabled, restricted }
     public enum ApprovalsReviewer: Sendable, Equatable { case user, autoReview }
@@ -116,6 +130,47 @@ Good examples of prefixes:
 - ["gh", "pr", "check"]
 - ["cargo", "test"]
 """#
+    /// Verbatim md (codex-rs prompts/permissions/approval_policy/
+    /// on_request_rule_request_permission.md), trim_end'd. Served in place of
+    /// `approvalOnRequest` when `exec_permission_approvals_enabled` is true,
+    /// and appended under granular policy when shell-permission requests can
+    /// still prompt.
+    static let approvalOnRequestRuleRequestPermission = #"""
+# Permission Requests
+
+Commands may require user approval before execution. Prefer requesting sandboxed additional permissions instead of asking to run fully outside the sandbox.
+
+## Preferred request mode
+
+When you need extra sandboxed permissions for one command, use:
+
+- `sandbox_permissions: "with_additional_permissions"`
+- `additional_permissions` with one or more of:
+  - `network.enabled`: set to `true` to enable network access
+  - `file_system.read`: list of paths that need read access
+  - `file_system.write`: list of paths that need write access
+
+When using the `request_permissions` tool directly, only request `network` and `file_system` permissions.
+
+This keeps execution inside the current sandbox policy, while adding only the requested permissions for that command, unless an exec-policy allow rule applies and authorizes running the command outside the sandbox.
+
+If the command already matches an exec-policy allow rule, the command can be auto-approved without an extra prompt. In that case, exec-policy allow behavior (including any sandbox bypass) takes precedence.
+
+## Escalation Requests
+
+Use full escalation only when sandboxed additional permissions cannot satisfy the task.
+
+- `sandbox_permissions: "require_escalated"`
+- Include `justification` as a short question asking for approval.
+- Optionally include `prefix_rule` to suggest a reusable allow rule.
+
+## Command segmentation reminder
+
+The command string is split into independent command segments at shell control operators, including pipes (`|`), logical operators (`&&`, `||`), command separators (`;`), and subshell boundaries (`(...)`, `$()`).
+
+Each segment is evaluated independently for sandbox restrictions and approval requirements.
+"""#
+
     static let autoReviewSuffix = "`approvals_reviewer` is `auto_review`: Sandbox escalations with require_escalated will be reviewed for compliance with the policy. If a rejection happens, you should proceed only with a materially safer alternative, or inform the user of the risk and send a final message to ask for approval."
 
     /// Verbatim intro for the granular approval section (upstream
@@ -128,12 +183,16 @@ Good examples of prefixes:
                 approvalPolicy: ApprovalPolicy,
                 approvalsReviewer: ApprovalsReviewer,
                 writableRoots: [String],
-                requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled) {
+                requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled,
+                execPermissionApprovalsEnabled: Bool = defaultExecPermissionApprovalsEnabled,
+                allowedPrefixes: [[String]] = []) {
         var text = ""
         Self.appendSection(&text, Self.sandboxText(sandboxMode, networkAccess))
         Self.appendSection(&text, Self.approvalText(
             approvalPolicy, approvalsReviewer,
-            requestPermissionsToolEnabled: requestPermissionsToolEnabled))
+            requestPermissionsToolEnabled: requestPermissionsToolEnabled,
+            execPermissionApprovalsEnabled: execPermissionApprovalsEnabled,
+            allowedPrefixes: allowedPrefixes))
         if let wr = Self.writableRootsText(writableRoots) {
             Self.appendSection(&text, wr)
         }
@@ -158,17 +217,159 @@ Good examples of prefixes:
         return TemplateRenderer().render(tmpl, ["network_access": net.rawValue])
     }
 
+    /// Verbatim upstream `request_permissions_tool_prompt_section()`
+    /// (core/src/context/permissions_instructions.rs): appended to the
+    /// unless-trusted / on-failure / on-request preambles when the built-in
+    /// `request_permissions` tool is enabled for the session.
+    static let requestPermissionsToolSection = "# request_permissions Tool\n\nThe built-in `request_permissions` tool is available in this session. Invoke it when you need to request additional `network` or `file_system` permissions before later shell-like commands need them. Request only the specific permissions required for the task."
+
+    /// Upstream `with_request_permissions_tool`: append the request_permissions
+    /// tool section when the tool is enabled, else return the text unchanged.
+    static func withRequestPermissionsTool(_ text: String, enabled: Bool) -> String {
+        enabled ? "\(text)\n\n\(requestPermissionsToolSection)" : text
+    }
+
+    /// Faithful port of upstream `on_request_instructions()` (closure in
+    /// `approval_text`): selects the rule-request-permission body when
+    /// exec-permission approvals are enabled, then appends the
+    /// request_permissions tool section (when the tool is enabled) and the
+    /// approved-command-prefixes section (when the exec policy has allow
+    /// prefixes), joined with blank lines.
+    static func onRequestInstructions(
+        requestPermissionsToolEnabled: Bool,
+        execPermissionApprovalsEnabled: Bool,
+        allowedPrefixes: [[String]]
+    ) -> String {
+        let onRequestRule = execPermissionApprovalsEnabled
+            ? approvalOnRequestRuleRequestPermission
+            : approvalOnRequest
+        var sections: [String] = [onRequestRule]
+        if requestPermissionsToolEnabled {
+            sections.append(requestPermissionsToolSection)
+        }
+        if let prefixes = approvedCommandPrefixesText(allowedPrefixes) {
+            sections.append(
+                "## Approved command prefixes\nThe following prefix rules have already been approved: \(prefixes)")
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    // MARK: Approved command prefixes (port of
+    // `codex_protocol::models::format_allow_prefixes` +
+    // `approved_command_prefixes_text`).
+
+    static let maxRenderedPrefixes = 100
+    static let maxAllowPrefixTextBytes = 5000
+    static let prefixTruncatedMarker = "...\n[Some commands were truncated]"
+
+    /// `approved_command_prefixes_text(exec_policy)`: render the allow-prefix
+    /// list, returning nil when it is empty.
+    static func approvedCommandPrefixesText(_ prefixes: [[String]]) -> String? {
+        guard let rendered = formatAllowPrefixes(prefixes), !rendered.isEmpty else {
+            return nil
+        }
+        return rendered
+    }
+
+    /// Verbatim port of `format_allow_prefixes`: sort by (len, combined str
+    /// len, lexicographic), render each prefix as a JSON-quoted token list,
+    /// cap at `maxRenderedPrefixes`, truncate to `maxAllowPrefixTextBytes`
+    /// characters, and append the truncation marker when anything was dropped.
+    static func formatAllowPrefixes(_ prefixes: [[String]]) -> String? {
+        if prefixes.isEmpty { return nil }
+        var truncated = prefixes.count > maxRenderedPrefixes
+
+        let sorted = prefixes.sorted { a, b in
+            if a.count != b.count { return a.count < b.count }
+            let la = a.reduce(0) { $0 + $1.count }
+            let lb = b.reduce(0) { $0 + $1.count }
+            if la != lb { return la < lb }
+            return lexicographicLess(a, b)
+        }
+
+        let fullText = sorted.prefix(maxRenderedPrefixes)
+            .map { "- \(renderCommandPrefix($0))" }
+            .joined(separator: "\n")
+
+        // Truncate to the last UTF-8 char boundary at `maxAllowPrefixTextBytes`
+        // characters (upstream uses `char_indices().nth(N)`, i.e. scalar count).
+        var output = fullText
+        let scalars = Array(output.unicodeScalars)
+        if scalars.count > maxAllowPrefixTextBytes {
+            truncated = true
+            output = String(String.UnicodeScalarView(scalars.prefix(maxAllowPrefixTextBytes)))
+        }
+
+        if truncated {
+            return output + prefixTruncatedMarker
+        }
+        return output
+    }
+
+    /// `render_command_prefix`: JSON-encode each token (so quotes/escapes
+    /// match `serde_json::to_string`) and wrap in `[...]`.
+    static func renderCommandPrefix(_ prefix: [String]) -> String {
+        let tokens = prefix.map { jsonEncodeString($0) }.joined(separator: ", ")
+        return "[\(tokens)]"
+    }
+
+    /// Lexicographic comparison of two `[String]` matching Rust's `Vec` `Ord`.
+    static func lexicographicLess(_ a: [String], _ b: [String]) -> Bool {
+        for (x, y) in zip(a, b) {
+            if x != y { return x < y }
+        }
+        return a.count < b.count
+    }
+
+    /// Minimal JSON string encoder mirroring `serde_json::to_string(&str)`:
+    /// the same set of escapes serde emits for a string scalar.
+    static func jsonEncodeString(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        out += "\""
+        return out
+    }
+
     static func approvalText(_ policy: ApprovalPolicy, _ reviewer: ApprovalsReviewer,
-                             requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled) -> String {
+                             requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled,
+                             execPermissionApprovalsEnabled: Bool = defaultExecPermissionApprovalsEnabled,
+                             allowedPrefixes: [[String]] = []) -> String {
         let base: String
         switch policy {
         case .never: base = approvalNever
-        case .unlessTrusted: base = approvalUnlessTrusted
-        case .onFailure: base = approvalOnFailure
-        case .onRequest: base = approvalOnRequest
+        case .unlessTrusted:
+            base = withRequestPermissionsTool(approvalUnlessTrusted,
+                                              enabled: requestPermissionsToolEnabled)
+        case .onFailure:
+            base = withRequestPermissionsTool(approvalOnFailure,
+                                              enabled: requestPermissionsToolEnabled)
+        case .onRequest:
+            base = onRequestInstructions(
+                requestPermissionsToolEnabled: requestPermissionsToolEnabled,
+                execPermissionApprovalsEnabled: execPermissionApprovalsEnabled,
+                allowedPrefixes: allowedPrefixes)
         case .granular(let cfg):
             base = granularInstructions(
-                cfg, requestPermissionsToolEnabled: requestPermissionsToolEnabled)
+                cfg,
+                requestPermissionsToolEnabled: requestPermissionsToolEnabled,
+                execPermissionApprovalsEnabled: execPermissionApprovalsEnabled,
+                allowedPrefixes: allowedPrefixes)
         }
         let suppressAutoReviewSuffix: Bool
         if case .never = policy { suppressAutoReviewSuffix = true }
@@ -180,23 +381,26 @@ Good examples of prefixes:
     }
 
     /// Faithful port of upstream `granular_instructions()`. Emits the granular
-    /// intro followed by a "may still prompt" list, a "rejected" list, and
-    /// (when sandbox_approval is allowed) the inline shell-permission request
-    /// rule guidance from `on_request_rule_request_permission.md`.
-    ///
-    /// Note: parity with upstream is preserved at the boolean-category level.
-    /// The downstream sections that depend on `exec_permission_approvals_enabled`,
-    /// `request_permissions_tool_enabled`, and approved-prefix lookup are not
-    /// yet plumbed through the Swift PermissionsInstructions constructor
-    /// (those feature flags do not currently surface in `SessionConfig`); they
-    /// will be wired alongside the broader F-6 / F-7 work in a follow-up. For
-    /// now we always emit the categories block and, when `sandbox_approval` is
-    /// allowed, the inline-escalation guidance — which matches the upstream
-    /// shape for the common case where shell-permission requests are enabled.
+    /// intro, a "may still prompt" list, a "rejected" list, then conditionally:
+    /// the inline shell-permission-request guidance (when exec-permission
+    /// approvals are enabled AND sandbox approvals can still prompt), the
+    /// request_permissions tool section (when the tool is enabled AND the
+    /// request_permissions category can still prompt), and the
+    /// approved-command-prefixes section (when the exec policy has allow
+    /// prefixes).
     static func granularInstructions(
         _ cfg: GranularConfig,
-        requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled
+        requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled,
+        execPermissionApprovalsEnabled: Bool = defaultExecPermissionApprovalsEnabled,
+        allowedPrefixes: [[String]] = []
     ) -> String {
+        // `granular_config.allows_*` map directly to the GranularConfig flags.
+        let sandboxApprovalPromptsAllowed = cfg.sandboxApproval
+        let shellPermissionRequestsAvailable =
+            execPermissionApprovalsEnabled && sandboxApprovalPromptsAllowed
+        let requestPermissionsToolPromptsAllowed =
+            requestPermissionsToolEnabled && cfg.requestPermissions
+
         // Categories follow upstream ordering: sandbox_approval, rules,
         // skill_approval, [request_permissions when tool enabled],
         // mcp_elicitations. Upstream gates the `request_permissions` bullet
@@ -231,6 +435,16 @@ Good examples of prefixes:
             sections.append(
                 "These approval categories are automatically rejected instead of prompting the user:\n"
                 + rejected.joined(separator: "\n"))
+        }
+        if shellPermissionRequestsAvailable {
+            sections.append(approvalOnRequestRuleRequestPermission)
+        }
+        if requestPermissionsToolPromptsAllowed {
+            sections.append(requestPermissionsToolSection)
+        }
+        if let prefixes = approvedCommandPrefixesText(allowedPrefixes) {
+            sections.append(
+                "## Approved command prefixes\nThe following prefix rules have already been approved: \(prefixes)")
         }
         return sections.joined(separator: "\n\n")
     }

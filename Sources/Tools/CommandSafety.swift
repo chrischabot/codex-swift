@@ -16,20 +16,20 @@ public enum CommandSafety: Sendable, Equatable {
     /// Read-only programs whose ANY invocation is safe regardless of arguments.
     /// Matches upstream's `is_safe_to_call_with_exec` set (the simple match arm).
     private static let alwaysSafePrograms: Set<String> = [
-        // Upstream simple-match list (unix-leaning).
+        // Upstream simple-match list (unix-leaning), verbatim from
+        // `is_safe_to_call_with_exec` (`is_safe_command.rs:71-98`). Do NOT add
+        // programs here that upstream does not auto-trust: anything outside this
+        // set (e.g. `sort`, `printf`, `diff`, `du`, `df`, `tree`, `less`,
+        // `more`, `ps`, `date`, `file`, `printenv`, `realpath`, `sleep`) must
+        // fall through to the approval-prompt path. `less`/`more` admit shell
+        // escapes and `sort -o`/redirection are not gated here, so auto-trusting
+        // them would widen the approval-bypass surface relative to upstream.
         "cat", "cd", "cut", "echo", "expr", "false", "grep", "head", "id",
         "ls", "nl", "paste", "pwd", "rev", "seq", "stat", "tail", "tr",
-        "true", "uname", "wc", "which", "whoami",
+        "true", "uname", "uniq", "wc", "which", "whoami",
         // Linux-only in upstream: numfmt, tac. We accept them universally;
         // platform gating is enforced at the host OS by the shell itself.
         "numfmt", "tac",
-        // codex-swift extensions (kept for compatibility with existing
-        // CommandSafetyTests baseline — these are still read-only):
-        "file", "date", "hostname", "printenv", "type", "basename",
-        "dirname", "realpath", "readlink", "sleep", "sort", "uniq", "od",
-        "xxd", "sha256sum", "md5sum", "cksum", "du", "df", "tree", "egrep",
-        "fgrep", "ag", "diff", "cmp", "comm", "column", "fold", "expand",
-        "less", "more", "ps", "groups", "tty", "locale", "printf",
     ]
 
     /// Programs whose safety depends on the argument vector. Handled in
@@ -299,6 +299,284 @@ public enum CommandSafety: Sendable, Equatable {
             out.append(toks)
         }
         return out
+    }
+
+    /// If `command` is a `bash -lc "<script>"` / `zsh -lc` / `sh -c` invocation
+    /// whose script is a SINGLE command attaching its stdin via a here-doc
+    /// (`<<` / `<<-`) — and nothing else — return the executable-prefix argv of
+    /// that single command (literal words only). Returns nil otherwise.
+    ///
+    /// Mirrors upstream `parse_shell_lc_single_command_prefix`
+    /// (`shell-command/src/bash.rs:124-140`): a here-doc only attaches stdin and
+    /// does not change argv-matching semantics for the executable prefix, so it
+    /// is safe to collapse to the prefix for execpolicy classification — but the
+    /// caller MUST treat this as "complex parsing" (see `usedComplexParsing`),
+    /// suppressing the known-safe auto-allow so the user is still prompted.
+    ///
+    /// This path is reached ONLY for scripts that `parseShellLcPlainCommands`
+    /// rejected (here-docs contain `<` which is an escalating char), so the two
+    /// decomposition paths never both fire for the same script. The Swift
+    /// implementation is a hand-rolled, deliberately conservative reproduction
+    /// (no tree-sitter): it rejects anything beyond one here-doc-fed command of
+    /// literal words.
+    static func parseShellLcSingleCommandPrefix(_ command: [String]) -> [String]? {
+        guard command.count == 3 else { return nil }
+        let shell = programLookupKey(command[0])
+        let flag = command[1]
+        let script = command[2]
+        let knownShells: Set<String> = ["bash", "zsh", "sh"]
+        guard knownShells.contains(shell) else { return nil }
+        guard flag == "-lc" || flag == "-c" else { return nil }
+
+        // Must contain a here-doc redirect (`<<`) — but NOT a here-string
+        // (`<<<`), which upstream's grammar surfaces as a `herestring_redirect`
+        // that can smuggle substitutions (e.g. `<<< "$(rm -rf /)"`). Require a
+        // `<<` that is not immediately followed by another `<`.
+        guard let heredocRange = Self.firstHeredocOperator(in: script) else { return nil }
+
+        // The portion of the script BEFORE the here-doc body delimiter line is
+        // the command line; everything after the first newline is the body.
+        // We only classify the command line (the executable prefix).
+        let commandLine: String
+        if let nl = script.firstIndex(of: "\n") {
+            commandLine = String(script[..<nl])
+        } else {
+            commandLine = script
+        }
+        // The here-doc operator must appear on the command line.
+        guard heredocRange.lowerBound < (script.firstIndex(of: "\n") ?? script.endIndex) else {
+            return nil
+        }
+
+        // Split the command line into the part before the `<<` (the command +
+        // its args) and the part after (the delimiter, optionally with a
+        // trailing redirect that we must reject).
+        let beforeHeredoc = String(script[script.startIndex..<heredocRange.lowerBound])
+        let afterHeredoc = String(script[heredocRange.upperBound...])
+        // `afterHeredoc` (still on the command line) is the here-doc delimiter
+        // token, e.g. `'PY'` / `PY`. Anything beyond a single bare/quoted token
+        // (e.g. an extra `> /tmp/out.txt` file redirect, or `&&` chaining) means
+        // this is not a lone here-doc-fed command → reject.
+        let afterLine: String
+        if let nl = afterHeredoc.firstIndex(of: "\n") {
+            afterLine = String(afterHeredoc[..<nl])
+        } else {
+            afterLine = afterHeredoc
+        }
+        let delimTokens = tokens(afterLine)
+        guard delimTokens.count == 1 else { return nil }
+
+        // The command-and-args portion must not contain any shell metacharacter
+        // that introduces side effects we can't reason about (redirection,
+        // substitution, subshells, globs, env-assignment prefix, arithmetic
+        // expansion like `$((1<<2))`, chaining). This mirrors the tree-sitter
+        // rejections (`has_error`, word-expansion, file_redirect, multi-command,
+        // variable assignment).
+        if beforeHeredoc.contains(where: { escalatingChars.contains($0) }) {
+            return nil
+        }
+        // The control operators that `escalatingChars` does NOT include
+        // (`|`, `&`, `;`) would indicate multiple commands — reject those too.
+        if beforeHeredoc.contains("|") || beforeHeredoc.contains("&")
+            || beforeHeredoc.contains(";") {
+            return nil
+        }
+        let toks = tokens(beforeHeredoc)
+        guard let head = toks.first, !head.isEmpty else { return nil }
+        // Reject an env-assignment prefix (`PATH=/tmp/evil:$PATH cat ...`):
+        // matches upstream's rejection of a leading `variable_assignment`.
+        if head.contains("="), !head.hasPrefix("-") { return nil }
+        return toks
+    }
+
+    /// Locate the first here-doc operator (`<<`, but not the here-string
+    /// `<<<`) in `script`, returning the range of the `<<` token. Returns nil
+    /// when there is no plain here-doc (e.g. only a here-string, or `<` file
+    /// redirects, or an arithmetic `$((1<<2))` — though those carry `$`/`(` and
+    /// are rejected earlier by the caller).
+    private static func firstHeredocOperator(in script: String) -> Range<String.Index>? {
+        let chars = Array(script)
+        var i = 0
+        var quote: Character? = nil
+        while i < chars.count {
+            let ch = chars[i]
+            if let q = quote {
+                if ch == q { quote = nil }
+                i += 1
+                continue
+            }
+            if ch == "\"" || ch == "'" { quote = ch; i += 1; continue }
+            if ch == "<", i + 1 < chars.count, chars[i + 1] == "<" {
+                // Reject here-strings (`<<<`).
+                if i + 2 < chars.count, chars[i + 2] == "<" { return nil }
+                let lower = script.index(script.startIndex, offsetBy: i)
+                let upper = script.index(lower, offsetBy: 2)
+                return lower..<upper
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    // MARK: – Approval-cache canonicalization -----------------------------------
+
+    /// Canonical-key prefixes mirroring upstream
+    /// `core/src/command_canonicalization.rs:5-6`.
+    private static let canonicalBashScriptPrefix = "__codex_shell_script__"
+    private static let canonicalPowershellScriptPrefix = "__codex_powershell_script__"
+
+    /// PowerShell wrapper flags accepted before `-Command`/`-c`. Mirrors
+    /// `shell-command/src/powershell.rs:9` `POWERSHELL_FLAGS` (lowercased).
+    private static let powershellFlags: Set<String> = [
+        "-nologo", "-noprofile", "-command", "-c",
+    ]
+
+    /// Mirrors upstream `detect_shell_type`
+    /// (`shell-command/src/shell_detect.rs:13-32`): match on the full path
+    /// string for the recognised shell names, otherwise recurse on the file
+    /// stem (the basename with any extension stripped). Only the shell types
+    /// the canonicalizer cares about are modelled here.
+    private enum ShellKind { case zsh, sh, bash, powershell }
+
+    private static func detectShellType(_ shellPath: String) -> ShellKind? {
+        switch shellPath {
+        case "zsh": return .zsh
+        case "sh": return .sh
+        case "bash": return .bash
+        case "pwsh", "powershell": return .powershell
+        default:
+            // file_stem: basename without its extension.
+            let base = (shellPath as NSString).lastPathComponent
+            let stem = (base as NSString).deletingPathExtension
+            // Recurse only when the stem differs from the original path,
+            // matching upstream's `shell_name_path != Path::new(shell_path)`
+            // guard (prevents infinite recursion).
+            if stem != shellPath {
+                return detectShellType(stem)
+            }
+            return nil
+        }
+    }
+
+    /// Mirrors upstream `extract_bash_command`
+    /// (`shell-command/src/bash.rs:97-110`): returns the `(shell, script)` pair
+    /// when `command` is a 3-element `[shell, "-lc"|"-c", script]` invocation of
+    /// a recognised bash/zsh/sh shell.
+    static func extractBashCommand(_ command: [String]) -> (shell: String, script: String)? {
+        guard command.count == 3 else { return nil }
+        let shell = command[0]
+        let flag = command[1]
+        let script = command[2]
+        guard flag == "-lc" || flag == "-c" else { return nil }
+        switch detectShellType(shell) {
+        case .zsh, .bash, .sh: return (shell, script)
+        default: return nil
+        }
+    }
+
+    /// Mirrors upstream `extract_powershell_command`
+    /// (`shell-command/src/powershell.rs:42-70`): returns the `(shell, script)`
+    /// pair when `command` is a PowerShell invocation whose flags up to and
+    /// including `-Command`/`-c` are all recognised PowerShell flags.
+    static func extractPowershellCommand(_ command: [String]) -> (shell: String, script: String)? {
+        guard command.count >= 3 else { return nil }
+        let shell = command[0]
+        guard detectShellType(shell) == .powershell else { return nil }
+        var i = 1
+        while i + 1 < command.count {
+            let flag = command[i].lowercased()
+            // Reject unknown flags (matches upstream early return).
+            guard powershellFlags.contains(flag) else { return nil }
+            if flag == "-command" || flag == "-c" {
+                return (shell, command[i + 1])
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    /// Canonicalize command argv for approval-cache matching, mirroring upstream
+    /// `canonicalize_command_for_approval`
+    /// (`core/src/command_canonicalization.rs:14-38`).
+    ///
+    /// - A plain word-only single `shell -lc "<cmd>"` invocation collapses to the
+    ///   inner argv (so `/bin/bash -lc 'cargo test'` and `bash -lc 'cargo   test'`
+    ///   both canonicalize to `["cargo", "test"]`).
+    /// - A more complex bash/zsh/sh script (here-docs, multiple commands, etc.)
+    ///   collapses to `["__codex_shell_script__", <shell_mode>, <script>]`, where
+    ///   `shell_mode` is the original flag (`command[1]`) so the key is stable
+    ///   across wrapper-path spellings while preserving the exact script text.
+    /// - A PowerShell wrapper collapses to `["__codex_powershell_script__", <script>]`.
+    /// - Anything else is returned verbatim.
+    public static func canonicalizeCommandForApproval(_ command: [String]) -> [String] {
+        if let commands = parseShellLcPlainCommands(command), commands.count == 1 {
+            return commands[0]
+        }
+        if let (_, script) = extractBashCommand(command) {
+            let shellMode = command.count > 1 ? command[1] : ""
+            return [canonicalBashScriptPrefix, shellMode, script]
+        }
+        if let (_, script) = extractPowershellCommand(command) {
+            return [canonicalPowershellScriptPrefix, script]
+        }
+        return command
+    }
+
+    /// True if `argv` is one of the synthetic canonical script keys produced by
+    /// `canonicalizeCommandForApproval` (i.e. its first token is the bash or
+    /// powershell script-prefix sentinel). Such keys are valid in-memory
+    /// approval-cache keys but are NOT real command prefixes and must not be
+    /// persisted as `prefix_rule(...)` lines.
+    public static func isCanonicalScriptKey(_ argv: [String]) -> Bool {
+        guard let first = argv.first else { return false }
+        return first == canonicalBashScriptPrefix
+            || first == canonicalPowershellScriptPrefix
+    }
+
+    // MARK: – Dangerous-command heuristic ---------------------------------------
+
+    /// Mirrors upstream `is_dangerous_to_call_with_exec`
+    /// (`shell-command/src/command_safety/is_dangerous_command.rs:145-157`):
+    /// a single concrete argv is dangerous if it is `rm -f` / `rm -rf`, or it
+    /// is `sudo <cmd>` where `<cmd>` recursively classifies as dangerous.
+    ///
+    /// NOTE: upstream matches `argv[1]` *exactly* against `-f` / `-rf` — it
+    /// does NOT treat `--force`, `-fd`, `-rf/` (a combined token) or any
+    /// other flag form as dangerous at the base case. Keep this exact.
+    private static func isDangerousArgv(_ command: ArraySlice<String>) -> Bool {
+        guard let first = command.first else { return false }
+        switch first {
+        case "rm":
+            let idx = command.index(after: command.startIndex)
+            guard idx < command.endIndex else { return false }
+            let flag = command[idx]
+            return flag == "-f" || flag == "-rf"
+        case "sudo":
+            // `sudo <cmd>` → classify `<cmd>` recursively.
+            return isDangerousArgv(command.dropFirst())
+        default:
+            return false
+        }
+    }
+
+    /// Top-level dangerous-command classifier. Mirrors upstream
+    /// `command_might_be_dangerous`
+    /// (`is_dangerous_command.rs:7-28`): flags `rm -f`/`-rf`, `sudo <dangerous>`
+    /// recursively, and any inner command of a `bash -lc "<script>"` /
+    /// `sh -c` / `zsh -lc` decomposition being dangerous.
+    ///
+    /// The Windows PowerShell path (`is_dangerous_powershell_words`) is out of
+    /// scope for the POSIX port and is treated as not-dangerous, matching the
+    /// `#[cfg(not(windows))]` stub upstream (`is_dangerous_command.rs:39-43`).
+    public static func isDangerousCommand(argv: [String]) -> Bool {
+        if argv.isEmpty { return false }
+        if isDangerousArgv(argv[...]) { return true }
+        // Support `bash -lc "<script>"` where ANY inner command is dangerous.
+        if let inner = parseShellLcPlainCommands(argv),
+           inner.contains(where: { isDangerousArgv($0[...]) }) {
+            return true
+        }
+        return false
     }
 
     // MARK: – isSafeArgv (single argv vector) -----------------------------------

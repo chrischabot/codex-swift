@@ -120,7 +120,10 @@ final class UnifiedExecTests: XCTestCase {
                      argumentsJSON: #"{"process_id":999999,"input":"x"}"#),
             cwd: dir)
         XCTAssertFalse(r.success)
-        XCTAssertTrue(r.output.contains("no such process"),
+        // Upstream `UnifiedExecError::UnknownProcessId` (errors.rs:10-12) renders
+        // `Unknown process id <id>`; the legacy tool surfaces the manager error
+        // verbatim.
+        XCTAssertTrue(r.output.contains("Unknown process id 999999"),
                       "continuing a dead/unknown process fails cleanly: \(r.output)")
     }
 

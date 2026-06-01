@@ -63,7 +63,12 @@ When two AGENTS.md files disagree, the one located deeper in the directory struc
     public func agentsMdPaths() -> [String] {
         if projectDocMaxBytes == 0 { return [] }
         let fm = FileManager.default
-        let dir = (cwd as NSString).standardizingPath
+        // Upstream `agents_md.rs` runs `dunce::canonicalize` (symlink-resolving)
+        // on the cwd BEFORE the project-root ancestor walk, so markers and
+        // AGENTS.md files are discovered along the REAL path. `standardizingPath`
+        // alone only normalizes `.`/`..`/`~` and does NOT resolve symlinks;
+        // resolve symlinks first, then standardize the relative components.
+        let dir = ((cwd as NSString).resolvingSymlinksInPath as NSString).standardizingPath
         var projectRoot: String?
         if !projectRootMarkers.isEmpty {
             var cursor = dir

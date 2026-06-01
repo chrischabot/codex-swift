@@ -355,11 +355,13 @@ final class MemoryToolsTests: XCTestCase {
                        "unknown match_mode.type must be rejected")
     }
 
-    func testToolOutputSchemaIsEmittedInOpenAIRequestBody() throws {
-        // P4.8 — when a ToolSpec carries an outputSchemaJSON, the OpenAI
-        // Responses request body must emit `output_schema` next to
-        // `parameters` for that tool (mirrors `ResponsesApiTool.output_schema`
-        // from `codex-tools/src/responses_api.rs`).
+    func testToolOutputSchemaIsNeverEmittedInOpenAIRequestBody() throws {
+        // Upstream `ResponsesApiTool.output_schema` is `#[serde(skip)]`
+        // (`codex-tools/src/responses_api.rs:35`), so even when a ToolSpec
+        // carries an `outputSchemaJSON` (retained for internal code-mode
+        // validation), the Responses request body must NEVER serialize an
+        // `output_schema` key. Every function tool must, however, emit the
+        // non-skippable `strict` bool.
         let outSchema =
             #"{"type":"object","properties":{"items":{"type":"array","items":{"type":"string"}}},"required":["items"],"additionalProperties":false}"#
         let spec = ToolSpec(name: "memories_list",
@@ -374,26 +376,14 @@ final class MemoryToolsTests: XCTestCase {
             ModelSettings(model: "m", threadId: "t"),
             maxOutputTokens: nil)
         guard let tools = body["tools"] as? [[String: Any]],
-              let first = tools.first,
-              let emitted = first["output_schema"] as? [String: Any] else {
-            return XCTFail("output_schema must appear on the tool entry: \(body)")
+              let first = tools.first else {
+            return XCTFail("tools array missing: \(body)")
         }
-        XCTAssertEqual(emitted["type"] as? String, "object",
-                       "emitted output_schema must preserve schema body")
-        XCTAssertEqual(emitted["additionalProperties"] as? Bool, false)
-        // When a tool has no outputSchemaJSON, the key must be omitted so the
-        // wire shape stays unchanged for the majority of tools.
-        let noOut = ToolSpec(name: "x",
-                             description: "x",
-                             parametersJSON: #"{"type":"object"}"#)
-        let prompt2 = Prompt(instructions: "i", input: [.userText("hi")],
-                             tools: [noOut])
-        let body2 = OpenAIResponsesClient.buildRequestBody(
-            prompt2, ModelSettings(model: "m", threadId: "t"),
-            maxOutputTokens: nil)
-        let tools2 = body2["tools"] as? [[String: Any]] ?? []
-        XCTAssertNil(tools2.first?["output_schema"],
-                     "output_schema must be omitted when not declared")
+        XCTAssertNil(first["output_schema"],
+                     "output_schema is #[serde(skip)] upstream — must never be sent on the wire")
+        XCTAssertEqual(first["strict"] as? Bool, false,
+                       "every function tool must serialize the non-skippable `strict` bool")
+        XCTAssertNotNil(first["parameters"], "parameters must still be present")
     }
 
     func testMemoriesSearchUsesQueriesArray() async throws {

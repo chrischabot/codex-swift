@@ -1,5 +1,6 @@
 import Foundation
 import InfraPrimitives
+import ModelClient
 import Sandbox
 
 private struct RemoteJSON: @unchecked Sendable {
@@ -60,6 +61,24 @@ private actor RemoteExecServerJSONClient {
     /// and the tool surfaces a structured restart marker to the model.
     func currentSessionId() -> String? {
         sessionId
+    }
+
+    /// Issue an `fs/copy` request (exec-server `FS_COPY_METHOD`). Mirrors
+    /// upstream `FsCopyParams` (exec-server/src/protocol.rs:248-255): camelCase
+    /// `sourcePath` / `destinationPath`, a required `recursive` bool, and an
+    /// optional `sandbox` context (sent as JSON null when absent, matching the
+    /// sibling fs methods). A content-overwriting copy is naturally idempotent,
+    /// so it replays under `.safe`.
+    func copy(sourcePath: String,
+              destinationPath: String,
+              recursive: Bool,
+              sandbox: RemoteJSON? = nil) async throws -> RemoteJSON {
+        try await request(method: "fs/copy", params: RemoteJSON([
+            "sourcePath": sourcePath,
+            "destinationPath": destinationPath,
+            "recursive": recursive,
+            "sandbox": sandbox.map { $0.object } ?? NSNull(),
+        ]), replay: .safe)
     }
 
     func request(method: String,
@@ -280,9 +299,6 @@ private enum RemoteErrorClassifier {
 
 private struct RemotePath {
     static func resolve(_ path: String, cwd: String) throws -> String {
-        if path.hasPrefix("/") {
-            throw ToolError(message: "absolute path not allowed: \(path)")
-        }
         let trimmed = path.trimmingCharacters(in: .whitespaces)
         let components = trimmed.split(separator: "/", omittingEmptySubsequences: true)
         if components.contains("..") {
@@ -291,6 +307,13 @@ private struct RemotePath {
         let root = (cwd as NSString).standardizingPath
         guard root.hasPrefix("/") else {
             throw ToolError(message: "remote cwd must be absolute")
+        }
+        // Accept ABSOLUTE paths as-is. The agent is told its repo lives at an
+        // absolute path (e.g. `/app`), so `/app/src/x` is the natural form; the
+        // exec-server enforces the workspace boundary. Rejecting absolute paths
+        // here causes the model to think the filesystem is inaccessible and bail.
+        if trimmed.hasPrefix("/") {
+            return (trimmed as NSString).standardizingPath
         }
         guard !trimmed.isEmpty else { return root }
         return ((root as NSString).appendingPathComponent(trimmed) as NSString).standardizingPath
@@ -366,7 +389,10 @@ public struct RemoteExecServerShellTool: Tool {
                 "pipeStdin": false,
                 "arg0": NSNull(),
             ]), replay: .tolerateExistsOnRetry)
-            let deadline = Date().addingTimeInterval(Double(args.timeoutMs ?? 120_000) / 1000.0)
+            // Default timeout is generous: real builds/test suites (go test, tsc,
+            // vitest, cargo) routinely exceed two minutes, and a too-short deadline
+            // means the agent can never observe its own test results.
+            let deadline = Date().addingTimeInterval(Double(args.timeoutMs ?? 300_000) / 1000.0)
             var afterSeq: UInt64?
             var output = HeadTailBuffer(maxBytes: maxOutputBytes)
             var exitCode: Int?
@@ -405,8 +431,14 @@ public struct RemoteExecServerShellTool: Tool {
             }
             _ = try? await client.request(method: "process/terminate",
                                           params: RemoteJSON(["processId": processId]))
-            return ToolResult(callId: call.callId, output: "command timed out",
-                              success: false, truncated: false)
+            // Return whatever output accumulated before the deadline rather than
+            // discarding it — partial output is far more useful to the model than
+            // a bare "timed out", and lets it see how far a long build/test got.
+            let partial = output.rendered()
+            let header = "[command timed out after \((args.timeoutMs ?? 300_000) / 1000)s; partial output below]\n"
+            return ToolResult(callId: call.callId,
+                              output: partial.isEmpty ? "command timed out (no output)" : header + partial,
+                              success: false, truncated: output.didTruncate)
         } catch let error as ToolError {
             return ToolResult(callId: call.callId, output: error.message,
                               success: false, truncated: false)
@@ -635,7 +667,14 @@ public struct RemoteExecServerUnifiedExecTool: Tool {
         var argv: [String] {
             switch self {
             case .argv(let argv): return argv
-            case .line(let line): return ["/bin/sh", "-lc", line]
+            // Non-login `-c` (not `-lc`): match upstream `unified_exec::get_command`
+            // whose `use_login_shell` defaults to false (allow_login_shell is off
+            // unless explicitly requested), so the standard path is a non-login
+            // shell that does NOT source ~/.zshenv / login init files. Parity with
+            // the local UnifiedExec / ShellTool default, which deliberately avoids
+            // the login-init secret side-channel (core/src/shell.rs:43-52,
+            // core/src/tools/handlers/unified_exec.rs:97-122).
+            case .line(let line): return ["/bin/sh", "-c", line]
             }
         }
     }
@@ -832,13 +871,56 @@ public struct RemoteExecServerUnifiedExecTool: Tool {
         // `.never`: writeStdin is the one client-irreparable non-idempotent op.
         // Upstream exec-server has no stdin-write deduplication, so a transport
         // failure mid-write would result in duplicate stdin on retry.
-        _ = try await client.request(method: "process/writeStdin", params: RemoteJSON([
+        //
+        // Upstream exec-server contract (exec-server/src/protocol.rs):
+        //   method  = "process/write"   (EXEC_WRITE_METHOD)
+        //   params  = WriteParams { processId, chunk }  (camelCase)
+        //   `chunk`  is a `ByteChunk` newtype serialized as a base64 String.
+        let response = try await client.request(method: "process/write", params: RemoteJSON([
             "processId": remoteProcessId,
-            "processHandle": remoteProcessId,
-            "deltaBase64": Data(input.utf8).base64EncodedString(),
-            "closeStdin": false,
-        ]), replay: .never)
+            "chunk": Data(input.utf8).base64EncodedString(),
+        ]), replay: .never).object
+        // Upstream `WriteResponse { status: WriteStatus }`
+        // (exec-server/src/protocol.rs:133-146, camelCase): only "accepted" means
+        // the bytes were enqueued. "stdinClosed" / "unknownProcess" / "starting"
+        // are rejections that must NOT be treated as a successful delivery —
+        // surface them as an error so the model does not believe input landed.
+        // A missing/absent status field defaults to "accepted" (backward-compat
+        // with servers that omit it on success).
+        let status = (response["status"] as? String) ?? "accepted"
+        if let rejection = Self.writeStatusRejection(status, remoteProcessId: remoteProcessId) {
+            throw ToolError(message: rejection)
+        }
     }
+
+    /// Classify a `WriteResponse.status` (exec-server/src/protocol.rs:133-146).
+    /// Returns nil for "accepted" (delivery succeeded) and a human-readable
+    /// rejection message for every non-accepted `WriteStatus` variant.
+    static func writeStatusRejection(_ status: String,
+                                     remoteProcessId: String) -> String? {
+        switch status {
+        case "accepted":
+            return nil
+        case "stdinClosed":
+            return "process/write rejected: stdin is closed for process \(remoteProcessId)"
+        case "unknownProcess":
+            return "process/write rejected: unknown process \(remoteProcessId)"
+        case "starting":
+            return "process/write rejected: process \(remoteProcessId) is still "
+                + "starting and cannot accept input yet"
+        default:
+            return "process/write rejected with status \"\(status)\" for process "
+                + "\(remoteProcessId)"
+        }
+    }
+
+    #if DEBUG
+    /// Test-only hook exposing the free-form command argv derivation, so the
+    /// non-login `-c` parity with the local UnifiedExec path can be pinned.
+    static func _testLineArgv(_ line: String) -> [String] {
+        CommandSpec.line(line).argv
+    }
+    #endif
 
     private func readWindow(remoteProcessId: String,
                             afterSeq: UInt64?,
@@ -916,8 +998,15 @@ public struct RemoteExecServerUnifiedExecTool: Tool {
 public struct RemoteExecServerApplyPatchTool: Tool {
     public let name = "apply_patch"
     public let parallelSafe = false
-    public var toolDescription: String {
-        "Apply a Codex apply_patch envelope in the selected remote environment."
+    // FREEFORM apply_patch (matches codex-rs): the model is trained to emit the
+    // raw `*** Begin Patch … *** End Patch` envelope, and the gpt-5.x prompt omits
+    // patch instructions because the reference delivers them via THIS freeform
+    // tool spec. Advertising it as a JSON `{patch}` function (the old behavior)
+    // made the model's correct freeform calls hard-fail. Reuse the native
+    // ApplyPatchTool's lark grammar + description so the wire shape is identical.
+    public var toolDescription: String { ApplyPatchTool.freeformDescription }
+    public var freeformToolFormat: FreeformToolFormat? {
+        ApplyPatchTool.freeformFormat(includeEnvironmentId: false)
     }
     public var jsonSchema: String {
         #"{"type":"object","properties":{"patch":{"type":"string","description":"The *** Begin Patch / *** End Patch envelope"}},"required":["patch"],"additionalProperties":false}"#
@@ -932,14 +1021,24 @@ public struct RemoteExecServerApplyPatchTool: Tool {
     private struct Args: Decodable { var patch: String }
 
     public func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
-        guard let data = call.argumentsJSON.data(using: .utf8),
-              let args = try? JSONDecoder().decode(Args.self, from: data) else {
+        // Accept BOTH the raw freeform envelope (the normal path now) and the
+        // legacy JSON `{patch}` form, mirroring the native ApplyPatchTool.
+        let raw = call.argumentsJSON
+        let patch: String
+        if ApplyPatchTool.looksLikePatchEnvelope(raw) {
+            patch = raw
+        } else if let data = raw.data(using: .utf8),
+                  let args = try? JSONDecoder().decode(Args.self, from: data) {
+            patch = args.patch
+        } else if ApplyPatchTool.containsPatchEnvelope(raw) {
+            patch = raw
+        } else {
             return ToolResult(callId: call.callId, output: "invalid apply_patch arguments",
                               success: false, truncated: false)
         }
         let ap = ApplyPatch()
         do {
-            let planned = try ap.parse(args.patch)
+            let planned = try ap.parse(patch)
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("remote-apply-patch-\(UUID().uuidString)",
                                         isDirectory: true)
@@ -950,23 +1049,25 @@ public struct RemoteExecServerApplyPatchTool: Tool {
             for file in planned {
                 switch file.kind {
                 case .add:
-                    if try await remoteExists(file.path, cwd: cwd) {
-                        throw ApplyPatchError.targetExists(file.path)
-                    }
+                    // Probe the Add target's metadata over the exec-server data
+                    // path. Upstream `lib.rs:397-417` overwrites a pre-existing
+                    // Add target rather than erroring (no existence guard), but
+                    // the planner still stats the destination so the apply step
+                    // observes the remote filesystem state; we mirror that with a
+                    // tolerant `fs/getMetadata` whose result is advisory only.
+                    _ = try? await remoteMetadata(file.path, cwd: cwd)
                 case .update:
                     let original = try await readRemoteText(file.path, cwd: cwd)
                     try writeScratch(path: file.path, contents: original, root: scratch)
-                    if let movePath = file.movePath, movePath != file.path,
-                       try await remoteExists(movePath, cwd: cwd) {
-                        throw ApplyPatchError.targetExists(movePath)
-                    }
+                    // Upstream `lib.rs:465-486` overwrites a pre-existing move
+                    // destination rather than erroring; no existence guard.
                 case .delete:
                     let original = try await readRemoteText(file.path, cwd: cwd)
                     try writeScratch(path: file.path, contents: original, root: scratch)
                 }
             }
 
-            let applied = try ap.apply(args.patch, root: scratch.path)
+            let applied = try ap.apply(patch, root: scratch.path)
             for file in applied {
                 switch file.kind {
                 case .add:
@@ -981,39 +1082,73 @@ public struct RemoteExecServerApplyPatchTool: Tool {
                     try await removeRemote(path: file.path, cwd: cwd)
                 }
             }
-            let summary = applied.map { file in
-                if let movePath = file.movePath {
-                    return "\(file.kind.rawValue) \(file.path) -> \(movePath)"
-                }
-                return "\(file.kind.rawValue) \(file.path)"
-            }.joined(separator: "\n")
-            return ToolResult(callId: call.callId, output: "applied:\n\(summary)",
+            // Surface the committed per-file delta over `ApplyPatchDeltaBus` so
+            // the host's per-turn `TurnDiffTracker` accumulates it (turn/diff/updated)
+            // AND the engine emits the `fileChange` ThreadItem + item/fileChange/patchUpdated
+            // for the remote path too (parity with the local `ApplyPatchTool`,
+            // v9 app-server-events finding 3). Without this the remote apply_patch
+            // fileChange item would carry an empty change set.
+            let delta = applied.appliedPatchDelta()
+            if !delta.isEmpty,
+               let data = try? JSONEncoder().encode(delta),
+               let payload = String(data: data, encoding: .utf8) {
+                await ApplyPatchDeltaBus.shared.publish(callId: call.callId,
+                                                        payloadJSON: payload)
+            } else {
+                await ApplyPatchDeltaBus.shared.publish(
+                    callId: call.callId,
+                    payloadJSON: ApplyPatchDeltaBus.invalidateSentinel)
+            }
+            // Remote exec-server data-path summary: the remote surface emits an
+            // action-verb summary (`add` / `update` / `delete <path>`) describing
+            // what landed on the remote filesystem, grouped added → modified →
+            // deleted. This deliberately diverges from the local `ApplyPatchTool`
+            // single-letter `A/M/D` shape (ToolRouter.swift) because the remote
+            // summary narrates the operations performed over the data path rather
+            // than reproducing the local apply-patch print_summary verbatim.
+            var lines = ["Success. Updated the following files:"]
+            lines += applied.filter { $0.kind == .add }.map { "add \($0.path)" }
+            // Upstream emits the move destination for renames (parser.rs:92-106,
+            // lib.rs:524 `modified.push(hunk.path())`).
+            lines += applied.filter { $0.kind == .update }.map { "update \($0.movePath ?? $0.path)" }
+            lines += applied.filter { $0.kind == .delete }.map { "delete \($0.path)" }
+            return ToolResult(callId: call.callId, output: lines.joined(separator: "\n"),
                               success: true, truncated: false)
         } catch let error as ApplyPatchError {
-            return ToolResult(callId: call.callId, output: "apply_patch failed: \(error)",
+            // A failed apply invalidates any accumulated turn diff (parity with
+            // the local tool / upstream `ToolEventFailure::Output → Invalidate`).
+            await ApplyPatchDeltaBus.shared.publish(
+                callId: call.callId, payloadJSON: ApplyPatchDeltaBus.invalidateSentinel)
+            // Match upstream's model-facing text
+            // (core/src/tools/handlers/apply_patch.rs:423-425): surface the
+            // error's Display under "apply_patch verification failed: ".
+            return ToolResult(callId: call.callId,
+                              output: "apply_patch verification failed: \(error.formatted)",
                               success: false, truncated: false)
         } catch let error as ToolError {
+            await ApplyPatchDeltaBus.shared.publish(
+                callId: call.callId, payloadJSON: ApplyPatchDeltaBus.invalidateSentinel)
             return ToolResult(callId: call.callId, output: error.message,
                               success: false, truncated: false)
         } catch {
-            return ToolResult(callId: call.callId, output: "apply_patch failed: \(error)",
+            await ApplyPatchDeltaBus.shared.publish(
+                callId: call.callId, payloadJSON: ApplyPatchDeltaBus.invalidateSentinel)
+            return ToolResult(callId: call.callId,
+                              output: "apply_patch verification failed: \(error)",
                               success: false, truncated: false)
         }
     }
 
-    private func remoteExists(_ path: String, cwd: String) async throws -> Bool {
+    /// Stat a remote path over the exec-server data path. Naturally idempotent,
+    /// so it replays under `.safe`. The result is advisory: a not-found target
+    /// (the common case for an Add) is reported by the exec-server as an error,
+    /// which the caller tolerates.
+    private func remoteMetadata(_ path: String, cwd: String) async throws -> RemoteJSON {
         let remotePath = try RemotePath.resolve(path, cwd: cwd)
-        do {
-            _ = try await client.request(method: "fs/getMetadata", params: RemoteJSON([
-                "path": remotePath,
-                "sandbox": NSNull(),
-            ]), replay: .safe)
-            return true
-        } catch let error as ToolError where RemoteErrorClassifier.isNotFound(error.message) {
-            return false
-        } catch {
-            throw error
-        }
+        return try await client.request(method: "fs/getMetadata", params: RemoteJSON([
+            "path": remotePath,
+            "sandbox": NSNull(),
+        ]), replay: .safe)
     }
 
     private func readRemoteText(_ path: String, cwd: String) async throws -> String {

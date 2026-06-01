@@ -168,23 +168,42 @@ private func snapshotProcessTable() -> [Int32: [Int32]] {
 public struct ShellTool: Tool {
     public let name: String
     public let parallelSafe: Bool
+    // Verbatim upstream `shell_spec.rs::create_shell_command_tool` description
+    // (non-Windows). Prepend Windows-specific guidance under `cfg!(windows)`
+    // upstream; this port targets POSIX so the non-Windows string is used.
     public var toolDescription: String {
-        "Run a shell command (string or argv) to completion and capture the "
-        + "combined stdout/stderr. Best for one-shot commands, builds, and "
-        + "tests. IMPORTANT: when the shell exits, the tool reaps the entire "
-        + "child process group as fork-bomb containment, so plain `cmd &` "
-        + "does NOT survive. To launch a long-lived daemon (test server, "
-        + "background process you'll monitor in a later turn), detach it "
-        + "from the process group with `setsid`, e.g. "
-        + "`setsid python3 server.py >log.txt 2>&1 </dev/null &`. Use "
-        + "`unified_exec` for INTERACTIVE PTY processes (REPLs, ssh)."
+        "Runs a shell command and returns its output.\n"
+        + "- Always set the `workdir` param when using the shell_command "
+        + "function. Do not use `cd` unless absolutely necessary."
     }
     public var jsonSchema: String {
-        #"{"type":"object","properties":{"command":{"description":"shell string or argv array"},"cwd":{"type":"string"},"timeoutMs":{"type":"integer"}},"required":["command"],"additionalProperties":true}"#
+        // Verbatim upstream `shell_spec.rs::create_shell_command_tool`
+        // (BTreeMap-sorted): `command` / `timeout_ms` / `workdir` with the
+        // upstream property descriptions, PLUS the escalation/approval triplet
+        // justification / prefix_rule / sandbox_permissions, which upstream's
+        // `create_approval_parameters` inserts UNCONDITIONALLY (only the extra
+        // `additional_permissions` object is gated on
+        // exec_permission_approvals_enabled — off in the port's default path).
+        // The optional `login` boolean is advertised ONLY when `allow_login_shell`
+        // is enabled (shell_spec.rs:170-178). Required [command],
+        // additionalProperties:false.
+        var props =
+            #""command":{"type":"string","description":"The shell script to execute in the user's default shell"},"timeout_ms":{"type":"number","description":"The timeout for the command in milliseconds"},"workdir":{"type":"string","description":"The working directory to execute the command in"}"#
+        if allowLoginShell {
+            // Verbatim upstream `shell_spec.rs:172-177` shell_command `login` wording.
+            props += #","login":{"type":"boolean","description":"Whether to run the shell with login shell semantics. Defaults to true."}"#
+        }
+        props += "," + approvalParametersSchemaFragment
+        return #"{"type":"object","properties":{"# + props
+            + #"},"required":["command"],"additionalProperties":false}"#
     }
     private let sandbox: any Sandbox
     private let maxOutputBytes: Int
     private let fullAccess: Bool
+    /// Mirrors upstream `CommandToolOptions.allow_login_shell`. Off by default;
+    /// when enabled the `login` boolean is advertised and `login:true` derives
+    /// `-lc` argv. When disabled, an explicit `login:true` request is rejected.
+    private let allowLoginShell: Bool
 
     /// Default timeout when the model omits `timeoutMs`. Matches upstream
     /// `DEFAULT_EXEC_COMMAND_TIMEOUT_MS = 10_000` in `codex-rs/core/src/exec.rs`.
@@ -198,25 +217,53 @@ public struct ShellTool: Tool {
                 parallelSafe: Bool = false,
                 sandbox: any Sandbox,
                 limits: Limits = Limits(),
-                fullAccess: Bool = false) {
+                fullAccess: Bool = false,
+                allowLoginShell: Bool = false) {
         self.name = name
         self.parallelSafe = parallelSafe
         self.sandbox = sandbox
         self.maxOutputBytes = limits.clamped().maxToolOutputBytes
         self.fullAccess = fullAccess
+        self.allowLoginShell = allowLoginShell
     }
 
     private struct Args: Decodable {
         var command: CommandSpec
         var cwd: String?
         var timeoutMs: Int?
-        enum CodingKeys: String, CodingKey { case command, cwd, timeoutMs, timeout_ms }
+        var login: Bool?
+        // Upstream `shell_command` decodes the escalation triplet alongside the
+        // command (shell_spec.rs advertises them unconditionally). They are
+        // consumed by the session-level approval/escalation gate (which inspects
+        // the raw args JSON); decoded here so they are recognized rather than
+        // silently dropped as unknown keys.
+        var sandboxPermissions: String?
+        var justification: String?
+        var prefixRule: [String]?
+        // Upstream field names are `workdir` and `timeout_ms` (with serde alias
+        // `timeout`). Accept those as the canonical wire keys; keep `cwd` and
+        // `timeoutMs` as tolerant legacy aliases.
+        enum CodingKeys: String, CodingKey {
+            case command, workdir, cwd, timeout_ms, timeout, timeoutMs
+            case login
+            case sandbox_permissions, sandboxPermissions
+            case justification
+            case prefix_rule, prefixRule
+        }
         init(from d: any Decoder) throws {
             let c = try d.container(keyedBy: CodingKeys.self)
             command = try c.decode(CommandSpec.self, forKey: .command)
-            cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
-            timeoutMs = try c.decodeIfPresent(Int.self, forKey: .timeoutMs)
-                ?? c.decodeIfPresent(Int.self, forKey: .timeout_ms)
+            cwd = try c.decodeIfPresent(String.self, forKey: .workdir)
+                ?? c.decodeIfPresent(String.self, forKey: .cwd)
+            timeoutMs = try c.decodeIfPresent(Int.self, forKey: .timeout_ms)
+                ?? c.decodeIfPresent(Int.self, forKey: .timeout)
+                ?? c.decodeIfPresent(Int.self, forKey: .timeoutMs)
+            login = try c.decodeIfPresent(Bool.self, forKey: .login)
+            sandboxPermissions = try c.decodeIfPresent(String.self, forKey: .sandbox_permissions)
+                ?? c.decodeIfPresent(String.self, forKey: .sandboxPermissions)
+            justification = try c.decodeIfPresent(String.self, forKey: .justification)
+            prefixRule = try c.decodeIfPresent([String].self, forKey: .prefix_rule)
+                ?? c.decodeIfPresent([String].self, forKey: .prefixRule)
         }
     }
     /// Accept either an argv array or a shell string (Codex accepts both).
@@ -228,10 +275,21 @@ public struct ShellTool: Tool {
             if let arr = try? c.decode([String].self) { self = .argv(arr); return }
             self = .line(try c.decode(String.self))
         }
-        var argv: [String] {
+        var argv: [String] { argv(useLoginShell: false) }
+
+        /// Build the launch argv. `useLoginShell` selects `-lc` vs `-c`, matching
+        /// upstream `Shell::derive_exec_args(cmd, use_login_shell)` (shell.rs:43-52).
+        func argv(useLoginShell: Bool) -> [String] {
             switch self {
             case .argv(let a): return a
-            case .line(let s): return ["/bin/sh", "-c", s]
+            // Upstream `shell_command.rs` runs the free-form string under the
+            // user's default shell via `shell.derive_exec_args(cmd,
+            // use_login_shell)` (shell.rs:43-52), NOT a hardcoded /bin/sh, so
+            // zsh/bash syntax the model relies on works. Default `-c` (not
+            // `-lc`): login init files are not sourced (no API-key side-channel)
+            // unless `login` is explicitly requested with allow_login_shell on.
+            case .line(let s):
+                return UserShell.execArgs(command: s, useLoginShell: useLoginShell)
             }
         }
     }
@@ -267,7 +325,19 @@ public struct ShellTool: Tool {
                               success: false, truncated: false)
         }
         let workDir = args.cwd ?? cwd
-        let inner = args.command.argv
+        // Mirror upstream `unified_exec::get_command` login resolution: `login:true`
+        // requires `allow_login_shell` (else reject); when omitted, login defaults
+        // to `allow_login_shell`. Off by default, so the standard path stays `-c`.
+        let useLoginShell: Bool
+        switch args.login {
+        case .some(true) where !allowLoginShell:
+            return ToolResult(callId: call.callId,
+                output: "login shell is disabled by config; omit `login` or set it to false.",
+                success: false, truncated: false)
+        case .some(let v): useLoginShell = v
+        case .none: useLoginShell = allowLoginShell
+        }
+        let inner = args.command.argv(useLoginShell: useLoginShell)
         // Refuse bare-name exec BEFORE the sandbox wrapper runs (otherwise we
         // would just produce a confusing kernel-deny later for the same root
         // cause).
@@ -389,6 +459,8 @@ public struct ShellTool: Tool {
             }
         }
 
+        let startTime = Date()
+        var timedOut = false
         let exitCode: Int32 = await withTaskGroup(of: Int32?.self) { group in
             group.addTask { await exitLatch.wait() }
             group.addTask {
@@ -400,15 +472,23 @@ public struct ShellTool: Tool {
             }
             let first = await group.next() ?? nil
             group.cancelAll()
+            if first == nil { timedOut = true }
             return first ?? -1
         }
         await waitForDrain(drain, closing: outHandle)
         await waitForDrain(drainErr, closing: errHandle)
         let rendered = await collector.rendered()
         let truncated = await collector.didTruncate()
+        let durationSeconds = Date().timeIntervalSince(startTime)
+        let reportedExit: Int32 = timedOut ? shellExecTimeoutExitCode : exitCode
+        let body = formatShellExecOutputStructured(output: rendered,
+                                                   exitCode: reportedExit,
+                                                   durationSeconds: durationSeconds,
+                                                   timedOut: timedOut,
+                                                   timeoutMs: timeoutMs)
         return ToolResult(callId: callId,
-                          output: rendered.isEmpty ? "(no output)" : rendered,
-                          success: exitCode == 0, truncated: truncated)
+                          output: body,
+                          success: exitCode == 0 && !timedOut, truncated: truncated)
     }
     #endif
 
@@ -483,6 +563,7 @@ public struct ShellTool: Tool {
             scrubbedEnv.map { strdup("\($0.key)=\($0.value)") }
         cenv.append(nil)
 
+        let startTime = Date()
         var pid: pid_t = 0
         let rc = posix_spawn(&pid, exe, &actions, &attrs, cargs, cenv)
         posix_spawn_file_actions_destroy(&actions)
@@ -583,19 +664,16 @@ public struct ShellTool: Tool {
         await waitForDrain(drainErr, closing: errHandle)
         let rendered = await collector.rendered()
         let truncated = await collector.didTruncate()
-        // When the harness terminates the command, append a structured
-        // marker so the model can tell a timeout apart from other
-        // failure modes (defect #3: models were misattributing timeouts
-        // to approval-gate denials).
-        let body: String
-        if timedOut {
-            let prefix = rendered.isEmpty ? "" : rendered + "\n"
-            body = "\(prefix)[shell tool: command timed out after \(timeoutMs)ms]"
-        } else if rendered.isEmpty {
-            body = "(no output)"
-        } else {
-            body = rendered
-        }
+        let durationSeconds = Date().timeIntervalSince(startTime)
+        // Upstream surfaces EXEC_TIMEOUT_EXIT_CODE (124) on timeout
+        // (exec/src/exec.rs:58); the model is trained to read exit_code and
+        // duration_seconds from the structured envelope (tools/mod.rs:62-99).
+        let reportedExit: Int32 = timedOut ? shellExecTimeoutExitCode : exitCode
+        let body = formatShellExecOutputStructured(output: rendered,
+                                                   exitCode: reportedExit,
+                                                   durationSeconds: durationSeconds,
+                                                   timedOut: timedOut,
+                                                   timeoutMs: timeoutMs)
         return ToolResult(callId: callId,
                           output: body,
                           success: exitCode == 0 && !timedOut,
@@ -624,6 +702,76 @@ public struct ShellTool: Tool {
         try? handle.close()
         _ = await task.value
     }
+}
+
+/// Upstream `EXEC_TIMEOUT_EXIT_CODE` (exec/src/exec.rs:58): the conventional
+/// 124 exit code reported when the harness terminates a command on timeout.
+let shellExecTimeoutExitCode: Int32 = 124
+
+/// Builds the model-facing structured envelope for the default `shell` tool,
+/// mirroring upstream `format_exec_output_for_model_structured`
+/// (core/src/tools/mod.rs:62-99):
+///
+///   {"output": <content>, "metadata": {"exit_code": <i32>,
+///    "duration_seconds": <f32 rounded to 1 decimal>}}
+///
+/// On timeout the content is `build_content_with_timeout`
+/// (core/src/tools/mod.rs:139-150): the message `command timed out after
+/// {duration_ms} milliseconds\n` is prepended BEFORE the captured output, and
+/// the surfaced exit code is `EXEC_TIMEOUT_EXIT_CODE` (124).
+func formatShellExecOutputStructured(output: String,
+                                     exitCode: Int32,
+                                     durationSeconds: Double,
+                                     timedOut: Bool,
+                                     timeoutMs: Int) -> String {
+    let content: String
+    if timedOut {
+        // Match upstream build_content_with_timeout (core/src/tools/mod.rs:140-146)
+        // which reports the ACTUAL measured wall-clock elapsed time via
+        // exec_output.duration.as_millis(), NOT the configured timeout budget.
+        // Rust's Duration::as_millis truncates toward zero, so use Int() (which
+        // truncates) rather than rounding.
+        let elapsedMs = Int(durationSeconds * 1000.0)
+        content = "command timed out after \(elapsedMs) milliseconds\n\(output)"
+    } else {
+        content = output
+    }
+    // Match serde_json's f32 rendering for a value already rounded to 1 decimal
+    // place (Ryu shortest form): e.g. 0 -> "0.0", 1.5 -> "1.5", 2 -> "2.0".
+    let tenths = Int((durationSeconds * 10.0).rounded())
+    let whole = tenths / 10
+    let frac = abs(tenths % 10)
+    let durationField = "\(whole).\(frac)"
+
+    // JSON-escape the output string exactly as serde would (control chars,
+    // quotes, backslashes).
+    let escaped = jsonEscapeString(content)
+    return "{\"output\":\"\(escaped)\",\"metadata\":{\"exit_code\":\(exitCode),\"duration_seconds\":\(durationField)}}"
+}
+
+/// Minimal RFC-8259 string escaping matching serde_json's default encoder for
+/// the characters that appear in command output.
+private func jsonEscapeString(_ s: String) -> String {
+    var out = ""
+    out.reserveCapacity(s.count + 8)
+    for scalar in s.unicodeScalars {
+        switch scalar {
+        case "\"": out += "\\\""
+        case "\\": out += "\\\\"
+        case "\u{08}": out += "\\b"
+        case "\u{0C}": out += "\\f"
+        case "\n": out += "\\n"
+        case "\r": out += "\\r"
+        case "\t": out += "\\t"
+        default:
+            if scalar.value < 0x20 {
+                out += String(format: "\\u%04x", scalar.value)
+            } else {
+                out.unicodeScalars.append(scalar)
+            }
+        }
+    }
+    return out
 }
 
 /// Serializes head+tail-bounded capture across the stdout/stderr drains.
@@ -694,60 +842,245 @@ public func killProcessGroup(_ root: Int32) {
     #endif
 }
 
+/// Mirrors upstream `protocol/openai_models.rs::ConfigShellToolType` (serde
+/// `snake_case`). This is the per-model `shell_type` declared in `models.json`
+/// (and resolvable from the `/models` endpoint) that upstream
+/// `core/src/tools/spec_plan.rs::collect_tool_executors` gates the shell-tool
+/// family on: the model is offered EXACTLY ONE coherent shell interface, never
+/// `shell_command` and `exec_command`/`write_stdin` model-visible at once.
+public enum ShellToolType: String, Sendable, Equatable, Codable {
+    case `default`
+    case local
+    case unifiedExec = "unified_exec"
+    case disabled
+    case shellCommand = "shell_command"
+
+    /// Map the raw serde string from `models.json` / the `/models` endpoint
+    /// (upstream `ConfigShellToolType` `snake_case`) to a case. Unknown or nil
+    /// values fall back to `.shellCommand`, the value every shipped model
+    /// declares and the safe model-visible default.
+    public static func from(rawValue: String?) -> ShellToolType {
+        guard let rawValue, let v = ShellToolType(rawValue: rawValue) else {
+            return .shellCommand
+        }
+        return v
+    }
+}
+
 /// Registers the built-in tool inventory on a router (Codex `built_tools`
 /// core set). `unified_exec` is a persistent PTY-backed interactive process
 /// session manager; `apply_patch` mutates the workspace and is serial.
 public enum DefaultTools {
+    /// Upstream default for `request_permissions_tool_enabled`. Mirrors
+    /// `Feature::RequestPermissionsTool.default_enabled() == false`
+    /// (`features/src/tests.rs:129`), resolved into `ToolsConfig` at
+    /// `tools/src/tool_config.rs:196`. By default upstream does NOT advertise
+    /// `request_permissions`, so neither does the port.
+    public static let defaultRequestPermissionsToolEnabled = false
+    /// Upstream default for the `tool_search` discovery tool. Mirrors
+    /// `Feature::ToolSearch.default_enabled() == true`
+    /// (`features/src/tests.rs:193`). Upstream still only appends the
+    /// `tool_search` executor when at least one DEFERRED tool with search
+    /// metadata exists (`spec_plan.rs:523-540 append_tool_search_executor`), so
+    /// the port likewise installs it only when `deferred` is non-empty.
+    public static let defaultToolSearchEnabled = true
+
     public static func register(on router: ToolRouter,
                                 sandbox: any Sandbox,
                                 limits: Limits = Limits(),
                                 webSearch: (any WebSearchBackend)? = nil,
+                                shellType: ShellToolType = .shellCommand,
+                                allowLoginShell: Bool = true,
+                                requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled,
+                                toolSearchEnabled: Bool = defaultToolSearchEnabled,
                                 spawnAgentOptions: SpawnAgentToolOptions = SpawnAgentToolOptions()) async {
         let uem = UnifiedExecManager()
-        await router.register(ApplyPatchTool(sandbox: sandbox))
-        await router.register(ShellTool(name: "shell_command", parallelSafe: false,
-                                        sandbox: sandbox, limits: limits))
-        await router.register(UnifiedExecTool(manager: uem,
-                                              sandbox: sandbox,
-                                              limits: limits))
-        // Upstream parity (H-14 / P3.1): expose `exec_command` + `write_stdin`
-        // as separate tools sharing the same PTY manager as `unified_exec`.
-        await router.register(ExecCommandTool(manager: uem,
-                                              sandbox: sandbox,
-                                              limits: limits))
-        await router.register(WriteStdinTool(manager: uem, limits: limits))
-        await router.register(FileSearchTool())
-        await router.register(ReadFileTool(limits: limits))
-        await router.register(ListDirTool())
-        await router.register(WriteFileTool(sandbox: sandbox))
-        // Upstream parity (H-16 / P3.3): expose `view_image` so the model can
-        // load a local image into context for vision tasks.
-        await router.register(ViewImageTool(limits: limits))
-        // Upstream parity (H-17 / H-18 / P3.4): expose `update_plan`,
-        // `request_user_input`, `request_permissions` so the model can render
-        // a plan, ask the user structured questions, and request escalated
-        // sandbox permissions through structured channels rather than
-        // free-form chat. SessionEngine subscribes to the matching
-        // PlanUpdateBus / RequestUserInputBus / RequestPermissionsBus per
-        // turn to forward / answer the requests.
+        // Under `dangerFullAccess` the model's exec tools must skip the
+        // bare-name rejection (the env-wrap path) — there's no kernel sandbox
+        // to escape from. Derived once here so all three exec-tool variants
+        // see the same value. See commit ff1050a4 for the original intent.
+        let fullAccess = sandbox.mode == .dangerFullAccess
+        // Model-visible tool ordering MUST mirror upstream
+        // `core/src/tools/spec_plan.rs::collect_tool_executors` (the push order
+        // that `build_model_visible_specs_and_registry` preserves), or the
+        // prompt-cache key for the tool list diverges. Upstream push order:
+        //   1. shell/exec (shell_command  OR  exec_command + write_stdin),
+        //      plus the hidden shell_command fallback in UnifiedExec mode
+        //   2. [MCP resource handlers]      (port: none yet)
+        //   3. update_plan
+        //   4. [goal tools]                 (port: none)
+        //   5. request_user_input
+        //   6. request_permissions
+        //   7. apply_patch
+        //   8. view_image
+        //   9. collab tools (spawn, send_input, resume, wait, close)
+        //  10. [agent jobs / MCP tools / dynamic tools] then extension tools
+        // The port appends its non-upstream extension tools (file tools,
+        // workflows, git_diff, web_search, code) LAST so they never perturb the
+        // relative order of the upstream-parity prefix.
+        //
+        // (1) Shell / exec family.
+        // Upstream `spec_plan.rs::collect_tool_executors` gates the shell-tool
+        // family on `ConfigShellToolType` (the per-model `shell_type`). The
+        // model is offered EXACTLY ONE shell interface; `shell_command` and the
+        // `exec_command`/`write_stdin` PTY pair are NEVER both model-visible.
+        //
+        // - `.default` / `.local` / `.shellCommand`: model-visible `shell_command`
+        //   ONLY. (`models.json` declares `shell_type: shell_command` for every
+        //   shipped model, so this is the live default.)
+        // - `.unifiedExec`: model-visible `exec_command` + `write_stdin`, PLUS a
+        //   HIDDEN `shell_command` fallback (upstream registers
+        //   `ShellCommandHandler::from(backend)` with `options=None`, whose
+        //   `spec()` is `None` — dispatchable but not advertised).
+        // - `.disabled`: no shell tools at all.
+        switch shellType {
+        case .default, .local, .shellCommand:
+            // Upstream `shell_command.rs::supports_parallel_tool_calls` returns
+            // `options.is_some()`, and the model-visible `shell_command` is
+            // registered with `options=Some`, so it is parallel-safe.
+            await router.register(ShellTool(name: "shell_command", parallelSafe: true,
+                                            sandbox: sandbox, limits: limits,
+                                            fullAccess: fullAccess,
+                                            allowLoginShell: allowLoginShell))
+        case .unifiedExec:
+            // Upstream parity (H-14 / P3.1): expose `exec_command` + `write_stdin`
+            // as the model-visible interactive PTY pair.
+            await router.register(ExecCommandTool(manager: uem,
+                                                  sandbox: sandbox,
+                                                  limits: limits,
+                                                  fullAccess: fullAccess,
+                                                  allowLoginShell: allowLoginShell))
+            await router.register(WriteStdinTool(manager: uem, limits: limits))
+            // Upstream registers a `shell_command` handler with `options=None`
+            // (spec()=None) as a dispatchable fallback in UnifiedExec mode.
+            // Mirror it as a HIDDEN tool: callable, but not in `specs()`.
+            // Upstream `ShellCommandHandler::supports_parallel_tool_calls`
+            // returns `self.options.is_some()` (shell_command.rs:144-145); the
+            // unifiedExec fallback is constructed via `ShellCommandHandler::from`
+            // with `options=None` (spec_plan.rs:374), so it is SERIAL, not
+            // parallel-safe. The model-visible `shell_command` (options=Some,
+            // registered above) stays parallel-safe.
+            await router.registerHidden(ShellTool(name: "shell_command", parallelSafe: false,
+                                                  sandbox: sandbox, limits: limits,
+                                                  fullAccess: fullAccess,
+                                                  allowLoginShell: allowLoginShell))
+        case .disabled:
+            break
+        }
+        // The legacy combined `unified_exec` tool has NO model-visible
+        // counterpart in any upstream `shell_type` (upstream uses "unified_exec"
+        // only as an internal approval-cache key / parallel-category label,
+        // never as a `ToolSpec` name). Keep it CALLABLE for back-compat
+        // (`dispatch` falls back to the hidden registry) but DO NOT advertise it
+        // in `specs()`. Skip it entirely when shells are disabled.
+        if shellType != .disabled {
+            await router.registerHidden(UnifiedExecTool(manager: uem,
+                                                        sandbox: sandbox,
+                                                        limits: limits,
+                                                        fullAccess: fullAccess))
+        }
+        // (3) update_plan, (5) request_user_input, (6) request_permissions.
+        // Upstream parity (H-17 / H-18 / P3.4): the model can render a plan, ask
+        // the user structured questions, and request escalated sandbox
+        // permissions through structured channels rather than free-form chat.
+        // SessionEngine subscribes to the matching PlanUpdateBus /
+        // RequestUserInputBus / RequestPermissionsBus per turn to forward /
+        // answer the requests. (There are no goal tools in the port, so slot (4)
+        // is empty and update_plan is immediately followed by request_user_input.)
         await router.register(UpdatePlanTool())
         await router.register(RequestUserInputTool())
-        await router.register(RequestPermissionsTool())
-        // Upstream parity (H-19 / P3.5): expose the multi-agent surface so the
-        // model can spawn / wait / close / message / resume sub-agents. The
-        // tools are thin shims over `MultiAgentBus.shared`, which the host
+        // (6) request_permissions. Upstream `spec_plan.rs:402-404` pushes the
+        // RequestPermissionsHandler ONLY `if config.request_permissions_tool_enabled`,
+        // which `tool_config.rs:196` resolves from
+        // `Feature::RequestPermissionsTool` — a stable feature that is OFF by
+        // default (`features/src/tests.rs:129`). So a default-config upstream
+        // session does NOT advertise `request_permissions`; gate it identically
+        // here (audit tools-router finding 1) so the model-visible tool list and
+        // its prompt-cache key match an upstream default session.
+        if requestPermissionsToolEnabled {
+            await router.register(RequestPermissionsTool())
+        }
+        // (7) apply_patch. Upstream pushes `ApplyPatchHandler` AFTER
+        // request_permissions and BEFORE view_image (spec_plan.rs:419-422); the
+        // port previously emitted it FIRST, breaking the prompt-cache-parity
+        // claim. apply_patch mutates the workspace and is serial.
+        await router.register(ApplyPatchTool(sandbox: sandbox))
+        // (8) view_image. Upstream parity (H-16 / P3.3): load a local image into
+        // context for vision tasks (spec_plan.rs:435-440).
+        await router.register(ViewImageTool(limits: limits))
+        // (9) Collab / multi-agent surface. Upstream parity (H-19 / P3.5).
+        // Upstream non-v2 push order is spawn → send_input → resume → wait →
+        // close (spec_plan.rs:480-484); reproduce it exactly (the port previously
+        // emitted spawn → wait → close → send → resume). The tools are thin
+        // shims over `MultiAgentBus.shared`, which the host
         // (HarnessCore.AgentOrchestrator) configures at startup. Without an
         // installed provider every call returns a structured "unconfigured"
         // error so the model gets actionable feedback.
         await router.register(SpawnAgentTool(options: spawnAgentOptions))
-        await router.register(WaitAgentTool())
-        await router.register(CloseAgentTool())
         await router.register(SendInputTool())
         await router.register(ResumeAgentTool())
+        await router.register(WaitAgentTool())
+        await router.register(CloseAgentTool())
+        // (10) Port extension tools, appended AFTER the upstream-parity prefix so
+        // they never perturb its relative order.
+        //
+        // INTENTIONAL PORT DIVERGENCE (audit exec-unified-shell finding 2):
+        // Upstream (core/src/tools/spec_plan.rs:333-521) routes ALL filesystem
+        // reads/writes/searches through `shell_command`/`exec_command` +
+        // `apply_patch`; it has NO model-visible read_file/write_file/list_dir/
+        // file_search/git_diff handlers. codex-swift advertises these as
+        // additional convenience function tools (NOT replacements — the shell
+        // surface remains fully intact, so the wire protocol is a superset, not
+        // a divergence). They are exercised by FileToolsTests / GitUtilsTests /
+        // CodeModeTests / EndToEndTests and are an accepted, documented port
+        // extension outside the strict upstream tool contract.
+        await router.register(FileSearchTool())
+        await router.register(ReadFileTool(limits: limits))
+        await router.register(ListDirTool())
+        await router.register(WriteFileTool(sandbox: sandbox))
+        // Dynamic workflows: the `workflow` tool is *deferred* (hidden until the
+        // /workflow command or the "workflow" trigger word activates it),
+        // matching the explicit-opt-in model; the lifecycle/read tools are
+        // always available so a launched workflow can be observed/stopped.
+        await router.registerDeferred(WorkflowTool())
+        await router.register(WorkflowStopTool())
+        await router.register(WorkflowListTool())
+        await router.register(WorkflowStatusTool())
         await router.register(GitDiffTool(limits: limits))
+        // INTENTIONAL PORT DIVERGENCE (audit exec-unified-shell finding 1):
+        // Upstream advertises `web_search` as an OpenAI HOSTED tool spec
+        // ({type:"web_search", external_web_access/search_context_size/…},
+        // tools/src/tool_spec.rs:36-48) that the provider runs server-side; it
+        // is appended via hosted_model_tool_specs, never dispatched locally.
+        // codex-swift has no hosted-tool wire path (every registered Tool is
+        // serialized as {type:"function",…}); instead it ships a LOCAL
+        // web_search backend (Perplexity primary, OpenAI web_search API
+        // fallback) so non-ChatGPT auth can still search. This is a deliberate,
+        // test-backed (WebSearchTests) port feature. The name is kept as
+        // `web_search` for backend/UX continuity; when running against a
+        // provider that itself offers hosted web_search the local function
+        // shadows it. Accepted divergence pending a hosted-spec emission path.
         await router.register(WebSearchTool(
             backend: webSearch ?? ResolvedWebSearch.fromEnvironment(),
             sandbox: sandbox))
+        // tool_search discovery (audit tools-router finding 2). Upstream
+        // `spec_plan.rs:117 append_tool_search_executor` appends the model-visible
+        // `tool_search` tool AFTER all other executors (and before code-mode is
+        // prepended), gated on `Feature::ToolSearch` (default ON,
+        // `features/src/tests.rs:193`) AND only when at least one DEFERRED tool
+        // with search metadata exists (`spec_plan.rs:531-538` returns early on an
+        // empty `search_infos`). Mirror that: install `tool_search` here — last in
+        // the registration sequence, so it never perturbs the upstream-parity
+        // prefix — only when discovery is enabled and there is something to
+        // discover (the deferred `workflow` tool). Without this the model could
+        // never discover or activate any deferred tool (the BM25 backend was dead
+        // code with zero call sites). The wire ENVELOPE is the documented
+        // function-only divergence (see `ToolRouter.ToolSearchTool`); the
+        // discovery BEHAVIOR now matches upstream for function-only clients.
+        let hasDeferredTools = await !router.deferredToolNames().isEmpty
+        if toolSearchEnabled && hasDeferredTools {
+            await router.installToolSearch()
+        }
         let nestedToolNames = (await router.specs()).map { $0.name }
         await installCodeMode(on: router, toolNames: nestedToolNames) { name, argsJSON, cwd, timeoutMs in
             await router.dispatchNestedFromCode(name: name,

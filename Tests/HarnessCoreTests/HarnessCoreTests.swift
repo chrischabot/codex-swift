@@ -6,6 +6,7 @@ import Foundation
 @testable import Tools
 @testable import Sandbox
 @testable import ProtocolModel
+@testable import WireProtocol
 @testable import InfraPrimitives
 @testable import Prompts
 
@@ -23,11 +24,90 @@ func collectHC(_ engine: SessionEngine,
     return out
 }
 
+/// Sendable sink the turn-id-capturing collector writes the first `turn/started`
+/// id into, so a test can read the engine's actual active turn id (the value a
+/// real client would echo back as `expectedTurnId` on `turn/steer`).
+actor TurnIdBox {
+    private(set) var id: TurnId?
+    func set(_ v: TurnId) { if id == nil { id = v } }
+    func waitForId(timeout: Duration = .seconds(5)) async -> TurnId? {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while id == nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return id
+    }
+}
+
+/// Collector variant that records the first `turn/started` id into `box` while
+/// it collects until `until` fires.
+func collectHCCapturingTurnId(_ engine: SessionEngine, into box: TurnIdBox,
+                              until: @escaping @Sendable (ServerNotification) -> Bool)
+async -> [ServerNotification] {
+    let stream = await engine.events()
+    var out: [ServerNotification] = []
+    for await n in stream {
+        out.append(n)
+        if case .turnStarted(_, let t) = n { await box.set(t.id) }
+        if until(n) { break }
+    }
+    return out
+}
+
 final class HarnessCoreTests: XCTestCase {
 
     private func makeStore() throws -> (ThreadStore, String) {
         let home = NSTemporaryDirectory() + "hc-" + UUID().uuidString
         return (try ThreadStore(codexHome: home, limits: Limits()), home)
+    }
+
+    /// v9 finding 1: when a turn's model stream carries a rate-limit snapshot
+    /// (upstream `TokenCountEvent.rate_limits`), the engine must emit an
+    /// `account/rateLimits/updated` notification alongside the per-call
+    /// `thread/tokenUsage/updated` (mirrors
+    /// `bespoke_event_handling.rs:1571-1579`).
+    func testTurnEmitsAccountRateLimitsUpdatedWhenSnapshotObserved() async throws {
+        let (store, home) = try makeStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let tid = ThreadId.generate()
+        _ = try await store.create(SessionConfig(threadId: tid, cwd: "/w"))
+        let snap = RateLimitSnapshot(
+            limitId: "codex",
+            primary: RateLimitWindow(usedPercent: 55, windowMinutes: 60,
+                                     resetAt: 1_700_000_000))
+        let model = MockModelClient([
+            MockScenario([
+                .created,
+                .rateLimits(snap),
+                .agentDone(itemId: "m1", "done"),
+                .completeEndTurn(responseId: "r1", tokens: 5),
+            ]),
+        ])
+        let engine = SessionEngine(
+            config: SessionConfig(threadId: tid, cwd: "/w"),
+            model: model, store: store,
+            router: ToolRouter(limits: Limits()), limits: Limits())
+        await engine.start()
+        let collector = Task { await collectHC(engine) {
+            if case .turnCompleted = $0 { return true }; return false
+        } }
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
+        let events = await collector.value
+        let rlEvents = events.compactMap { ev -> JSONValue? in
+            if case .accountRateLimitsUpdated(let rl) = ev { return rl }
+            return nil
+        }
+        XCTAssertFalse(rlEvents.isEmpty,
+                       "a turn carrying a rate-limit snapshot must emit account/rateLimits/updated")
+        guard case .object(let obj)? = rlEvents.first else {
+            return XCTFail("rate-limits payload must be an object")
+        }
+        XCTAssertEqual(obj["limitId"], .string("codex"))
+        guard case .object(let primary)? = obj["primary"] else {
+            return XCTFail("primary window missing")
+        }
+        XCTAssertEqual(primary["usedPercent"], .int(55))
+        XCTAssertEqual(primary["windowDurationMins"], .int(60))
     }
 
     func testSingleHelloTurnEmitsLifecycleAndPersists() async throws {
@@ -41,7 +121,7 @@ final class HarnessCoreTests: XCTestCase {
                                    model: model, store: store, router: router, limits: Limits())
         await engine.start()
         let collector = Task { await collectHC(engine) { if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "hello")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "hello")], model: nil, turnId: nil))
         let events = await collector.value
 
         XCTAssertTrue(events.contains { if case .turnStarted = $0 { return true }; return false })
@@ -77,17 +157,17 @@ final class HarnessCoreTests: XCTestCase {
                                    model: model, store: store, router: router, limits: Limits())
         await engine.start()
         let collector = Task { await collectHC(engine) { if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "use the tool")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "use the tool")], model: nil, turnId: nil))
         let events = await collector.value
 
         XCTAssertTrue(events.contains {
-            if case .itemCompleted(_, _, let item) = $0,
-               case .commandExecution(_, _, _, let st, let out, _) = item {
+            if case .itemCompleted(_, _, let item, _) = $0,
+               case .commandExecution(_, _, _, let st, _, let out, _, _, _, _) = item {
                 return st == .completed && (out ?? "").contains("TOOLOUT")
             }; return false
         }, "tool result item must be completed")
         XCTAssertTrue(events.contains {
-            if case .itemCompleted(_, _, let item) = $0,
+            if case .itemCompleted(_, _, let item, _) = $0,
                case .agentMessage(_, let t) = item { return t == "done after tool" }
             return false
         })
@@ -95,7 +175,74 @@ final class HarnessCoreTests: XCTestCase {
         XCTAssertEqual(caps.count, 2, "tool follow-up makes a second model call")
     }
 
+    /// Finding (app-server-events): `turn/plan/updated` is never emitted because
+    /// the `update_plan` tool publishes to `PlanUpdateBus` but nothing
+    /// subscribes. SessionEngine must subscribe to the bus for the dispatched
+    /// callId and forward the parsed payload as `ServerNotification.planUpdate`
+    /// (parity with upstream `handle_turn_plan_update`,
+    /// bespoke_event_handling.rs:1241). This drives a real `update_plan` call and
+    /// asserts the notification reaches the event stream with the upstream wire
+    /// shape (camelCase v2 step status).
+    func testUpdatePlanToolEmitsTurnPlanUpdated() async throws {
+        let (store, home) = try makeStore()
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let tid = ThreadId.generate()
+        _ = try await store.create(SessionConfig(threadId: tid, cwd: "/w"))
+        let planArgs = #"{"explanation":"do work","plan":[{"step":"draft","status":"in_progress"},{"step":"ship","status":"pending"}]}"#
+        let model = MockModelClient([
+            MockScenario([.created,
+                          .toolCall(callId: "c1", name: "update_plan",
+                                    argumentsJSON: planArgs),
+                          .completeContinue(responseId: "r1", tokens: 5)]),
+            MockScenario([.created,
+                          .agentDone(itemId: "m1", "done"),
+                          .completeEndTurn(responseId: "r2", tokens: 6)]),
+        ])
+        let router = ToolRouter(limits: Limits())
+        await router.register(UpdatePlanTool())
+        let engine = SessionEngine(config: SessionConfig(threadId: tid, cwd: "/w"),
+                                   model: model, store: store, router: router, limits: Limits())
+        await engine.start()
+        let collector = Task { await collectHC(engine) { if case .turnCompleted = $0 { return true }; return false } }
+        await engine.submit(.startTurn(input: [TurnInput(text: "make a plan")], model: nil, turnId: nil))
+        let events = await collector.value
+
+        let planUpdate = events.first { if case .planUpdate = $0 { return true }; return false }
+        guard case .planUpdate(let pThread, let pTurn, let explanation, let plan)? = planUpdate else {
+            return XCTFail("turn/plan/updated must be emitted for an update_plan tool call")
+        }
+        XCTAssertEqual(pThread, tid)
+        XCTAssertEqual(pTurn.raw.isEmpty, false)
+        XCTAssertEqual(explanation, "do work")
+        XCTAssertEqual(plan.count, 2)
+        XCTAssertEqual(plan[0].step, "draft")
+        XCTAssertEqual(plan[0].status, .inProgress)
+        XCTAssertEqual(plan[1].step, "ship")
+        XCTAssertEqual(plan[1].status, .pending)
+
+        // The on-wire frame must carry the v2 camelCase step status.
+        guard case .notification(let msg) = planUpdate!.toMessage() else {
+            return XCTFail("expected notification frame")
+        }
+        XCTAssertEqual(msg.method, "turn/plan/updated")
+        XCTAssertEqual(msg.params?["explanation"]?.stringValue, "do work")
+        guard case .array(let items)? = msg.params?["plan"] else {
+            return XCTFail("plan should serialise as a JSON array")
+        }
+        XCTAssertEqual(items.first?["status"]?.stringValue, "inProgress")
+
+        // Subscription must be torn down once the dispatch resolves (no leak).
+        let remaining = await PlanUpdateBus.shared.subscriptionCount()
+        XCTAssertEqual(remaining, 0, "PlanUpdateBus subscription must be removed after the call resolves")
+    }
+
     func testStickyPreviousResponseIdWithinTurn() async throws {
+        // `previous_response_id` chaining is opt-in (the engine defaults to
+        // prompt-prefix replay + prompt_cache_key affinity to avoid the
+        // per-request server state-load latency). This test exercises the
+        // chaining path, so enable it explicitly.
+        setenv("CODEXKIT_USE_PREV_RESPONSE_ID", "1", 1)
+        defer { unsetenv("CODEXKIT_USE_PREV_RESPONSE_ID") }
         let (store, home) = try makeStore()
         defer { try? FileManager.default.removeItem(atPath: home) }
         let tid = ThreadId.generate()
@@ -116,7 +263,7 @@ final class HarnessCoreTests: XCTestCase {
                                    limits: Limits())
         await engine.start()
         let collector = Task { await collectHC(engine) { if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         _ = await collector.value
         let caps = await model.capturedRequests()
         XCTAssertEqual(caps.count, 2, "one tool follow-up → two sampling calls")
@@ -148,32 +295,38 @@ final class HarnessCoreTests: XCTestCase {
                                    limits: Limits(), autoCompactTokens: 1)
         await engine.start()
         let collector = Task { await collectHC(engine) { if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "do work")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "do work")], model: nil, turnId: nil))
         let events = await collector.value
         guard case .turnCompleted(_, let turn)? = events.last(where: { if case .turnCompleted = $0 { return true }; return false }) else {
             return XCTFail("no turnCompleted")
         }
         XCTAssertEqual(turn.status, .completed,
                        "Codex compaction reduces tokens and continues; there is no thrash-abort")
-        XCTAssertTrue(events.contains { if case .raw(let m, _) = $0 { return m == "thread/compacted" }; return false },
-                      "mid-turn auto-compaction emits the deprecated thread/compacted notification")
+        XCTAssertTrue(events.contains {
+                          if case .itemCompleted(_, _, let item, _) = $0,
+                             case .contextCompaction = item { return true }
+                          return false
+                      },
+                      "mid-turn auto-compaction emits the canonical contextCompaction item (v2 suppresses the deprecated thread/compacted notification)")
         let rebuilt = try await store.reconstruct(tid)
+        // P1.1 / F2: reconstruction replays the persisted `replacement_history`
+        // (replace-then-replay, mirroring upstream), so the compaction summary
+        // is the `.userMessage` bridge that `buildCompactedHistory` appends —
+        // not a synthesized `.agentMessage` from the `.compacted` summary field.
         XCTAssertTrue(rebuilt.items.contains {
-            if case .agentMessage(_, let t) = $0 {
+            if case .userMessage(_, let content) = $0 {
+                let t = content.first?.text ?? ""
                 return t.hasPrefix(Compaction.summaryPrefix) && t.contains("MODEL SUMMARY")
             }
             return false
         }, "history is replaced by the model-produced SUMMARY_PREFIX summary")
     }
 
-    /// P2.1 / C3 / H-01 / H-02: when a turn is interrupted mid-stream, the
-    /// engine emits a `turn/aborted` notification carrying the canonical
-    /// `reason: "interrupted"` and lifecycle fields (`completedAt`,
-    /// `durationMs`). The wire shape and field omission are covered by
-    /// `ProtocolModelTests.testTurnAbortedNotificationCarriesUpstreamFields`;
-    /// here we drive a live SessionEngine to assert the event fires and
-    /// carries non-nil timing.
-    func testTurnAbortedEmittedOnInterrupt() async throws {
+    /// Upstream fidelity (app-server `handle_turn_interrupted`): an interrupted
+    /// turn is delivered as a `turn/completed` notification whose
+    /// `turn.status == .interrupted`, carrying lifecycle fields
+    /// (`completedAt`, `durationMs`). There is NO `turn/aborted` wire method.
+    func testInterruptEmitsTurnCompletedInterrupted() async throws {
         let (store, home) = try makeStore()
         defer { try? FileManager.default.removeItem(atPath: home) }
         let tid = ThreadId.generate()
@@ -189,43 +342,30 @@ final class HarnessCoreTests: XCTestCase {
         await engine.start()
         let collector = Task {
             await collectHC(engine) { ev in
-                if case .turnAborted = ev { return true }
                 if case .turnCompleted = ev { return true }
                 return false
             }
         }
-        await engine.submit(.startTurn(input: [TurnInput(text: "long task")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "long task")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(60))
         await engine.submit(.interrupt(turnId: TurnId("x")))
         let events = await collector.value
 
-        // Exactly one turnAborted (no turnCompleted for the aborted turn).
-        let aborted = events.compactMap { ev -> (String, Int?, Int?)? in
-            if case .turnAborted(_, _, let reason, let completedAt, let durationMs, _) = ev {
-                return (reason, completedAt, durationMs)
-            }
+        // Exactly one terminal turn/completed, status == interrupted.
+        let completed = events.compactMap { ev -> TurnObject? in
+            if case .turnCompleted(_, let turn) = ev { return turn }
             return nil
         }
-        XCTAssertEqual(aborted.count, 1, "exactly one turn/aborted per interrupt")
-        XCTAssertEqual(aborted.first?.0, "interrupted",
-                       "user-initiated interrupt → canonical TurnAbortReason.interrupted")
-        XCTAssertNotNil(aborted.first?.1, "completedAt populated")
-        XCTAssertNotNil(aborted.first?.2, "durationMs populated")
-
-        let completedCount = events.filter {
-            if case .turnCompleted = $0 { return true }; return false
-        }.count
-        XCTAssertEqual(completedCount, 0,
-            "no turn/completed may be emitted for an aborted turn (upstream invariant)")
+        XCTAssertEqual(completed.count, 1, "exactly one turn/completed per interrupt")
+        XCTAssertEqual(completed.first?.status, .interrupted,
+                       "user-initiated interrupt → turn.status == interrupted")
+        XCTAssertNotNil(completed.first?.completedAt, "completedAt populated")
+        XCTAssertNotNil(completed.first?.durationMs, "durationMs populated")
     }
 
     func testInterruptYieldsInterruptedTurn() async throws {
-        // P2.1 / C3: an interrupted turn now emits a distinct `turn/aborted`
-        // notification (NOT `turn/completed`) — parity with upstream's
-        // `abort_regular_task_emits_turn_aborted_only` invariant. The
-        // collector therefore terminates on either terminal event; we assert
-        // that the terminal event was `turnAborted` and that no
-        // `turnCompleted` was emitted for the same turn.
+        // Upstream fidelity: an interrupted turn is delivered as
+        // `turn/completed` with `turn.status == .interrupted`.
         let (store, home) = try makeStore()
         defer { try? FileManager.default.removeItem(atPath: home) }
         let tid = ThreadId.generate()
@@ -242,26 +382,20 @@ final class HarnessCoreTests: XCTestCase {
         let collector = Task {
             await collectHC(engine) { ev in
                 if case .turnCompleted = ev { return true }
-                if case .turnAborted = ev { return true }
                 return false
             }
         }
-        await engine.submit(.startTurn(input: [TurnInput(text: "long task")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "long task")], model: nil, turnId: nil))
         try await Task.sleep(for: .milliseconds(60))
         await engine.submit(.interrupt(turnId: TurnId("x")))
         let events = await collector.value
-        // No `turnCompleted` may be emitted on an aborted turn.
-        let hasCompleted = events.contains {
+        guard case .turnCompleted(_, let turn)? = events.last(where: {
             if case .turnCompleted = $0 { return true }; return false
-        }
-        XCTAssertFalse(hasCompleted, "aborted turn must NOT emit turn/completed")
-        guard case .turnAborted(_, _, let reason, _, _, _)? = events.last(where: {
-            if case .turnAborted = $0 { return true }; return false
         }) else {
-            return XCTFail("no turnAborted")
+            return XCTFail("no turnCompleted")
         }
-        XCTAssertEqual(reason, "interrupted",
-            "user-initiated interrupt maps to canonical TurnAbortReason `interrupted`")
+        XCTAssertEqual(turn.status, .interrupted,
+            "user-initiated interrupt maps to turn.status interrupted")
     }
 
     func testShellToolCallProceedsUnderNeverPolicyEvenWithEscalationRequest() async throws {
@@ -309,17 +443,17 @@ final class HarnessCoreTests: XCTestCase {
         let collector = Task { await collectHC(engine) {
             if case .turnCompleted = $0 { return true }; return false
         } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let events = await collector.value
 
         // The shell call must have completed without an approval denial.
         let shellItem = events.compactMap { ev -> ThreadItem? in
-            if case .itemCompleted(_, _, let item) = ev,
+            if case .itemCompleted(_, _, let item, _) = ev,
                case .commandExecution = item { return item }
             return nil
         }.first
         guard let item = shellItem,
-              case let .commandExecution(_, _, _, _, output, exitCode) = item else {
+              case let .commandExecution(_, _, _, _, _, output, exitCode, _, _, _) = item else {
             return XCTFail("no commandExecution item; events: \(events)")
         }
         XCTAssertEqual(exitCode, 0,
@@ -517,7 +651,10 @@ final class HarnessCoreTests: XCTestCase {
         XCTAssertTrue(willRetry, "stream-error during retry must set willRetry=true")
         XCTAssertNotNil(turnId,
                         "stream-error during a turn must carry the active turnId for UI grouping")
-        XCTAssertEqual(body.codexErrorInfo, "StreamError")
+        // Internal fine-grained reason is StreamError; the wire-facing
+        // codexErrorInfo collapses it to `.other` (no upstream analogue).
+        XCTAssertEqual(body.reason, "StreamError")
+        XCTAssertEqual(body.codexErrorInfo, .other)
         XCTAssertTrue(body.message.contains("transient"),
                       "error message should propagate the underlying failure; got: \(body.message)")
 
@@ -625,14 +762,17 @@ final class HarnessCoreTests: XCTestCase {
         await engine.start()
 
         // Collector that stops after the FIRST turnCompleted (the
-        // steer-driven follow-up turn that may run afterwards is separate).
+        // steer-driven follow-up turn that may run afterwards is separate),
+        // capturing the active turn id so the steer can echo it as
+        // expectedTurnId (the upstream `turn/steer` contract).
+        let turnIdBox = TurnIdBox()
         let firstTurnCompleted = Task {
-            await collectHC(engine) {
+            await collectHCCapturingTurnId(engine, into: turnIdBox) {
                 if case .turnCompleted = $0 { return true }; return false
             }
         }
 
-        await engine.submit(.startTurn(input: [TurnInput(text: "use the tool")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "use the tool")], model: nil, turnId: nil))
 
         // Wait until the tool has actually started executing — this proves
         // the engine task is suspended awaiting the tool result, with a
@@ -645,8 +785,9 @@ final class HarnessCoreTests: XCTestCase {
         // compaction, the next loop iteration would drain this BEFORE the
         // follow-up sampling, interleaving a user message between the tool
         // call and its model response.
+        let activeTurnId = await turnIdBox.waitForId() ?? TurnId("t")
         await engine.submit(.steer(input: [TurnInput(text: "STEER_PAYLOAD_42")],
-                                   expectedTurnId: TurnId("t")))
+                                   expectedTurnId: activeTurnId))
 
         // Tiny pause so the steer enqueue commits before the tool returns
         // (deterministic ordering for the race we want to test).
@@ -674,6 +815,7 @@ final class HarnessCoreTests: XCTestCase {
             switch item {
             case .userText(let t), .developerText(let t), .assistantText(let t): return t
             case .toolOutput(_, let o): return o
+            case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
         XCTAssertFalse(followUpPromptText.contains("STEER_PAYLOAD_42"),
@@ -685,6 +827,7 @@ final class HarnessCoreTests: XCTestCase {
             switch item {
             case .userText(let t), .developerText(let t), .assistantText(let t): return t
             case .toolOutput(_, let o): return o
+            case .reasoning(let summary, let content, _): return (summary + content).joined(separator: "\n")
             }
         }.joined(separator: "\n")
         XCTAssertFalse(firstPromptText.contains("STEER_PAYLOAD_42"))
@@ -826,20 +969,20 @@ final class HarnessCoreTests: XCTestCase {
         // Drain turn 1.
         let t1 = Task { await collectHC(engine) {
             if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
         _ = await t1.value
 
         // Turn 2: collect everything until the second turnCompleted.
         let t2 = Task { await collectHC(engine) {
             if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "second turn")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "second turn")], model: nil, turnId: nil))
         let events2 = await t2.value
 
         // Exactly one ContextWindowExceeded error notification was emitted
         // with willRetry=true.
         let trimErrors = events2.compactMap { ev -> (Bool, ErrorBody)? in
             if case .error(_, _, let willRetry, let body) = ev,
-               body.codexErrorInfo == "ContextWindowExceeded" {
+               body.codexErrorInfo == .contextWindowExceeded {
                 return (willRetry, body)
             }
             return nil
@@ -900,13 +1043,13 @@ final class HarnessCoreTests: XCTestCase {
             let t = Task { await collectHC(engine) {
                 if case .turnCompleted = $0 { return true }; return false } }
             await engine.submit(.startTurn(input: [TurnInput(text: "seed-\(i)")],
-                                           model: nil))
+                                           model: nil, turnId: nil))
             _ = await t.value
         }
 
         let final = Task { await collectHC(engine) {
             if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "explode")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "explode")], model: nil, turnId: nil))
         let events = await final.value
 
         guard case .turnCompleted(_, let turn)? = events.last(where: {
@@ -917,7 +1060,7 @@ final class HarnessCoreTests: XCTestCase {
 
         let willRetryCount = events.reduce(0) { acc, ev -> Int in
             if case .error(_, _, let willRetry, let body) = ev,
-               willRetry, body.codexErrorInfo == "ContextWindowExceeded" {
+               willRetry, body.codexErrorInfo == .contextWindowExceeded {
                 return acc + 1
             }
             return acc
@@ -963,13 +1106,13 @@ final class HarnessCoreTests: XCTestCase {
             let t = Task { await collectHC(engine) {
                 if case .turnCompleted = $0 { return true }; return false } }
             await engine.submit(.startTurn(input: [TurnInput(text: "seed-\(i)")],
-                                           model: nil))
+                                           model: nil, turnId: nil))
             _ = await t.value
         }
 
         let final = Task { await collectHC(engine) {
             if case .turnCompleted = $0 { return true }; return false } }
-        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let events = await final.value
 
         guard case .turnCompleted(_, let turn)? = events.last(where: {
@@ -980,7 +1123,7 @@ final class HarnessCoreTests: XCTestCase {
 
         let willRetryCount = events.reduce(0) { acc, ev -> Int in
             if case .error(_, _, let willRetry, let body) = ev,
-               willRetry, body.codexErrorInfo == "ContextWindowExceeded" {
+               willRetry, body.codexErrorInfo == .contextWindowExceeded {
                 return acc + 1
             }
             return acc
@@ -1002,10 +1145,10 @@ final class HarnessCoreTests: XCTestCase {
         let id = ItemId.generate("c")
         let pending = ThreadItem.commandExecution(
             id: id, command: ["echo"], cwd: "/w",
-            status: .inProgress, aggregatedOutput: nil, exitCode: nil)
+            status: .inProgress, commandActions: [], aggregatedOutput: nil, exitCode: nil)
         let completed = ThreadItem.commandExecution(
             id: id, command: ["echo"], cwd: "/w",
-            status: .completed, aggregatedOutput: "out", exitCode: 0)
+            status: .completed, commandActions: [], aggregatedOutput: "out", exitCode: 0)
         ctx.appendItem(pending)
         ctx.appendItem(completed)
         XCTAssertEqual(ctx.history.count, 2,

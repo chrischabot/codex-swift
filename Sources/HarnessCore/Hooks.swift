@@ -4,6 +4,7 @@ import InfraPrimitives
 import Observability
 import Config
 import WireProtocol
+import ProtocolModel
 
 // Module-level logger for hook-output validation warnings.
 private let hookLog = Log(category: "HookEngine")
@@ -55,6 +56,22 @@ public enum HookEventName: String, Sendable, Codable, Equatable, CaseIterable {
         }
     }
 
+    /// Upstream per-event "invalid JSON output" Failed-status message
+    /// (`hooks/src/events/*.rs`, the `looks_like_json` parse-failure arm).
+    /// Reproduced verbatim so `hook/completed` error entries match upstream.
+    public var invalidJSONMessage: String {
+        switch self {
+        case .preToolUse:        return "hook returned invalid pre-tool-use JSON output"
+        case .permissionRequest: return "hook returned invalid permission-request JSON output"
+        case .postToolUse:       return "hook returned invalid post-tool-use JSON output"
+        case .preCompact:        return "hook returned invalid PreCompact hook JSON output"
+        case .postCompact:       return "hook returned invalid PostCompact hook JSON output"
+        case .sessionStart:      return "hook returned invalid session start JSON output"
+        case .userPromptSubmit:  return "hook returned invalid user prompt submit JSON output"
+        case .stop:              return "hook returned invalid stop hook JSON output"
+        }
+    }
+
     /// Accept the codex kebab wire form (`pre-tool-use`), the Swift
     /// camelCase form (`preToolUse`), the upstream snake_case config-key
     /// form (`pre_tool_use`), and PascalCase (`PreToolUse`), all
@@ -85,19 +102,46 @@ public struct HookDefinition: Sendable, Codable, Equatable {
     public var matcher: String?
     public var command: String
     public var timeoutSec: UInt64
+    /// Provenance for the `HookRunSummary` surfaced via `hook/started` /
+    /// `hook/completed`. `sourcePath` is the declaring `hooks.json`;
+    /// `source` is the v2 `HookSource` wire string (`user`/`project`/…).
+    public var sourcePath: String
+    public var source: String
+    /// Stable, global discovery-time index. Upstream assigns this ONCE while
+    /// walking the full handler set (every event, every config layer) in
+    /// `engine/discovery.rs` (`let mut display_order = 0_i64;` … incremented
+    /// per discovered command handler), and it is preserved verbatim through
+    /// `select_handlers` into both `HookRunSummary.display_order` and the
+    /// `run_id` (`{event_label}:{display_order}:{source_path}`,
+    /// engine/mod.rs:55-62). It is NOT recomputed per fire. Assigned by the
+    /// loader; defaults to 0 for ad-hoc definitions constructed in tests.
+    public var displayOrder: Int
+    /// The hook's declared `statusMessage` (config `statusMessage` /
+    /// `status_message`). Upstream `ConfiguredHandler::status_message`
+    /// (engine/discovery.rs:436/463/485) is surfaced verbatim on BOTH the
+    /// `hook/started` and `hook/completed` `HookRunSummary.statusMessage`,
+    /// regardless of run outcome (dispatcher.rs:79,132). `None`/absent in the
+    /// common case; never derived from the run result.
+    public var statusMessage: String?
 
     public init(eventName: HookEventName, matcher: String? = nil,
-                command: String, timeoutSec: UInt64 = HookDefinition.defaultTimeoutSec) {
+                command: String, timeoutSec: UInt64 = HookDefinition.defaultTimeoutSec,
+                sourcePath: String = "", source: String = "unknown",
+                displayOrder: Int = 0, statusMessage: String? = nil) {
         self.eventName = eventName
         self.matcher = matcher
         self.command = command
         self.timeoutSec = timeoutSec
+        self.sourcePath = sourcePath
+        self.source = source
+        self.displayOrder = displayOrder
+        self.statusMessage = statusMessage
     }
 
     /// Default hook timeout in seconds. Matches upstream codex-rs
-    /// (`engine/discovery.rs::timeout_sec.unwrap_or(600)`). Hardening
-    /// note: clamped to `[1, 600]` inside `runCommand()` so a misconfigured
-    /// hook can never block a turn indefinitely.
+    /// (`engine/discovery.rs::timeout_sec.unwrap_or(600).max(1)`). Only the
+    /// lower bound is clamped in `runCommand()` (`max(timeoutSec, 1)`); a
+    /// configured timeout above 600s is honored verbatim, matching upstream.
     public static let defaultTimeoutSec: UInt64 = 600
     public static let defaultTimeoutMillis: UInt64 = 600_000
 
@@ -145,6 +189,15 @@ public struct HookDefinition: Sendable, Codable, Equatable {
         self.command = cmd
         self.timeoutSec = uint(["timeout", "timeoutSec", "timeout_sec"])
             ?? HookDefinition.defaultTimeoutSec
+        // Provenance is assigned by the loader, not present in the hook JSON.
+        self.sourcePath = str(["sourcePath", "source_path"]) ?? ""
+        self.source = str(["source"]) ?? "unknown"
+        // Assigned by the loader as a global discovery counter; the hook JSON
+        // never carries it.
+        self.displayOrder = 0
+        // Configured handler statusMessage (config `statusMessage` /
+        // `status_message`), surfaced verbatim on both summaries.
+        self.statusMessage = str(["statusMessage", "status_message"])
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -153,6 +206,9 @@ public struct HookDefinition: Sendable, Codable, Equatable {
         if let matcher { try c.encode(matcher, forKey: DynamicKey("matcher")) }
         try c.encode(command, forKey: DynamicKey("command"))
         try c.encode(timeoutSec, forKey: DynamicKey("timeout"))
+        if let statusMessage {
+            try c.encode(statusMessage, forKey: DynamicKey("statusMessage"))
+        }
     }
 }
 
@@ -251,6 +307,16 @@ public struct HookOutcome: Sendable, Equatable {
     /// `decision`/`shouldBlock`/`reason` triple is preserved untouched so
     /// existing callers keep working.
     public var outputSchemaError: String?
+    /// H-hooks F8 — PostToolUse model FEEDBACK. Upstream's PostToolUse parser
+    /// distinguishes `feedback_messages_for_model` (rendered as a
+    /// `HookOutputEntryKind::Feedback` entry and used to replace the tool
+    /// output text, post_tool_use.rs:256-269) from `additional_contexts_for_model`
+    /// (rendered as `Context` and injected as developer messages,
+    /// common::append_additional_context). The exit-2 stderr arm pushes a
+    /// `Feedback` entry — NOT a `Context` entry. Carrying it here lets
+    /// summarize() emit the correct `feedback` kind while the SessionEngine
+    /// still threads it to the model.
+    public var feedbackMessage: String?
     public var raw: String
 
     public init(decision: HookDecision, reason: String? = nil,
@@ -259,6 +325,7 @@ public struct HookOutcome: Sendable, Equatable {
                 shouldStop: Bool = false, stopReason: String? = nil,
                 shouldBlock: Bool = false, continuationPrompt: String? = nil,
                 outputSchemaError: String? = nil,
+                feedbackMessage: String? = nil,
                 raw: String = "") {
         self.decision = decision
         self.reason = reason
@@ -270,6 +337,7 @@ public struct HookOutcome: Sendable, Equatable {
         self.shouldBlock = shouldBlock
         self.continuationPrompt = continuationPrompt
         self.outputSchemaError = outputSchemaError
+        self.feedbackMessage = feedbackMessage
         self.raw = raw
     }
 }
@@ -303,6 +371,28 @@ public struct HookRequest: Sendable, Equatable {
     /// Stop-only: the last assistant message produced before the Stop hook
     /// fires (nullable on the wire).
     public var lastAssistantMessage: String?
+    /// PreToolUse / PostToolUse: the active tool-call id. Upstream
+    /// `PreToolUseCommandInput.tool_use_id` / `PostToolUseCommandInput.tool_use_id`
+    /// are REQUIRED (non-optional) fields (hooks/src/schema.rs:242-256,279-294),
+    /// always emitted on the hook stdin payload for those two events.
+    public var toolUseId: String?
+    /// PermissionRequest-only: the run-id suffix appended to the
+    /// `HookRunSummary.id` (upstream `PermissionRequestRequest.run_id_suffix`,
+    /// hooks/src/events/permission_request.rs:44). Upstream callers supply the
+    /// tool `call_id` / guardian-approval-id here (core/src/hook_runtime.rs:208).
+    /// For PreToolUse / PostToolUse the suffix is `toolUseId`; this field is
+    /// only consulted for PermissionRequest.
+    public var runIdSuffix: String?
+    /// PreToolUse / PostToolUse / PermissionRequest: compatibility matcher
+    /// aliases tested IN ADDITION to the canonical tool name. Upstream
+    /// `HookToolName.matcher_aliases` (core/src/tools/hook_names.rs:34-39):
+    /// `apply_patch` carries `["Write", "Edit"]` so Claude-Code-style hook
+    /// matchers select on apply_patch tool calls. Threaded into the matcher
+    /// input set by `common::matcher_inputs` (hooks/src/events/common.rs:137-146)
+    /// and consulted by `dispatcher::select_handlers_for_matcher_inputs`
+    /// (hooks/src/engine/dispatcher.rs:57-60). The canonical name still wins on
+    /// the hook stdin payload (`tool_name`); aliases only affect SELECTION.
+    public var matcherAliases: [String]
     public var extra: [String: String]
 
     public init(eventName: HookEventName, sessionId: String, cwd: String,
@@ -312,6 +402,9 @@ public struct HookRequest: Sendable, Equatable {
                 permissionMode: String? = nil, transcriptPath: String? = nil,
                 source: String? = nil, stopHookActive: Bool? = nil,
                 lastAssistantMessage: String? = nil,
+                toolUseId: String? = nil,
+                runIdSuffix: String? = nil,
+                matcherAliases: [String] = [],
                 extra: [String: String] = [:]) {
         self.eventName = eventName
         self.sessionId = sessionId
@@ -327,12 +420,79 @@ public struct HookRequest: Sendable, Equatable {
         self.source = source
         self.stopHookActive = stopHookActive
         self.lastAssistantMessage = lastAssistantMessage
+        self.toolUseId = toolUseId
+        self.runIdSuffix = runIdSuffix
+        self.matcherAliases = matcherAliases
         self.extra = extra
     }
 
-    /// codex treats the matcher as meaningful only for pre/post-tool-use
-    /// (matched against the tool name); empty otherwise.
-    public var matchString: String { toolName ?? "" }
+    /// The run-id suffix appended to `HookRunSummary.id` for tool-scoped
+    /// events (upstream `common::hook_run_for_tool_use`,
+    /// hooks/src/events/common.rs:93-95). PreToolUse / PostToolUse append the
+    /// `tool_use_id`; PermissionRequest appends `run_id_suffix`. All other
+    /// events have no suffix.
+    public var hookRunIdSuffix: String? {
+        switch eventName {
+        case .preToolUse, .postToolUse:
+            // Upstream `tool_use_id` is a non-optional `String`, so the suffix
+            // is ALWAYS appended (empty string when the caller didn't thread an
+            // id, yielding a trailing `:`), matching `format!("{}:{tool_use_id}", id)`.
+            return toolUseId ?? extra["tool_use_id"] ?? ""
+        case .permissionRequest:
+            // Upstream `run_id_suffix` is a non-optional `String`; always append.
+            return runIdSuffix ?? ""
+        case .preCompact, .postCompact, .sessionStart,
+             .userPromptSubmit, .stop:
+            return nil
+        }
+    }
+
+    /// Upstream `matcher_pattern_for_event` + per-event matcher inputs decide
+    /// what string the hook matcher is tested against:
+    ///   - PreToolUse / PermissionRequest / PostToolUse → the tool name
+    ///     (`common::matcher_inputs`, events/{pre,post}_tool_use.rs,
+    ///     permission_request.rs).
+    ///   - SessionStart → the session `source` (startup/resume/clear)
+    ///     (events/session_start.rs:66-70).
+    ///   - PreCompact / PostCompact → the compaction `trigger` (manual/auto),
+    ///     threaded through `extra["trigger"]` (events/compact.rs:59-62,138-141).
+    ///   - UserPromptSubmit / Stop → `None`: the matcher is ignored entirely
+    ///     (events/user_prompt_submit.rs:51-55, stop.rs:57). Upstream
+    ///     `dispatcher::select_handlers_for_matcher_inputs` short-circuits these
+    ///     two events to `=> true` (dispatcher.rs:62) WITHOUT calling
+    ///     `matches_matcher`, so `matches(...)` returns true for them regardless
+    ///     of this value; the nil result here merely documents "no matcher
+    ///     input".
+    /// Returns nil when there is no matcher input for the event.
+    public var matchString: String? {
+        switch eventName {
+        case .preToolUse, .permissionRequest, .postToolUse:
+            return toolName ?? ""
+        case .sessionStart:
+            return source ?? ""
+        case .preCompact, .postCompact:
+            return extra["trigger"] ?? ""
+        case .userPromptSubmit, .stop:
+            return nil
+        }
+    }
+
+    /// The full ordered set of matcher inputs a tool-scoped matcher is tested
+    /// against — the canonical name first, then any compatibility aliases.
+    /// Faithful to upstream `common::matcher_inputs`
+    /// (hooks/src/events/common.rs:137-146): `std::iter::once(tool_name)
+    /// .chain(matcher_aliases)`. For non-tool events (which carry no aliases)
+    /// this is just `[matchString]` (or `[]` when `matchString` is nil, the
+    /// UserPromptSubmit / Stop case that the dispatcher short-circuits anyway).
+    public var matchInputs: [String] {
+        guard let base = matchString else { return [] }
+        switch eventName {
+        case .preToolUse, .permissionRequest, .postToolUse:
+            return [base] + matcherAliases
+        default:
+            return [base]
+        }
+    }
 
     /// Stable JSON object written to the hook command's stdin. Faithful to
     /// upstream `codex_hooks::schema::*CommandInput` (P4.6 / H-27, H-28):
@@ -351,7 +511,14 @@ public struct HookRequest: Sendable, Equatable {
             o["turn_id"] = turnId ?? ""
         }
         o["model"] = model ?? ""
-        o["permission_mode"] = permissionMode ?? "default"
+        // Upstream `PreCompactCommandInput` / `PostCompactCommandInput`
+        // (hooks/src/schema.rs:296-326) carry only session_id, turn_id,
+        // transcript_path, cwd, hook_event_name, model, trigger — there is NO
+        // `permission_mode` on the compact inputs. Every other turn-scoped
+        // event includes it.
+        if eventName != .preCompact && eventName != .postCompact {
+            o["permission_mode"] = permissionMode ?? "default"
+        }
         // Upstream emits `transcript_path: null` when unset; we serialize it
         // as NSNull so JSONSerialization writes a literal `null`.
         if let transcriptPath {
@@ -368,6 +535,12 @@ public struct HookRequest: Sendable, Equatable {
                 o["tool_input"] = toolArgumentsJSON
             }
         }
+        // PreToolUse / PostToolUse carry a REQUIRED `tool_use_id` on the wire
+        // (hooks/src/schema.rs:242-256,279-294). Emit it unconditionally for
+        // those two events; empty string when the caller didn't thread an id.
+        if eventName == .preToolUse || eventName == .postToolUse {
+            o["tool_use_id"] = toolUseId ?? extra["tool_use_id"] ?? ""
+        }
         // PostToolUse: upstream key is `tool_response` (P4.6 / H-28).
         if eventName == .postToolUse, let toolOutput {
             if let d = toolOutput.data(using: .utf8),
@@ -376,10 +549,6 @@ public struct HookRequest: Sendable, Equatable {
             } else {
                 o["tool_response"] = toolOutput
             }
-            // Upstream also carries `tool_use_id`. We don't track per-tool
-            // call ids on the request struct yet; reuse `tool_name`-prefixed
-            // placeholder for forward compat. Hooks that don't read this
-            // field are unaffected.
         } else if let toolOutput {
             // Pre-P4.6 callers passed `toolOutput` for non-PostToolUse cases;
             // preserve their behaviour under the legacy key so we don't
@@ -440,25 +609,114 @@ public actor HookEngine {
     public static func load(codexHome: String, cwd: String,
                             legacyNotifyArgv: [String]? = nil) -> HookEngine {
         let state = hookState(codexHome: codexHome)
-        func parse(_ data: Data, path: String) -> [HookDefinition] {
+        // Global discovery-time counter, incremented once per discovered
+        // command handler across BOTH files (home then project), exactly like
+        // upstream `discovery::discover_handlers` (`let mut display_order = 0`).
+        // It advances for every command handler that survives the
+        // empty/non-command checks — including ones later dropped for
+        // disabled/untrusted state — so the value assigned to a runnable hook
+        // matches what the Rust client computes.
+        var displayOrderCounter = 0
+        func parse(_ data: Data, path: String, source: String,
+                   displayOrder: inout Int) -> [HookDefinition] {
             guard let value = try? JSONDecoder().decode(JSONValue.self, from: data) else {
                 return []
             }
-            let rawHooks = value["hooks"]?.arrayValue ?? value.arrayValue ?? []
+            // Each candidate carries the upstream (group_index, handler_index)
+            // pair so the persisted trust key matches `codex_hooks::hook_key`
+            // (`{path}:{snake_event}:{group_index}:{handler_index}`,
+            // hooks/src/lib.rs:91-101).
+            var rawHooks: [(raw: JSONValue, groupIndex: Int, handlerIndex: Int)] = []
+            if let topArray = value["hooks"]?.arrayValue ?? value.arrayValue {
+                // Legacy flat-array form (Swift-only convenience): each entry is
+                // its own group with a single handler. Preserve the historical
+                // key generation — running array index as group_index, 0 as
+                // handler_index — which is what older state files were written
+                // against.
+                for (idx, raw) in topArray.enumerated() {
+                    rawHooks.append((raw, idx, 0))
+                }
+            } else if case .object(let eventsMap)? = value["hooks"] {
+                // Canonical upstream grouped-object form (config/src/hooks.rs
+                // `HookEventsToml`): `hooks` is a MAP from EventName →
+                // [{ matcher, hooks: [{type:"command", command, timeout,
+                // statusMessage}] }]. group_index enumerates the matcher-groups
+                // WITHIN one event and handler_index enumerates the handlers
+                // WITHIN that group (discovery.rs:418-472). Both enumerations
+                // count every group / handler (including skipped non-command or
+                // empty ones) so the index positions stay aligned with the
+                // state file the Rust client wrote.
+                // Upstream `HookEventsToml::into_matcher_groups`
+                // (config/src/hook_config.rs) yields events in a FIXED struct
+                // order, not the JSON map's insertion order:
+                // pre_tool_use, permission_request, post_tool_use, pre_compact,
+                // post_compact, session_start, user_prompt_submit, stop. This
+                // ordering drives the global `display_order` counter, so we
+                // iterate `HookEventName.allCases` (declared in that same order)
+                // rather than the dictionary's arbitrary key order.
+                for canonical in HookEventName.allCases {
+                    // The JSON map keys are the v2 wire/config strings; resolve
+                    // each declared key to its canonical event and only process
+                    // entries belonging to the current canonical event.
+                    let matchedKeys = eventsMap.keys.filter {
+                        normalizedHookEventName($0) == canonical.configKey
+                            || HookEventName.from(wire: $0) == canonical
+                    }
+                    for eventKey in matchedKeys.sorted() {
+                        guard case .array(let groups)? = eventsMap[eventKey] else { continue }
+                        let eventName = eventKey
+                        for (groupIndex, g) in groups.enumerated() {
+                        let matcher = g["matcher"]?.stringValue
+                        guard case .array(let handlers)? = g["hooks"] else { continue }
+                        for (handlerIndex, h) in handlers.enumerated() {
+                            // Only `command`-type handlers run, but a skipped
+                            // non-command/empty handler still consumes its
+                            // handler_index upstream — so we `continue` without
+                            // resetting the enumeration counter.
+                            if let type = h["type"]?.stringValue, type != "command" { continue }
+                            let cmd = h["command"]?.stringValue ?? ""
+                            guard !cmd.isEmpty else { continue }
+                            var obj: [String: JSONValue] = [
+                                "event": .string(eventName),
+                                "command": .string(cmd),
+                            ]
+                            if let m = matcher { obj["matcher"] = .string(m) }
+                            if let t = h["timeout"]?.intValue { obj["timeout"] = .int(t) }
+                            // Configured handler statusMessage (discovery.rs:436);
+                            // surfaced verbatim on both hook/started + hook/completed.
+                            if let sm = h["statusMessage"]?.stringValue
+                                ?? h["status_message"]?.stringValue {
+                                obj["statusMessage"] = .string(sm)
+                            }
+                            rawHooks.append((.object(obj), groupIndex, handlerIndex))
+                        }
+                        }
+                    }
+                }
+            }
             let dec = JSONDecoder()
             var out: [HookDefinition] = []
-            for (index, raw) in rawHooks.enumerated() {
+            for (raw, groupIndex, handlerIndex) in rawHooks {
                 guard let object = raw.objectValue,
                       let encoded = try? JSONEncoder().encode(raw),
-                      let def = try? dec.decode(HookDefinition.self, from: encoded) else {
+                      var def = try? dec.decode(HookDefinition.self, from: encoded) else {
                     continue
                 }
+                // Provenance for the v2 HookRunSummary surfaced via
+                // hook/started + hook/completed.
+                def.sourcePath = path
+                def.source = source
+                // Assign the global discovery index, then advance the counter
+                // for every command handler (upstream increments after pushing
+                // the entry, regardless of enabled/trusted state — discovery.rs:514).
+                def.displayOrder = displayOrder
+                displayOrder += 1
                 let event = object["event"]?.stringValue
                     ?? object["eventName"]?.stringValue
                     ?? object["event_name"]?.stringValue
                     ?? def.eventName.rawValue
                 let eventName = normalizedHookEventName(event) ?? def.eventName.configKey
-                let key = "\(path):\(eventName):\(index):0"
+                let key = "\(path):\(eventName):\(groupIndex):\(handlerIndex)"
                 let entry = state[key]
                 let enabled = entry?["enabled"]?.boolValue ?? true
                 let canonicalHash = currentHookHash(def)
@@ -472,9 +730,9 @@ public actor HookEngine {
             }
             return out
         }
-        func read(_ path: String) -> [HookDefinition] {
+        func read(_ path: String, source: String) -> [HookDefinition] {
             guard let d = FileManager.default.contents(atPath: path) else { return [] }
-            return parse(d, path: path)
+            return parse(d, path: path, source: source, displayOrder: &displayOrderCounter)
         }
         var defs: [HookDefinition] = []
         let homeFile = (codexHome as NSString)
@@ -482,8 +740,9 @@ public actor HookEngine {
         let cwdFile = ((cwd as NSString)
             .appendingPathComponent(".codex") as NSString)
             .appendingPathComponent("hooks.json")
-        defs.append(contentsOf: read(homeFile))
-        defs.append(contentsOf: read(cwdFile))
+        // $CODEX_HOME/hooks.json → user layer; <cwd>/.codex/hooks.json → project.
+        defs.append(contentsOf: read(homeFile, source: "user"))
+        defs.append(contentsOf: read(cwdFile, source: "project"))
         return HookEngine(hooks: defs, legacyNotifyArgv: legacyNotifyArgv)
     }
 
@@ -542,8 +801,15 @@ public actor HookEngine {
         // before hashing. Sending None on our side would diverge from the
         // upstream hash for an otherwise-identical hook.
         handler["timeout"] = .int(Int64(clamping: def.timeoutSec))
-        // command_windows + statusMessage are always None in our config
-        // shape today; omit them to match upstream's TOML-dropped Nones.
+        // `statusMessage` is part of the normalized handler upstream hashes
+        // (discovery.rs:463 `status_message: status_message.clone()`), but a
+        // `None`/absent value is dropped by the TOML round-trip — so we emit it
+        // only when set, mirroring upstream's TOML-dropped Nones.
+        if let sm = def.statusMessage {
+            handler["statusMessage"] = .string(sm)
+        }
+        // command_windows is always None in our config shape today; omit it to
+        // match upstream's TOML-dropped Nones.
 
         var obj: [String: JSONValue] = [
             "event_name": .string(def.eventName.configKey),
@@ -790,22 +1056,220 @@ public actor HookEngine {
 
     private func matches(_ def: HookDefinition, _ req: HookRequest) -> Bool {
         guard def.eventName == req.eventName else { return false }
-        guard let m = def.matcher, !m.isEmpty else { return true }
-        let s = req.matchString
-        if let re = try? NSRegularExpression(pattern: m) {
-            let r = NSRange(s.startIndex..<s.endIndex, in: s)
-            return re.firstMatch(in: s, range: r) != nil
+        // Faithful port of `dispatcher::select_handlers_for_matcher_inputs`
+        // (hooks/src/engine/dispatcher.rs:47-63): UserPromptSubmit and Stop
+        // ALWAYS fire — their arm is `=> true`, the matcher is never consulted
+        // (`matches_matcher` is not even called). Every other event tests its
+        // matcher against the per-event input string (nil → upstream's empty
+        // `matcher_inputs`, which routes to `matches_matcher(matcher, None)`).
+        switch req.eventName {
+        case .userPromptSubmit, .stop:
+            return true
+        default:
+            // Mirror `dispatcher::select_handlers_for_matcher_inputs`
+            // (dispatcher.rs:54-61): when the matcher-input set is empty, test
+            // against `None`; otherwise the handler matches if ANY input
+            // matches. `matchInputs` is the canonical tool name plus any
+            // compatibility aliases (e.g. apply_patch → ["Write", "Edit"]).
+            let inputs = req.matchInputs
+            if inputs.isEmpty {
+                return Self.matchesMatcher(def.matcher, nil)
+            }
+            return inputs.contains { Self.matchesMatcher(def.matcher, $0) }
         }
-        return s.contains(m)
+    }
+
+    /// Faithful port of upstream `events::common::matches_matcher`
+    /// (hooks/src/events/common.rs:120-135). `input == nil` models the
+    /// `matcher_input == None` case (UserPromptSubmit / Stop, where the
+    /// matcher is ignored): None matcher always matches, a match-all matcher
+    /// matches, and any concrete matcher (exact or regex) fails because there
+    /// is no input to test against.
+    static func matchesMatcher(_ matcher: String?, _ input: String?) -> Bool {
+        guard let matcher else { return true }
+        // `is_match_all_matcher`: empty or "*" matches everything. NOTE:
+        // upstream does NOT trim — only the literal empty string and literal
+        // "*" are match-all.
+        if isMatchAllMatcher(matcher) { return true }
+        // `is_exact_matcher`: alphanumeric / `_` / `|` only → split on `|` and
+        // require an EXACT (not substring) equality with the input.
+        if isExactMatcher(matcher) {
+            guard let input else { return false }
+            return matcher.split(separator: "|", omittingEmptySubsequences: false)
+                .contains { $0 == Substring(input) }
+        }
+        // Otherwise treat as a regex matched against the input.
+        guard let input else { return false }
+        guard let re = try? NSRegularExpression(pattern: matcher) else { return false }
+        let r = NSRange(input.startIndex..<input.endIndex, in: input)
+        return re.firstMatch(in: input, range: r) != nil
+    }
+
+    static func isMatchAllMatcher(_ matcher: String) -> Bool {
+        matcher.isEmpty || matcher == "*"
+    }
+
+    static func isExactMatcher(_ matcher: String) -> Bool {
+        matcher.allSatisfy { ch in
+            ch.isASCII && (ch.isLetter || ch.isNumber || ch == "_" || ch == "|")
+        }
+    }
+
+    /// Paired `hook/started` + `hook/completed` summaries for one hook run,
+    /// recorded by `fire` and drained by the SessionEngine for emission.
+    public struct HookRunRecord: Sendable, Equatable {
+        public let started: HookRunSummary
+        public let completed: HookRunSummary
+    }
+    private var lastRunRecords: [HookRunRecord] = []
+    /// Drain the run records produced by the most recent `fire(...)` so the
+    /// caller can emit `hook/started` / `hook/completed` notifications.
+    public func drainHookRunRecords() -> [HookRunRecord] {
+        let r = lastRunRecords; lastRunRecords = []; return r
     }
 
     public func fire(_ event: HookEventName, _ req: HookRequest) async -> [HookOutcome] {
         var out: [HookOutcome] = []
+        var records: [HookRunRecord] = []
+        // Upstream HookRunSummary: started_at/completed_at are Unix SECONDS;
+        // duration_ms is milliseconds. Scope is `turn` for all turn-scoped
+        // events (every hook except SessionStart, which is thread-scoped).
+        let scope = (event == .sessionStart) ? "thread" : "turn"
+
+        // Upstream emits ALL `hook/started` events for the matched hook set
+        // BEFORE running any hook (core/src/hook_runtime.rs: emit_hook_started_events
+        // over preview_runs, then hooks.run(...), then emit_hook_completed_events).
+        // We mirror that batched ordering: build the started summaries for every
+        // matched hook first, then run each command, then build the completed
+        // summaries. SessionEngine.emitHookRuns drains in the same two phases so
+        // the wire order is started(A),started(B),...,completed(A),completed(B).
+        struct Pending {
+            let def: HookDefinition
+            let order: Int
+            let id: String
+            let startedAtSec: Int
+            let startedAtMs: Double
+            let started: HookRunSummary
+        }
+        var pendings: [Pending] = []
         for def in hooks
         where def.eventName == event && matches(def, req) {
-            out.append(await runCommand(def, req))
+            // Upstream `ConfiguredHandler::run_id()` (hooks/src/engine/mod.rs:53-62):
+            // `format!("{}:{}:{}", event_name_label(), display_order, source_path)`
+            // where event_name_label() is the kebab wire form and display_order is
+            // the STABLE global discovery index (NOT a per-fire counter). This id
+            // is carried verbatim on every `hook/started` / `hook/completed`
+            // notification and Stop continuation fragments key off it, so it must
+            // match byte-for-byte.
+            let order = def.displayOrder
+            // For the three tool-scoped events upstream appends a run-id suffix
+            // via `common::hook_run_for_tool_use` (hooks/src/events/common.rs:93-95):
+            // PreToolUse/PostToolUse append `tool_use_id`, PermissionRequest
+            // appends `run_id_suffix`. The suffix lands on BOTH the started
+            // (preview) and completed summaries (pre_tool_use.rs:64-65,132-133;
+            // permission_request.rs:77-79,141), so the id reads
+            // `{event}:{display_order}:{source_path}:{suffix}`.
+            var id = "\(def.eventName.wire):\(order):\(def.sourcePath)"
+            if let suffix = req.hookRunIdSuffix {
+                id += ":\(suffix)"
+            }
+            let startedAtSec = Int(Date().timeIntervalSince1970)
+            let startedAtMs = Date().timeIntervalSince1970 * 1000
+            let started = HookRunSummary(
+                id: id, eventName: def.eventName.rawValue, scope: scope,
+                sourcePath: def.sourcePath, source: def.source,
+                displayOrder: order, status: "running",
+                statusMessage: def.statusMessage, startedAt: startedAtSec)
+            pendings.append(Pending(def: def, order: order, id: id,
+                                    startedAtSec: startedAtSec,
+                                    startedAtMs: startedAtMs, started: started))
         }
+        for p in pendings {
+            let outcome = await runCommand(p.def, req)
+            out.append(outcome)
+            let completedAtSec = Int(Date().timeIntervalSince1970)
+            let durationMs = Int(max(0, Date().timeIntervalSince1970 * 1000 - p.startedAtMs))
+            let (status, entries) = Self.summarize(outcome)
+            // statusMessage is the CONFIGURED handler value (unchanged across
+            // outcomes), threaded onto both summaries — never outcome-derived.
+            let completed = HookRunSummary(
+                id: p.id, eventName: p.def.eventName.rawValue, scope: scope,
+                sourcePath: p.def.sourcePath, source: p.def.source,
+                displayOrder: p.order, status: status,
+                statusMessage: p.def.statusMessage,
+                startedAt: p.startedAtSec, completedAt: completedAtSec,
+                durationMs: durationMs, entries: entries)
+            records.append(HookRunRecord(started: p.started, completed: completed))
+        }
+        lastRunRecords = records
         return out
+    }
+
+    /// Map a `HookOutcome` to a v2 `HookRunStatus` + ordered entries
+    /// (`HookOutputEntry`): schema violation → `failed`+error; stop → `stopped`;
+    /// block → `blocked`; otherwise `completed`.
+    ///
+    /// Entry ordering mirrors upstream's per-event parsers, which ALWAYS push
+    /// the universal `systemMessage` (`Warning`) entry FIRST, before any
+    /// event-specific stop/feedback/context/error entry (stop.rs:149-155,
+    /// pre_tool_use.rs:208-213, user_prompt_submit.rs:154-160,
+    /// session_start.rs:166-172). The `entries` array is ordered and
+    /// wire-observable, so warning leads.
+    ///
+    /// A Stop hook that BLOCKS (decision:block with a non-empty reason, or
+    /// exit-code 2 with stderr) records its continuation reason as a `feedback`
+    /// entry (stop.rs:171-184, :201-211); the `stop` kind is reserved ONLY for
+    /// the true `continue:false` stop_reason (stop.rs:160-166).
+    ///
+    /// NOTE: `statusMessage` is NOT derived here — upstream surfaces the
+    /// CONFIGURED handler `status_message` on the summary unchanged
+    /// (dispatcher.rs:79,132), so it is threaded in by the caller.
+    static func summarize(_ o: HookOutcome) -> (String, [HookOutputEntry]) {
+        var entries: [HookOutputEntry] = []
+        // Universal warning (systemMessage) leads, matching upstream.
+        if let m = o.systemMessage, !m.isEmpty {
+            entries.append(HookOutputEntry(kind: "warning", text: m))
+        }
+        if let c = o.additionalContext, !c.isEmpty {
+            entries.append(HookOutputEntry(kind: "context", text: c))
+        }
+        // The event-specific block reason surfaces as exactly ONE `feedback`
+        // entry. For a Stop-block the reason is carried by `continuationPrompt`
+        // (the trimmed value upstream pushes, stop.rs:181-184); for every other
+        // blocking event it is carried by `reason`. They never both contribute
+        // for the same run (continuationPrompt is only set for Stop, where it
+        // equals the trimmed `reason`), so prefer continuationPrompt to avoid a
+        // duplicate feedback entry.
+        if !o.shouldStop {
+            if let s = o.continuationPrompt, !s.isEmpty {
+                entries.append(HookOutputEntry(kind: "feedback", text: s))
+            } else if let r = o.reason, !r.isEmpty {
+                entries.append(HookOutputEntry(kind: "feedback", text: r))
+            }
+        }
+        // H-hooks F8 — PostToolUse exit-2 stderr surfaces as a dedicated
+        // `feedback` entry (post_tool_use.rs:256-269), distinct from `context`.
+        if let f = o.feedbackMessage, !f.isEmpty {
+            entries.append(HookOutputEntry(kind: "feedback", text: f))
+        }
+        if let e = o.outputSchemaError, !e.isEmpty {
+            entries.append(HookOutputEntry(kind: "error", text: e))
+        }
+        // Only a true continue:false termination reason is a `stop` entry.
+        if o.shouldStop, let s = o.stopReason, !s.isEmpty {
+            entries.append(HookOutputEntry(kind: "stop", text: s))
+        }
+        let status: String
+        if o.outputSchemaError != nil {
+            status = "failed"
+        } else if o.shouldStop {
+            status = "stopped"
+        } else if o.decision == .block || o.shouldBlock {
+            status = "blocked"
+        } else {
+            status = "completed"
+        }
+        return (status, entries)
     }
 
     public func aggregate(_ outcomes: [HookOutcome]) -> HookDecision {
@@ -887,9 +1351,12 @@ public actor HookEngine {
             "input-messages": payload.inputMessages,
         ]
         if let client = payload.client { object["client"] = client }
-        if let last = payload.lastAssistantMessage {
-            object["last-assistant-message"] = last
-        }
+        // Upstream `UserNotification::AgentTurnComplete` only marks `client`
+        // with `skip_serializing_if=Option::is_none` (hooks/src/legacy_notify.rs:14-25);
+        // `last_assistant_message` is a plain `Option<String>` with NO skip, so
+        // when None it serializes as `"last-assistant-message": null` — the key
+        // is always present.
+        object["last-assistant-message"] = payload.lastAssistantMessage as Any? ?? NSNull()
         let data = try JSONSerialization.data(withJSONObject: object,
                                               options: [.sortedKeys])
         return String(decoding: data, as: UTF8.self)
@@ -985,6 +1452,11 @@ public actor HookEngine {
             }
             out.permissionDecisionReason =
                 hso["permissionDecisionReason"] as? String
+            // Track raw presence of `updatedInput` (upstream keys on
+            // `updated_input.is_some()`, i.e. the field being present, not on
+            // whether it re-serialized).
+            let updatedInputPresent = hso["updatedInput"] != nil
+                && !(hso["updatedInput"] is NSNull)
             if let upd = hso["updatedInput"] as? [String: Any],
                let bytes = try? JSONSerialization.data(withJSONObject: upd,
                                                        options: [.sortedKeys]) {
@@ -992,39 +1464,49 @@ public actor HookEngine {
             }
             out.additionalContext = (hso["additionalContext"] as? String)
                 ?? (hso["additional_context"] as? String)
-            // P4.5 / F3: warn when permissionDecision:allow lacks updatedInput.
-            // Upstream `unsupported_pre_tool_use_hook_specific_output` flags
-            // this as invalid ("PreToolUse hook returned unsupported
-            // permissionDecision:allow"). String is kept byte-for-byte
-            // identical to upstream `output_parser.rs` so log scrapers and
-            // shared tooling can match either implementation.
-            //
-            // Divergence note (deliberate): upstream marks the hook
-            // `HookRunStatus::Failed` and emits a `HookOutputEntryKind::Error`
-            // alongside this message (see `events/pre_tool_use.rs:214-219`).
-            // We surface the same signal at the outcome level via
-            // `outputSchemaError` (see below) so callers that want the
-            // "this output violated the schema" bit can act on it; the log
-            // itself stays at warn because there is no per-hook run-status
-            // surface in Swift today and downgrading to "this turn failed"
-            // would over-escalate compared to upstream (the hook still
-            // returns — just with its decision ignored).
-            if out.permissionDecision == .allow, out.updatedInputJSON == nil {
-                let msg = "PreToolUse hook returned unsupported permissionDecision:allow"
-                hookLog.warn(msg)
-                schemaError = msg
+            // Faithful port of upstream
+            // `unsupported_pre_tool_use_hook_specific_output`
+            // (output_parser.rs:388-432). The checks are mutually exclusive and
+            // ordered exactly as upstream:
+            //   1. updatedInput present && permissionDecision != allow →
+            //      "PreToolUse hook returned updatedInput without
+            //      permissionDecision:allow" (F4).
+            //   2. permissionDecision == allow && updatedInput absent →
+            //      "PreToolUse hook returned unsupported permissionDecision:allow".
+            //   3. permissionDecision == ask →
+            //      "PreToolUse hook returned unsupported permissionDecision:ask" (F3).
+            //   4. permissionDecision == deny && no non-empty reason →
+            //      "PreToolUse hook returned permissionDecision:deny without a
+            //      non-empty permissionDecisionReason".
+            //   5. permissionDecision == none && permissionDecisionReason
+            //      present → "PreToolUse hook returned permissionDecisionReason
+            //      without permissionDecision" (F5).
+            // Upstream marks the run Failed (HookRunStatus::Failed) and drops
+            // updated_input/block_reason when invalid_reason fires; we mirror
+            // via `outputSchemaError` and clear `updatedInputJSON`.
+            let denyReasonEmpty = (out.permissionDecisionReason ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if updatedInputPresent, out.permissionDecision != .allow {
+                schemaError = "PreToolUse hook returned updatedInput without permissionDecision:allow"
+            } else {
+                switch out.permissionDecision {
+                case .allow where !updatedInputPresent:
+                    schemaError = "PreToolUse hook returned unsupported permissionDecision:allow"
+                case .ask:
+                    schemaError = "PreToolUse hook returned unsupported permissionDecision:ask"
+                case .deny where denyReasonEmpty:
+                    schemaError = "PreToolUse hook returned permissionDecision:deny" +
+                        " without a non-empty permissionDecisionReason"
+                case .none where out.permissionDecisionReason != nil:
+                    schemaError = "PreToolUse hook returned permissionDecisionReason without permissionDecision"
+                default:
+                    break
+                }
             }
-            // P4.5 / F4: warn when permissionDecision:deny lacks a non-empty
-            // permissionDecisionReason. Upstream `invalid_pre_tool_use_reason_message`
-            // flags this as invalid (and likewise marks `HookRunStatus::Failed`
-            // — see divergence note above; we mirror via `outputSchemaError`).
-            if out.permissionDecision == .deny,
-               (out.permissionDecisionReason ?? "")
-                   .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let msg = "PreToolUse hook returned permissionDecision:deny" +
-                    " without a non-empty permissionDecisionReason"
+            if let msg = schemaError {
                 hookLog.warn(msg)
-                schemaError = msg
+                // Upstream drops updated_input on any invalid_reason.
+                out.updatedInputJSON = nil
             }
         case .permissionRequest:
             // Upstream nests behavior under `decision` (not `permissionDecision`).
@@ -1035,6 +1517,26 @@ public actor HookEngine {
                     out.permissionDecision = parsed
                 }
                 out.permissionDenyMessage = decisionObj["message"] as? String
+                // H-hooks F6: faithful port of upstream
+                // `unsupported_permission_request_hook_specific_output`
+                // (output_parser.rs:351-364). The reserved decision fields are
+                // checked in order; the first present one marks the run Failed
+                // and the decision is dropped (parse_permission_request drops
+                // `decision` when invalid_reason is Some).
+                if decisionObj["updatedInput"] != nil
+                    && !(decisionObj["updatedInput"] is NSNull) {
+                    schemaError = "PermissionRequest hook returned unsupported updatedInput"
+                } else if decisionObj["updatedPermissions"] != nil
+                    && !(decisionObj["updatedPermissions"] is NSNull) {
+                    schemaError = "PermissionRequest hook returned unsupported updatedPermissions"
+                } else if (decisionObj["interrupt"] as? Bool) == true {
+                    schemaError = "PermissionRequest hook returned unsupported interrupt:true"
+                }
+                if schemaError != nil {
+                    // Decision dropped on invalid_reason.
+                    out.permissionDecision = nil
+                    out.permissionDenyMessage = nil
+                }
             }
         case .postToolUse, .sessionStart, .userPromptSubmit:
             out.additionalContext = (hso["additionalContext"] as? String)
@@ -1064,8 +1566,27 @@ public actor HookEngine {
         box.process.standardInput = box.stdin
         box.process.standardOutput = box.stdout
         box.process.standardError = box.stderr
+        // Upstream runs every hook with `command.current_dir(cwd)`
+        // (hooks/src/engine/command_runner.rs:34-39) where cwd is the
+        // turn/session working directory (pre_tool_use.rs:107
+        // `request.cwd.as_path()`), so relative paths, `pwd`, and `$(git ...)`
+        // resolve against the session cwd rather than the daemon's. Guard for
+        // an empty/nonexistent path: when unset or missing we leave the
+        // process to inherit the parent cwd (Process rejects a missing dir).
+        if !req.cwd.isEmpty {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: req.cwd, isDirectory: &isDir),
+               isDir.boolValue {
+                box.process.currentDirectoryURL = URL(fileURLWithPath: req.cwd, isDirectory: true)
+            }
+        }
 
-        let timeoutSecs = min(max(def.timeoutSec, 1), 600)
+        // Upstream clamps only the LOWER bound:
+        // `timeout_sec.unwrap_or(600).max(1)` (hooks/src/engine/discovery.rs:457)
+        // then `Duration::from_secs(handler.timeout_sec)`
+        // (command_runner.rs:71) — a configured timeout above 600 is honored
+        // verbatim. Match that: lower-bound 1, no upper cap.
+        let timeoutSecs = max(def.timeoutSec, 1)
         let reaper = self.reaper
         let resumer = Resumer()
 
@@ -1127,12 +1648,15 @@ public actor HookEngine {
         if trimmed.hasPrefix("{"),
            let d = trimmed.data(using: .utf8),
            let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
-            var decision: HookDecision = .allow
-            if let dec = obj["decision"] as? String {
-                let l = dec.lowercased()
-                if l == "block" { decision = .block }
-                else if l == "allow" { decision = .allow }
-            }
+            let reason = obj["reason"] as? String
+            let trimmedReason = (reason ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let hasDecisionBlock: Bool = {
+                if let dec = obj["decision"] as? String {
+                    return dec.lowercased() == "block"
+                }
+                return false
+            }()
             // P4.6 / H-29: Stop-hook semantic. Upstream's `events/stop.rs`
             // treats `continue: false` as "terminate the session" and
             // `decision: "block"` (with a non-empty reason) as "inject the
@@ -1141,39 +1665,207 @@ public actor HookEngine {
             // blockingReason API surface, but the new dedicated fields
             // (`shouldStop`, `shouldBlock`, `continuationPrompt`) carry the
             // full upstream signal for the SessionEngine to act on.
+            var decision: HookDecision = .allow
             var shouldStop = false
             var stopReason: String?
             var shouldBlock = false
             var continuationPrompt: String?
+            // `continue: false` is upstream's *universal* output field, and each
+            // event interprets it differently:
+            //   - Stop / PreCompact / PostCompact / SessionStart: terminator —
+            //     sets `should_stop` (events/stop.rs, compact.rs:352-355,
+            //     session_start.rs:180). `decision = .block` is also set for the
+            //     compact events so the SessionEngine's aggregate()/blockingReason
+            //     abort path keeps working.
+            //   - PreToolUse / PermissionRequest: UNSUPPORTED — upstream's
+            //     `unsupported_*_universal` (output_parser.rs:319-341) marks the
+            //     run Failed and does NOT block or stop.
+            //   - PostToolUse / UserPromptSubmit: ignored entirely (no error, no
+            //     stop, no block) — their parsers don't inspect continue.
+            var blockReasonGate: String?
             if let cont = obj["continue"] as? Bool, cont == false {
-                decision = .block
-                if req.eventName == .stop {
+                switch req.eventName {
+                case .stop, .preCompact, .postCompact, .sessionStart:
+                    shouldStop = true
+                    stopReason = (obj["stopReason"] as? String)
+                        ?? (obj["stop_reason"] as? String)
+                    if req.eventName == .preCompact || req.eventName == .postCompact {
+                        // Compaction abort flows through the legacy
+                        // aggregate()/blockingReason API in firePreCompactHook.
+                        decision = .block
+                    }
+                case .preToolUse, .permissionRequest:
+                    blockReasonGate = blockReasonGate
+                        ?? "\(req.eventName.pascalCase) hook returned unsupported continue:false"
+                case .postToolUse:
+                    // H-hooks F1: PostToolUse `continue:false` terminates the
+                    // run. Upstream (events/post_tool_use.rs Some(0) arm) sets
+                    // status=Stopped, should_stop=true, stop_reason from the
+                    // universal field, and ALWAYS pushes a `Stop` entry whose
+                    // text falls back to "PostToolUse hook stopped execution"
+                    // when stop_reason is absent. continue:false is checked
+                    // BEFORE invalid_reason/invalid_block_reason, so it wins
+                    // over the suppressOutput / reason-without-decision gates.
+                    shouldStop = true
+                    stopReason = (obj["stopReason"] as? String)
+                        ?? (obj["stop_reason"] as? String)
+                        ?? "PostToolUse hook stopped execution"
+                case .userPromptSubmit:
+                    // H-hooks F2: UserPromptSubmit `continue:false` aborts the
+                    // prompt. Upstream (events/user_prompt_submit.rs Some(0)
+                    // arm) sets status=Stopped, should_stop=true, stop_reason
+                    // from the universal field, and pushes a `Stop` entry ONLY
+                    // when stop_reason is present (no fallback text, unlike
+                    // PostToolUse). continue:false is checked before
+                    // invalid_block_reason, so it wins.
                     shouldStop = true
                     stopReason = (obj["stopReason"] as? String)
                         ?? (obj["stop_reason"] as? String)
                 }
             }
-            if let blk = obj["block"] as? Bool, blk == true { decision = .block }
-            let reason = obj["reason"] as? String
-            // Stop-hook decision:block — only honored when reason is non-empty
-            // (upstream `events/stop.rs::parse_completed`, line 173-194).
-            // `shouldStop` (continue:false) wins over `shouldBlock`.
-            if req.eventName == .stop,
-               !shouldStop,
-               let dec = obj["decision"] as? String,
-               dec.lowercased() == "block" {
-                let trimmedReason = (reason ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmedReason.isEmpty {
-                    shouldBlock = true
-                    continuationPrompt = trimmedReason
+            // Universal `stopReason` / `suppressOutput` are unsupported on the
+            // tool-scoped events and mark the run Failed
+            // (output_parser.rs:319-345). Precedence within
+            // `unsupported_*_universal` is continue:false → stopReason →
+            // suppressOutput (the `else if` ladder), so these only set the gate
+            // when continue:false didn't already. PreToolUse / PermissionRequest
+            // flag BOTH stopReason and suppressOutput; PostToolUse flags only
+            // suppressOutput (no stopReason arm). Other events accept these
+            // fields and are unaffected.
+            // Upstream `stop_reason: Option<String>` — JSON `null` is None, so a
+            // literal `null` value is NOT a present stopReason.
+            let universalStopReasonPresent =
+                (obj["stopReason"] is String) || (obj["stop_reason"] is String)
+            let suppressOutputTrue: Bool = {
+                if let b = obj["suppressOutput"] as? Bool { return b }
+                if let b = obj["suppress_output"] as? Bool { return b }
+                return false
+            }()
+            switch req.eventName {
+            case .preToolUse, .permissionRequest:
+                if universalStopReasonPresent {
+                    blockReasonGate = blockReasonGate
+                        ?? "\(req.eventName.pascalCase) hook returned unsupported stopReason"
+                } else if suppressOutputTrue {
+                    blockReasonGate = blockReasonGate
+                        ?? "\(req.eventName.pascalCase) hook returned unsupported suppressOutput"
                 }
+            case .postToolUse:
+                // continue:false (shouldStop) wins over the suppressOutput
+                // gate upstream (Stopped is set before invalid_reason).
+                if suppressOutputTrue, !shouldStop {
+                    blockReasonGate = blockReasonGate
+                        ?? "PostToolUse hook returned unsupported suppressOutput"
+                }
+            case .preCompact, .postCompact, .sessionStart,
+                 .userPromptSubmit, .stop:
+                break
+            }
+            if let blk = obj["block"] as? Bool, blk == true { decision = .block }
+            // `decision: "block"` handling. Upstream requires a non-empty reason
+            // for UserPromptSubmit, PostToolUse, and Stop; an empty/missing
+            // reason marks the run Failed and suppresses the block
+            // (output_parser.rs:197-202, 243-251; events/stop.rs). For other
+            // events (e.g. PreToolUse legacy decision:block), the reason is not
+            // gated here.
+            if hasDecisionBlock {
+                switch req.eventName {
+                case .stop:
+                    // `shouldStop` (continue:false) wins over `shouldBlock`.
+                    if !shouldStop {
+                        if !trimmedReason.isEmpty {
+                            decision = .block
+                            shouldBlock = true
+                            continuationPrompt = trimmedReason
+                        } else {
+                            blockReasonGate = blockReasonGate
+                                ?? "Stop hook returned decision:block without a non-empty reason"
+                        }
+                    }
+                case .userPromptSubmit, .postToolUse, .preToolUse:
+                    // Upstream `unsupported_pre_tool_use_legacy_decision`
+                    // (output_parser.rs:434-457) and the PostToolUse/
+                    // UserPromptSubmit parsers all require a non-empty trimmed
+                    // reason for a legacy `decision:block`; an empty/missing
+                    // reason yields `block_reason = None` and an `invalid_reason`
+                    // ("<Event> hook returned decision:block without a non-empty
+                    // reason"), so the hook is marked Failed and does NOT block.
+                    if !trimmedReason.isEmpty {
+                        decision = .block
+                    } else {
+                        blockReasonGate = blockReasonGate
+                            ?? "\(req.eventName.pascalCase) hook returned decision:block without a non-empty reason"
+                    }
+                default:
+                    decision = .block
+                }
+            }
+            // Upstream `unsupported_pre_tool_use_legacy_decision`
+            // (output_parser.rs:434-457) flags two more PreToolUse legacy-decision
+            // cases as Failed:
+            //   - `decision:"approve"` → "PreToolUse hook returned unsupported
+            //     decision:approve"
+            //   - no `decision` but a top-level `reason` present → "PreToolUse hook
+            //     returned reason without decision"
+            // (`decision:"block"` is handled above.) These checks only run when
+            // NOT using the hook-specific decision path
+            // (`use_hook_specific_decision`, output_parser.rs:112-123): a
+            // `hookSpecificOutput` carrying permissionDecision /
+            // permissionDecisionReason / updatedInput takes the structured path
+            // instead.
+            if req.eventName == .preToolUse {
+                let usesHookSpecificDecision: Bool = {
+                    guard let hsoRaw = obj["hookSpecificOutput"] as? [String: Any] else {
+                        return false
+                    }
+                    return hsoRaw["permissionDecision"] != nil
+                        || hsoRaw["permissionDecisionReason"] != nil
+                        || hsoRaw["updatedInput"] != nil
+                }()
+                if !usesHookSpecificDecision {
+                    let decisionStr = (obj["decision"] as? String)?.lowercased()
+                    // Upstream `decision: Option<...>` treats both an absent key
+                    // and JSON `null` as None.
+                    let decisionIsNone =
+                        obj["decision"] == nil || obj["decision"] is NSNull
+                    if decisionStr == "approve" {
+                        blockReasonGate = blockReasonGate
+                            ?? "PreToolUse hook returned unsupported decision:approve"
+                    } else if decisionIsNone, obj["reason"] != nil {
+                        // `reason` present (any value, including empty) but no
+                        // `decision` → reason-without-decision. Upstream keys on
+                        // `reason.is_some()` regardless of trimmed content.
+                        blockReasonGate = blockReasonGate
+                            ?? "PreToolUse hook returned reason without decision"
+                    }
+                }
+            }
+            // H-hooks F7: PostToolUse reason-without-decision. Upstream
+            // (output_parser.rs:203-204) sets invalid_block_reason =
+            // "PostToolUse hook returned reason without decision" when
+            // `!should_block && universal.continue_processing && reason.is_some()`.
+            // `should_block` is the legacy decision:block (only honored with a
+            // non-empty reason); `continue_processing` means continue:false was
+            // not set (continue:false / shouldStop wins over this gate, checked
+            // first upstream). Keyed on `reason.is_some()` regardless of trimmed
+            // content (the empty-reason+decision:block case is already handled
+            // by the decision:block-without-reason gate above).
+            if req.eventName == .postToolUse, !shouldStop, !hasDecisionBlock,
+               obj["reason"] != nil {
+                blockReasonGate = blockReasonGate
+                    ?? "PostToolUse hook returned reason without decision"
             }
             let sysMsg = (obj["systemMessage"] as? String)
                 ?? (obj["system_message"] as? String)
             // Parse `hookSpecificOutput` (modern protocol). Fall back to flat
             // legacy `additionalContext` if no structured form is present.
-            let (hso, flatAddCtx, schemaError) = Self.parseHookSpecificOutput(obj, event: req.eventName)
+            let (hso, flatAddCtx, hsoSchemaError) = Self.parseHookSpecificOutput(obj, event: req.eventName)
+            // Universal-field / block-reason gate (continue:false on non-Stop,
+            // decision:block-without-reason on UserPromptSubmit/PostToolUse/Stop)
+            // surfaces as a schema error so summarize() reports `failed`. Keep an
+            // already-present hookSpecificOutput schema error (it is more
+            // specific) if both fire.
+            let schemaError = hsoSchemaError ?? blockReasonGate
             // PermissionRequest hook's deny decision implies block at the
             // outcome level so existing aggregate/blockingReason paths keep
             // working without callers having to peek into hookSpecificOutput.
@@ -1196,38 +1888,158 @@ public actor HookEngine {
                                raw: raw)
         }
 
+        // Invalid-JSON-output parity. Upstream every event parser, on exit 0
+        // with `looks_like_json(stdout)` (starts with `{` or `[`) but a parse
+        // failure, marks the run `HookRunStatus::Failed` with a per-event
+        // "hook returned invalid <event> JSON output" Error entry (e.g.
+        // post_tool_use.rs:248-254, session_start.rs:193-199). The JSON-success
+        // path above returns; reaching here with a JSON-looking stdout at exit
+        // 0 means the parse failed (or the stdout is `[`-prefixed, which never
+        // decodes to a hook object) — surface it as a failed run. No block.
+        if result.exitCode == 0,
+           trimmed.hasPrefix("{") || trimmed.hasPrefix("[") {
+            return HookOutcome(decision: .allow, reason: nil,
+                               outputSchemaError: req.eventName.invalidJSONMessage,
+                               raw: raw)
+        }
+
         if result.exitCode == 2 {
-            let txt = result.stderr.isEmpty ? trimmed : result.stderr
-            // Stop-hook exit-2: upstream treats stderr as the continuation
-            // prompt (events/stop.rs:203-222), NOT as a session terminator.
-            if req.eventName == .stop, !txt.isEmpty {
-                return HookOutcome(
-                    decision: .block,
-                    reason: txt,
-                    shouldBlock: true,
-                    continuationPrompt: txt,
+            // Per-event exit-code-2 semantics, ported faithfully from each
+            // `hooks/src/events/*.rs` parser. The stderr message (trimmed and
+            // required non-empty) is the user-facing signal; an empty stderr is
+            // a `HookRunStatus::Failed` with a per-event message surfaced via
+            // `outputSchemaError`. Critically, exit-2 means different things per
+            // event: PreToolUse/PermissionRequest BLOCK, PostToolUse FEEDBACK
+            // (no block — the tool already ran), Stop CONTINUATION, and
+            // UserPromptSubmit STOP. SessionStart and PreCompact/PostCompact
+            // have NO exit-2 arm at all — they fall through to the generic
+            // nonzero-exit Failed path.
+            let stderrTrimmed = result.stderr
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            switch req.eventName {
+            case .preToolUse:
+                // pre_tool_use.rs:248-264 — Blocked with the stderr feedback.
+                if !stderrTrimmed.isEmpty {
+                    return HookOutcome(decision: .block, reason: stderrTrimmed,
+                                       shouldBlock: true, raw: raw)
+                }
+                return HookOutcome(decision: .allow, reason: nil,
+                    outputSchemaError:
+                        "PreToolUse hook exited with code 2 but did not write a blocking reason to stderr",
                     raw: raw)
-            }
-            // P4.6 cosmetic parity (events/stop.rs:213-220): a Stop hook that
-            // exits with code 2 but writes nothing to stderr is treated
-            // upstream as `HookRunStatus::Failed` with NO block signal — the
-            // session is allowed to terminate as planned. The intermediate
-            // outcome therefore carries `decision: .allow` / `shouldBlock:
-            // false` (no continuation injected) and surfaces the divergence
-            // via `outputSchemaError` so callers / tests can still detect the
-            // failed run.
-            if req.eventName == .stop {
-                return HookOutcome(
-                    decision: .allow,
-                    reason: nil,
+            case .permissionRequest:
+                // permission_request.rs:243-258 — Blocked → Deny{message}.
+                // Upstream sets `decision = Deny { message }`; the consumer
+                // (`firePermissionRequestHook`) reads the structured
+                // permissionDecision, so we MUST populate `hookSpecificOutput`
+                // here (not just the legacy `decision:.block`), otherwise the
+                // deny is silently dropped and the tool is permitted
+                // (fail-OPEN security bug). Carry both the structured
+                // permissionDecision=.deny + permissionDenyMessage AND the
+                // legacy decision:.block for belt-and-suspenders parity.
+                if !stderrTrimmed.isEmpty {
+                    return HookOutcome(decision: .block, reason: stderrTrimmed,
+                                       hookSpecificOutput: HookSpecificOutput(
+                                           permissionDecision: .deny,
+                                           permissionDenyMessage: stderrTrimmed),
+                                       raw: raw)
+                }
+                return HookOutcome(decision: .allow, reason: nil,
+                    outputSchemaError:
+                        "PermissionRequest hook exited with code 2 but did not write a denial reason to stderr",
+                    raw: raw)
+            case .postToolUse:
+                // post_tool_use.rs:256-269 — stderr is model FEEDBACK, NOT a
+                // block (the tool has already run) and NOT additional context.
+                // Upstream pushes a `HookOutputEntryKind::Feedback` entry and a
+                // `feedback_messages_for_model` message (which replaces the tool
+                // output text); it does NOT call append_additional_context (which
+                // would be a `Context` entry). H-hooks F8: route via
+                // `feedbackMessage` so summarize() emits a `feedback` entry while
+                // status stays `completed`.
+                if !stderrTrimmed.isEmpty {
+                    return HookOutcome(decision: .allow, reason: nil,
+                                       feedbackMessage: stderrTrimmed,
+                                       raw: raw)
+                }
+                return HookOutcome(decision: .allow, reason: nil,
+                    outputSchemaError:
+                        "PostToolUse hook exited with code 2 but did not write feedback to stderr",
+                    raw: raw)
+            case .stop:
+                // stop.rs:203-228 — stderr becomes the continuation prompt
+                // (re-enter sampling); empty stderr is a Failed run, no block.
+                if !stderrTrimmed.isEmpty {
+                    return HookOutcome(decision: .block, reason: stderrTrimmed,
+                                       shouldBlock: true,
+                                       continuationPrompt: stderrTrimmed,
+                                       raw: raw)
+                }
+                return HookOutcome(decision: .allow, reason: nil,
                     outputSchemaError:
                         "Stop hook exited with code 2 but did not write a continuation prompt to stderr",
                     raw: raw)
+            case .userPromptSubmit:
+                // user_prompt_submit.rs:212-227 — stderr aborts the prompt
+                // (should_stop with the stderr as the stop reason).
+                if !stderrTrimmed.isEmpty {
+                    return HookOutcome(decision: .block, reason: stderrTrimmed,
+                                       shouldStop: true,
+                                       stopReason: stderrTrimmed,
+                                       raw: raw)
+                }
+                return HookOutcome(decision: .allow, reason: nil,
+                    outputSchemaError:
+                        "UserPromptSubmit hook exited with code 2 but did not write a blocking reason to stderr",
+                    raw: raw)
+            case .sessionStart:
+                // session_start.rs:208-214 — NO exit-2 arm: exit 2 is just a
+                // generic nonzero exit → Failed, no block, no context.
+                return HookOutcome(decision: .allow, reason: nil,
+                    outputSchemaError: "hook exited with code 2", raw: raw)
+            case .preCompact, .postCompact:
+                // compact.rs:275-282 — NO exit-2 arm: Failed with stderr (or
+                // the generic message), and compaction is NOT aborted (block is
+                // reserved for the stdout `continue:false` path).
+                return HookOutcome(decision: .allow, reason: nil,
+                    outputSchemaError: stderrTrimmed.isEmpty
+                        ? "hook exited with code 2" : stderrTrimmed,
+                    raw: raw)
             }
-            return HookOutcome(
-                decision: .block,
-                reason: txt.isEmpty ? "blocked by hook (exit 2)" : txt,
-                raw: raw)
+        }
+
+        // Generic nonzero-exit (other than the per-event exit-2 cases above):
+        // every upstream parser maps an unhandled nonzero exit code to a
+        // `HookRunStatus::Failed` with `format!("hook exited with code {N}")`
+        // (or, for PreCompact/PostCompact, the trimmed stderr if present). No
+        // block/stop/context — surface as a failed run via outputSchemaError.
+        if result.exitCode != 0 {
+            let stderrTrimmed = result.stderr
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let failMsg: String
+            if (req.eventName == .preCompact || req.eventName == .postCompact),
+               !stderrTrimmed.isEmpty {
+                failMsg = stderrTrimmed
+            } else {
+                failMsg = "hook exited with code \(result.exitCode)"
+            }
+            return HookOutcome(decision: .allow, reason: nil,
+                               outputSchemaError: failMsg, raw: raw)
+        }
+
+        // Bare-text stdout convenience path. Upstream's UserPromptSubmit and
+        // SessionStart parsers (events/user_prompt_submit.rs:197-210,
+        // events/session_start.rs:199-205): when exit code is 0, stdout is
+        // non-empty, and it does NOT look like JSON (`looks_like_json` =
+        // starts with `{` or `[`), the trimmed stdout is injected into the
+        // model turn as additionalContext. Note `[`-prefixed stdout that
+        // failed to parse is upstream-Failed-invalid-JSON, NOT context — so we
+        // gate on the leading char, mirroring `looks_like_json`.
+        if result.exitCode == 0, !trimmed.isEmpty,
+           !trimmed.hasPrefix("{"), !trimmed.hasPrefix("["),
+           (req.eventName == .userPromptSubmit || req.eventName == .sessionStart) {
+            return HookOutcome(decision: .allow, reason: nil,
+                               additionalContext: trimmed, raw: raw)
         }
 
         return HookOutcome(decision: .allow, reason: nil, raw: raw)

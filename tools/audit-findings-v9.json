@@ -1,0 +1,658 @@
+{
+ "note": "audit-v9 (after F-I); unit re-derived from file paths",
+ "units": {
+  "model-client": [
+   {
+    "title": "account/rateLimits/updated notification never emitted during turns",
+    "severity": "major",
+    "category": "missing-notification",
+    "rustEvidence": "app-server/src/bespoke_event_handling.rs:1571-1579 \u2014 on every TokenCountEvent carrying rate_limits, upstream sends ServerNotification::AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification { rate_limits: rate_limits.into() }). The event fires whenever a streamed model response includes rate-limit headers (protocol/src/protocol.rs:2103 RateLimitWindow).",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift:511,553,688 defines ServerNotification.accountRateLimitsUpdated and its 'account/rateLimits/updated' wire mapping, but grep across all Sources shows it is constructed nowhere. The model client DOES parse the headers (Sources/ModelClient/URLSessionResponsesClient.swift:195-196 and OpenAIResponsesClient.swift:407-412 call tracker.recordRateLimits), but UsageTracker.recordRateLimits (Sources/ModelClient/ModelProvider.swift:537-539) only stores _lastRateLimits and never forwards it; no code path emits the notification.",
+    "description": "Upstream pushes a live account/rateLimits/updated server notification to the client every time a turn's model response carries rate-limit data, so a frontend's usage meter updates mid-conversation. The Swift port parses the same rate-limit headers but discards them into a tracker field that nothing reads, so a connected frontend never receives in-turn rate-limit updates and its usage gauge goes stale until it manually polls account/rateLimits/read.",
+    "fixRecommendation": "In the session/turn event path that surfaces token-usage (Sources/HarnessCore/SessionEngine.swift around the .tokenUsageUpdated emits at lines 1899/2540/3057, and the supervisor's engine-event->wire bridge in Sources/codex-session/main.swift), when a RateLimitSnapshot was observed for the turn, emit ServerNotification.accountRateLimitsUpdated(rateLimits: <snapshot-as-RateLimitSnapshot JSON>) alongside the token-usage notification, mirroring bespoke_event_handling.rs:1571-1579. Build the JSON via the same shape as RequestRouter.rateLimitSnapshot."
+   },
+   {
+    "title": "store defaults to true; upstream defaults false for non-Azure providers",
+    "severity": "major",
+    "category": "wrong-default",
+    "rustEvidence": "core/src/client.rs:754 `store: provider.is_azure_responses_endpoint(),` \u2014 for the standard OpenAI provider this is `false`. client_common.rs:54-60 Prompt default and ResponsesApiRequest carry no store coupling beyond Azure. The serializer always emits `store` (non-skippable bool, common.rs:179).",
+    "swiftStatus": "Sources/ModelClient/ModelClient.swift:188 `store: Bool = true` default in ModelSettings.init. Sources/ModelClient/OpenAIResponsesClient.swift:197 `let effectiveStore = settings.previousResponseId != nil ? true : settings.store`. The primary turn-loop settings (Sources/HarnessCore/SessionEngine.swift:1652, 1802) never pass `store`, so every standard streaming request sends `store: true`, whereas upstream sends `store: false`.",
+    "description": "Upstream sends `store: false` on every non-Azure Responses request (it relies on prompt_cache_key + full transcript replay, never chaining via previous_response_id over REST). The Swift default of `store: true` means the standard OpenAI HTTP turn sends `store: true` on the wire for every turn, diverging from upstream and instructing the server to persist responses the upstream client explicitly does not persist.",
+    "fixRecommendation": "Change ModelSettings.init default to `store: false` (matching upstream non-Azure default) and have the provider/Azure path set it to true when `provider.is_azure_responses_endpoint()`. Keep the existing previousResponseId\u2192true coupling. This restores `store: false` for standard OpenAI turns while preserving the sticky-routing exception."
+   },
+   {
+    "title": "Structured-output text.format (output_schema / json_schema) path is absent",
+    "severity": "major",
+    "category": "missing-type",
+    "rustEvidence": "client_common.rs:44-48 Prompt has `output_schema: Option<Value>` and `output_schema_strict: bool`. core/src/client.rs:738-742 calls `create_text_param_for_request(verbosity, &prompt.output_schema, prompt.output_schema_strict)`. codex-api/src/common.rs:279-297 builds `TextControls{ format: TextFormat{ type: JsonSchema, strict, schema, name: \"codex_output_schema\" } }`, serialized under `text.format` (verified by client_common_tests.rs:44-117).",
+    "swiftStatus": "Sources/ModelClient/ModelClient.swift:86-95 Swift `Prompt` has only instructions/input/tools \u2014 no output_schema or output_schema_strict. OpenAIResponsesClient.swift:284-286 only ever emits `body[\"text\"] = [\"verbosity\": ...]`; ReasoningResolution.resolveVerbosity has no schema branch. No reference to `codex_output_schema` or `json_schema` text.format anywhere in Sources/.",
+    "description": "When a caller requests structured JSON output, upstream emits `text.format = {type:\"json_schema\", name:\"codex_output_schema\", strict:<bool>, schema:<obj>}`. The Swift port has no way to carry an output schema into the request and never emits text.format, so structured-output requests cannot be expressed. If only verbosity is set the wire shape matches; the schema sub-feature is entirely missing.",
+    "fixRecommendation": "Add `outputSchema: JSONValue?` and `outputSchemaStrict: Bool` to Swift `Prompt` (Sources/ModelClient/ModelClient.swift), then in buildRequestBody emit `text.format = [\"type\":\"json_schema\", \"name\":\"codex_output_schema\", \"strict\": strict, \"schema\": schema]` merged with the optional verbosity key, mirroring create_text_param_for_request (common.rs:279-297)."
+   },
+   {
+    "title": "Reasoning delta events emitted even when summary_index/content_index missing",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-api/src/sse/responses.rs:291-306 \u2014 `response.reasoning_summary_text.delta` only yields when BOTH `delta` and `summary_index` are Some; `response.reasoning_text.delta` only yields when both `delta` and `content_index` are Some. A frame missing the index produces no event.",
+    "swiftStatus": "Sources/ModelClient/URLSessionResponsesClient.swift:332-338 and OpenAIResponsesClient.swift:581-596 use `Self.intOf(obj[\"summary_index\"])` / `intOf(obj[\"content_index\"])` which default to 0 when the field is absent, so a delta with no index is still emitted (with index 0).",
+    "description": "Upstream drops a reasoning delta frame that lacks its index; the Swift port substitutes index 0 and emits the event. In normal streams the index is always present so the observable difference is limited to malformed/edge frames, but the gating semantics differ.",
+    "fixRecommendation": "Guard the reasoning delta cases on presence of the index (e.g. `guard let si = obj[\"summary_index\"] as? Int ...`) and skip emission when absent, matching responses.rs:291-306. Low priority since real frames always carry the index."
+   },
+   {
+    "title": "response.completed with unparseable payload is silently defaulted instead of erroring",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-api/src/sse/responses.rs:358-374 \u2014 `response.completed` deserializes into `ResponseCompleted{ id: String (required), ... }`; on failure it returns `Err(ApiError::Stream(\"failed to parse ResponseCompleted: ...\"))`. A missing `id` is therefore a stream error.",
+    "swiftStatus": "Sources/ModelClient/URLSessionResponsesClient.swift:413-433 and OpenAIResponsesClient.swift:698-736 read `resp?[\"id\"] as? String ?? \"resp\"` and always yield `.completed`, never failing on a malformed completed frame.",
+    "description": "Upstream treats a structurally invalid response.completed (e.g. missing id) as a fatal stream error; the Swift port substitutes the literal \"resp\" and completes successfully. This only matters for malformed server frames but is a behavioral divergence in the terminal-event path.",
+    "fixRecommendation": "If `response.completed` lacks a string `id`, finish the stream with a ModelError(\"failed to parse ResponseCompleted\", retryable: true) instead of defaulting to \"resp\", matching responses.rs:368-372."
+   },
+   {
+    "title": "Default rate-limit snapshot reads plan_type from headers; upstream only sets it from the SSE event",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-api/src/rate_limits.rs:89-97 `parse_rate_limit_for_limit` always sets `plan_type: None` (header-derived snapshots never carry plan_type). plan_type is only populated by `parse_rate_limit_event` (rate_limits.rs:158) from the `codex.rate_limits` SSE payload.",
+    "swiftStatus": "Sources/ModelClient/ModelProvider.swift:480-492 `parseRateLimits` reads `map[\"x-codex-plan-type\"]` and sets `planType` on the header-derived snapshot, and also uses it as a non-nil presence gate (line 484).",
+    "description": "The Swift header-based rate-limit parser populates plan_type from an `x-codex-plan-type` header, whereas upstream's header parser always leaves plan_type None and only derives it from the rate-limit SSE event. This can surface a plan_type on a header snapshot upstream would not, and lets a lone plan_type header keep a snapshot that upstream would gate out.",
+    "fixRecommendation": "In ModelProvider.swift parseRateLimits, drop the `x-codex-plan-type` header read (set planType nil for header snapshots) and remove planType from the has_data presence gate, matching rate_limits.rs:95. Keep plan_type only on the SSE-event parse path if/when implemented."
+   }
+  ],
+  "app-server-registry": [
+   {
+    "title": "Rate-limit window duration uses floor division instead of ceiling",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "backend-client/src/client.rs:592-598 window_minutes_from_seconds: `Some((seconds_i64 + 59) / 60)` \u2014 ceiling division of limit_window_seconds to minutes (e.g. 90s -> 2 min).",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1264-1267 \u2014 `let seconds = object[\"limit_window_seconds\"]?.intValue` then `\"windowDurationMins\": seconds.map { .int($0 / 60) }` uses truncating/floor division (90s -> 1 min).",
+    "description": "For window durations that are not exact multiples of 60 seconds, the Swift port reports one fewer minute than upstream (floor vs ceiling). 300s/3600s/900s (the common windows) are unaffected, but any non-multiple-of-60 window yields a different windowDurationMins on the account/rateLimits/read response wire.",
+    "fixRecommendation": "In Sources/Supervisor/RequestRouter.swift:1267 change `.int($0 / 60)` to ceiling division: `.int(($0 + 59) / 60)` to match backend-client/src/client.rs:598."
+   },
+   {
+    "title": "initialize does not validate clientInfo.name as a valid HTTP header value",
+    "severity": "minor",
+    "category": "missing-error-code",
+    "rustEvidence": "app-server/src/request_processors/initialize_processor.rs:88-92 \u2014 `if HeaderValue::from_str(&name).is_err() { return Err(invalid_request(format!(\"Invalid clientInfo.name: '{name}'. Must be a valid HTTP header value.\"))); }` runs during initialize before committing session state.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1404-1428 \u2014 the `initialize` branch parses InitializeParams and immediately builds the InitializeResult with no validation of `clientInfo.name`; any string (including one with control chars/newlines invalid as an HTTP header) is accepted and the connection becomes initialized.",
+    "description": "Upstream rejects an initialize whose clientInfo.name is not a valid HTTP header value with invalid_request (-32600) carrying \"Invalid clientInfo.name: '<name>'. Must be a valid HTTP header value.\". The Swift port performs no such validation, so a malformed name that upstream rejects is accepted. Edge-case: conformant frontends always send valid names, so observable impact is limited to adversarial/malformed handshakes.",
+    "fixRecommendation": "In RequestRouter.handleRequest's initialize branch (RequestRouter.swift ~1416, after extracting clientInfo), reject names that are not valid HTTP header values (no control chars, ASCII-printable) with WireError.invalidRequest(id:, \"Invalid clientInfo.name: '<name>'. Must be a valid HTTP header value.\") and return without setting `initialized = true`."
+   },
+   {
+    "title": "Generic 'invalid threadId' pre-check ordering and message diverge from upstream per-processor validation",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "Upstream validates thread-id INSIDE each processor (after the experimental gate at message_processor.rs:792-796), e.g. turn_processor.rs:192, thread_goal_processor.rs:479, thread_processor.rs:669/728/1303 all emit `invalid_request(format!(\"invalid thread id: {err}\"))`. There is no generic dispatch-level threadId well-formedness check (grep of app-server/src found none).",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:1455-1459 \u2014 a generic precheck `if let tidVal = raw.params?[\"threadId\"], ... !ThreadId(s).isWellFormed { send WireError.invalidRequest(id:, \"invalid threadId\") }` runs for ALL methods, and it executes BEFORE the experimental gate at lines 1461-1465.",
+    "description": "Two sub-divergences on the malformed-threadId path: (1) message text \u2014 Swift emits \"invalid threadId\" (no space, camelCase) where upstream emits \"invalid thread id: <serde err>\"; (2) ordering \u2014 for an experimental thread method (e.g. thread/goal/get, thread/turns/list) called by a non-experimental connection WITH a malformed threadId, Swift returns the threadId error while upstream returns the experimental-capability error (\"<reason> requires experimentalApi capability\"), because upstream gates experimental before any thread-id parsing. Both responses are code -32600, so this only changes the error message on a low-traffic error path.",
+    "fixRecommendation": "Move the generic threadId precheck (RequestRouter.swift:1455-1459) to AFTER the experimental gate (1461-1465) to match upstream ordering, and align the message to \"invalid thread id\" form (or remove the generic precheck and rely on per-handler validation, which the typed handlers already perform). If matching upstream's message verbatim, use \"invalid thread id: <error>\"."
+   },
+   {
+    "title": "Override detection reports an override when a higher-precedence layer holds the SAME value the user just wrote",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server/src/config_manager_service.rs:594-623 compute_override_metadata(): returns None early when `user_value.is_some() && user_value == effective_value` (line 605-607). So if the highest-precedence layer carries the identical value, status stays Ok (no overriddenMetadata).",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:6103-6121 firstOverriddenEdit() only skips when the effective layer IS the user layer (`if case .user = meta.name { continue }`); it does not compare values. If a system/mdm/project layer carries the same value the user wrote, Swift returns okOverridden + overriddenMetadata where upstream returns plain ok.",
+    "description": "Upstream suppresses the override report when the effective value equals the user-written value, even if it is technically sourced from a higher layer. The Swift port keys solely on layer identity, so a no-op-equivalent write can be reported as overridden (status okOverridden) when upstream would report ok. Edge case; only triggers when a higher layer duplicates the exact written value.",
+    "fixRecommendation": "In firstOverriddenEdit(), before reporting, compare the user-layer value at keyPath against the effective value; if equal, skip (return ok) to match upstream compute_override_metadata line 605-607."
+   }
+  ],
+  "app-server-events": [
+   {
+    "title": "Browser-login cancellation completion error text omits upstream prefix",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "login/src/server.rs:195-196 a browser login shutdown yields Err(io::Error::other(\"Login was not completed\")); the browser background task in account_processor.rs:397-398 wraps any login-server error as `Some(format!(\"Login server error: {err}\"))`, so the AccountLoginCompleted notification for a cancelled BROWSER login carries error = \"Login server error: Login was not completed\". (Device-code cancel emits the bare \"Login was not completed\" at account_processor.rs:466-468.)",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:2290-2292 \u2014 the account/login/cancel handler emits AccountLoginCompleted with error: \"Login was not completed\" for BOTH device-code and browser logins, without the \"Login server error: \" prefix for the browser case.",
+    "description": "On explicit cancellation of an in-progress browser ChatGPT login, the completion notification's error string differs from upstream (\"Login was not completed\" vs \"Login server error: Login was not completed\"). Device-code cancellation matches. Low-traffic, cosmetic, but a frontend matching on the exact error text would see a mismatch.",
+    "fixRecommendation": "Track whether the cancelled login was browser vs device-code (pendingBrowserLogins vs pendingDeviceLogins) and, for the browser case, emit error: \"Login server error: Login was not completed\" to match account_processor.rs:398; keep the bare string for device-code."
+   },
+   {
+    "title": "Realtime backend default system prompt (backend_prompt.md) is never applied",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "core/src/realtime_prompt.rs:1-24 \u2014 BACKEND_PROMPT = include_str!(\"../templates/realtime/backend_prompt.md\"); prepare_realtime_backend_prompt(prompt, config_prompt): when both request prompt and config_prompt are absent, returns BACKEND_PROMPT.trim_end().replace(\"{{ user_first_name }}\", current_user_first_name()). backend_prompt.md is a 66-line '## Identity, tone, and role / You are Codex, an OpenAI general-purpose agentic assistant...' system prompt.",
+    "swiftStatus": "ABSENT. Sources/Supervisor/RequestRouter.swift:2563 parseRealtimeStart sets prompt = params[\"prompt\"] (nil when absent); handleRealtimeRequest (line 2469) emits a system itemAdded only `if let prompt = state.prompt, !prompt.isEmpty`. No default backend prompt and no `{{ user_first_name }}` substitution exists anywhere in Sources/ (grep for 'general-purpose agentic assistant' / 'user_first_name' returns nothing).",
+    "description": "Upstream, when a realtime session starts with no explicit prompt and no config prompt, the model receives the full backend_prompt.md as its system prompt (with the user's first name substituted). The Swift realtime/start handler injects no system prompt at all in that case. The realtime path in Swift is largely a protocol stub (mockWebRTCAnswer, canned notifications), so impact is limited, which is why this is minor.",
+    "fixRecommendation": "Port templates/realtime/backend_prompt.md into Sources/Prompts (e.g. a Templates.realtimeBackendPrompt constant or a Resources file) and add a prepareRealtimeBackendPrompt(prompt:configPrompt:) helper that replicates realtime_prompt.rs precedence (config_prompt non-empty > Some(prompt) > Some(None)->'' > default backend prompt with `{{ user_first_name }}` replaced). Apply it in parseRealtimeStart when prompt is nil."
+   },
+   {
+    "title": "Steer validation errors emit codexErrorInfo \"other\" instead of \"badRequest\"",
+    "severity": "major",
+    "category": "missing-error-code",
+    "rustEvidence": "core/src/session/mod.rs:234-262 SteerInputError::to_error_event(): NoActiveTurn, ExpectedTurnMismatch, and EmptyInput all set `codex_error_info: Some(CodexErrorInfo::BadRequest)`. protocol/v2/shared.rs:69,89 + From<CoreCodexErrorInfo> maps BadRequest -> wire string \"badRequest\". turn/steer always passes a required expected_turn_id (v2/turn.rs:149), so ExpectedTurnMismatch/NoActiveTurn are reachable.",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:553-568 emits these three steer errors with `codexErrorInfo: \"Steer\"`. ProtocolModel/Events.swift:46-64 CodexErrorInfo.from(reason:) has no \"Steer\" case, so it collapses to `.other` -> wire \"other\". Only the ActiveTurnNotSteerable case (line 579-580) sets a correct wireInfo.",
+    "description": "Upstream surfaces empty-input / no-active-turn / expected-turn-mismatch steer failures as codexErrorInfo \"badRequest\"; the Swift port emits \"other\". A frontend that branches on codexErrorInfo (e.g. to distinguish a recoverable client mistake from an opaque internal failure) will misclassify all three steer-precondition errors.",
+    "fixRecommendation": "In SessionEngine.swift:556,562,568 pass `wireInfo: .badRequest` (or change the internal reason tag to one that CodexErrorInfo.from maps to .badRequest) for the EmptyInput, NoActiveTurn, and ExpectedTurnMismatch steer errors so the wire codexErrorInfo is \"badRequest\"."
+   },
+   {
+    "title": "Multi-agent spawn does not surface as the upstream collabAgentToolCall wire item",
+    "severity": "major",
+    "category": "missing-type",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/item.rs:311-331 defines ThreadItem::CollabAgentToolCall { id, tool, status, senderThreadId, receiverThreadIds, prompt, model, reasoningEffort, agentsStates }. core/src/agent/control.rs:168-196 spawn_agent emits collab spawn lifecycle that maps to this item; CollabAgentSpawnBeginEvent exists (protocol.rs:3714).",
+    "swiftStatus": "Sources/HarnessCore/MultiAgent.swift implements a bespoke AgentRegistry/AgentOrchestrator with its own AgentStatus(pending/running/completed/failed/closed) and AgentSpawnTool/AgentWaitTool/etc.; it never produces a `collabAgentToolCall` ThreadItem. ProtocolModel/Items.swift:90 only references collabAgentToolCall as an example of the verbatim `.unknown` fallback, which the engine never emits.",
+    "description": "Upstream's multi-agent spawn is observable to the frontend as a structured CollabAgentToolCall item (sender/receiver thread ids, agent states, prompt, model). The Swift port's agent tooling uses a parallel internal model and emits no such wire item, so a frontend cannot render multi-agent spawn/wait/message state the upstream way. This is a feature-gated (MultiAgentV2) experimental subsystem.",
+    "fixRecommendation": "Model ThreadItem.collabAgentToolCall in ProtocolModel/Items.swift with the upstream fields and have the agent-control tools in MultiAgent.swift emit item/started + item/completed notifications carrying it (status transitions, agentsStates) instead of (or in addition to) the internal AgentRegistry-only representation."
+   },
+   {
+    "title": "CommandExecution item omits null-able fields (aggregatedOutput/exitCode/durationMs/processId) instead of emitting explicit null",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/item.rs:248-270 \u2014 CommandExecution declares `process_id: Option<String>`, `aggregated_output: Option<String>`, `exit_code: Option<i32>`, `duration_ms: Option<i64>` with NO `#[serde(skip_serializing_if)]`. item_builders.rs:88-105 build_command_execution_begin_item sets process_id/aggregated_output/exit_code/duration_ms all to None, so item/started serializes `\"aggregatedOutput\":null,\"exitCode\":null,\"durationMs\":null,\"processId\":null`.",
+    "swiftStatus": "Sources/ProtocolModel/Items.swift:256-268 \u2014 encoder uses `try c.encodeIfPresent(pid, .processId)`, `encodeIfPresent(out, .aggregatedOutput)`, `encodeIfPresent(ec, .exitCode)`, `encodeIfPresent(durationMs, .durationMs)`, which OMIT the keys when nil rather than emitting JSON null. (`source` and `commandActions` are correctly encoded unconditionally.)",
+    "description": "Upstream always emits these four keys as null when absent; the Swift port drops them entirely. A frontend generated from upstream's TS types that types these as required `T | null` keys will see `undefined` on the first item/started for every command/tool item (where all four are nil) and on item/completed when output is empty / process_id absent.",
+    "fixRecommendation": "In Sources/ProtocolModel/Items.swift commandExecution encode branch, change the four `encodeIfPresent` calls for `processId`, `aggregatedOutput`, `exitCode`, `durationMs` to unconditional `encode(...)` (which emits explicit null for nil optionals), matching the existing treatment of `source`/`commandActions` and the TurnObject/TokenUsageBody null-emit pattern already used elsewhere."
+   },
+   {
+    "title": "apply_patch produces a generic commandExecution item; upstream FileChange item type and item/fileChange/patchUpdated are never emitted",
+    "severity": "major",
+    "category": "missing-notification",
+    "rustEvidence": "event_mapping.rs:403-410 maps EventMsg::PatchApplyUpdated \u2192 ServerNotification::FileChangePatchUpdated (item/fileChange/patchUpdated) with `changes: Vec<FileUpdateChange>`; CoreTurnItem::FileChange \u2192 ThreadItem::FileChange (v2/item.rs:273-277, 828-836) so apply_patch surfaces as item/started + item/completed with `type:\"fileChange\"`, `changes`, `status: PatchApplyStatus`.",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:2381-2386 emits the in-progress item as `.commandExecution(command:[name]\u2026)` for ALL tool calls including apply_patch, and 2603-2616 emits item/completed as `.commandExecution`. `fileChangePatchUpdated` (Events.swift:403, 531, 610) has no emit() call site anywhere in Sources/; ThreadItem.fileChange (Items.swift:58) is modeled but never produced by the engine.",
+    "description": "For file-editing turns, upstream sends item/started + item/completed with the fileChange item shape (path/kind/diff per file, PatchApplyStatus) plus incremental item/fileChange/patchUpdated notifications; the Swift port instead emits commandExecution items named e.g. `[\"apply_patch\"]` and never the fileChange item nor the patchUpdated stream. A frontend rendering a file-diff view keyed on item type `fileChange` / patchUpdated sees nothing. (turn/diff/updated IS emitted, partially mitigating, but the per-item fileChange surface is absent.)",
+    "fixRecommendation": "In SessionEngine.swift, detect the apply_patch tool path and build a `.fileChange(id:changes:status:)` ThreadItem (from the committed ApplyPatchDeltaBus payload already captured at 2411-2414) for item/started + item/completed, and emit `.fileChangePatchUpdated(threadId:turnId:itemId:changes:)` from the ApplyPatchDeltaBus subscription as the patch streams (parity with EventMsg::PatchApplyUpdated)."
+   },
+   {
+    "title": "item/autoApprovalReview/started and item/autoApprovalReview/completed are modeled but never emitted",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "common.rs:1471-1472 registers item/autoApprovalReview/{started,completed}; bespoke_event_handling.rs guardian_auto_approval_review_notification (tests at 2305-2448) emits ItemGuardianApprovalReviewStarted/Completed from GuardianAssessmentEvent with review status/risk/userAuthorization/rationale + action. v2/item.rs:1073,1102 mark the payload [UNSTABLE].",
+    "swiftStatus": "Events.swift:420-435,533-534,617-632 fully model both cases and payloads, but SessionEngine.swift:1267-1292 guardianReview() runs an LLM review of a server request and returns an ApprovalDecision WITHOUT emitting either notification; no emit(.autoApprovalReview\u2026) call exists in Sources/.",
+    "description": "The guardian auto-review lifecycle notifications are never sent. Upstream marks this payload [UNSTABLE] (\"expected to change soon\") and a stock frontend does not depend on it, so impact is limited; flagged for completeness since the audit explicitly lists item/autoApprovalReview/*.",
+    "fixRecommendation": "If/when the guardian-review surface is targeted, emit `.autoApprovalReviewStarted` before guardianReview() begins and `.autoApprovalReviewCompleted` (with the mapped GuardianApprovalReviewStatus + AutoReviewDecisionSource.agent) after it resolves, mirroring guardian_auto_approval_review_notification. Otherwise document as an intentional gap."
+   },
+   {
+    "title": "model/rerouted reason modeled as free String instead of ModelRerouteReason enum",
+    "severity": "minor",
+    "category": "other",
+    "rustEvidence": "v2/model.rs:136-142 ModelReroutedNotification.reason is `ModelRerouteReason`, a camelCase enum with the single variant `highRiskCyberActivity` (model.rs:13-17).",
+    "swiftStatus": "Events.swift:884-887 `struct Rerouted { \u2026 var reason: String }` and the `.modelRerouted(\u2026reason: String)` case (Events.swift:490). No emission site exists for `.modelRerouted` in Sources/.",
+    "description": "If model/rerouted were emitted, `reason` would serialize as an arbitrary string rather than the constrained enum value `highRiskCyberActivity`. Because there is no emitter today the wire is never produced, so this is latent/cosmetic.",
+    "fixRecommendation": "Model `reason` as an enum (single case `highRiskCyberActivity`) for type fidelity, or leave as-is and ensure any future emitter passes the literal `\"highRiskCyberActivity\"`."
+   }
+  ],
+  "auth": [
+   {
+    "title": "codex_streamlined_login param accepted but ignored",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/account.rs:55-60 LoginAccountParams::Chatgpt { codex_streamlined_login: bool }; account_processor.rs:320-329 threads it into LoginServerOptions; login/src/server.rs:887-889 appends `codex_streamlined_login=true` to the post-callback success-redirect URL (compose_success_url) and server.rs:407-410 selects a streamlined success page body.",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:2132 \u2014 the 'chatgpt' login branch never reads params[\"codexStreamlinedLogin\"]; the ChatGPTLoginCallbackServer is constructed without it, so the flag has no effect on the browser success page.",
+    "description": "The codex_streamlined_login flag (default false) only changes the browser success-redirect page shown after the OAuth callback, not the JSON-RPC auth_url or any wire response. The Swift port silently ignores it, so a client requesting the streamlined success experience gets the standard success page. No JSON-RPC field is wrong; impact is confined to the in-browser post-login page.",
+    "fixRecommendation": "Read params[\"codexStreamlinedLogin\"]?.boolValue (default false) and thread it into ChatGPTLoginCallbackServer's success-page composition so the success redirect appends codex_streamlined_login=true, matching login/src/server.rs:887-889. Low priority if the port's callback server does not implement the platform success-redirect."
+   }
+  ],
+  "mcp": [
+   {
+    "title": "Streamable-HTTP client never opens the standalone GET SSE listening stream (server\u2192client messages lost)",
+    "severity": "major",
+    "category": "missing-notification",
+    "rustEvidence": "rmcp-0.15.0/src/transport/streamable_http_client.rs:371-405 \u2014 after the initialize handshake, when a session_id exists the worker unconditionally spawns `client.get_stream(uri, session_id, None, auth_header)` (the standalone HTTP GET to the MCP endpoint, Accept: text/event-stream) and feeds its frames into `context.send_to_handler(...)`. This is the channel by which the server delivers notifications and server-initiated requests (e.g. elicitation/create, progress, list_changed) that are NOT tied to a specific client POST. codex-rs uses this transport via rmcp_client.rs:810-818 (StreamableHttpClientTransport::with_client).",
+    "swiftStatus": "Sources/MCP/McpHttpClient.swift:277-363 (processStreamingResponse) \u2014 frames are only consumed from the SSE body of a POST the client itself initiated. There is no GET request opened after initialize. McpHttpClient.swift:98-99 `start()`/`stop()` are no-ops and nothing maintains a persistent server\u2192client channel. notificationSink and elicitationHandler only fire for frames inlined in a POST response.",
+    "description": "Upstream's HTTP transport keeps a long-lived GET SSE stream open for the whole session so the server can push notifications and issue elicitation/create out-of-band. The Swift port can only observe frames that the server happens to interleave into the SSE body of an in-flight POST. A server that pushes notifications/progress/list_changed or an elicitation on the standalone stream (the spec-compliant location) will be silently ignored by the Swift HTTP client.",
+    "fixRecommendation": "In McpHttpClient, after a successful initialize that yields a sessionId, spawn a background task that issues `curl -sS -N -X GET <url> -H 'Accept: text/event-stream' -H 'Mcp-Session-Id: <sid>' [auth]` and feeds parsed SSE frames through the same dispatch path as processStreamingResponse (notificationSink + elicitation reply). Tear it down in stop(). Tolerate HTTP 405 (server does not support GET stream) by simply not retrying, matching rmcp's ServerDoesNotSupportSse branch (streamable_http_client.rs:406-409)."
+   },
+   {
+    "title": "Streamable-HTTP client never sends DELETE to terminate the session on shutdown",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "rmcp-0.15.0/src/transport/streamable_http_client.rs:524-537 \u2014 on close the worker calls `client.delete_session(url, session_id, auth_header)` (HTTP DELETE with Mcp-Session-Id) within a 5s timeout to release the server-side session; ServerDoesNotSupportDeleteSession is tolerated. The session id captured on initialize is the one deleted.",
+    "swiftStatus": "Sources/MCP/McpHttpClient.swift:99 `public func stop() async {}` is an explicit no-op; sessionId (captured at McpHttpClient.swift:290) is never used to issue a DELETE.",
+    "description": "When a session ends, upstream explicitly tells the MCP server to drop the session via DELETE; the Swift port leaks it, leaving the server to expire it on its own timeout. Low traffic and not a request/response correctness break, but it is an observable protocol-message the server expects.",
+    "fixRecommendation": "In McpHttpClient.stop(), if `sessionId` is set, fire `curl -sS -X DELETE <url> -H 'Mcp-Session-Id: <sid>' [auth]` (best-effort, short timeout) and ignore non-2xx/405 responses."
+   },
+   {
+    "title": "openai/fileParams input-schema masking (tool_with_model_visible_input_schema) is not reproduced",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "codex-rs/codex-mcp/src/tools.rs:117-130 (tool_with_model_visible_input_schema) + 251-295 (mask_input_schema_for_file_path_params / mask_input_property_schema): for every param named in tool meta `openai/fileParams` (META_OPENAI_FILE_PARAMS = \"openai/fileParams\", tools.rs:249), the property schema is rewritten to type string (or array of string) with the verbatim guidance text \"This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here.\" before the schema is shown to the model. connection_manager.rs:421-426 applies this at manager return boundaries.",
+    "swiftStatus": "ABSENT. Sources/MCP/McpToolNormalization.swift normalizes names only; no equivalent of mask_input_schema_for_file_path_params exists anywhere under Sources/ (grep for openai/fileParams, fileParams, 'absolute local file path', mask_input found no matches). McpManager.startAll (McpManager.swift:391-399) forwards the raw inputSchemaJSON unchanged.",
+    "description": "MCP tools that declare file-path upload params via `_meta[\"openai/fileParams\"]` get the raw (often binary/base64) schema exposed to the model in the Swift port instead of the masked absolute-path string/array schema + guidance text upstream presents. Affects codex-apps / OpenAI file-upload connectors; low traffic for a generic stdio/HTTP server.",
+    "fixRecommendation": "Carry tool `_meta` through listTools (it is currently dropped \u2014 see related finding), then in McpManager (or McpToolNormalization) port mask_input_schema_for_file_path_params: read meta[\"openai/fileParams\"], and for each named property rewrite to {type:string|array(items:string), description: existing + guidance} using the exact upstream guidance string, before registering the McpToolProxy schema."
+   },
+   {
+    "title": "Tool _meta (connector_id / connector_name / connector_description) is dropped during listTools",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "rmcp-client/src/rmcp_client.rs:452-495 (list_tools_with_connector_ids + meta_string): each Tool's `_meta` is mined for connector_id (key \"connector_id\"), connector_name (\"connector_name\" or \"connector_display_name\"), connector_description (\"connector_description\" or \"connectorDescription\"); codex-mcp/src/tools.rs:28-54 keeps connector_id/connector_name/namespace_description on ToolInfo; these feed codex-apps exposure (mcp_tool_exposure.rs:69-92) and the model-visible namespace description.",
+    "swiftStatus": "Sources/MCP/McpClient.swift:875-886 and Sources/MCP/McpHttpClient.swift:696-710 \u2014 listTools builds McpToolSpec from name/description/inputSchema only; the tool object's `_meta` is never read. McpToolSpec (McpClient.swift:340-344) has no meta/connector fields.",
+    "description": "The Swift port discards every tool's `_meta`, so connector identity (used upstream for codex-apps connector gating and namespace descriptions) and the openai/fileParams masking input are unavailable. For a generic MCP server with no codex-apps connectors this is inert, but it makes the file-param masking finding above unfixable until meta is preserved.",
+    "fixRecommendation": "Add an optional `meta: JSONLite?` (or connector_id/name/description) to McpToolSpec and populate it from the tool object's `_meta` in both listTools implementations, mirroring meta_string's key precedence (connector_name||connector_display_name, connector_description||connectorDescription)."
+   },
+   {
+    "title": "Elicitation form-vs-url classification keys off presence of `url` rather than the `mode` tag",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "rmcp-0.15.0/src/model.rs:2004-2031 \u2014 CreateElicitationRequestParams is `#[serde(tag = \"mode\")]` with variants \"form\"/\"url\"; when `mode` is absent it defaults to FormElicitationParam (CreateElicitationRequestParamDeserializeHelper). can_auto_accept_elicitation (codex-mcp/src/elicitation.rs:246-256) matches on the decoded variant: Form with empty requested_schema.properties \u2192 auto-accept; Url \u2192 never.",
+    "swiftStatus": "Sources/MCP/McpElicitationPolicy.swift:73-90 (canAutoAccept) classifies as URL purely by a non-empty top-level `url` field, and treats everything else as Form keyed off `requestedSchema.properties`.",
+    "description": "Upstream decides form-vs-url by the `mode` discriminator (with form as the missing-mode default). The Swift heuristic uses the `url` field instead. For spec-conformant payloads these agree (url variant carries `url`, form variant does not), but a malformed/edge payload that sets `mode:\"url\"` without a `url` field, or carries a stray `url` on a form, would be classified differently. Narrow edge case.",
+    "fixRecommendation": "In canAutoAccept, first inspect params[\"mode\"]: \"url\" \u2192 return false; \"form\" or absent \u2192 evaluate requestedSchema.properties emptiness. Keep the url-field check only as a fallback for missing `mode`."
+   },
+   {
+    "title": "Several server notifications have no typed emitter (only the .raw escape hatch)",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "common.rs:1495 `McpServerStatusUpdated => \"mcpServer/startupStatus/updated\"`, :1508 `ModelVerification => \"model/verification\"`, :1510 `GuardianWarning => \"guardianWarning\"`, :1512 `ConfigWarning => \"configWarning\"`, :1490 `FileChangeOutputDelta => \"item/fileChange/outputDelta\"`, :1533-1534 windows notifications, :1527-1528 `thread/realtime/error`. These are defined in server_notification_definitions!.",
+    "swiftStatus": "Sources/ProtocolModel/Events.swift ServerNotification (354-560) has no case for `mcpServer/startupStatus/updated`, `model/verification`, `guardianWarning`, `configWarning`, `item/fileChange/outputDelta`, `windowsSandbox/setupCompleted`, `windows/worldWritableWarning`, or `thread/realtime/error`; grep across Sources finds no literal for them. They can only be emitted via the generic `.raw(method, payload)` case (Events.swift:555).",
+    "description": "These notifications are emitted by the server, so a missing typed constructor is a feature gap rather than a decode break \u2014 `.raw` keeps the wire correct if a caller constructs the payload. `mcpServer/startupStatus/updated` and `model/verification` are the most relevant (a live frontend uses them to update MCP server status and surface model verifications); the windows/realtime ones are platform/experimental and lower priority on macOS.",
+    "fixRecommendation": "If/when the corresponding server features land, add typed ServerNotification cases (at minimum `mcpServerStatusUpdated` and `modelVerification`) with method strings `mcpServer/startupStatus/updated` and `model/verification` and payload structs matching v2/mcp.rs and v2/notification.rs. Until then, document that they are intentionally routed through `.raw`."
+   },
+   {
+    "title": "item/mcpToolCall/progress modeled but never emitted (MCP tool-call streaming absent)",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "common.rs:1493 registers item/mcpToolCall/progress; v2/mcp.rs:199-207 McpToolCallProgressNotification { thread_id, turn_id, item_id, message }.",
+    "swiftStatus": "Events.swift:396,530,607-609 model `.mcpToolCallProgress` with the correct `Progress {threadId,turnId,itemId,message}` payload, but there is no emit() call site; MCP tool calls are otherwise routed through the `.unknown` ThreadItem fallback (Items.swift:88-102).",
+    "description": "Live MCP tool-call progress updates are not streamed. This is low-traffic and tied to MCP tool execution which is itself only partially modeled in the port, so a typical CodexApp session without MCP progress-reporting tools is unaffected.",
+    "fixRecommendation": "When the MCP tool-call execution path is wired, forward MCP progress notifications as `.mcpToolCallProgress(threadId:turnId:itemId:message:)`. Otherwise note as an intentional MCP-path gap."
+   }
+  ],
+  "prompts": [
+   {
+    "title": "Review-output text renderer (render_review_output_text / format_review_findings_block) not ported",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "core/src/review_format.rs:14-82 \u2014 REVIEW_FALLBACK_MESSAGE = \"Reviewer failed to output a response.\"; format_review_findings_block renders header 'Full review comments:' (>1 finding) or 'Review comment:' (1 finding), per-item '- {title} \u2014 {path}:{start}-{end}' lines plus 2-space-indented body lines, optional '[x]'/'[ ]' selection markers; render_review_output_text joins overall_explanation + findings block or emits the fallback.",
+    "swiftStatus": "ABSENT. grep across Sources/ for 'Full review comments', 'Review comment:', 'Reviewer failed to output', formatReviewFindings, renderReviewOutput returns nothing.",
+    "description": "The user-facing rendering of a ReviewOutputEvent (the textual summary shown after a review thread completes, including the fallback message and the '\u2014 path:start-end' finding format) has no Swift equivalent. A frontend relying on the server to format review findings into a message would not receive the upstream text. Minor because the structured ReviewOutputEvent/findings can be rendered client-side and the review request/system prompts are present.",
+    "fixRecommendation": "Add a Swift port of review_format.rs (e.g. Sources/Prompts/ReviewFormat.swift) reproducing format_review_findings_block and render_review_output_text with the exact header strings ('Full review comments:' / 'Review comment:'), the '- {title} \u2014 {path}:{start}-{end}' line format, 2-space body indentation, optional checkbox markers, and REVIEW_FALLBACK_MESSAGE. Wire it where review completion text is produced."
+   },
+   {
+    "title": "Personality migration (one-time config default seeding) not ported",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "core/src/personality_migration.rs:15-63 \u2014 PERSONALITY_MIGRATION_FILENAME = \".personality_migration\"; maybe_migrate_personality writes a marker and, when no explicit personality is configured and prior recorded sessions exist, persists personality=Pragmatic via ConfigEditsBuilder (statuses SkippedMarker/SkippedExplicitPersonality/SkippedNoSessions/Applied; marker contents 'v1\\n').",
+    "swiftStatus": "ABSENT. grep for maybeMigratePersonality / PERSONALITY_MIGRATION / SkippedNoSessions across Sources/ returns nothing; only Personality.swift (the enum) and Templates.swift exist.",
+    "description": "The startup migration that retroactively sets pragmatic personality for existing users (writing ~/.codex/.personality_migration) is not implemented. This is a config-management one-shot, not a wire method, and Swift already defaults unset personality to pragmatic, so observable model behavior is unchanged for the common case. Minor.",
+    "fixRecommendation": "If config-file parity with the real codex_home matters (so the CLI/other tools see the persisted personality and marker), port maybe_migrate_personality to write '.personality_migration' (contents 'v1\\n') and set personality=pragmatic under the same skip conditions. Otherwise document as intentionally omitted."
+   },
+   {
+    "title": "Custom review target does not trim or reject empty instructions",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/review_prompts.rs:88-94 \u2014 ReviewTarget::Custom { instructions } => { let prompt = instructions.trim(); if prompt.is_empty() { anyhow::bail!(\"Review prompt cannot be empty\"); } Ok(prompt.to_string()) } (trims whitespace and errors on empty).",
+    "swiftStatus": "Sources/ProtocolModel/ClientRequest.swift:291-292 \u2014 case \"custom\": return o[\"instructions\"]?.stringValue ?? Self.uncommittedPrompt \u2014 returns the raw, untrimmed instructions and silently falls back to the uncommitted prompt when instructions are missing rather than erroring.",
+    "description": "Upstream trims the custom instructions and rejects an empty/whitespace-only custom review prompt with an error; Swift sends the raw (possibly whitespace-padded) string and, when instructions are absent, silently substitutes the uncommitted-changes prompt. A client sending an empty custom review would get a different (non-error) outcome and a different prompt body.",
+    "fixRecommendation": "In ClientRequest.reviewPrompt 'custom' branch, trim the instructions; if the trimmed result is empty, surface an error to the caller (or at minimum do not fall back to the uncommitted prompt). Return the trimmed string otherwise, matching review_prompts.rs:88-94."
+   },
+   {
+    "title": "Legacy PromptComposer.environmentMessage emits an obsolete environment_context schema",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "core/src/context/environment_context.rs:276-322 \u2014 EnvironmentContext::body emits only `<cwd>`, `<shell>`, optional `<current_date>`, `<timezone>`, `<network enabled=\"true\">\u2026</network>` (allowed/denied domains), and `<subagents>` (with a `<environments>` multi-env variant). There are no `<model>`, `<sandbox_mode>`, `<approval_policy>`, `<network_access>`, or `<writable_roots>` tags.",
+    "swiftStatus": "Sources/Prompts/PromptComposer.swift:145-164 environmentMessage emits `<model>`, `<sandbox_mode>`, `<approval_policy>`, `<network_access>enabled|restricted`, `<writable_roots><root>\u2026` \u2014 a schema upstream does not use. NOTE: the live path (Sources/Prompts/Fragments.swift:84-118 EnvironmentContext + InitialContextBuilder) is faithful to upstream; PromptComposer.environmentMessage appears to be a parallel/legacy helper.",
+    "description": "PromptComposer.environmentMessage produces an environment_context body with tags and a network representation that do not match the current upstream serialization. If any code path actually serializes via PromptComposer.environmentMessage rather than Fragments.EnvironmentContext, the model would receive a divergent environment_context block. Confirmed minor because the wired InitialContextBuilder uses the faithful Fragments.EnvironmentContext.",
+    "fixRecommendation": "Confirm PromptComposer.environmentMessage is dead/test-only; if it is reachable by any live assembly path, delete it or rewrite it to delegate to Fragments.EnvironmentContext so the cwd/shell/current_date/timezone/network/subagents shape is the single source of truth."
+   }
+  ],
+  "apply-patch": [
+   {
+    "title": "Parser silently skips blank lines between top-level hunks; upstream rejects them",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/parser.rs:286-287,368-373 \u2014 parse_one_hunk takes lines[0].trim() and, if it matches none of ADD/DELETE/UPDATE markers, falls through to Err(InvalidHunkError{ message: \"'{first_line}' is not a valid hunk header. \u2026\" }). The top-level loop (parser.rs:186-191) does NOT skip blank lines between hunks; only the *inside* of an Update hunk consumes blanks (parser.rs:328-332). So a blank line between, e.g., an Add hunk and a following Update hunk reaches parse_one_hunk with lines[0]==\"\" and errors as \"'' is not a valid hunk header. \u2026\".",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:383-386 \u2014 the top-level while loop has `if trimmed.isEmpty { i += 1; continue }`, silently skipping blank lines between hunks and accepting the patch.",
+    "description": "For a multi-hunk patch with a blank line separating hunks (e.g. `*** Add File: a\\n+hi\\n\\n*** Update File: b\\n\u2026`), upstream rejects the patch with InvalidHunkError on the blank line, whereas Swift skips the blank and parses the next hunk successfully. Swift is strictly more lenient, so a patch that upstream would reject (and report to the model) is accepted by Swift.",
+    "fixRecommendation": "In Sources/Tools/ApplyPatch.swift remove the top-level blank-line skip at lines 383-386 (the inner Update-hunk blank handling at lines 433-436 already mirrors parser.rs:328-332). Without the top-level skip, a blank line at the hunk-header position falls through to the existing 'is not a valid hunk header' branch (lines 471-475) with trimmed==\"\", matching upstream exactly."
+   },
+   {
+    "title": "Empty/whitespace-only patch yields wrong boundary error message",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "apply-patch/src/parser.rs:224-228,278-281 \u2014 for an empty input, `\"\".trim().lines()` produces an empty slice; check_patch_boundaries_strict matches `[] => (None, None)`, and check_start_and_end_lines_strict's `(None,None)` falls to the final arm returning InvalidPatchError(\"The last line of the patch must be '*** End Patch'\").",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:305-330 \u2014 `trimmedWhole` of an empty/whitespace patch is \"\"; split(omittingEmptySubsequences:false) yields [\"\"], so first==last==\"\"; boundaryError takes the `f != \"*** Begin Patch\"` branch and returns \"The first line of the patch must be '*** Begin Patch'\".",
+    "description": "For a completely empty or whitespace-only patch, upstream reports \"The last line of the patch must be '*** End Patch'\" while Swift reports \"The first line of the patch must be '*** Begin Patch'\". The model-facing text therefore differs for this degenerate input.",
+    "fixRecommendation": "In boundaryError (ApplyPatch.swift:319-330) special-case a fully empty patch (e.g. when the trimmed whole is empty or `lines == [\"\"]`) to return the 'last line' message, matching parser.rs's (None,None) arm. Lowest-risk: if first is empty AND last is empty, return the 'last line of the patch must be \u2026' string."
+   },
+   {
+    "title": "Environment ID marker prefix omits trailing space, accepting forms upstream rejects",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/parser.rs:36 `ENVIRONMENT_ID_MARKER: &str = \"*** Environment ID: \"` (with trailing space) and parser.rs:207 `first_line.trim_start().strip_prefix(ENVIRONMENT_ID_MARKER)`. A line like `*** Environment ID:remote` (no space) does NOT strip and is treated as a hunk header (\u2192 unrecognised-header error).",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:364 \u2014 `Self.afterPrefix(ls, \"*** Environment ID:\")` uses the marker WITHOUT the trailing space, then trims the remainder, so `*** Environment ID:remote` is accepted as environment_id=\"remote\".",
+    "description": "Upstream requires a space after the colon in the Environment ID preamble marker; Swift accepts the no-space form. For well-formed input that includes the space both behave identically, so this only affects malformed/edge inputs.",
+    "fixRecommendation": "Change the prefix at ApplyPatch.swift:364 to include the trailing space: `Self.afterPrefix(ls, \"*** Environment ID: \")`, exactly matching ENVIRONMENT_ID_MARKER."
+   },
+   {
+    "title": "Parser rejects absolute paths and `..` components; upstream accepts and resolves them",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "apply-patch/src/parser.rs:288-373 parses Add/Delete/Update/Move paths via PathBuf::from(path) with NO rejection of absolute paths or `..`; test_parse_patch_accepts_relative_and_absolute_hunk_paths (parser.rs:728-771) explicitly asserts absolute paths parse, and Hunk::resolve_path (parser.rs:84-90) resolves them against cwd.",
+    "swiftStatus": "Sources/Tools/ApplyPatch.swift:393,410,417,424 call validateRelativePath during parse, which throws ApplyPatchError.unsafePath for any leading '/' (\"absolute path: \u2026\"), any `..` component (\"path traversal: \u2026\"), or empty path (validateRelativePath, lines 261-266).",
+    "description": "The Swift parser layers path-traversal/absolute-path guards into parsing, so patches that name an absolute path or a `..` component (which upstream parses and resolves against cwd) are rejected outright with an unsafePath error that has no upstream equivalent. This is an intentional defense-in-depth choice for the macOS server (the sandbox is the real boundary), but it diverges from upstream's permissive parser contract and changes both acceptance and error text for those inputs.",
+    "fixRecommendation": "If exact upstream parse fidelity is desired, move these guards out of the pure parse path into the apply path (assertContained already enforces containment at apply time). Otherwise document this as an intentional, accepted hardening divergence \u2014 frontends/models in this harness always emit relative paths, so it does not affect normal traffic."
+   }
+  ],
+  "persistence-rollout": [
+   {
+    "title": "response_item message/reasoning lines emit an `id` field upstream never serializes",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "protocol/src/models.rs:753-756 ResponseItem::Message { #[serde(default, skip_serializing)] id: Option<String>, ... } and :766-770 Reasoning { #[serde(default, skip_serializing)] id: String, ... } \u2014 upstream NEVER serializes `id` for message/reasoning response items.",
+    "swiftStatus": "Sources/Persistence/Rollout.swift:880-885,897,902 threadItemToResponseItem emits \"id\": id.raw for userMessage/agentMessage/contextMessage and reasoning. The on-disk JSON therefore carries an extra `id` key absent from upstream output.",
+    "description": "Upstream marks the message/reasoning `id` with skip_serializing (deserialize-only), so it is never written to the rollout. Swift writes it. Because upstream's field is #[serde(default, skip_serializing)] it still deserializes a present `id` without error, so cross-impl reads are not broken \u2014 only the byte shape diverges (an extra key). Swift's own reader also tolerates it.",
+    "fixRecommendation": "If exact byte-parity with upstream rollouts is desired, omit `id` from the message/reasoning dicts in threadItemToResponseItem (Rollout.swift:880-912). Functionally optional since upstream accepts the extra field; the comment at lines 875-879 already documents the one-way parity."
+   },
+   {
+    "title": "user_message / agent_message / token_count / compacted payloads carry an extra `turn_id` field not present upstream",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "protocol/src/protocol.rs:2230 UserMessageEvent {message, images, image_details, local_images, local_image_details, text_elements} and :2221 AgentMessageEvent {message, phase, memory_citation} have NO turn_id; TokenCountEvent (:2075) is {info, rate_limits} with no turn_id; CompactedItem (:2794) is {message, replacement_history} with no turn_id. EventMsg (:1269-1272) is internally-tagged without deny_unknown_fields.",
+    "swiftStatus": "Sources/Persistence/Rollout.swift:489-498 (user_message adds \"turn_id\"), :506-512 (agent_message adds \"turn_id\"), :705-714 (token_count adds \"turn_id\"), :638 (compacted adds \"turn_id\").",
+    "description": "Swift injects a `turn_id` key into several event_msg payloads and into the compacted item to support its own cursor-based turn binding on replay. Upstream's structs do not define `turn_id` for these, but serde ignores unknown fields by default (no deny_unknown_fields), so upstream deserialization is unaffected. The divergence is an extra key in the on-disk bytes only.",
+    "fixRecommendation": "Optional: drop the `turn_id` additions (Rollout.swift:491,508,707,638) for exact byte-parity. Swift's reader already falls back to the running cursor (rustEventRecords lines 1378,1385,1393,1427 use `?? currentTurnId`) and upstream's TurnStarted event supplies turn_id, so the field is not required for correct replay."
+   },
+   {
+    "title": "session_meta `originator` is hardcoded to codex-swift/0.1.0 instead of a configured originator/version",
+    "severity": "minor",
+    "category": "wrong-default",
+    "rustEvidence": "rollout/src/recorder.rs builds SessionMeta.originator/cli_version from config (upstream originator is e.g. \"codex_cli_rs\" or the terminal program, and cli_version is the real crate version); the field is a required SessionMeta field (protocol.rs:2726-2727).",
+    "swiftStatus": "Sources/Persistence/ThreadStore.swift:199-200 cliVersion = \"0.1.0\"; originator = \"codex-swift/\\(cliVersion)\" (hardcoded).",
+    "description": "The originator/cli_version recorded in the session_meta preamble are stub values rather than derived from the host's originator config or real version. This is observable metadata in the rollout head but does not break wire deserialization or replay; analytics/source attribution would be wrong.",
+    "fixRecommendation": "Source originator and cli_version from configuration (e.g. the app-server originator and the actual build version) in ThreadStore.sessionMetaRecord (ThreadStore.swift:194-221) rather than hardcoding."
+   },
+   {
+    "title": "CompactionPhase rawValues are camelCase and lack upstream PreTurn; pre-turn path mislabeled as betweenTurns",
+    "severity": "minor",
+    "category": "wrong-casing",
+    "rustEvidence": "analytics/src/facts.rs:235-241 `#[serde(rename_all = \"snake_case\")] enum CompactionPhase { StandaloneTurn, PreTurn, MidTurn }` (wire strings standalone_turn/pre_turn/mid_turn; verified in analytics_client_tests.rs:1254 \"mid_turn\", :1808 \"standalone_turn\"). The pre-sampling/pre-turn auto-compact uses CompactionPhase::PreTurn (turn.rs:756, :807); mid-turn uses MidTurn (turn.rs:505).",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:1551-1555 `enum CompactionPhase: String { case midTurn; case betweenTurns; case standaloneTurn }` \u2014 no explicit raw values, so rawValues serialize as \"midTurn\"/\"betweenTurns\"/\"standaloneTurn\". The pre-turn path passes phase: .betweenTurns (SessionEngine.swift:1992), a variant that does not exist upstream; upstream uses PreTurn there.",
+    "description": "The compaction phase enum diverges in two ways: (1) casing \u2014 camelCase vs upstream snake_case; (2) the Swift `betweenTurns` variant replaces upstream `pre_turn` for the pre-sampling compaction path. These strings are persisted into the `.compacted` rollout record (SessionEngine.swift:1905 `phase: phase.rawValue`). They are NOT part of the JSON-RPC wire protocol the frontend consumes (upstream phase/reason go to a separate analytics telemetry endpoint), so impact is limited to persistence-format fidelity / any tooling that reads compaction rollout records.",
+    "fixRecommendation": "If rollout-record parity matters, give CompactionPhase explicit snake_case raw values (`case midTurn = \"mid_turn\"`, `case standaloneTurn = \"standalone_turn\"`) and replace `betweenTurns` with `preTurn = \"pre_turn\"`, updating the call site at SessionEngine.swift:1992 to `.preTurn`. Otherwise document as an intentional sidecar divergence."
+   },
+   {
+    "title": "Interrupted-turn marker ignores config/feature gates for role, text, and disable",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tasks/mod.rs:74-111 InterruptedTurnHistoryMarker::from_config: returns Disabled when !agent_interrupt_message_enabled (no marker at all); Developer (role \"developer\", INTERRUPTED_DEVELOPER_GUIDANCE) when Feature::MultiAgentV2 is on; otherwise ContextualUser (role \"user\", INTERRUPTED_GUIDANCE).",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:3002-3007 unconditionally writes a user-role contextMessage with TurnAborted.interruptedGuidance whenever status==.interrupted && reason==.interrupted, with no config/feature gating. Sources/Prompts/Fragments.swift:190-193 defines both interruptedGuidance and interruptedDeveloperGuidance but only the former is used.",
+    "description": "Upstream can disable the interrupted-turn history marker entirely (agent_interrupt_message_enabled=false) and switches it to a developer-role message with different verbatim text under MultiAgentV2; the Swift port always injects the user-role contextual variant. Under MultiAgentV2 the model-visible history (and resumed rollouts) diverges in both role and guidance text.",
+    "fixRecommendation": "Gate the marker in finishTurn on the equivalent of agent_interrupt_message_enabled (skip entirely when disabled) and, when the MultiAgent feature is active, write a developer-role message using interruptedDeveloperGuidance, matching interrupted_turn_history_marker()."
+   }
+  ],
+  "hooks": [
+   {
+    "title": "Matcher \"*\" wildcard is not recognized; every \"*\" hook silently stops matching",
+    "severity": "critical",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/events/common.rs matches_matcher: `Some(matcher) if is_match_all_matcher(matcher) => true`, and `fn is_match_all_matcher(matcher) -> bool { matcher.is_empty() || matcher == \"*\" }`. So matcher \"*\" matches ALL tools.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:871-880 `matches(...)`: only nil/empty matcher is treated as match-all (`guard let m = def.matcher, !m.isEmpty else { return true }`); any other value, including \"*\", is compiled via `try? NSRegularExpression(pattern: m)` and falls back to `s.contains(m)`. `NSRegularExpression(pattern: \"*\")` throws (dangling quantifier) so it degrades to `toolName.contains(\"*\")`, which is false for every real tool name.",
+    "description": "Upstream treats matcher \"*\" (the documented wildcard) identically to empty: match every tool. Swift treats \"*\" as a regex, which fails to compile, then as a literal substring search, so a hook configured with matcher \"*\" matches NOTHING in Swift. This breaks the most common PreToolUse/PostToolUse/PermissionRequest hook configuration.",
+    "fixRecommendation": "In Sources/HarnessCore/Hooks.swift `matches(...)`, before the regex path add: if the trimmed matcher is empty or equals \"*\", return true (match-all). Mirror upstream `is_match_all_matcher`."
+   },
+   {
+    "title": "Exact-matcher semantics (pipe-split equality) not reproduced",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/events/common.rs: `Some(matcher) if is_exact_matcher(matcher) => input.map(|input| matcher.split('|').any(|candidate| candidate == input)).unwrap_or(false)`; `fn is_exact_matcher(matcher) { matcher.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|') }`. So matcher \"Bash\" exact-matches only the tool literally named \"Bash\"; \"Read|Write\" matches Read or Write exactly.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:871-880: a matcher like \"Bash\" is always compiled as a regex and matched with `firstMatch` (partial/substring), with no exact/`|`-split branch.",
+    "description": "For alphanumeric/`_`/`|` matchers upstream does EXACT (anchored) equality after splitting on `|`. Swift does an unanchored regex match. Consequence: a matcher \"Bash\" will (incorrectly) match a tool named \"BashRunner\" or \"run_bash\" in Swift, and \"Read|Write\" is interpreted as a regex alternation that also partial-matches. Selection of which hooks fire diverges for these very common simple matchers.",
+    "fixRecommendation": "In `matches(...)`, add an exact-matcher branch mirroring `is_exact_matcher`: if every char is ASCII-alphanumeric/`_`/`|`, split on `|` and require an exact == comparison against `req.matchString`; only fall through to regex for matchers containing other characters."
+   },
+   {
+    "title": "SessionStart matcher is matched against \"\" instead of the session source (startup/resume/clear)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/events/session_start.rs:66-70 and 82-86 call `dispatcher::select_handlers(handlers, HookEventName::SessionStart, Some(request.source.as_str()))` \u2014 the matcher input for SessionStart hooks is the session `source` string (startup/resume/clear), not a tool name.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:363 `matchString { toolName ?? \"\" }` is used for ALL events; SessionStart requests (SessionEngine.swift:3191) never set `toolName`, so a SessionStart hook's matcher is matched against the empty string, never against `req.source`.",
+    "description": "A SessionStart hook configured with e.g. `matcher: \"resume\"` should run only on resume upstream, but in Swift it is matched against \"\" (so it never matches a non-match-all matcher, and conversely a regex like \".*\" would always match regardless of source). The session-source matcher dimension is entirely lost.",
+    "fixRecommendation": "Make `matchString` event-aware: for `.sessionStart` return `source ?? \"\"`; for pre/post-tool-use and permission-request return `toolName ?? \"\"`; for the rest upstream passes None (no matcher input) \u2014 model that by treating a present non-match-all matcher as non-matching (or pass nil to the matcher logic)."
+   },
+   {
+    "title": "display_order is recomputed per-fire/per-event instead of a global discovery-time counter (also corrupts run_id)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/engine/discovery.rs:71 `let mut display_order = 0_i64;` then incremented once per discovered handler across ALL events and ALL config layers (discovery.rs:489,510,514), assigned once at discovery. run_id embeds it: hooks/src/engine/mod.rs:55-62 `format!(\"{}:{}:{}\", event_name_label(), display_order, source_path)`. So display_order is stable and global, and the same value appears in both the HookRunSummary.display_order field and the run id.",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:919-938: `var order = 0` is reset on every `fire(...)` call and incremented only over the hooks that match the CURRENT event; that local `order` feeds both `displayOrder: order` and the run id `\"\\(def.eventName.wire):\\(order):\\(def.sourcePath)\"`.",
+    "description": "Upstream display_order is a single monotonically-increasing index assigned during discovery over the full handler set (every event, every layer). Swift derives it freshly each fire as a 0-based counter over only the matched hooks of one event. For any config with more than one hook, the Swift display_order and the embedded run-id index diverge from upstream (e.g. a pre-tool-use hook that is the 2nd discovered handler gets upstream id `pre-tool-use:1:<path>` / display_order 1, but Swift emits `pre-tool-use:0:<path>` / display_order 0). Frontends/tooling that key off run id or display_order will not line up with the upstream contract.",
+    "fixRecommendation": "Assign each HookDefinition a stable global `displayOrder` at load time in `HookEngine.load(...)` (increment a single counter as handlers are appended across home then project files / events), store it on the definition, and use that stored value in `fire(...)` for both `displayOrder` and the run-id, instead of the per-fire `order` counter."
+   },
+   {
+    "title": "tool_use_id is never written to PreToolUse/PostToolUse stdin payloads",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "hooks/src/schema.rs:242-256 PreToolUseCommandInput has `pub tool_use_id: String;` (required), and lines 279-294 PostToolUseCommandInput has `pub tool_use_id: String;` \u2014 both are non-optional required fields sourced from `tool_use_id` (hook_runtime.rs:161,254-264).",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:407-410: the comment explicitly states `tool_use_id` is not tracked and not emitted; `jsonObject()` (lines 371-431) never sets a `tool_use_id` key, and HookRequest has no tool_use_id field.",
+    "description": "Upstream always provides a `tool_use_id` on the PreToolUse and PostToolUse hook stdin JSON. The Swift payload omits it entirely. Hooks that correlate pre/post tool invocations by `tool_use_id` get no value. Impact is limited because hooks read stdin leniently, but it is a missing required wire field relative to the upstream contract.",
+    "fixRecommendation": "Add a `toolUseId: String?` field to HookRequest, thread the active tool-call id through the PreToolUse/PostToolUse request builders in SessionEngine.swift, and emit `o[\"tool_use_id\"] = toolUseId ?? \"\"` in `jsonObject()` for `.preToolUse`/`.postToolUse`."
+   },
+   {
+    "title": "PreToolUse legacy decision:block is not gated on a non-empty reason",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "hooks/src/engine/output_parser.rs parse_pre_tool_use: block_reason for a legacy `decision: Block` is `reason.as_deref().and_then(trimmed_reason)` \u2014 i.e. an empty/missing reason yields `block_reason = None`, so the hook does NOT block (and unsupported_pre_tool_use_legacy_decision may mark it Failed).",
+    "swiftStatus": "Sources/HarnessCore/Hooks.swift:1371-1394: the `if hasDecisionBlock` switch gates UserPromptSubmit/PostToolUse/Stop on a non-empty trimmed reason, but PreToolUse falls into `default:` which sets `decision = .block` unconditionally regardless of reason.",
+    "description": "For a PreToolUse hook that emits `{\"decision\":\"block\"}` with no reason, upstream does not block, whereas Swift blocks the tool. This is fail-safe (Swift is stricter) and a rare edge case, but it diverges from the upstream parser's reason-gating.",
+    "fixRecommendation": "In the `hasDecisionBlock` switch, give `.preToolUse` the same non-empty-trimmed-reason gate used for UserPromptSubmit/PostToolUse (block only when a non-empty reason is present; otherwise surface a schema/Failed signal), instead of letting it hit the unconditional `default` arm."
+   }
+  ],
+  "exec-unified-shell": [
+   {
+    "title": "web_search exposed as a local JSON function tool instead of upstream hosted ToolSpec::WebSearch",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "tools/src/tool_spec.rs:36-48 defines ToolSpec::WebSearch serialized with #[serde(tag=\"type\")] rename \"web_search\" carrying external_web_access/filters/user_location/search_context_size/search_content_types; core/src/tools/hosted_spec.rs:20-50 create_web_search_tool returns that hosted variant (no `parameters`, no local handler) \u2014 OpenAI executes the search server-side. spec_plan.rs:166-178 appends it via hosted_model_tool_specs, never as a dispatchable executor.",
+    "swiftStatus": "Sources/Tools/WebSearch.swift:840-852 WebSearchTool conforms to Tool with name=\"web_search\", jsonSchema {\"query\":string} and a local run() that calls a provider backend; ToolRouter registers it (ShellTool.swift:911-913) so it serializes as {type:\"function\",name:\"web_search\",parameters:{query}} and is dispatched locally.",
+    "description": "Upstream advertises web_search as the OpenAI hosted tool ({type:\"web_search\", external_web_access, search_context_size, ...}) which the model provider runs server-side and streams results for. The Swift port instead advertises {type:\"function\",name:\"web_search\",parameters:{\"query\":string}} and dispatches it to a local HTTP backend. The wire tool-definition shape, the field set, and the execution model all differ; a frontend/model expecting upstream hosted-search behavior (live/cached external_web_access, content types, location/filters) gets a single-string-query local function instead.",
+    "fixRecommendation": "If hosted web_search parity is required, emit web_search as a hosted spec variant (type:\"web_search\" with external_web_access/search_context_size/etc. per web_search_mode + web_search_tool_type) in the model request and stop registering it as a dispatchable function tool; gate it on web_search_mode like upstream. If the local-search behavior is intentional for non-ChatGPT auth, give it a distinct non-colliding name so it is not mistaken for upstream's hosted web_search."
+   },
+   {
+    "title": "Port adds model-visible function tools with no upstream built-in equivalent (read_file/write_file/list_dir/file_search/git_diff/workflow)",
+    "severity": "major",
+    "category": "missing-tool",
+    "rustEvidence": "core/src/tools/spec_plan.rs:333-521 collect_tool_executors enumerates the full built-in set: shell_command|exec_command|write_stdin, update_plan(PlanHandler), request_user_input, request_permissions(gated), apply_patch(gated), view_image, multi-agent, mcp, goals, tool_search. No read_file/write_file/list_dir/file_search/git_diff/workflow handlers exist (grep of core/src + tools/src finds these names only in mcp.rs test fixtures, mcp.rs:414).",
+    "swiftStatus": "Sources/Tools/ShellTool.swift:874-910 registers FileSearchTool, ReadFileTool, ListDirTool, WriteFileTool, GitDiffTool, plus WorkflowTool/WorkflowStop/List/Status; Sources/Tools/FileTools.swift:111/356/590/769 and GitUtils.swift:776 define names file_search/read_file/write_file/list_dir/git_diff.",
+    "description": "Upstream routes all filesystem reads/writes/searches through shell_command (or exec_command) and apply_patch; the system prompt and model behavior are tuned to that minimal tool surface. The Swift port advertises six-plus extra function tools that the upstream model never sees. This changes the model-visible tool inventory and the tool-choice distribution, diverging from upstream fidelity (a frontend mirroring upstream's tool list will see unexpected tools).",
+    "fixRecommendation": "If strict upstream parity is the goal, do not register read_file/write_file/list_dir/file_search/git_diff as model-visible tools (have the model use shell_command/apply_patch as upstream does), or gate them behind an explicit port-extension feature flag that is off by default. At minimum document them as intentional port extensions outside the upstream contract."
+   },
+   {
+    "title": "Unified-exec environment overrides diverge: Swift sets TERM=xterm-256color instead of upstream's deterministic non-interactive env block (TERM=dumb, NO_COLOR=1, PAGER=cat, ...)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/unified_exec/process_manager.rs:60-71 UNIFIED_EXEC_ENV = [(\"NO_COLOR\",\"1\"),(\"TERM\",\"dumb\"),(\"LANG\",\"C.UTF-8\"),(\"LC_CTYPE\",\"C.UTF-8\"),(\"LC_ALL\",\"C.UTF-8\"),(\"COLORTERM\",\"\"),(\"PAGER\",\"cat\"),(\"GIT_PAGER\",\"cat\"),(\"GH_PAGER\",\"cat\"),(\"CODEX_CI\",\"1\")]; applied via apply_unified_exec_env() at process_manager.rs:94-99 and called in open_session_with_sandbox (process_manager.rs:1011).",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:367-372 spawn() injects ONLY additionalExtras:[\"TERM\":\"xterm-256color\"]. None of the other 9 vars are set; TERM is set to an interactive color terminal \u2014 the opposite of upstream's TERM=dumb. SpawnEnvironment.swift default extras only add NSUnbufferedIO=YES.",
+    "description": "Upstream deliberately forces a non-interactive, no-color, paging-disabled environment for every unified-exec child so command output is deterministic and free of ANSI escapes / pager pauses. Swift forces TERM=xterm-256color and omits NO_COLOR/COLORTERM/PAGER/GIT_PAGER/GH_PAGER/LANG/LC_*/CODEX_CI. Tools like git, ls --color=auto, grep, gh, less will emit color codes or page, corrupting the captured output the model reads and breaking parity with what upstream-trained models expect.",
+    "fixRecommendation": "In Sources/Tools/UnifiedExec.swift, replace the single TERM extra with the full upstream UNIFIED_EXEC_ENV map (NO_COLOR=1, TERM=dumb, LANG=C.UTF-8, LC_CTYPE=C.UTF-8, LC_ALL=C.UTF-8, COLORTERM=\"\", PAGER=cat, GIT_PAGER=cat, GH_PAGER=cat, CODEX_CI=1), applied AFTER the base scrub so these override inherited values. Do not set TERM=xterm-256color."
+   },
+   {
+    "title": "Swift always allocates a PTY and ignores the tty parameter; upstream defaults tty=false (plain pipes, stdin closed) and only opens a PTY when tty=true",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "shell_spec.rs:42-47 tty defaults false ('plain pipes'); unified_exec.rs:37-38,71-73 default_tty()=false; process_manager.rs:968-989 spawns pty::spawn_process_with_inherited_fds only when tty, else pipe::spawn_process_no_stdin_with_inherited_fds (no stdin). write_stdin with non-empty input on a non-tty session returns UnifiedExecError::StdinClosed (process_manager.rs:617-620).",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:989-992 ExecCommandTool decodes tty 'for contract parity' but comment states 'this tool always runs in a PTY ... tty:false is accepted but does not switch to plain pipes'. UnifiedExecManager.open always calls PTY.spawn (UnifiedExec.swift:447-534). No pipe/no-stdin path exists.",
+    "description": "Upstream's default exec_command (tty=false) runs the command attached to plain pipes with stdin CLOSED; a subsequent write_stdin with bytes returns the StdinClosed error instructing the model to 'rerun exec_command with tty=true'. Swift always opens a PTY, so stdin is always writable and the StdinClosed contract never fires. Programs that detect a TTY (e.g. isatty) behave differently (interactive prompts, line buffering, color) under Swift's always-PTY path versus upstream's default pipe path, and the model's trained workflow of escalating to tty=true is silently a no-op.",
+    "fixRecommendation": "Honor the tty flag in ExecCommandTool: when tty=false (default) spawn with stdin closed via pipes (no PTY), and make write_stdin to such a session return the upstream StdinClosed message 'stdin is closed for this session; rerun exec_command with tty=true to keep stdin open'. Only allocate a PTY when tty=true."
+   },
+   {
+    "title": "write_stdin StdinClosed error contract is absent",
+    "severity": "minor",
+    "category": "missing-error-code",
+    "rustEvidence": "core/src/unified_exec/errors.rs:15-18 StdinClosed => \"stdin is closed for this session; rerun exec_command with tty=true to keep stdin open\"; returned by process_manager.rs:617-620 when input non-empty and !tty.",
+    "swiftStatus": "ABSENT. Sources/Tools/UnifiedExec.swift WriteStdinTool/manager never returns this error string; writes always succeed because every session is a PTY.",
+    "description": "Because Swift never runs a non-tty (pipe, stdin-closed) session, the StdinClosed error path and its exact message string are never produced. A model trained on upstream that receives StdinClosed and reacts by re-running with tty=true gets a different (silent-success) experience. This is the wire-level corollary of the always-PTY divergence.",
+    "fixRecommendation": "Once tty=false is honored (see the PTY/tty finding), return the verbatim message 'stdin is closed for this session; rerun exec_command with tty=true to keep stdin open' from WriteStdinTool when args.chars is non-empty for a non-tty session."
+   },
+   {
+    "title": "original_token_count is computed from the already-byte-capped output instead of the full pre-truncation collected text",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/unified_exec/process_manager.rs:578 original_token_count = approx_token_count(&text) where text = String::from_utf8_lossy(&collected) is the FULL window output BEFORE token truncation; output field is then truncated separately via truncated_output() (context.rs:394-398).",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:860 sections.append(\"Original token count: \\((output.utf8.count + 3) / 4)\") computes the count from `output`, which is the HeadTailBuffer-capped string returned by readWindow (already truncated to maxBytes).",
+    "description": "Upstream reports the token count of the original (uncapped) output so the model knows how much was truncated; the output field carries the truncated text with a marker. Swift computes the count on the post-cap bytes, so when output exceeds the cap, original_token_count understates the true original size and equals the truncated size. The field becomes uninformative for large outputs.",
+    "fixRecommendation": "Thread the pre-cap byte length (or full token count) out of HeadTailBuffer/readWindow and use it for the 'Original token count:' line, keeping the truncated text for the 'Output:' section, matching upstream's two-quantity model."
+   },
+   {
+    "title": "shell_command uses hardcoded /bin/sh -c instead of the user's default shell (zsh on macOS) via derive_exec_args",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/handlers/shell/shell_command.rs:80-93 base_command = shell.derive_exec_args(command, use_login_shell) where shell = session.user_shell(); shell.rs:43-52 derives [shell_path, \"-c\", command] for the user's actual shell (default_user_shell on macOS prefers user shell then zsh, shell.rs:312-336).",
+    "swiftStatus": "Sources/Tools/ShellTool.swift:236-250 CommandSpec.line wraps a free-form string as [\"/bin/sh\",\"-c\",s] \u2014 always /bin/sh, never the user's zsh/bash default shell.",
+    "description": "Upstream runs shell_command strings under the user's configured login shell binary (zsh by default on macOS) with -c, so zsh-specific syntax/builtins/aliases-in-rc behavior is available. Swift hardcodes /bin/sh (dash-like POSIX shell on macOS), so commands relying on zsh/bash features (globbing extensions, [[ ]], arrays, process substitution) behave differently or fail. The exec_command path (UnifiedExec.swift CmdSpec) has the same /bin/sh hardcode versus upstream's session.user_shell().",
+    "fixRecommendation": "Resolve the user's default shell (mirror shell.rs default_user_shell: prefer $SHELL/getpwuid shell, then zsh, then bash on macOS) and build [shellPath, useLoginShell ? \"-lc\" : \"-c\", cmd] in both ShellTool.CommandSpec and UnifiedExec CmdSpec/CommandSpec, instead of unconditionally using /bin/sh."
+   },
+   {
+    "title": "Process-id (session_id) allocation is sequential from 1, not the upstream production random range 1000..100000",
+    "severity": "minor",
+    "category": "wrong-default",
+    "rustEvidence": "core/src/unified_exec/process_manager.rs:332-357 allocate_process_id: production (non-test) path uses rand::rng().random_range(1_000..100_000); only test/deterministic mode uses the max+1 sequential scheme starting at 1000.",
+    "swiftStatus": "Sources/Tools/UnifiedExec.swift:433-466,502-515 UnifiedExecManager.State.nextId starts at 1 and increments by 1 per open; ids are 1,2,3,... not random 1000-99999.",
+    "description": "session_id is model-visible (returned in output and passed back to write_stdin). Upstream production ids are random in [1000,100000); Swift returns small sequential ids starting at 1. Opaque to a frontend, but a model trained on upstream sees a different id distribution, and the lower-bound (>=1000) invariant some prompts rely on is not preserved. Low traffic / cosmetic.",
+    "fixRecommendation": "Allocate processId via a random value in 1000..<100000 (retrying on collision) for production, matching allocate_process_id; reserve the sequential scheme for a test-only deterministic mode."
+   }
+  ],
+  "tools-router": [
+   {
+    "title": "wait_agent marked parallel-safe in Swift but serial upstream",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/tools/handlers/multi_agents/wait.rs:31-205 implements ToolExecutor/CoreToolRuntime for the wait handler with no supports_parallel_tool_calls override, so it uses the trait default tools/src/tool_executor.rs:50-52 => false (serial; takes the exclusive write side of the per-turn parallel RwLock in parallel.rs:110-114).",
+    "swiftStatus": "Sources/Tools/MultiAgentTools.swift:256-259 WaitAgentTool has `public let parallelSafe = true`, so ToolRouter.dispatch (ToolRouter.swift:198-199) takes the shared read side of ParallelGate.",
+    "description": "Upstream wait_agent runs serially (write side of the parallel gate); the Swift WaitAgentTool declares itself parallel-safe and takes the read side, allowing it to run concurrently with other parallel-safe tools. This changes turn-level tool concurrency semantics relative to upstream. Low traffic but a real gating divergence.",
+    "fixRecommendation": "Set parallelSafe = false on WaitAgentTool in Sources/Tools/MultiAgentTools.swift to match upstream's default (serial) for the wait handler."
+   },
+   {
+    "title": "Top-level model-visible tool spec order is alphabetical in Swift but insertion-order upstream",
+    "severity": "minor",
+    "category": "ordering",
+    "rustEvidence": "core/src/tools/spec_plan.rs:122-148 build_model_visible_specs_and_registry pushes specs in executor collection order (code-mode prepended via prepend_code_mode_executors:543-554, hosted web_search/image_gen appended via specs.extend(hosted_specs):139); only intra-namespace tools are sorted (merge_into_namespaces:296-301). Top-level order is NOT alphabetical.",
+    "swiftStatus": "Sources/Tools/ToolRouter.swift:168-179 specs() collects all tools then `.sorted { $0.name < $1.name }` \u2014 a flat alphabetical ordering by tool name.",
+    "description": "Upstream emits the model-visible tool list in a deterministic insertion order (shell first, then plan/user-input/permissions/apply_patch/view_image/multi-agent/mcp..., with code-mode tools prepended and hosted tools appended). The Swift port sorts the entire list alphabetically. Both are deterministic so this does not break correctness, but the ordering differs from upstream, which affects prompt-cache key parity and any client that compares the tool array against upstream.",
+    "fixRecommendation": "If prompt-cache/wire parity with upstream is desired, reproduce upstream's insertion ordering (code-mode prepended, built-ins in spec_plan order, hosted appended) rather than a flat alphabetical sort in ToolRouter.specs(); otherwise document the intentional divergence."
+   }
+  ],
+  "misc": [
+   {
+    "title": "request_user_input description drops upstream mode-availability suffix",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "core/src/tools/handlers/request_user_input_spec.rs request_user_input_tool_description: format!(\"Request user input for one to three short questions and wait for the response. This tool is only available in {allowed_modes}.\") \u2014 the trailing sentence naming the allowed modes is part of the model-facing description.",
+    "swiftStatus": "Sources/Tools/RequestUserInput.swift:63-65 toolDescription = \"Request user input for one to three short questions and wait for the response.\" \u2014 omits the \"This tool is only available in {allowed_modes}.\" sentence.",
+    "description": "The Swift tool description is the upstream prefix only; the upstream description always appends a sentence stating which collaboration modes the tool is available in. The model-visible description differs from upstream. Since the suffix is dynamic (depends on available modes) the port may not be able to reproduce it verbatim, but the static second sentence is currently missing entirely.",
+    "fixRecommendation": "Append the mode-availability sentence to RequestUserInput.swift toolDescription, formatted like upstream format_allowed_modes (\"...only available in {mode} mode\" / \"...in {a} or {b} mode\" / \"...in modes: a,b,c\"), using the session's configured request_user_input available modes."
+   },
+   {
+    "title": "Overload (-32001) error message text differs from upstream",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "app-server/src/in_process.rs:547-550 and 631-634 emit OVERLOADED_ERROR_CODE (-32001) with message \"in-process app-server request queue is full\" / \"in-process server request queue is full\".",
+    "swiftStatus": "Sources/WireProtocol/WireErrors.swift:7 overloadMessage = \"Server overloaded; retry later.\" (code -32001 is correct).",
+    "description": "The numeric code (-32001) matches, but the human-readable message string differs. Upstream's message originates on the in-process transport (a different path than the multi-process JSON-RPC server the Swift port implements), so a frontend keys on the code rather than the text; the divergence is cosmetic.",
+    "fixRecommendation": "Low priority. If byte-exact parity is desired, align the message in WireErrors.swift, but a frontend should branch on code -32001, not the message; safe to leave as-is or document as an intentional difference."
+   }
+  ],
+  "context-compaction": [
+   {
+    "title": "Compaction prompt (compactPrompt) is missing the trailing newline upstream includes",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "core/templates/compact/prompt.md is 426 bytes and ends with byte 0x0a (\\n) \u2014 confirmed via `xxd ... | tail`: \"...nue the work.\\n\". compact.rs:46 `pub const SUMMARIZATION_PROMPT: &str = include_str!(\"../templates/compact/prompt.md\");` includes that trailing newline, and turn.rs/compact.rs send it verbatim as the compaction user-input text.",
+    "swiftStatus": "Sources/Prompts/Templates.swift:425-435 `compactPrompt = #\"\"\"...continue the work.\"\"\"#` \u2014 a Swift multiline literal whose content ends at \"continue the work.\" with NO trailing newline (verified: utf8.count=425, hasSuffix(\"\\n\")=false). Used as the model input at SessionEngine.swift:1649 / :1799 (`.userText(Compaction.compactionPrompt)`).",
+    "description": "Upstream sends a compaction prompt that ends with a trailing \\n (426 bytes); the Swift port sends the same text without the trailing \\n (425 bytes). This is a 1-byte divergence in load-bearing prompt text streamed to the model for every local/remote compaction. summary_prefix.md correctly has NO trailing newline (399 bytes) and Swift matches that one.",
+    "fixRecommendation": "In Sources/Prompts/Templates.swift, append a trailing newline to `compactPrompt` so it is byte-identical to core/templates/compact/prompt.md (e.g. end the literal with an explicit empty final line, or define it as the current value + \"\\n\")."
+   },
+   {
+    "title": "CompactionReason lacks ModelDownshift and the model-downshift pre-turn compaction path is unimplemented",
+    "severity": "minor",
+    "category": "missing-method",
+    "rustEvidence": "analytics/src/facts.rs:222-226 `enum CompactionReason { UserRequested, ContextLimit, ModelDownshift }`. turn.rs:772-813 `maybe_run_previous_model_inline_compact` runs an auto-compact against the PREVIOUS model with CompactionReason::ModelDownshift / CompactionPhase::PreTurn when `total_usage_tokens > new_auto_compact_limit && previous.slug != current.slug && old_context_window > new_context_window` (turn.rs:797-799), before the regular pre-sampling compaction.",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift:1557-1560 `enum CompactionReason: String { case contextLimit = \"context_limit\"; case userRequested = \"user_requested\" }` \u2014 no `modelDownshift`. grep across Sources/HarnessCore, Sources/Supervisor, Sources/Config for downshift/previousTurnSettings/old_context_window returns nothing: the `maybe_run_previous_model_inline_compact` behavior is entirely ABSENT.",
+    "description": "When a session switches to a smaller-context-window model mid-conversation, upstream proactively compacts against the previous model before the first turn on the new model so the surviving history fits. The Swift port does not implement this; it relies solely on the standard pre-turn/mid-turn auto-compact against the current model. Behaviorally this is an edge case (only on a model downshift to a smaller window) and the standard auto-compact still eventually fires, so correctness degrades gracefully rather than breaking the wire protocol.",
+    "fixRecommendation": "If mid-session model switching to a smaller-window model is a supported flow, add a pre-sampling check in SessionEngine.runTurn that mirrors maybe_run_previous_model_inline_compact (compare previous vs current resolved context windows and auto-compact limit) and add a `modelDownshift = \"model_downshift\"` case to CompactionReason. Otherwise document as an intentional omission."
+   }
+  ],
+  "session-turn-loop": [
+   {
+    "title": "No final consolidated turn/diff re-emit at end of each sampling request",
+    "severity": "minor",
+    "category": "missing-notification",
+    "rustEvidence": "core/src/session/turn.rs:2155 sets should_emit_turn_diff=true on ResponseEvent::Completed, then turn.rs:2306-2314 emits a final EventMsg::TurnDiff(get_unified_diff()) after the sampling request completes, in addition to the per-apply_patch emissions from core/src/tools/events.rs:553-600 (emit_patch_end).",
+    "swiftStatus": "Sources/HarnessCore/SessionEngine.swift only emits turnDiffUpdated incrementally from ingestApplyPatchDelta during the pendingTools drain (lines 2582-2583, 696-730). There is no end-of-sampling-request consolidated re-emit corresponding to turn.rs:2306.",
+    "description": "Upstream emits one extra turn/diff/updated carrying the cumulative diff at the close of each sampling request. Because the per-apply_patch tool emissions already carry the cumulative diff, the final re-emit is functionally a duplicate, so clients receive one fewer (redundant) turn/diff/updated per request rather than wrong data. Low impact, but a strict event-stream comparison will differ.",
+    "fixRecommendation": "Optional: after the per-call drain in the sampling loop (around SessionEngine.swift:2618), if any apply_patch delta was tracked this request, emit one turnDiffUpdated with turnDiffTracker.getUnifiedDiff() to mirror turn.rs:2306. Skip if exact event-count parity is not required."
+   }
+  ],
+  "sandbox-safety-policy": [
+   {
+    "title": "ApprovalDecision amendment sub-variants drop the inner struct-field wrapper (execpolicy_amendment / network_policy_amendment)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/item.rs:45-64 `CommandExecutionApprovalDecision` is an externally-tagged enum whose two data variants are STRUCT variants: `AcceptWithExecpolicyAmendment { execpolicy_amendment: ExecPolicyAmendment }` and `ApplyNetworkPolicyAmendment { network_policy_amendment: NetworkPolicyAmendment }`. The generated schema (app-server-protocol/schema/json/CommandExecutionRequestApprovalResponse.json:20-66 and CommandExecutionApprovalDecision.ts:7) confirms the wire shape is `{\"acceptWithExecpolicyAmendment\": {\"execpolicy_amendment\": [..strings..]}}` and `{\"applyNetworkPolicyAmendment\": {\"network_policy_amendment\": {host,action}}}` \u2014 note the inner field key is snake_case (no rename_all on the variant struct fields).",
+    "swiftStatus": "Sources/ProtocolModel/ServerRequest.swift:78-86 (decode) and 106-111 (encode) treat the payload as the bare amendment value: it decodes `c.decode(ExecPolicyAmendment.self, forKey:.acceptWithExecpolicyAmendment)` (an array) and encodes `c.encode(amendment, forKey:.acceptWithExecpolicyAmendment)`, producing `{\"acceptWithExecpolicyAmendment\": [\"git\",\"status\"]}`. The inner `{\"execpolicy_amendment\": ...}` / `{\"network_policy_amendment\": ...}` object wrapper is missing. decodeDecision (ServerRequest.swift:382-385) feeds the client's `{\"decision\":...}` response through this, and WorkerRuntime.swift:105-109 falls back to `.decline` when decode throws.",
+    "description": "A real frontend that lets the user choose accept-with-execpolicy-amendment or apply-network-policy-amendment sends `{\"decision\":{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":[...]}}}`. Swift's ApprovalDecision.init(from:) opens the `acceptWithExecpolicyAmendment` key and tries to decode an ExecPolicyAmendment (a transparent string array) but finds an object, throwing; resolveServerResponse then silently treats the approval as `.decline`. Outbound (if Swift ever emits the decision) it writes the wrong shape too. Plain accept/acceptForSession/decline/cancel are unaffected.",
+    "fixRecommendation": "In Sources/ProtocolModel/ServerRequest.swift, wrap the amendment payloads in the inner struct-field object. Decode: open nested container under `acceptWithExecpolicyAmendment` keyed by `execpolicy_amendment` (snake_case) and decode ExecPolicyAmendment from there; same for `applyNetworkPolicyAmendment` / `network_policy_amendment`. Encode: write `{\"acceptWithExecpolicyAmendment\":{\"execpolicy_amendment\":<array>}}` and `{\"applyNetworkPolicyAmendment\":{\"network_policy_amendment\":<obj>}}`. Use literal snake_case CodingKeys for the inner keys (the variant struct fields are NOT camelCased)."
+   },
+   {
+    "title": "CommandExecutionRequestApprovalParams omits proposed-amendment, command-actions, network-context and available-decisions fields",
+    "severity": "minor",
+    "category": "wrong-field",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/item.rs:1256-1308 `CommandExecutionRequestApprovalParams` carries `network_approval_context`, `command_actions: Option<Vec<CommandAction>>`, `additional_permissions`, `proposed_execpolicy_amendment: Option<ExecPolicyAmendment>`, `proposed_network_policy_amendments: Option<Vec<NetworkPolicyAmendment>>`, and `available_decisions: Option<Vec<CommandExecutionApprovalDecision>>` (all `skip_serializing_if = Option::is_none`).",
+    "swiftStatus": "Sources/ProtocolModel/ServerRequest.swift:134-164 `CommandApprovalParams` models only threadId/turnId/itemId/startedAtMs/approvalId/reason/command/cwd. The six display/amendment fields above are absent, so the Swift server can never offer the user a proposed execpolicy/network amendment, the friendly parsed command-action list, or a constrained set of available decisions.",
+    "description": "Because every missing field is `skip_serializing_if = Option::is_none`, the omission stays wire-valid (a frontend sees them as absent/optional). The impact is feature/UX degradation, not a decode break: the approval prompt loses the proposed-amendment affordance (which ties into the amendment-decision path in the previous finding) and parsed-command display.",
+    "fixRecommendation": "Add optional fields `networkApprovalContext`, `commandActions: [CommandAction]?`, `proposedExecpolicyAmendment: ExecPolicyAmendment?`, `proposedNetworkPolicyAmendments: [NetworkPolicyAmendment]?`, `availableDecisions: [ApprovalDecision]?` (and the experimental `additionalPermissions`) to CommandApprovalParams in ServerRequest.swift, encoded with encodeIfPresent, and populate them where the engine builds command-approval requests."
+   },
+   {
+    "title": "prompt_is_rejected_by_policy is unimplemented: a policy 'prompt' rule is not forbidden under AskForApproval::Never",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/exec_policy.rs:175-198 prompt_is_rejected_by_policy returns PROMPT_CONFLICT_REASON for Never; :331-356 a Decision::Prompt drives ExecApprovalRequirement::Forbidden when prompt_is_rejected_by_policy(...) is Some. Constants exec_policy.rs:43-48 (PROMPT_CONFLICT_REASON='approval required by policy, but AskForApproval is set to Never', REJECT_SANDBOX_APPROVAL_REASON, REJECT_RULES_APPROVAL_REASON).",
+    "swiftStatus": "ExecPolicy.classifyExact (Sources/Tools/ExecPolicy.swift:584-587) returns matches.max() for a matched prompt rule (= .needsApproval) without consulting the approval policy; SessionEngine.swift:955-957 maps .needsApproval to the generic approval path, and Approvals.swift:50-53 decideCommand(.never) returns .proceedSandboxed. So a policy rule with decision=\"prompt\" runs sandboxed under Never instead of being forbidden, and the Granular rules-vs-sandbox_approval distinction (allows_rules_approval) is absent.",
+    "description": "Upstream distinguishes a policy-RULE prompt from a sandbox/escalation prompt and, under AskForApproval::Never, converts any Prompt decision into Forbidden with PROMPT_CONFLICT_REASON. Under Granular it independently checks allows_rules_approval() (rules) vs allows_sandbox_approval(). The Swift port has no equivalent: a prefix_rule(decision=\"prompt\") under .never silently runs the command sandboxed, and the Granular rules/sandbox_approval split is collapsed into a single sandboxApproval flag, so a policy-mandated approval is not enforced.",
+    "fixRecommendation": "In SessionEngine (or ExecPolicy) port prompt_is_rejected_by_policy: when the matched decision is .needsApproval AND it was driven by a policy prefix-rule (not just the heuristic fallback), reject under .never (reason PROMPT_CONFLICT_REASON) and under .granular when the rules/sandbox_approval flag is false (REJECT_RULES_APPROVAL_REASON / REJECT_SANDBOX_APPROVAL_REASON). Add a Granular `rules` flag distinct from `sandboxApproval`."
+   },
+   {
+    "title": "Explicitly allow-listed commands do not bypass the sandbox (bypass_sandbox unimplemented)",
+    "severity": "major",
+    "category": "wrong-semantics",
+    "rustEvidence": "core/src/exec_policy.rs:357-377: Decision::Allow yields ExecApprovalRequirement::Skip { bypass_sandbox: commands.iter().all(... rule_match decision == Decision::Allow) }. An execpolicy allow-rule match sets bypass_sandbox=true so the command runs OUTSIDE the Codex sandbox.",
+    "swiftStatus": "SessionEngine.swift:953-954 maps ExecDecision.safe to CommandSafety.classify(argv:[\"true\"]) => .safe, then Approvals.swift decideCommand returns .proceedSandboxed for every policy. grep across Sources/ finds no bypass_sandbox / bypassSandbox path. Allow-listed commands always run inside the kernel sandbox.",
+    "description": "When a command is explicitly allowed by an execpolicy prefix-rule, upstream runs it WITHOUT the kernel sandbox (bypass_sandbox=true), because the user has vouched for the exact command. The Swift port always runs .safe commands sandboxed, so an allow-listed command that legitimately needs to write outside the workspace or use the network (the reason it was allow-listed) will be blocked by the sandbox in Swift but succeed upstream.",
+    "fixRecommendation": "Thread a 'bypass sandbox' flag out of ExecPolicy.classify when the matched decision came from a policy allow-rule (vs the heuristic fallback). When set, run the command via the escalated/unsandboxed path instead of sandboxed()."
+   },
+   {
+    "title": "Justification-aware forbidden/prompt reason strings (derive_forbidden_reason / derive_prompt_reason) are not reproduced",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "core/src/exec_policy.rs:928-991: derive_prompt_reason emits '`{cmd}` requires approval: {justification}' or '`{cmd}` requires approval by policy'; derive_forbidden_reason emits '`{cmd}` rejected: {justification}', '`{cmd}` rejected: policy forbids commands starting with `{prefix}`', or '`{cmd}` rejected: blocked by policy'. These reasons are surfaced to the model/user via ExecApprovalRequirement::Forbidden{reason}/NeedsApproval{reason}.",
+    "swiftStatus": "SessionEngine.swift:951-952 returns deny(\"forbidden by exec policy\") \u2014 a single generic string. grep for the upstream reason substrings ('rejected: policy forbids', 'requires approval by policy', etc.) across Sources/ returns nothing.",
+    "description": "Upstream surfaces a specific, justification-carrying rejection/prompt reason (so a policy author's rationale and recommended alternative reach the model). The Swift port discards the matched rule's justification and the matched prefix, emitting a fixed 'forbidden by exec policy' string. The model loses the policy-author guidance and the per-rule justification.",
+    "fixRecommendation": "Return the matched rule (and its justification/matched-prefix) from ExecPolicy.classify and build the reason text mirroring derive_forbidden_reason/derive_prompt_reason, then pass it as the deny()/approval reason in SessionEngine."
+   },
+   {
+    "title": "proposedExecpolicyAmendment / proposedNetworkPolicyAmendments missing from CommandApprovalParams and never derived",
+    "severity": "major",
+    "category": "wrong-field",
+    "rustEvidence": "app-server-protocol/src/protocol/v2/item.rs:1298-1305 CommandExecutionRequestApprovalParams.proposed_execpolicy_amendment: Option<ExecPolicyAmendment> and proposed_network_policy_amendments: Option<Vec<NetworkPolicyAmendment>>. Derivation: core/src/exec_policy.rs:318-329, :345-353, :864-903 (derive_requested_execpolicy_amendment_from_prefix_rule, BANNED_PREFIX_SUGGESTIONS at :52-99, prefix_rule_would_approve_all_commands).",
+    "swiftStatus": "Sources/ProtocolModel/ServerRequest.swift:134-164 CommandApprovalParams has only threadId/turnId/itemId/startedAtMs/approvalId/reason/command/cwd \u2014 no proposedExecpolicyAmendment, proposedNetworkPolicyAmendments, commandActions, additionalPermissions, or availableDecisions. ExecPolicy.swift has no amendment-derivation or BANNED_PREFIX_SUGGESTIONS logic (grep for 'osascript'/'bannedPrefix' finds only Prompts/Permissions.swift).",
+    "description": "The command-approval request the frontend receives carries an optional proposed execpolicy amendment (the prefix-rule a client can one-click persist) and proposed network-policy amendments. Swift never derives these and the wire struct omits the fields, so the 'accept with execpolicy amendment' / 'apply network policy amendment' decisions (which Swift DOES accept on the response side, ServerRequest.swift:106-111) can never be populated with a server-proposed amendment. The BANNED_PREFIX_SUGGESTIONS guard (which prevents suggesting overly-broad interpreter prefixes like python/bash/sudo) is also absent.",
+    "fixRecommendation": "Add proposedExecpolicyAmendment (Optional<ExecPolicyAmendment>) and proposedNetworkPolicyAmendments to CommandApprovalParams with skip-if-nil encoding, and port derive_requested_execpolicy_amendment_from_prefix_rule + BANNED_PREFIX_SUGGESTIONS + prefix_rule_would_approve_all_commands to populate them when raising a command approval."
+   },
+   {
+    "title": "Protected-metadata deny is unconditional rather than gated on can_write_path_with_cwd",
+    "severity": "minor",
+    "category": "wrong-semantics",
+    "rustEvidence": "sandboxing/src/seatbelt.rs:406-422 protected_metadata_names_for_writable_root only adds a PROTECTED_METADATA_PATH_NAME to the require-not set when !file_system_sandbox_policy.can_write_path_with_cwd(root/name, cwd) \u2014 i.e. a profile that explicitly grants write to .git/.codex/.agents keeps it writable.",
+    "swiftStatus": "Sandbox.swift:441-459 (and bwrap path :532-539) unconditionally emit a deny clause for every protectedMetadataNames entry (.git/.codex/.agents) in every writable root, with no check for an explicit write grant.",
+    "description": "Upstream allows a writable root to opt back into writing .git/.codex/.agents via an explicit write entry; Swift hard-denies them always. For the default profile (which protects these) the behavior matches, so this only diverges for the rare case of an explicit metadata write grant. The mechanism also differs (separate top-level (deny ...) clauses vs require-not inside the allow clause), which is functionally equivalent because Seatbelt deny wins.",
+    "fixRecommendation": "If explicit per-root metadata write grants are ever supported, gate the protected-metadata deny on whether the policy grants write to that exact path (mirroring can_write_path_with_cwd). Otherwise note as an intentional always-protect hardening."
+   }
+  ],
+  "config": [
+   {
+    "title": "Seatbelt read policy is hard-coded to (allow file-read*) and ignores restricted readable-roots / deny-read globs",
+    "severity": "minor",
+    "category": "missing-type",
+    "rustEvidence": "sandboxing/src/seatbelt.rs:654-702 builds file-read* from get_readable_roots_with_cwd / has_full_disk_read_access, and :424-456 build_seatbelt_unreadable_glob_policy emits (deny file-read* (regex ...)) / (deny file-write-unlink ...) for unreadable globs; :708-720 appends MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS when include_platform_defaults().",
+    "swiftStatus": "Sandbox.swift:387 always starts the profile with [SeatbeltPolicy.base, \"(allow file-read*)\"] regardless of policy; there is no readable-roots restriction, no unreadable-glob deny rules, and no restricted_read_only_platform_defaults section. SandboxPolicy (Sandbox.swift:10-42) has no readable-roots / unreadable-globs / read-deny fields.",
+    "description": "The Swift SandboxPolicy models only writable roots + network; it cannot express restricted read access or deny-read globs. Because the upstream DEFAULT restricted policy has a Root read entry (full-disk read), the common case (workspace-write with full read) matches, so this is a feature gap rather than a default-case wire break \u2014 but any session configured with read restrictions or unreadable globs would be enforced upstream and silently unenforced in Swift.",
+    "fixRecommendation": "If/when codex-swift supports read-restricted profiles, extend SandboxPolicy with readable-roots and unreadable-globs and port build_seatbelt_access_policy('file-read*'), build_seatbelt_unreadable_glob_policy, and the MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS fragment. Otherwise document this as an intentional unsupported feature."
+   },
+   {
+    "title": "config/value/write overriddenMetadata.message is a single generic string instead of upstream's per-layer-type text",
+    "severity": "minor",
+    "category": "prompt-text",
+    "rustEvidence": "app-server/src/config_manager_service.rs:566-592 override_message(): distinct strings per layer \u2014 Mdm => \"Overridden by managed policy (MDM): {domain}\"; System => \"Overridden by managed config (system): {file}\"; Project => \"Overridden by project config: {dot_codex_folder}/config.toml\"; SessionFlags => \"Overridden by session flags\"; User => \"Overridden by user config: {file}\"; LegacyManagedConfigTomlFromFile => \"Overridden by legacy managed_config.toml: {file}\"; LegacyManagedConfigTomlFromMdm => \"Overridden by legacy managed configuration from MDM\". This text is placed in OverriddenMetadata.message (config_manager_service.rs:614-617).",
+    "swiftStatus": "Sources/Supervisor/RequestRouter.swift:6113-6118 firstOverriddenEdit() always emits the single literal message \"The value written to the user config is overridden by a higher-precedence layer.\" regardless of which layer (system/mdm/project/session) shadows the write.",
+    "description": "Upstream computes a different human-readable message per overriding layer type (and embeds the domain/file path for MDM/System/Project/User/legacy layers). The Swift port hard-codes one generic message. A frontend that surfaces or matches on `overriddenMetadata.message` will show different text than codex-rs; any UI relying on the specific phrasing or the embedded path/domain loses that information.",
+    "fixRecommendation": "In Sources/Supervisor/RequestRouter.swift firstOverriddenEdit(), branch on meta.name (the ConfigLayerSource) and build the message exactly as upstream override_message() does: include the domain for .mdm, the file path for .system/.user/.legacyManagedConfigTomlFromFile, the \"{dotCodexFolder}/config.toml\" for .project, and the fixed strings for .sessionFlags / .legacyManagedConfigTomlFromMdm."
+   }
+  ]
+ }
+}

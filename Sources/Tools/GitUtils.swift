@@ -307,6 +307,43 @@ public actor GitUtils {
         return ordered
     }
 
+    /// Verbatim port of upstream `parse_git_remote_urls`
+    /// (`git-utils/src/info.rs:273-298`): for every `… (fetch)` line, split on
+    /// TAB (then space), keep `name` → RAW fetch URL (NOT canonicalized — the
+    /// turn-metadata header carries the raw remote string). Returns `nil` when
+    /// there are no fetch remotes (upstream `BTreeMap::is_empty` → `None`).
+    public func rawRemoteURLMap() async -> [String: String]? {
+        let r = await GitRunner.run(["remote", "-v"], cwd: cwd)
+        guard r.exitCode == 0 else { return nil }
+        var remotes: [String: String] = [:]
+        for line in r.stdout.split(separator: "\n", omittingEmptySubsequences: true) {
+            let s = String(line)
+            guard s.hasSuffix(" (fetch)") else { continue }
+            let fetchLine = String(s.dropLast(" (fetch)".count))
+            let parts: [Substring]
+            if fetchLine.contains("\t") {
+                parts = fetchLine.split(separator: "\t", maxSplits: 1,
+                                        omittingEmptySubsequences: false)
+            } else {
+                parts = fetchLine.split(separator: " ", maxSplits: 1,
+                                        omittingEmptySubsequences: false)
+            }
+            guard parts.count == 2 else { continue }
+            let name = String(parts[0])
+            let url = String(parts[1].drop(while: { $0 == " " }))
+            if !url.isEmpty { remotes[name] = url }
+        }
+        return remotes.isEmpty ? nil : remotes
+    }
+
+    /// Upstream `get_has_changes` (`git-utils/src/info.rs:264-271`):
+    /// `git status --porcelain` with non-empty stdout. `nil` on non-zero exit.
+    public func hasChanges() async -> Bool? {
+        let r = await GitRunner.run(["status", "--porcelain"], cwd: cwd)
+        guard r.exitCode == 0 else { return nil }
+        return !r.stdout.isEmpty
+    }
+
     /// `^[^@/]+@([^:/]+):(.+)$`. Compiled once, reused across calls.
     private static let scpRegex: NSRegularExpression = {
         // The literal is well-formed; force-try is fine here.

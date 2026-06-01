@@ -18,6 +18,8 @@ private func piBlob(_ items: [PromptInput]) -> String {
         switch i {
         case .userText(let t), .developerText(let t), .assistantText(let t): return t
         case .toolOutput(_, let o): return o
+        case .reasoning(let summary, let content, _):
+            return (summary + content).joined(separator: "\n")
         }
     }.joined(separator: "\n")
 }
@@ -41,8 +43,17 @@ private func piCollect(_ e: SessionEngine, untilCompletions n: Int = 1,
 
 final class PromptInjectionAdversarialTests: XCTestCase {
 
+    // The byte-stable reference must be composed for the SAME model the engine
+    // uses. The engine threads `SessionConfig.model` (default "gpt-5.5") into
+    // `PromptComposer.modelInstructions()`, which the prompt refactor routes
+    // through the bundled `ModelsCatalog` (models.json) for the gpt-5.5
+    // `base_instructions`. The bare composer (empty model) instead falls
+    // through to `Templates.defaultBaseInstructions`, so it must NOT be used as
+    // the reference here — that is exactly the snapshot that drifted. The
+    // security property (instructions byte-stable, injected text never present)
+    // is asserted against this model-correct reference.
     private static let stableSystem =
-        PromptComposer(personality: .pragmatic).modelInstructions()
+        PromptComposer(personality: .pragmatic, model: "gpt-5.5").modelInstructions()
 
     private func makeStore() throws -> (ThreadStore, String) {
         let home = piTmp("home")
@@ -72,7 +83,7 @@ final class PromptInjectionAdversarialTests: XCTestCase {
                                    router: ToolRouter(limits: Limits()), limits: Limits())
         await engine.start()
         let collector = Task { await piCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: inj)], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: inj)], model: nil, turnId: nil))
         _ = await collector.value
 
         let caps = await model.capturedRequests()
@@ -114,7 +125,7 @@ final class PromptInjectionAdversarialTests: XCTestCase {
                                    router: ToolRouter(limits: Limits()), limits: Limits())
         await engine.start()
         let collector = Task { await piCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "hi")], model: nil, turnId: nil))
         _ = await collector.value
         let caps = await model.capturedRequests()
         for cap in caps {
@@ -191,12 +202,13 @@ final class PromptInjectionAdversarialTests: XCTestCase {
                                    limits: Limits())
         await engine.start()
         let collector = Task { await piCollect(engine) }
-        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil))
+        await engine.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
         let evs = await collector.value
-        // No thread/compacted was emitted just because tool output contained
-        // the summary prefix.
+        // No contextCompaction item was emitted just because tool output
+        // contained the summary prefix.
         XCTAssertFalse(evs.contains {
-            if case .raw(let m, _) = $0 { return m == "thread/compacted" }
+            if case .itemCompleted(_, _, let item, _) = $0,
+               case .contextCompaction = item { return true }
             return false
         }, "tool output cannot forge a compaction")
         // System instructions remained byte-stable across the follow-up call.

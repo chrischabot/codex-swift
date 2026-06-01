@@ -77,8 +77,14 @@ sections, in this order:
 
 2. **Personality substitution** — When the default template is used, the
    `{{ personality }}` placeholder is replaced with the chosen personality
-   block (`Personality.templateText`). The two built-in personalities are
-   `personalityPragmatic` and `personalityFriendly`, both in `Templates.swift`.
+   block (`Personality.templateText`). The built-in personalities are
+   `personalityPragmatic` and `personalityFriendly` (both in `Templates.swift`),
+   plus the documented `none` value: `Personality.none` resolves the
+   `{{ personality }}` slot to the **empty string** (upstream
+   `get_personality_message` → `Personality::None => String::new()`), never
+   falling back to the pragmatic default. `Personality.init(fromOptional:)`
+   maps `"none"` → `.none`, `"friendly"` → `.friendly`, `"pragmatic"` →
+   `.pragmatic`, and any other/absent value → the pragmatic default.
 
 3. **Multi-agent hint** — When `multiAgentEnabled == true`, the composer
    appends `Templates.collabExperimentalPrompt` after the base prompt. This
@@ -274,6 +280,15 @@ budget:
 - `SKILL_METADATA_CONTEXT_WINDOW_PERCENT = 2`% of the context window
   (in approx-tokens, ≈ `ceil(bytes / 4)`) when a context-window size is
   available.
+
+`SessionEngine.buildInitialContextMessages` resolves the live model context
+window (`modelContextWindow()` → `ModelCatalog.default.contextWindow(for:)`)
+and passes it into `SkillsBody.defaultBudget(contextWindow:)`, so a session
+with a real model (e.g. the 272 000-token default → `Tokens(5440)`) uses the
+2 %-token budget exactly as upstream
+`default_skill_metadata_budget(model_info.context_window)`
+(`core-skills/src/render.rs`). The 8 000-char fallback only applies when no
+positive window is available.
 
 When all full descriptions fit, every skill renders at full length.
 
@@ -617,3 +632,33 @@ a change that adds per-turn data to `modelInstructions()`, these tests will
 fail and you should reconsider — anything per-turn belongs in
 `developerMessage()` or in an `InitialContextMessage`, not in the cacheable
 preamble.
+
+## 12. Intentional Divergences
+
+The following upstream prompt-adjacent behaviors are deliberately NOT ported.
+Each is a non-prompt-visible bookkeeping/feature gap, not a fidelity break.
+
+- **Personality migration (`maybe_migrate_personality`,
+  `.personality_migration` marker)** — Upstream's one-time startup routine
+  (`core/src/personality_migration.rs`) writes `personality = pragmatic` into
+  `config.toml` (and a `v1\n` marker file) for pre-existing users who never set
+  a personality and have prior sessions. The Swift port omits this because the
+  *prompt-visible* result is already identical: `Feature::Personality` is
+  Stable/default-enabled upstream, so an unset personality already resolves to
+  the pragmatic default in both implementations
+  (`Personality.default == .pragmatic`). The marker is config-file persistence
+  bookkeeping with no effect on the model-visible prompt or `prompt_cache_key`,
+  and the macOS app-server does not migrate a shared `config.toml` across
+  invocations. If config-persistence parity is later required, mirror
+  `personality_migration.rs` (skip-if-explicit, skip-if-no-prior-sessions,
+  else write `personality = pragmatic` + marker) in a codexd startup routine.
+
+- **Realtime backend prompt (`prepare_realtime_backend_prompt`,
+  `templates/realtime/backend_prompt.md`)** — Upstream's experimental
+  realtime-voice backend system prompt and its `{{ user_first_name }}`
+  substitution (`core/src/realtime_prompt.rs`) are not reproduced. The feature
+  is `[UNSTABLE]`, TUI-oriented, and the JSON-RPC app-server frontend has no
+  realtime-voice pathway — only the config passthrough key
+  `experimental_realtime_ws_backend_prompt` exists (`Config.swift`). If voice
+  is brought into scope, vendor `backend_prompt.md` and port the
+  config-override → per-request prompt → default-with-first-name resolution.
