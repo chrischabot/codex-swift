@@ -26,10 +26,16 @@ public struct ComputerUseExecutor: Sendable {
     private let screen: CGRect
 
     public init(targetWidth: Int = 1280) {
-        // NSScreen.frame is points, bottom-left origin; for the MAIN display the
-        // origin is (0,0) and CGEvent's top-left (0,0) coincides, so width/height
-        // transfer directly (we keep a top-left model→screen map, no Y flip).
-        let frame = NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        // Match `screencapture -D 1` (the MAIN/primary display) for BOTH the
+        // screenshot the model sees AND the coordinate mapping, so eyes and hands
+        // target the same display. `CGDisplayBounds(CGMainDisplayID())` is the
+        // main display in the global display coordinate space (top-left origin,
+        // points) — exactly the space `CGEvent` mouse positions use. We must NOT
+        // use `NSScreen.main`: that is the screen with KEYBOARD FOCUS, which on a
+        // multi-monitor setup diverges from `-D 1` and makes every click land on
+        // the wrong display (the pre-fix bug).
+        let b = CGDisplayBounds(CGMainDisplayID())
+        let frame = (b.width > 0 && b.height > 0) ? b : CGRect(x: 0, y: 0, width: 1440, height: 900)
         self.screen = frame
         self.targetWidth = targetWidth
         self.targetHeight = max(1, Int((CGFloat(targetWidth) * frame.height / frame.width).rounded()))
@@ -99,6 +105,12 @@ public struct ComputerUseExecutor: Sendable {
         return CGPoint(x: x, y: y)
     }
 
+    // Testing seams (internal): the resolved screen bounds the model↔screen map
+    // uses, and the map itself — so a test can assert it tracks the MAIN display
+    // (`-D 1`) rather than the keyboard-focused screen.
+    var screenBoundsForTesting: CGRect { screen }
+    func mapModelPointForTesting(_ x: Double, _ y: Double) -> CGPoint { point(x, y) }
+
     // MARK: Hands — mouse
 
     private func postMouse(_ type: CGEventType, at p: CGPoint, button: CGMouseButton, flags: CGEventFlags) {
@@ -145,11 +157,24 @@ public struct ComputerUseExecutor: Sendable {
         move(x: x, y: y)
         // CGEvent scroll is in lines (units .line); OpenAI scroll deltas are in
         // pixels — divide to lines (~10px/line) and invert Y (scrollY>0 = down).
-        let lines = Int32((-scrollY / 10).rounded())
-        let hLines = Int32((scrollX / 10).rounded())
+        // Clamp before the Int32 conversion: the deltas are untrusted model JSON
+        // (read verbatim), and `Int32(huge)` traps. NaN/∞ collapse to 0.
+        let lines = Self.clampInt32(-scrollY / 10)
+        let hLines = Self.clampInt32(scrollX / 10)
         guard let e = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2,
                               wheel1: lines, wheel2: hLines, wheel3: 0) else { return }
         e.post(tap: .cghidEventTap)
+    }
+
+    /// Round a Double to Int32, saturating to the representable range and mapping
+    /// NaN/∞ to 0 — so an out-of-range or non-finite (untrusted) model value can
+    /// never trap the `Int32(...)` conversion.
+    static func clampInt32(_ d: Double) -> Int32 {
+        guard d.isFinite else { return 0 }
+        let r = d.rounded()
+        if r >= Double(Int32.max) { return Int32.max }
+        if r <= Double(Int32.min) { return Int32.min }
+        return Int32(r)
     }
 
     private static func mouseKind(_ button: String) -> (CGMouseButton, CGEventType, CGEventType) {
@@ -180,17 +205,46 @@ public struct ComputerUseExecutor: Sendable {
     /// are pressed.
     public func keypress(_ keys: [String]) {
         let flags = Self.modifierFlags(keys)
-        let mains = keys.filter { !Self.isModifier($0) }.compactMap { Self.keyCode($0) }
-        if mains.isEmpty {
-            // Pure modifier press is a no-op chord; still flush a flagsChanged.
-            return
+        let nonMods = keys.filter { !Self.isModifier($0) }
+        // A pure-modifier chord (e.g. just ["SHIFT"]) has nothing to press.
+        if nonMods.isEmpty { return }
+        for key in nonMods {
+            switch Self.keyDispatch(key) {
+            case .keycode(let code):
+                guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+                      let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { continue }
+                down.flags = flags; up.flags = flags
+                down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+            case .unicode(let s):
+                // Unmapped single character (a SHIFTED symbol like "+", ":", "?"
+                // with no direct keycode): inject via Unicode so it actually types
+                // instead of the old silent no-op. A Unicode-string event CANNOT
+                // carry modifier flags — so if the chord has modifiers (e.g.
+                // ⌘+"+"), injecting the bare character would type a stray symbol
+                // into the focused field rather than perform the chord. In that
+                // case do nothing (the inert pre-fix behavior) instead of
+                // corrupting content; modifier+symbol chords whose symbol is
+                // unshifted already take the keycode path above.
+                if !flags.isEmpty { continue }
+                var u = Array(s.utf16)
+                guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                      let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { continue }
+                down.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
+                up.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
+                down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+            case .unsupported:
+                continue   // multi-char unknown token (no keycode, not a single char)
+            }
         }
-        for code in mains {
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
-                  let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false) else { continue }
-            down.flags = flags; up.flags = flags
-            down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
-        }
+    }
+
+    /// How a non-modifier `keypress` key is realized. Pure + `internal` so it is
+    /// unit-testable without synthesizing real events.
+    enum KeyDispatch: Equatable { case keycode(CGKeyCode), unicode(String), unsupported }
+    static func keyDispatch(_ key: String) -> KeyDispatch {
+        if let c = keyCode(key) { return .keycode(c) }
+        if key.count == 1 { return .unicode(key) }
+        return .unsupported
     }
 
     private static func isModifier(_ k: String) -> Bool {
@@ -231,6 +285,16 @@ public struct ComputerUseExecutor: Sendable {
         }
         let digits: [String: CGKeyCode] = ["0":29,"1":18,"2":19,"3":20,"4":21,"5":23,"6":22,"7":26,"8":28,"9":25]
         if let c = digits[k] { return c }
+        // Unshifted US-layout punctuation — given real keycodes so chords like
+        // ⌘- / ⌘= / ⌘/ carry their modifier (the prior code had none, so these
+        // fell through to a modifier-less Unicode insert). Matched on the raw key
+        // (punctuation is case-invariant). SHIFTED symbols (+, :, ?, …) have no
+        // direct keycode and still take the Unicode path.
+        let punct: [String: CGKeyCode] = [
+            "-": 0x1B, "=": 0x18, "[": 0x21, "]": 0x1E, "\\": 0x2A, ";": 0x29,
+            "'": 0x27, ",": 0x2B, ".": 0x2F, "/": 0x2C, "`": 0x32,
+        ]
+        if let c = punct[key] { return c }
         return nil
     }
 }

@@ -15,7 +15,16 @@ public final class ComputerUseLoop: @unchecked Sendable {
         public var environment: String = "mac"
         public var reasoningEffort: String = "low"   // low recommended for computer use
         public var maxSteps: Int = 40
-        public var confirmRiskyActions: Bool = true   // honor pending_safety_checks
+        /// When true, a `computer_call` carrying `pending_safety_checks` is NOT
+        /// executed unless `confirmHandler` approves it. The default handler
+        /// DENIES (safe), so the default behavior is to STOP on a flagged action
+        /// rather than the old silent auto-acknowledge. Set false (the CLI's
+        /// `--no-confirm`) to proceed + auto-acknowledge without confirming.
+        public var confirmRiskyActions: Bool = true
+        /// Confirmation gate consulted (only when `confirmRiskyActions`) before
+        /// performing an action with pending safety checks. Receives the check
+        /// codes; returns true to proceed. Default: deny.
+        public var confirmHandler: @Sendable ([String]) -> Bool = { _ in false }
         public var dryRun: Bool = false               // log actions but do NOT touch mouse/keyboard
         public var log: @Sendable (String) -> Void = { print($0); fflush(stdout) }
         public init() {}
@@ -60,7 +69,10 @@ public final class ComputerUseLoop: @unchecked Sendable {
         var previousId: String? = nil
         var finalText = ""
 
-        for step in 1...opts.maxSteps {
+        // Clamp: a non-positive maxSteps (e.g. the CLI's unclamped `--max-steps 0`)
+        // would make `1...0` trap. At least one step always runs.
+        let maxSteps = Self.clampedMaxSteps(opts.maxSteps)
+        for step in 1...maxSteps {
             var body: [String: Any] = [
                 "model": opts.model,
                 "tools": [tool],
@@ -90,21 +102,39 @@ public final class ComputerUseLoop: @unchecked Sendable {
                 return finalText
             }
 
+            // PRE-SCAN every call in this step for a blocked safety check BEFORE
+            // performing ANY action — otherwise an earlier non-flagged call would
+            // physically drive the mouse/keyboard before we discover a later call
+            // must be blocked (partial execution). When confirmRiskyActions is on
+            // (the standalone CLI default), a denied check stops the whole step
+            // with nothing performed and nothing acknowledged.
+            for call in calls {
+                let safety = call["pending_safety_checks"] as? [[String: Any]] ?? []
+                guard !safety.isEmpty else { continue }
+                let codes = safety.compactMap { $0["code"] as? String ?? $0["id"] as? String }
+                opts.log("⚠️ pending safety checks: \(codes.joined(separator: ", "))")
+                if Self.shouldBlockRiskyAction(confirmRiskyActions: opts.confirmRiskyActions,
+                                               codes: codes, confirm: opts.confirmHandler) {
+                    let msg = "Stopped: the model requested an action flagged by pending safety "
+                        + "check(s) [\(codes.joined(separator: ", "))]; it was not confirmed "
+                        + "(confirmRiskyActions is on). Re-run with confirmation/--no-confirm to proceed."
+                    opts.log("⛔️ " + msg)
+                    return finalText.isEmpty ? msg : finalText + "\n" + msg
+                }
+            }
+
             // Execute each computer_call's action(s) and build outputs.
             var outputs: [[String: Any]] = []
             for call in calls {
                 guard let callId = call["call_id"] as? String else { continue }
                 let safety = call["pending_safety_checks"] as? [[String: Any]] ?? []
-                if !safety.isEmpty {
-                    let names = safety.compactMap { $0["code"] as? String ?? $0["id"] as? String }.joined(separator: ", ")
-                    opts.log("⚠️ pending safety checks: \(names)")
-                    if opts.confirmRiskyActions {
-                        opts.log("   (auto-acknowledging in PoC; wire a real confirm here for production)")
-                    }
-                }
                 for action in Self.actions(of: call) {
+                    // Honor cancellation promptly: when the turn is interrupted or
+                    // its deadline fires, ToolRouter cancels this task — stop
+                    // driving the desktop instead of finishing the action batch.
+                    try Task.checkCancellation()
                     Self.describe(action).map { opts.log("• step \(step): \($0)\(opts.dryRun ? "  [dry-run]" : "")") }
-                    if !opts.dryRun { perform(action) }
+                    if !opts.dryRun { try await perform(action) }
                 }
                 guard let shot = exec.screenshotDataURL() else { throw LoopError.screenshot }
                 var out: [String: Any] = [
@@ -117,9 +147,30 @@ public final class ComputerUseLoop: @unchecked Sendable {
             }
             input = outputs
         }
-        opts.log("⏹ hit max steps (\(opts.maxSteps))")
+        opts.log("⏹ hit max steps (\(maxSteps))")
         return finalText
     }
+
+    // MARK: pure decision helpers (unit-testable without network/desktop)
+
+    /// At least one step always runs; a non-positive `maxSteps` (e.g. the CLI's
+    /// unclamped `--max-steps 0`) is clamped so `1...maxSteps` cannot trap.
+    static func clampedMaxSteps(_ n: Int) -> Int { max(1, n) }
+
+    /// A pending-safety-check action is BLOCKED iff we are honoring checks
+    /// (`confirmRiskyActions`) and the confirmation gate denies. With
+    /// `confirmRiskyActions == false` (`--no-confirm`) nothing blocks; the
+    /// default confirm handler denies, so the default is to block.
+    static func shouldBlockRiskyAction(confirmRiskyActions: Bool, codes: [String],
+                                       confirm: ([String]) -> Bool) -> Bool {
+        confirmRiskyActions && !confirm(codes)
+    }
+
+    /// Testing seam: drive a single action through `perform` so a test can assert
+    /// cancellation propagates (the settle/`wait` sleeps now use `try await`, not
+    /// `try?`). Use a non-input action (`screenshot`/`wait`) to avoid synthesizing
+    /// real events.
+    func performForTesting(_ a: [String: Any]) async throws { try await perform(a) }
 
     // MARK: action parse + dispatch
 
@@ -149,7 +200,11 @@ public final class ComputerUseLoop: @unchecked Sendable {
         return out
     }
 
-    private func perform(_ a: [String: Any]) {
+    /// `async` (not sync) so its settle/wait delays use `Task.sleep` — which
+    /// SUSPENDS the task — instead of `Thread.sleep`, which would BLOCK a shared
+    /// cooperative-pool worker thread for the whole multi-step run when the
+    /// `computer_use` tool drives the loop in-process under the ToolRouter.
+    private func perform(_ a: [String: Any]) async throws {
         let type = (a["type"] as? String ?? "").lowercased()
         let x = Self.num(a, ["x"]); let y = Self.num(a, ["y"])
         let button = a["button"] as? String ?? "left"
@@ -165,12 +220,14 @@ public final class ComputerUseLoop: @unchecked Sendable {
         case "type": exec.type(a["text"] as? String ?? "")
         case "keypress": exec.keypress(keys)
         case "drag": exec.drag(path: Self.dragPath(a), button: button)
-        case "wait": Thread.sleep(forTimeInterval: 1.0)
+        case "wait": try await Task.sleep(for: .seconds(1))
         case "screenshot": break   // handled implicitly (we always send a fresh screenshot)
         default: opts.log("⚠️ unknown action type: \(type)")
         }
-        // Small settle delay so the UI updates before the next screenshot.
-        Thread.sleep(forTimeInterval: 0.4)
+        // Small settle delay so the UI updates before the next screenshot. `try`
+        // (not `try?`): a CancellationError here PROPAGATES so an interrupt stops
+        // the loop promptly mid-batch instead of finishing the remaining actions.
+        try await Task.sleep(for: .milliseconds(400))
     }
 
     private static func describe(_ a: [String: Any]) -> String? {

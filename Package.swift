@@ -348,7 +348,7 @@ let package = Package(
                 dependencies: ["Channels", "HarnessCore", "ModelClient", "Persistence",
                                "Tools", "ProtocolModel", "InfraPrimitives", "ExtensionAPI"], swiftSettings: strict),
         .testTarget(name: "ToolsTests",
-                dependencies: ["Tools", "Sandbox", "ProtocolModel", "InfraPrimitives"], swiftSettings: strict),
+                dependencies: ["Tools", "Sandbox", "ProtocolModel", "InfraPrimitives", "ComputerUse"], swiftSettings: strict),
         .testTarget(name: "SandboxTests",
                 dependencies: ["Sandbox", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "MCPTests",

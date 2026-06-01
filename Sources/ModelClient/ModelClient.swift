@@ -44,6 +44,23 @@ public enum PromptInput: Sendable, Equatable {
     case reasoning(summary: [String], content: [String], encryptedContent: String?)
 }
 
+/// Coerce a replayed `function_call` name to a valid OpenAI function identifier
+/// (`^[A-Za-z0-9_-]+$`); invalid characters become `_`, an empty result becomes
+/// `"tool"`. The Responses API 400s the WHOLE request on a malformed name, which
+/// drops the entire turn — so this is the wire-boundary backstop for the request
+/// builders (the semantic name is chosen upstream in `ContextManager.forPrompt`).
+func sanitizedResponsesFunctionName(_ s: String) -> String {
+    var chars: [Character] = []
+    chars.reserveCapacity(s.count)
+    for u in s.unicodeScalars {
+        let v = u.value
+        let ok = (0x41...0x5A).contains(v) || (0x61...0x7A).contains(v)
+            || (0x30...0x39).contains(v) || v == 0x5F || v == 0x2D
+        chars.append(ok ? Character(u) : "_")
+    }
+    return chars.isEmpty ? "tool" : String(chars)
+}
+
 /// One model-visible tool spec (Codex `ToolSpec` / `router.model_visible_specs()`).
 /// `parametersJSON` is the JSON-Schema object string for the tool arguments.
 /// `outputSchemaJSON` is an optional JSON-Schema object string describing the

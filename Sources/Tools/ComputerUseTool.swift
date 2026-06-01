@@ -107,6 +107,20 @@ public struct ComputerUseTool: Tool {
 
         var options = ComputerUseLoop.Options()
         options.maxSteps = max(1, min(args.max_steps ?? defaultMaxSteps, 60))
+        // Safety-check policy for the integrated tool. The HUMAN approval layer is
+        // the session-level `.hostControl` gate (SessionEngine prompts before this
+        // whole invocation under cautious policies). Within an already-approved
+        // invocation we AUTO-PROCEED past OpenAI's benign navigation checks
+        // (sensitive_domain / irrelevant_domain — raised on routine bank/login/
+        // email pages), because deny-by-default would abort the entire task on the
+        // first such check. But we still BLOCK higher-signal codes
+        // (malicious_instructions and any UNRECOGNIZED code) so a prompt-injected
+        // high-risk action stops rather than running unattended on the desktop.
+        options.confirmRiskyActions = true
+        options.confirmHandler = { codes in
+            let autoAck: Set<String> = ["sensitive_domain", "irrelevant_domain"]
+            return codes.allSatisfy { autoAck.contains($0) }
+        }
         let trace = TraceCollector()
         // Capture the loop's progress lines into the result instead of stdout
         // (stdout is the daemon's wire-protocol channel — must stay clean).

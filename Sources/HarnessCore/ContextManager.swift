@@ -376,6 +376,19 @@ public struct ContextManager: Sendable {
     /// tool outputs) is sent every request; the server prompt cache keyed by
     /// `prompt_cache_key = threadId` (and WS incremental delta) makes the
     /// re-send cheap. Assistant turns are NOT dropped.
+    /// True iff `s` is a non-empty OpenAI function identifier (`^[A-Za-z0-9_-]+$`).
+    /// Used to keep a replayed `function_call` name valid on the wire.
+    static func isValidFunctionName(_ s: String) -> Bool {
+        guard !s.isEmpty else { return false }
+        for u in s.unicodeScalars {
+            let v = u.value
+            let ok = (0x41...0x5A).contains(v) || (0x61...0x7A).contains(v)
+                || (0x30...0x39).contains(v) || v == 0x5F || v == 0x2D
+            if !ok { return false }
+        }
+        return true
+    }
+
     public func forPrompt(extra: [PromptInput] = []) -> [PromptInput] {
         var out: [PromptInput] = []
         for item in history {
@@ -385,7 +398,7 @@ public struct ContextManager: Sendable {
                 if !t.isEmpty { out.append(.userText(t)) }
             case .agentMessage(_, let t):
                 if !t.isEmpty { out.append(.assistantText(t)) }
-            case .commandExecution(let id, let command, _, _, _, let o, _, _, _, _):
+            case .commandExecution(let id, let command, _, _, _, let o, _, _, let source, _):
                 // Replay the REAL tool name on the synthesized function_call so
                 // the model sees WHICH call produced this output across
                 // iterations (mirrors codex-rs replaying the verbatim
@@ -398,7 +411,17 @@ public struct ContextManager: Sendable {
                 // arguments string (see Rollout.swift:843-880), so `"{}"` is
                 // passed for `argumentsJSON`.
                 if let o {
-                    let name = command.first ?? "tool"
+                    // The name MUST be a valid OpenAI function identifier
+                    // (^[A-Za-z0-9_-]+$) or the Responses API rejects the whole
+                    // request with 400. For an agent tool-call `command.first` IS
+                    // the tool name (valid). For a `.userShell` execution
+                    // `command` holds the raw user-typed command (e.g.
+                    // "git status"), which is NOT a valid name — that ran via the
+                    // shell tool, so use "shell_command". The `isValidFunctionName`
+                    // guard also catches any other non-conforming name defensively.
+                    let raw = command.first ?? "tool"
+                    let name = (source == .userShell || !Self.isValidFunctionName(raw))
+                        ? "shell_command" : raw
                     out.append(.toolOutput(callId: id.raw, name: name,
                                            argumentsJSON: "{}", output: o))
                 }

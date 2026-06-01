@@ -162,7 +162,8 @@ public actor OpenAIResponsesClient: ModelClient {
                 // `{type,name,arguments,call_id}` (`namespace` omitted when
                 // absent, `id` is `#[serde(skip_serializing)]`).
                 input.append(["type": "function_call", "call_id": callId,
-                              "name": name, "arguments": argumentsJSON])
+                              "name": sanitizedResponsesFunctionName(name),
+                              "arguments": argumentsJSON])
                 let formattedOutput = reserializeFreeformShellOutputs
                     ? (FreeformApplyPatchFormatting
                         .reserializeShellOutput(output) ?? output)

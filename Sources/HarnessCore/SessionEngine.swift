@@ -203,6 +203,10 @@ public actor SessionEngine {
     /// `acceptForSession` memory: command/patch prefixes the user already
     /// approved for the rest of this session (Codex prefix-rule persistence).
     private var sessionApprovedPrefixes: Set<String> = []
+    /// `acceptForSession` memory for the host-control (`computer_use`) approval
+    /// gate: once the user approves desktop control "for this session", we do not
+    /// re-prompt on every subsequent `computer_use` call.
+    private var hostControlApprovedForSession = false
     /// Durable approved-prefix store (Codex `prefix_rule` persistence). When
     /// set, `acceptForSession` persists across sessions and is consulted
     /// before prompting. nil → in-memory only (backward compatible).
@@ -924,6 +928,20 @@ public actor SessionEngine {
         return obj["command"] as? String
     }
 
+    /// Short, human-readable description of a `computer_use` call for the approval
+    /// prompt: the `task` argument, truncated. Falls back to the raw args.
+    private static func computerUseTaskSummary(fromArgs args: String) -> String {
+        let task: String
+        if let d = args.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+           let t = obj["task"] as? String, !t.isEmpty {
+            task = t
+        } else {
+            task = args
+        }
+        return task.count > 200 ? String(task.prefix(200)) + "…" : task
+    }
+
     private func toolPreflight(callId: String, name: String, args inArgs: String,
                                turnId: TurnId) async -> ToolPreflightOutcome {
         // P4.5 / C11: PreToolUse may rewrite the tool input via
@@ -1051,6 +1069,36 @@ public actor SessionEngine {
                 cwd: config.cwd))
                 ?? ToolResult(callId: callId, output: "escalated shell failed",
                               success: false, truncated: false)
+        }
+
+        // Host-control tools (`computer_use`) drive the real desktop. They have
+        // no sandbox to escalate out of, so they get a dedicated prompt-then-run
+        // gate (NOT the command/patch escalation paths, whose `escalated()` would
+        // mis-run the JSON args as a shell command). Under cautious policies the
+        // user is prompted before the model takes the mouse/keyboard; `accept for
+        // session` is remembered so we do not re-prompt every call.
+        if opKind == .hostControl {
+            if ApprovalPolicyEngine.decideHostControl(policy: policy),
+               !hostControlApprovedForSession {
+                let task = Self.computerUseTaskSummary(fromArgs: args)
+                let params = CommandApprovalParams(
+                    threadId: config.threadId, turnId: turnId,
+                    itemId: ItemId(callId),
+                    startedAtMs: Int64(Date().timeIntervalSince1970 * 1000),
+                    reason: "Allow the agent to control this Mac's desktop (mouse, keyboard, screen)?",
+                    command: "computer_use: \(task)",
+                    cwd: config.cwd)
+                switch await approvalDecision(.makeCommandApproval(idString: rid, params)) {
+                case .acceptForSession:
+                    hostControlApprovedForSession = true
+                case .accept, .acceptWithExecpolicyAmendment, .applyNetworkPolicyAmendment:
+                    break   // proceed (this call only)
+                case .decline, .cancel:
+                    return deny("user declined desktop control")
+                }
+            }
+            let r = await sandboxed()   // sandboxed() == router.dispatch — correct for computer_use
+            return (r, r.success ? .completed : .failed)
         }
 
         if opKind == .command {
@@ -1427,6 +1475,11 @@ public actor SessionEngine {
         switch ApprovalPolicyEngine.op(forTool: name) {
         case .command: return "item/commandExecution/requestApproval"
         case .patch:   return "item/fileChange/requestApproval"
+        case .hostControl:
+            // Host-control (computer_use) drives the desktop — always privileged,
+            // so the channel owner-gate denies a non-owner (secure default, same
+            // bucket as unknown effectful tools).
+            return "item/tool/call"
         case .none:
             // Benign ONLY for an allowlisted, genuinely-local, side-effect-free
             // read (both conditions — `parallelSafe` AND named). This closes the

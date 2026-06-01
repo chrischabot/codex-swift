@@ -28,7 +28,7 @@ public enum ApprovalDecisionKind: Sendable, Equatable {
 }
 
 public enum ApprovalPolicyEngine {
-    public enum Op: Sendable, Equatable { case command, patch, none }
+    public enum Op: Sendable, Equatable { case command, patch, hostControl, none }
 
     public static func op(forTool name: String) -> Op {
         switch name {
@@ -37,8 +37,35 @@ public enum ApprovalPolicyEngine {
             return .command
         case "apply_patch":
             return .patch
+        // Host-control tools drive the real desktop (mouse/keyboard/screen).
+        // They have no sandbox to escalate out of, so they get their own approval
+        // category gated by `decideHostControl` rather than the command path
+        // (whose escalate branch would mis-run the args as a shell command).
+        case "computer_use":
+            return .hostControl
         default:
             return .none
+        }
+    }
+
+    /// Whether a host-control tool (`computer_use`) must PROMPT for approval
+    /// before driving the desktop, given the session approval policy. `never`
+    /// (the user opted into never-ask) and `onFailure` (low-friction) run without
+    /// a prompt — the tool is already opt-in per session; the cautious policies
+    /// (`unlessTrusted`, `onRequest`, and `granular` when sandbox-approval is on)
+    /// prompt because handing the model the mouse/keyboard is inherently
+    /// untrusted. There is no sandboxed fallback, so the decision is binary:
+    /// prompt-then-run, or run.
+    public static func decideHostControl(policy: ApprovalPolicy) -> Bool {
+        switch policy {
+        case .never, .onFailure: return false
+        // `granular` ALWAYS prompts for host control: there is no sandboxed
+        // fallback to fall back to, so mapping it to `cfg.sandboxApproval` would
+        // INVERT the safety meaning — `sandboxApproval == false` (the restrictive
+        // setting that auto-REJECTS escalation for commands/patches) would instead
+        // auto-ALLOW desktop control with no prompt. Prompting under granular is
+        // the conservative, consistent choice.
+        case .unlessTrusted, .onRequest, .granular: return true
         }
     }
 

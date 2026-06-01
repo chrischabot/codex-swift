@@ -96,7 +96,8 @@ public enum RemoteCompaction {
                 // + arguments (parity with the streaming request body; upstream
                 // replays the verbatim `ResponseItem::FunctionCall`).
                 input.append(["type": "function_call", "call_id": callId,
-                              "name": name, "arguments": argumentsJSON])
+                              "name": sanitizedResponsesFunctionName(name),
+                              "arguments": argumentsJSON])
                 input.append(["type": "function_call_output",
                               "call_id": callId, "output": output])
             case .reasoning(let summary, let content, let encryptedContent):

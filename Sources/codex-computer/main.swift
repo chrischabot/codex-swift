@@ -16,8 +16,18 @@ setvbuf(stdout, nil, _IONBF, 0)   // unbuffered: stream progress immediately
 let raw = Array(CommandLine.arguments.dropFirst())
 
 func optValue(_ name: String) -> String? {
-    guard let i = raw.firstIndex(of: name), i + 1 < raw.count else { return nil }
-    return raw[i + 1]
+    // `--name value`
+    if let i = raw.firstIndex(of: name), i + 1 < raw.count { return raw[i + 1] }
+    // `--name=value`
+    if let tok = raw.first(where: { $0.hasPrefix(name + "=") }) {
+        return String(tok.dropFirst(name.count + 1))
+    }
+    return nil
+}
+// Was the flag supplied at all (either `--name value` or `--name=value`)? Used
+// so a present-but-valueless flag fails fast instead of silently defaulting.
+func optPresent(_ name: String) -> Bool {
+    raw.contains(name) || raw.contains(where: { $0.hasPrefix(name + "=") })
 }
 let hasFlag: (String) -> Bool = { raw.contains($0) }
 let isOpt: (String) -> Bool = { ["--width", "--max-steps", "--effort"].contains($0) }
@@ -32,8 +42,33 @@ for (i, tok) in raw.enumerated() {
 
 var execOpts = ComputerUseExecutor(targetWidth: Int(optValue("--width") ?? "") ?? 1280)
 var opts = ComputerUseLoop.Options()
-if let m = optValue("--effort") { opts.reasoningEffort = m }
-if let s = Int(optValue("--max-steps") ?? "") { opts.maxSteps = s }
+if optPresent("--effort") {
+    // Validate up front: the value is sent verbatim as reasoning.effort, and an
+    // unknown value makes EVERY Responses request 400 (an opaque mid-run failure).
+    // The set matches gpt-5.5's `supported_reasoning_levels` in the model catalog
+    // (models.json) — {low, medium, high, xhigh}. NOTE: `minimal` is NOT valid for
+    // gpt-5.5 and `xhigh` IS; keep this in sync if the CLI ever targets another model.
+    let allowed = ["low", "medium", "high", "xhigh"]
+    guard let m = optValue("--effort") else {
+        FileHandle.standardError.write(Data(
+            "error: --effort requires a value (\(allowed.joined(separator: "|")))\n".utf8))
+        exit(2)
+    }
+    guard allowed.contains(m.lowercased()) else {
+        FileHandle.standardError.write(Data(
+            "error: --effort must be one of \(allowed.joined(separator: ", ")); got \"\(m)\"\n".utf8))
+        exit(2)
+    }
+    opts.reasoningEffort = m.lowercased()
+}
+if optPresent("--max-steps") {
+    guard let v = optValue("--max-steps"), let s = Int(v), s > 0 else {
+        FileHandle.standardError.write(Data(
+            "error: --max-steps requires a positive integer\n".utf8))
+        exit(2)
+    }
+    opts.maxSteps = s
+}
 if hasFlag("--no-confirm") { opts.confirmRiskyActions = false }
 if hasFlag("--dry-run") { opts.dryRun = true }
 
@@ -54,7 +89,7 @@ if hasFlag("--check") || hasFlag("-h") || hasFlag("--help") {
     print("Screen Recording permission: \(p.screenRecording ? "✅" : "❌ — grant in System Settings → Privacy & Security → Screen Recording")")
     print("Accessibility permission:    \(p.accessibility ? "✅" : "❌ — grant in System Settings → Privacy & Security → Accessibility")")
     if hasFlag("--check") { exit(p.ok ? 0 : 1) }
-    print("\nUsage: codex-computer [--width N] [--max-steps N] [--effort low|medium|high] [--no-confirm] \"<task>\"")
+    print("\nUsage: codex-computer [--width N] [--max-steps N] [--effort low|medium|high|xhigh] [--no-confirm] \"<task>\"")
     exit(0)
 }
 
