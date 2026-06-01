@@ -143,10 +143,14 @@ final class Run: @unchecked Sendable {
         self.scope = opts.scope ?? WorkflowRunScope(budgetTotal: opts.budgetTotal)
     }
 
-    // run a closure on the JS queue, awaiting its result
-    private func onQueue<T: Sendable>(_ body: @escaping @Sendable (JSContext) -> T) async -> T {
+    // Run a closure on the JS queue, awaiting its result. The body receives an
+    // OPTIONAL JSContext: after teardown (`ctx = nil`, set on this same serial
+    // queue) a late in-flight-agent callback can still be enqueued here, and a
+    // force-unwrap (`ctx!`) would crash the whole process. Such late callbacks'
+    // results are discarded anyway, so passing nil lets the body no-op safely.
+    private func onQueue<T: Sendable>(_ body: @escaping @Sendable (JSContext?) -> T) async -> T {
         await withCheckedContinuation { (c: CheckedContinuation<T, Never>) in
-            jsQueue.async { [self] in c.resume(returning: body(ctx!)) }
+            jsQueue.async { [self] in c.resume(returning: body(ctx)) }
         }
     }
 
@@ -185,7 +189,7 @@ final class Run: @unchecked Sendable {
           function(e){ globalThis.__wf_err = (e && e.message) ? String(e.message) : String(e); globalThis.__wf_done = true; }
         );
         """
-        await onQueue { ctx in _ = ctx.evaluateScript(bootstrap) }
+        await onQueue { ctx in _ = ctx?.evaluateScript(bootstrap) }
 
         // Abort watcher: aborts (stop()/deadline) are set on a flag the pump
         // only re-reads at its loop top. When the pump is parked on
@@ -206,10 +210,10 @@ final class Run: @unchecked Sendable {
 
         struct Outcome: Sendable { var done: Bool; var result: String?; var err: String? }
         let outcome: Outcome = await onQueue { ctx in
-            let done = ctx.objectForKeyedSubscript("__wf_done")?.toBool() ?? false
-            let resVal = ctx.objectForKeyedSubscript("__wf_result")
+            let done = ctx?.objectForKeyedSubscript("__wf_done")?.toBool() ?? false
+            let resVal = ctx?.objectForKeyedSubscript("__wf_result")
             let result: String? = (resVal?.isUndefined == false && resVal?.isNull == false) ? resVal?.toString() : nil
-            let errVal = ctx.objectForKeyedSubscript("__wf_err")
+            let errVal = ctx?.objectForKeyedSubscript("__wf_err")
             let err: String? = (errVal?.isUndefined == false && errVal?.isNull == false) ? errVal?.toString() : nil
             return Outcome(done: done, result: result, err: err)
         }
@@ -244,8 +248,8 @@ final class Run: @unchecked Sendable {
         while true {
             if opts.abort.isSet { return }
             let (specs, done): ([PendingWork], Bool) = await onQueue { [self] ctx in
-                _ = ctx.evaluateScript("void 0")    // drain microtasks
-                let d = ctx.objectForKeyedSubscript("__wf_done")?.toBool() ?? false
+                _ = ctx?.evaluateScript("void 0")    // drain microtasks
+                let d = ctx?.objectForKeyedSubscript("__wf_done")?.toBool() ?? false
                 let taken = pending; pending.removeAll()
                 return (taken, d)
             }
