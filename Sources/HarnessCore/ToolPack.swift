@@ -36,6 +36,12 @@ public extension ToolPack {
 public struct WorkflowsToolPack: ToolPack, Sendable {
     public let id = "workflows"
     public init() {}
+    /// NOTE: do NOT route this pack through `ToolPackRegistry`. That seam
+    /// `register`s (advertises) every returned tool, but the real composition
+    /// root wires `WorkflowTool` via `registerDeferred` — it stays hidden until
+    /// the `/workflow` command or the "workflow" trigger word activates it
+    /// (keyword opt-in). `tools()` lists all four for manifest/introspection
+    /// fidelity; the deferred/advertised split is the composition root's job.
     public func tools() -> [any Tool] {
         [WorkflowTool(), WorkflowStopTool(), WorkflowListTool(), WorkflowStatusTool()]
     }

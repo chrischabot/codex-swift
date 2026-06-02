@@ -1011,6 +1011,35 @@ public actor SessionEngine {
         // in preflight and never reaches here), and the dispatch gate (a deny
         // short-circuits in preflight). This method does the order-independent
         // tail: approval policy + router dispatch.
+
+        // ADDONS Phase 0 #3: tool-DECLARED approval. A `.none`-op tool (a Google
+        // write, an outbound push, …) otherwise skips the approval engine
+        // entirely, so an OWNER-initiated or unattended (cron) destructive call
+        // would run with NO consent — the confused-deputy gap. If the tool
+        // declares `.required` for THIS call, route it through the canonical
+        // `approvalDecision` path (extension review → guardian → human
+        // coordinator) BEFORE any dispatch — regardless of op-kind or remote
+        // environment. `approvalDecision` returns `.decline` when nothing can
+        // approve, so an unattended session FAILS CLOSED (the cron "reduced
+        // capability set"). An explicit PermissionRequest-hook allow bypasses it.
+        if !permissionAllow,
+           case .required = await router.approvalRequirement(
+               for: ToolCall(callId: callId, name: name, argumentsJSON: args)) {
+            let parsedArgs = (try? JSONDecoder().decode(JSONValue.self, from: Data(args.utf8))) ?? .null
+            let rid = "srv_\(UUID().uuidString.prefix(12))"
+            let request = ServerRequest.dynamicToolCall(.string(rid), DynamicToolCallParams(
+                threadId: config.threadId, turnId: turnId, callId: callId,
+                namespace: nil, tool: name, arguments: parsedArgs))
+            switch await approvalDecision(request) {
+            case .accept, .acceptForSession:
+                break   // approved → fall through to the normal dispatch tail
+            default:
+                return (ToolResult(callId: callId,
+                                   output: "Not approved by user: tool '\(name)' requires approval",
+                                   success: false, truncated: false), .declined)
+            }
+        }
+
         let opKind = ApprovalPolicyEngine.op(forTool: name)
         // Remote exec-server data path: when the session is bound to a remote
         // environment, exec-style tools (`shell_command`, `unified_exec`,

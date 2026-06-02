@@ -81,6 +81,13 @@ public actor SessionSupervisor {
     /// ThreadClosedNotification). Cleared on re-subscribe or teardown.
     private var formerSubscribers: [ThreadId: [NotificationSink]] = [:]
     private var relays: [ThreadId: Task<Void, Never>] = [:]
+    /// Monotonic per-thread relay generation. Bumped on every relay CREATION
+    /// (`ensureWorker`, `rebindRemoteEnvironment`) and on every force-stop /
+    /// quiesce. A relay captures its generation; when it ends it calls
+    /// `clearThread(_:gen:)`, which no-ops if the generation is stale — so a
+    /// relay whose worker was replaced (rebind) or explicitly torn down cannot
+    /// clobber the live worker/subscribers or emit a spurious `thread/closed`.
+    private var relayGen: [ThreadId: UInt64] = [:]
     private var nextSinkId: UInt64 = 0
     private let maxSessions: Int
     private let limits: Limits
@@ -124,6 +131,13 @@ public actor SessionSupervisor {
 
     private func subscribersFor(_ t: ThreadId) -> [NotificationSink] { subscribers[t] ?? [] }
 
+    /// Advance and return the relay generation for `t` (see `relayGen`).
+    private func nextRelayGen(_ t: ThreadId) -> UInt64 {
+        let g = (relayGen[t] ?? 0) &+ 1
+        relayGen[t] = g
+        return g
+    }
+
     /// Bind (or reuse) a worker for `config` and add this connection as a
     /// subscriber. Idempotent per thread; many connections fan out from one
     /// worker (rework many-conn→one-thread). Returns the subscriber id so a
@@ -160,6 +174,7 @@ public actor SessionSupervisor {
             governorStates[config.threadId] = .normal
         }
         let tid = config.threadId
+        let gen = nextRelayGen(tid)
         relays[tid] = Task {
             for await ev in handle.link.outbound {
                 switch ev {
@@ -191,11 +206,11 @@ public actor SessionSupervisor {
                 case .mcpResponse(let response):
                     self.resolveMcpResponse(response)
                 case .finished:
-                    self.clearThread(tid)
+                    self.clearThread(tid, gen: gen)
                     return
                 }
             }
-            self.clearThread(tid)
+            self.clearThread(tid, gen: gen)
         }
         boundConfigs[config.threadId] = config
         markThreadLoaded(config.threadId)
@@ -207,7 +222,12 @@ public actor SessionSupervisor {
         return sinkId
     }
 
-    private func clearThread(_ tid: ThreadId) {
+    private func clearThread(_ tid: ThreadId, gen: UInt64) {
+        // Stale-relay guard: a relay whose generation is no longer current (its
+        // worker was replaced by a rebind, or force-stopped/quiesced) must NOT
+        // tear down the live thread or emit thread/closed to (possibly
+        // preserved) subscribers. Only the CURRENT relay's natural end runs.
+        guard relayGen[tid] == gen else { return }
         relays[tid] = nil
         workers[tid] = nil
         boundConfigs[tid] = nil
@@ -221,6 +241,13 @@ public actor SessionSupervisor {
         // status while subscribers are still attached.
         resolveAllServerRequests(for: tid)
         removeStatusFacts(tid)
+        // Notify subscribers the thread closed (worker died / outbound ended)
+        // BEFORE dropping them, so an in-flight turn collector (collectTurn)
+        // and any other subscriber observe a terminal event instead of hanging
+        // until their own timeout. Mirrors the idle-unload `thread/closed`
+        // delivery in `forceStopWorker`.
+        let closing = subscribers[tid] ?? formerSubscribers[tid] ?? []
+        for s in closing { s.deliver(.threadClosed(threadId: tid)) }
         subscribers[tid] = nil
         formerSubscribers[tid] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != tid }
@@ -441,6 +468,7 @@ public actor SessionSupervisor {
             governorStates[threadId] = .normal
         }
         let tid = threadId
+        let gen = nextRelayGen(tid)
         relays[tid] = Task {
             for await ev in handle.link.outbound {
                 switch ev {
@@ -472,11 +500,11 @@ public actor SessionSupervisor {
                 case .mcpResponse(let response):
                     self.resolveMcpResponse(response)
                 case .finished:
-                    self.clearThread(tid)
+                    self.clearThread(tid, gen: gen)
                     return
                 }
             }
-            self.clearThread(tid)
+            self.clearThread(tid, gen: gen)
         }
         boundConfigs[threadId] = newConfig
         markThreadLoaded(threadId)
@@ -526,6 +554,7 @@ public actor SessionSupervisor {
         h.terminate()
         relays[threadId]?.cancel()
         relays[threadId] = nil
+        _ = nextRelayGen(threadId)   // invalidate the cancelled relay (see forceStopWorker)
         workers[threadId] = nil
         boundConfigs[threadId] = nil
         ledgers[threadId] = nil
@@ -536,6 +565,11 @@ public actor SessionSupervisor {
         quiescingWorkers.remove(threadId)
         resolveAllServerRequests(for: threadId)
         removeStatusFacts(threadId)
+        // Tell subscribers (e.g. an in-flight `collectTurn`) the thread closed,
+        // so they observe a terminal event instead of hanging to their own
+        // timeout (the relay was cancelled above and no longer delivers).
+        let closing = subscribers[threadId] ?? formerSubscribers[threadId] ?? []
+        for s in closing { s.deliver(.threadClosed(threadId: threadId)) }
         subscribers[threadId] = nil
         formerSubscribers[threadId] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != threadId }
@@ -633,7 +667,14 @@ public actor SessionSupervisor {
         h.link.finish()
         relays[tid]?.cancel()
         relays[tid] = nil
+        // Invalidate the cancelled relay (it no-ops in clearThread) and do our
+        // OWN full teardown — including `boundConfigs` and `subscribers`, which
+        // the relay's clearThread used to clear — so a thread re-ensured before
+        // the old relay drains is not clobbered. The non-retryable `.error`
+        // delivered above is the collector's terminal signal (folds to "failed").
+        _ = nextRelayGen(tid)
         workers[tid] = nil
+        boundConfigs[tid] = nil
         ledgers[tid] = nil
         governorStates[tid] = nil
         resourceControls[tid] = nil
@@ -642,6 +683,7 @@ public actor SessionSupervisor {
         quiescingWorkers.remove(tid)
         resolveAllServerRequests(for: tid)
         removeStatusFacts(tid)
+        subscribers[tid] = nil
         formerSubscribers[tid] = nil
         pendingServerRequests = pendingServerRequests.filter { $0.value != tid }
         resolveMcpResponsesForClosedThread(tid)
@@ -653,6 +695,12 @@ public actor SessionSupervisor {
         h.link.finish()
         relays[tid]?.cancel()
         relays[tid] = nil
+        // Invalidate the just-cancelled relay's generation SYNCHRONOUSLY (before
+        // any `await` in a caller like rebind), so when that relay drains and
+        // calls `clearThread` it no-ops instead of tearing down the replacement
+        // worker / emitting a spurious thread/closed. This path does its own
+        // teardown + (when clearSubscribers) thread/closed below.
+        _ = nextRelayGen(tid)
         workers[tid] = nil
         boundConfigs[tid] = nil
         ledgers[tid] = nil

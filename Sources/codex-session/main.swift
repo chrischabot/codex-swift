@@ -380,6 +380,12 @@ struct SessionWorkerMain {
             if addonConfig.isFeatureEnabled("extensions") {
                 for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
             }
+            // ADDONS Phase 0 #2: addon tool-pack seam (mirrors codexd). #4
+            // (Google Workspace), #7 (Push), #8 (Media) append their packs here;
+            // each is gated by `[features].<pack.id>` and self-prunes when
+            // unconfigured.
+            let toolPacks: [any ToolPack] = []
+            await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
             let extRegistry = installAddons(
                 config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
             let engine = SessionEngine(config: c, model: model, store: store,

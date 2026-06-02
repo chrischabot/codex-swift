@@ -357,6 +357,9 @@ public actor RequestRouter {
     private let remoteControlEnroller: RemoteControlEnroller
     private let remoteControlWebSocketConnector: RemoteControlWebSocketConnector
     private let memoryResetHandler: (@Sendable () async -> Void)?
+    /// Injected live realtime voice backend (OpenAI Realtime API). When nil,
+    /// `thread/realtime/*` uses the built-in echo mock. See RealtimeBackend.swift.
+    private let realtimeBackendFactory: RealtimeBackendFactory?
     private let mcpManager = McpManager()
     private let fileWatchManager = FileWatchManager()
     private let skillsChangeWatchManager = SkillsChangeWatchManager()
@@ -380,6 +383,10 @@ public actor RequestRouter {
     private var fuzzySearchSessions: [FuzzySearchSessionKey: FuzzySearchSession] = [:]
     private var subscriptions: [ThreadId: UInt64] = [:]
     private var realtimeSessions: [ThreadId: RealtimeSessionState] = [:]
+    /// Live realtime voice sessions (OpenAI Realtime API bridge), keyed by
+    /// thread. Populated only when `realtimeBackendFactory` is injected; when
+    /// it is nil the `realtimeSessions` echo path above runs instead.
+    private var liveRealtimeSessions: [ThreadId: any RealtimeBackendSession] = [:]
     private var pendingDirectServerResponses:
         [String: CheckedContinuation<JSONValue?, Never>] = [:]
     private var pendingLoginIds: [ObjectIdentifier: String] = [:]
@@ -811,7 +818,8 @@ public actor RequestRouter {
                 accountNudgeEmailSender: AccountNudgeEmailSender? = nil,
                 remoteControlEnroller: RemoteControlEnroller? = nil,
                 remoteControlWebSocketConnector: RemoteControlWebSocketConnector? = nil,
-                memoryResetHandler: (@Sendable () async -> Void)? = nil) {
+                memoryResetHandler: (@Sendable () async -> Void)? = nil,
+                realtimeBackendFactory: RealtimeBackendFactory? = nil) {
         self.supervisor = supervisor
         self.store = store
         self.codexHome = codexHome
@@ -824,6 +832,7 @@ public actor RequestRouter {
         self.remoteControlWebSocketConnector =
             remoteControlWebSocketConnector ?? Self.connectRemoteControlWebSocket
         self.memoryResetHandler = memoryResetHandler
+        self.realtimeBackendFactory = realtimeBackendFactory
     }
 
     public func handle(_ message: JSONRPCMessage, _ conn: any ClientConnection) async {
@@ -880,6 +889,14 @@ public actor RequestRouter {
         await cancelFuzzySearchSessions(connection: connection)
         await terminateCommandExecSessions(connection: connection)
         await terminateProcessSessions(connection: connection)
+        // Close any live realtime voice sessions so the upstream Realtime API
+        // WebSocket is not leaked when a tab disconnects without `stop`. Each
+        // per-connection router owns its own sessions.
+        let liveSessions = liveRealtimeSessions
+        liveRealtimeSessions.removeAll()
+        for (_, session) in liveSessions {
+            await session.stop(reason: "connection_closed")
+        }
     }
 
     private func reply(_ conn: any ClientConnection, _ id: RequestId, _ result: JSONValue) async {
@@ -2807,6 +2824,13 @@ public actor RequestRouter {
     private func handleRealtimeRequest(id: RequestId, method: String,
                                        params: JSONValue?,
                                        conn: any ClientConnection) async -> Bool {
+        // When a live backend is injected (codexd `CODEXKIT_REALTIME_LIVE=1`),
+        // bridge to the OpenAI Realtime API instead of the echo mock. listVoices
+        // stays the static catalog for both backends.
+        if realtimeBackendFactory != nil, method != "thread/realtime/listVoices" {
+            return await handleLiveRealtimeRequest(id: id, method: method,
+                                                   params: params, conn: conn)
+        }
         switch method {
         case "thread/realtime/listVoices":
             await reply(conn, id, Self.realtimeVoicesResponse())
@@ -2923,6 +2947,122 @@ public actor RequestRouter {
             "defaultV1": .string("alloy"),
             "defaultV2": .string("marin"),
         ])])
+    }
+
+    /// Build the `thread/realtime/*` notification sink for a connection. Each
+    /// `(method, params)` the live backend produces is wrapped in a
+    /// `ServerNotification` and sent down `conn`.
+    private static func makeRealtimeEmit(conn: any ClientConnection) -> RealtimeEmit {
+        { method, params in
+            await conn.send(ServerNotification.raw(method: method, params: params).toMessage())
+        }
+    }
+
+    /// Live realtime backend dispatch (OpenAI Realtime API bridge). Mirrors the
+    /// echo handler's start/itemAdded handshake, then hands the streaming
+    /// transcript + audio to the injected backend session.
+    private func handleLiveRealtimeRequest(id: RequestId, method: String,
+                                           params: JSONValue?,
+                                           conn: any ClientConnection) async -> Bool {
+        guard let factory = realtimeBackendFactory else { return false }
+        switch method {
+        case "thread/realtime/start":
+            do {
+                let (threadId, state, sdpAnswer) = try Self.parseRealtimeStart(params: params)
+                // Replace any prior live session on this thread.
+                if let prior = liveRealtimeSessions.removeValue(forKey: threadId) {
+                    await prior.stop(reason: "restart")
+                }
+                await reply(conn, id, .object([:]))
+                await conn.send(ServerNotification.raw(
+                    method: "thread/realtime/started",
+                    params: .object([
+                        "threadId": .string(threadId.raw),
+                        "realtimeSessionId": .string(state.sessionId),
+                        "version": .string("v2"),
+                    ])).toMessage())
+                if let sdpAnswer {
+                    await conn.send(ServerNotification.raw(
+                        method: "thread/realtime/sdp",
+                        params: .object([
+                            "threadId": .string(threadId.raw),
+                            "sdp": .string(sdpAnswer),
+                        ])).toMessage())
+                }
+                if let prompt = state.prompt, !prompt.isEmpty {
+                    await conn.send(ServerNotification.raw(
+                        method: "thread/realtime/itemAdded",
+                        params: .object([
+                            "threadId": .string(threadId.raw),
+                            "item": .object([
+                                "type": .string("message"),
+                                "role": .string("system"),
+                                "text": .string(prompt),
+                            ]),
+                        ])).toMessage())
+                }
+                let emit = Self.makeRealtimeEmit(conn: conn)
+                let startParams = RealtimeStartParams(
+                    threadId: threadId.raw,
+                    outputModality: state.outputModality,
+                    voice: state.voice,
+                    instructions: state.prompt)
+                do {
+                    let session = try await factory(startParams, emit)
+                    liveRealtimeSessions[threadId] = session
+                } catch {
+                    // Connection failed after we acknowledged start: tell the
+                    // client the session closed rather than leaving it hanging.
+                    await emit("thread/realtime/closed", .object([
+                        "threadId": .string(threadId.raw),
+                        "reason": .string("connect failed: \(error.localizedDescription)"),
+                    ]))
+                }
+            } catch {
+                await conn.send(WireError.invalidRequest(id: id, error.localizedDescription))
+            }
+            return true
+        case "thread/realtime/appendText":
+            do {
+                let (threadId, text) = try Self.parseRealtimeAppendText(params: params)
+                guard let session = liveRealtimeSessions[threadId] else {
+                    throw SimpleError("thread/realtime/appendText requires an active realtime session")
+                }
+                await reply(conn, id, .object([:]))
+                await session.appendText(text)
+            } catch {
+                await conn.send(WireError.invalidRequest(id: id, error.localizedDescription))
+            }
+            return true
+        case "thread/realtime/appendAudio":
+            do {
+                let (threadId, audio) = try Self.parseRealtimeAppendAudio(params: params)
+                guard let session = liveRealtimeSessions[threadId] else {
+                    throw SimpleError("thread/realtime/appendAudio requires an active realtime session")
+                }
+                await reply(conn, id, .object([:]))
+                await session.appendAudio(audio)
+            } catch {
+                await conn.send(WireError.invalidRequest(id: id, error.localizedDescription))
+            }
+            return true
+        case "thread/realtime/stop":
+            do {
+                let threadId = try Self.parseRealtimeThreadId(params: params,
+                                                              method: "thread/realtime/stop")
+                guard let session = liveRealtimeSessions.removeValue(forKey: threadId) else {
+                    throw SimpleError("thread/realtime/stop requires an active realtime session")
+                }
+                await reply(conn, id, .object([:]))
+                // The session emits `thread/realtime/closed` itself.
+                await session.stop(reason: "client_stopped")
+            } catch {
+                await conn.send(WireError.invalidRequest(id: id, error.localizedDescription))
+            }
+            return true
+        default:
+            return false
+        }
     }
 
     private static func parseRealtimeStart(params: JSONValue?) throws

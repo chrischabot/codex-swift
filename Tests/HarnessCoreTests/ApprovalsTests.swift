@@ -23,6 +23,7 @@ private actor MockApprover: ApprovalCoordinator {
         return decision
     }
     func count() -> Int { requests.count }
+    func methods() -> [String] { requests.map(\.method) }
 }
 
 private struct StubShell: Tool {
@@ -30,6 +31,30 @@ private struct StubShell: Tool {
     func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
         ToolResult(callId: call.callId, output: "SANDBOXED-STUB",
                    success: true, truncated: false)
+    }
+}
+
+/// ADDONS Phase 0 #3: a tool that DECLARES it needs approval for every call.
+/// Writes `marker` only if it actually runs, so a denied / fail-closed call
+/// leaves no marker (observable proof the gate ran before dispatch).
+private struct RequiredMarkerTool: Tool {
+    let name = "destructive_op"; let parallelSafe = false
+    let marker: String
+    func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement { .required }
+    func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
+        FileManager.default.createFile(atPath: marker, contents: Data("ran".utf8))
+        return ToolResult(callId: call.callId, output: "DID-IT", success: true, truncated: false)
+    }
+}
+
+/// A normal `.none`-default tool (control): must run WITHOUT any approval, even
+/// when a deny-coordinator is wired.
+private struct PlainMarkerTool: Tool {
+    let name = "plain_op"; let parallelSafe = false
+    let marker: String
+    func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
+        FileManager.default.createFile(atPath: marker, contents: Data("ran".utf8))
+        return ToolResult(callId: call.callId, output: "PLAIN", success: true, truncated: false)
     }
 }
 
@@ -679,5 +704,88 @@ final class ApprovalsTests: XCTestCase {
         }, "the in-root patch applied")
         XCTAssertEqual(try? String(contentsOfFile: work + "/ok.txt", encoding: .utf8),
                        "written\n", "the patch wrote the file (upstream appends trailing newline)")
+    }
+
+    // MARK: ADDONS Phase 0 #3 — tool-declared approval (close the owner confused-deputy gap)
+
+    private func runRequiredTool(coordinator: MockApprover?, marker: String,
+                                 work: String, store: ThreadStore) async -> [ServerNotification] {
+        let router = ToolRouter(limits: Limits())
+        await router.register(RequiredMarkerTool(marker: marker))
+        let model = toolCallModel("{\"verb\":\"delete\"}", tool: "destructive_op")
+        // `.never` policy: a `.none`-op tool would normally run with NO prompt —
+        // the exact confused-deputy case the contract closes.
+        let eng = await engine(policy: .never, cwd: work, store: store, model: model, router: router)
+        if let coordinator { await eng.setApprovalCoordinator(coordinator) }
+        await eng.start()
+        let col = Task { await apCollect(eng) }
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
+        return await col.value
+    }
+
+    func testRequiredToolDeclinedDoesNotRun() async throws {
+        let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let approver = MockApprover(.decline)
+        _ = await runRequiredTool(coordinator: approver, marker: marker, work: work, store: store)
+        let n = await approver.count()
+        XCTAssertEqual(n, 1, "a declared-required tool prompts exactly once even under .never")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker),
+                       "a declined required tool must NOT run")
+    }
+
+    func testRequiredToolAcceptedRuns() async throws {
+        let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let approver = MockApprover(.accept)
+        _ = await runRequiredTool(coordinator: approver, marker: marker, work: work, store: store)
+        let n = await approver.count()
+        XCTAssertEqual(n, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker),
+                      "an approved required tool runs")
+    }
+
+    func testRequiredToolFailsClosedWithoutCoordinator() async throws {
+        let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        // No coordinator wired (unattended / cron-style): approvalDecision returns
+        // .decline → the declared-destructive tool is denied (reduced capability set).
+        _ = await runRequiredTool(coordinator: nil, marker: marker, work: work, store: store)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker),
+                       "with no approver, a required tool FAILS CLOSED (does not run)")
+    }
+
+    func testRequiredToolPromptUsesItemToolCallMethod() async throws {
+        let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let approver = MockApprover(.accept)
+        _ = await runRequiredTool(coordinator: approver, marker: marker, work: work, store: store)
+        let methods = await approver.methods()
+        XCTAssertEqual(methods, ["item/tool/call"],
+                       "tool approval reuses the dynamicToolCall request (item/tool/call)")
+    }
+
+    func testPlainToolRunsWithoutApprovalRequest() async throws {
+        let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let router = ToolRouter(limits: Limits())
+        await router.register(PlainMarkerTool(marker: marker))
+        let model = toolCallModel("{}", tool: "plain_op")
+        let eng = await engine(policy: .never, cwd: work, store: store, model: model, router: router)
+        let approver = MockApprover(.decline)   // would deny IF consulted
+        await eng.setApprovalCoordinator(approver)
+        await eng.start()
+        let col = Task { await apCollect(eng) }
+        await eng.submit(.startTurn(input: [TurnInput(text: "go")], model: nil, turnId: nil))
+        _ = await col.value
+        let n = await approver.count()
+        XCTAssertEqual(n, 0, "a `.none`-default tool is never sent for approval")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker),
+                      "a plain tool runs unimpeded (byte-identical to before the contract)")
     }
 }

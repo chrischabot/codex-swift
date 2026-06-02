@@ -511,6 +511,56 @@
       "service_tiers": [],
       "additional_speed_tiers": [],
       "supports_reasoning_summaries": true
+    },
+    {
+      "prefer_websockets": true,
+      "realtime": true,
+      "input_modalities": [
+        "text",
+        "audio",
+        "image"
+      ],
+      "output_modalities": [
+        "text",
+        "audio"
+      ],
+      "context_window": 128000,
+      "max_context_window": 128000,
+      "max_output_tokens": 32000,
+      "slug": "gpt-realtime-2",
+      "display_name": "GPT Realtime 2",
+      "description": "Most capable realtime voice model: speech-to-speech with configurable reasoning effort, stronger instruction following, and reliable tool use.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Lower latency, lighter reasoning" },
+        { "effort": "medium", "description": "Balances latency and reasoning depth" },
+        { "effort": "high", "description": "Greater reasoning depth for complex voice agents" }
+      ],
+      "visibility": "list",
+      "supported_in_api": true,
+      "supports_reasoning_summaries": true
+    },
+    {
+      "prefer_websockets": true,
+      "realtime": true,
+      "input_modalities": [
+        "text",
+        "audio",
+        "image"
+      ],
+      "output_modalities": [
+        "text",
+        "audio"
+      ],
+      "context_window": 128000,
+      "max_context_window": 128000,
+      "max_output_tokens": 32000,
+      "slug": "gpt-realtime",
+      "display_name": "GPT Realtime",
+      "description": "Realtime speech-to-speech voice model.",
+      "visibility": "list",
+      "supported_in_api": true,
+      "supports_reasoning_summaries": false
     }
   ]
 }

@@ -146,6 +146,34 @@ struct CodexDaemon {
             .replacingOccurrences(of: "=", with: "")
     }
 
+    /// Live realtime-voice backend (OpenAI Realtime API bridge), opt-in via
+    /// `CODEXKIT_REALTIME_LIVE=1`. Requires a direct `OPENAI_API_KEY` (the
+    /// `/v1/realtime` socket is Bearer-authenticated and does not accept the
+    /// ChatGPT OAuth token, same as computer-use). Falls back to nil — the
+    /// built-in echo backend — when unset or unconfigured, so the default web
+    /// experience is unchanged. `CODEXKIT_REALTIME_MODEL` overrides the model
+    /// (default `gpt-realtime-2`); `CODEXKIT_REALTIME_ENDPOINT` overrides the
+    /// wss endpoint.
+    private static func realtimeBackendFactory() -> RealtimeBackendFactory? {
+        let env = ProcessInfo.processInfo.environment
+        guard env["CODEXKIT_REALTIME_LIVE"] == "1" else { return nil }
+        guard let key = env["OPENAI_API_KEY"], !key.isEmpty else {
+            FileHandle.standardError.write(Data(
+                "codexd: CODEXKIT_REALTIME_LIVE=1 but OPENAI_API_KEY is unset; realtime voice uses the echo backend\n".utf8))
+            return nil
+        }
+        let model = env["CODEXKIT_REALTIME_MODEL"] ?? "gpt-realtime-2"
+        let backend: LiveRealtimeBackend
+        if let endpoint = env["CODEXKIT_REALTIME_ENDPOINT"], !endpoint.isEmpty {
+            backend = LiveRealtimeBackend(model: model, apiKey: key, endpoint: endpoint)
+        } else {
+            backend = LiveRealtimeBackend(model: model, apiKey: key)
+        }
+        FileHandle.standardError.write(Data(
+            "codexd: realtime voice backend = live (model=\(model))\n".utf8))
+        return backend.makeFactory()
+    }
+
     private static func unixPath(from raw: String, codexHome: String) -> String? {
         let expanded: String
         if raw == "$CODEX_HOME" {
@@ -378,6 +406,12 @@ struct CodexDaemon {
                     if addonConfig.isFeatureEnabled("extensions") {
                         for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
                     }
+                    // ADDONS Phase 0 #2: addon tool-pack seam. #4 (Google
+                    // Workspace), #7 (Push), #8 (Media) construct their packs
+                    // with deps and append here; each is gated by
+                    // `[features].<pack.id>` and self-prunes when unconfigured.
+                    let toolPacks: [any ToolPack] = []
+                    await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
                     let extRegistry = installAddons(
                         config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
                     let engine = SessionEngine(config: c, model: model, store: store,
@@ -456,10 +490,15 @@ struct CodexDaemon {
         }
 
         let appMemory = MemoryStore(codexHome: codexHome)
+        // Realtime voice backend: live OpenAI Realtime bridge when opted in,
+        // else nil (echo). Shared by the stdio/UDS router and every per-tab web
+        // router; the factory builds a fresh session per `thread/realtime/start`.
+        let realtimeFactory = Self.realtimeBackendFactory()
         let router = RequestRouter(supervisor: supervisor, store: store,
                                    codexHome: codexHome, auth: authManager,
                                    config: appConfig,
-                                   memoryResetHandler: { await appMemory.reset() })
+                                   memoryResetHandler: { await appMemory.reset() },
+                                   realtimeBackendFactory: realtimeFactory)
 
         // Automations: persistent store + interval scheduler (fires saved
         // prompts on a schedule). Shared with the RequestRouter handler via the
@@ -485,7 +524,8 @@ struct CodexDaemon {
                     RequestRouter(supervisor: supervisor, store: store,
                                   codexHome: codexHome, auth: authManager,
                                   config: appConfig,
-                                  memoryResetHandler: { await appMemory.reset() })
+                                  memoryResetHandler: { await appMemory.reset() },
+                                  realtimeBackendFactory: realtimeFactory)
                 })
             Task {
                 do { try await gateway.run() }

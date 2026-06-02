@@ -16,6 +16,12 @@ public enum Pricing {
         ("gpt-4o",       Rate(inp: 2.50, cached: 1.25,  out: 10.0)),
         ("o3",           Rate(inp: 2.0,  cached: 0.50,  out: 8.0)),
         ("o4-mini",      Rate(inp: 1.10, cached: 0.275, out: 4.40)),
+        // Realtime voice models — TEXT-token rates only. The bench cost column
+        // does not model audio tokens (in $32 / cached $0.40 / out $64 per 1M)
+        // or image input ($5 per 1M). `gpt-realtime-2` must precede the shorter
+        // `gpt-realtime` prefix so the first-match lookup resolves it.
+        ("gpt-realtime-2", Rate(inp: 4.0, cached: 0.40, out: 24.0)),
+        ("gpt-realtime",   Rate(inp: 4.0, cached: 0.40, out: 24.0)),
     ]
 
     /// Cost given total input (incl. cached), cached subset, and output tokens.

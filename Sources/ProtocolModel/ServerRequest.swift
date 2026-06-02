@@ -320,6 +320,11 @@ public struct DynamicToolCallParams: Sendable, Codable, Equatable {
     public var namespace: String?
     public var tool: String
     public var arguments: JSONValue
+    public init(threadId: ThreadId, turnId: TurnId, callId: String,
+                namespace: String? = nil, tool: String, arguments: JSONValue) {
+        self.threadId = threadId; self.turnId = turnId; self.callId = callId
+        self.namespace = namespace; self.tool = tool; self.arguments = arguments
+    }
 }
 
 public struct ChatgptAuthTokensRefreshParams: Sendable, Codable, Equatable {

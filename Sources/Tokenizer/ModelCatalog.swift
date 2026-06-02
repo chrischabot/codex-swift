@@ -85,6 +85,21 @@ public struct ModelCatalog: Sendable {
         ModelEntry(slug: "o4-mini", displayName: "o4-mini",
                    description: "Reasoning model.",
                    contextWindow: 200_000, maxContextWindow: 200_000),
+        // Realtime speech-to-speech voice models (`/v1/realtime`). 128k context,
+        // 32k max output, knowledge cutoff 2024-09-30. Both slugs are present so
+        // longest-prefix resolution picks `gpt-realtime-2` over `gpt-realtime`.
+        // `hidden: true` keeps them resolvable (context window / tokenizer /
+        // pricing) without surfacing them in the `model/list` coding picker —
+        // the realtime model is selected server-side for the voice bridge, not
+        // chosen for Responses-API coding turns.
+        ModelEntry(slug: "gpt-realtime-2", displayName: "GPT Realtime 2",
+                   description: "Most capable realtime voice model (speech-to-speech).",
+                   contextWindow: 128_000, maxContextWindow: 128_000,
+                   maxOutputTokens: 32_000, hidden: true, tokenizerName: "o200k_base"),
+        ModelEntry(slug: "gpt-realtime", displayName: "GPT Realtime",
+                   description: "Realtime speech-to-speech voice model.",
+                   contextWindow: 128_000, maxContextWindow: 128_000,
+                   maxOutputTokens: 32_000, hidden: true, tokenizerName: "o200k_base"),
     ])
 
     /// codex `model_info_from_slug` fallback for unknown slugs.

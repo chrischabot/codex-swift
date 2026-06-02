@@ -197,7 +197,7 @@ let package = Package(
         .target(name: "SessionWorkerCore",
                 dependencies: ["HarnessCore", "IPC", "ProtocolModel"], swiftSettings: strict),
         .target(name: "Supervisor",
-                dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools", "Prompts"],
+                dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools", "Prompts", "ModelClient"],
                 swiftSettings: strict),
         .target(name: "Broker",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),

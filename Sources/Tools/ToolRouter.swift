@@ -59,7 +59,24 @@ public protocol Tool: Sendable {
     /// this; every other tool keeps the default `nil` (JSON function spec).
     /// Mirrors upstream `codex_tools::ToolSpec::Freeform(FreeformTool)`.
     var freeformToolFormat: FreeformToolFormat? { get }
+    /// Per-call approval declaration (ADDONS Phase 0 #3). Default `.none`
+    /// (byte-identical for every built-in tool). A tool returns `.required` for
+    /// a call that performs a destructive/irreversible external action (a Google
+    /// write, sending mail, an arbitrary outbound push) so the engine routes it
+    /// through the human `ApprovalCoordinator` even for an OWNER under a
+    /// non-prompting policy — closing the confused-deputy gap where `.none`-op
+    /// tools otherwise skip the approval engine entirely.
+    func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement
     func run(_ call: ToolCall, cwd: String) async throws -> ToolResult
+}
+
+/// Whether a specific tool CALL needs human approval before it runs (ADDONS
+/// Phase 0 #3). `.none` is the default for every tool; a tool that can perform
+/// destructive external actions returns `.required` for those calls (it may
+/// inspect `call.argumentsJSON` to decide — e.g. a write verb vs. a read).
+public enum ToolApprovalRequirement: Sendable, Equatable {
+    case none
+    case required
 }
 
 public extension Tool {
@@ -67,6 +84,7 @@ public extension Tool {
     var jsonSchema: String { #"{"type":"object","additionalProperties":true}"# }
     var outputSchemaJSON: String? { nil }
     var freeformToolFormat: FreeformToolFormat? { nil }
+    func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement { .none }
 }
 
 public struct ToolError: Error, Sendable, Equatable { public let message: String }
@@ -177,6 +195,24 @@ public actor ToolRouter {
     /// Register a callable-but-never-advertised tool (excluded from both
     /// `specs()` and `tool_search`). See `hidden`.
     public func registerHidden(_ tool: any Tool) { hidden[tool.name] = tool }
+
+    /// Every tool name currently known to the router — advertised + deferred
+    /// (e.g. the trigger-gated `workflow` tool) + hidden. The tool-pack registry
+    /// uses this to detect name collisions BEFORE registering a pack tool, so a
+    /// pack cannot silently shadow a built-in / MCP / earlier-pack tool
+    /// (`register` is last-writer-wins by name).
+    public func knownToolNames() -> Set<String> {
+        Set(tools.keys).union(deferred.keys).union(hidden.keys)
+    }
+
+    /// The approval requirement a registered tool declares for `call` (ADDONS
+    /// Phase 0 #3). `.none` if the tool isn't registered. The engine consults
+    /// this before dispatch so a declared-destructive call is routed through the
+    /// human approver even when the tool's op-kind is `.none`.
+    public func approvalRequirement(for call: ToolCall) -> ToolApprovalRequirement {
+        (tools[call.name] ?? deferred[call.name] ?? hidden[call.name])?
+            .approvalRequirement(call) ?? .none
+    }
 
     /// Whether a registered tool declares itself `parallelSafe` (the author's
     /// signal that it is side-effect-free / concurrency-safe — a sound proxy for

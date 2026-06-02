@@ -145,6 +145,25 @@ final class PromptsTests: XCTestCase {
         XCTAssertEqual(entry?.supportVerbosity, true)
     }
 
+    func testModelsCatalogRegistersRealtimeModel() {
+        // gpt-realtime-2 must be present with audio I/O modalities and the
+        // realtime flag so the voice bridge recognizes it as speech-to-speech.
+        guard let entry = ModelsCatalog.entry(for: "gpt-realtime-2") else {
+            return XCTFail("gpt-realtime-2 missing from models.json")
+        }
+        XCTAssertTrue(entry.realtime, "gpt-realtime-2 must carry realtime=true")
+        XCTAssertTrue(entry.supportsAudioInput, "gpt-realtime-2 accepts audio input")
+        XCTAssertTrue(entry.supportsAudioOutput, "gpt-realtime-2 emits audio output")
+        XCTAssertTrue(entry.supportsImageInput, "gpt-realtime-2 accepts image input")
+        XCTAssertTrue(ModelsCatalog.isRealtime("gpt-realtime-2"))
+        XCTAssertTrue(ModelsCatalog.isRealtime("gpt-realtime"))
+        // Unknown dated snapshots still resolve via the slug-family fallback.
+        XCTAssertTrue(ModelsCatalog.isRealtime("gpt-realtime-2-2026-01-01"))
+        // Non-realtime models are not misclassified.
+        XCTAssertFalse(ModelsCatalog.isRealtime("gpt-5.5"))
+        XCTAssertEqual(ModelsCatalog.entry(for: "gpt-5.5")?.realtime, false)
+    }
+
     func testComposerDeveloperMessageSubstitutesPersonality() {
         // Personality substitution is MODEL-AWARE: assert it against a catalog
         // model (gpt-5.5) whose entry ships an `instructions_template`.

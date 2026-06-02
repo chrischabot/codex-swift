@@ -69,6 +69,17 @@ public enum ModelsCatalog {
         /// (`mcp_tool_call.rs::sanitize_mcp_tool_result_for_model`). Empty when
         /// the catalog entry omits the field.
         public let inputModalities: [String]
+        /// Mirrors `output_modalities` in `models.json` (upstream
+        /// `ModelInfo::output_modalities`). The set of modalities the model can
+        /// emit (e.g. `["text", "audio"]` for the realtime voice models).
+        /// Empty when the catalog entry omits the field.
+        public let outputModalities: [String]
+        /// Mirrors the `realtime` flag in `models.json`. True for the
+        /// speech-to-speech voice models served over `/v1/realtime`
+        /// (`gpt-realtime`, `gpt-realtime-2`). These are NOT used by the
+        /// Responses-API agent turn loop; they drive the realtime voice bridge
+        /// (`thread/realtime/*` → OpenAI Realtime WebSocket).
+        public let realtime: Bool
         /// Mirrors the `id`s of the `service_tiers` array in `models.json`
         /// (upstream `ModelInfo::service_tiers`). The set of service-tier ids
         /// the model advertises (e.g. `["priority"]`). Upstream gates the
@@ -90,6 +101,18 @@ public enum ModelsCatalog {
         /// `"image"`.
         public var supportsImageInput: Bool {
             inputModalities.contains("image")
+        }
+
+        /// Whether this model accepts audio input. True when `input_modalities`
+        /// contains `"audio"` (the realtime voice models).
+        public var supportsAudioInput: Bool {
+            inputModalities.contains("audio")
+        }
+
+        /// Whether this model can emit audio output. True when
+        /// `output_modalities` contains `"audio"` (the realtime voice models).
+        public var supportsAudioOutput: Bool {
+            outputModalities.contains("audio")
         }
 
         /// Resolve `instructions` for this model with the given personality
@@ -139,6 +162,8 @@ public enum ModelsCatalog {
         let defaultReasoningSummary: String?
         let supportVerbosity: Bool?
         let inputModalities: [String]?
+        let outputModalities: [String]?
+        let realtime: Bool?
         let serviceTiers: [RawServiceTier]?
 
         enum CodingKeys: String, CodingKey {
@@ -153,6 +178,8 @@ public enum ModelsCatalog {
             case defaultReasoningSummary = "default_reasoning_summary"
             case supportVerbosity = "support_verbosity"
             case inputModalities = "input_modalities"
+            case outputModalities = "output_modalities"
+            case realtime
             case serviceTiers = "service_tiers"
         }
     }
@@ -198,6 +225,8 @@ public enum ModelsCatalog {
                                 defaultReasoningSummary: r.defaultReasoningSummary,
                                 supportVerbosity: r.supportVerbosity ?? false,
                                 inputModalities: r.inputModalities ?? [],
+                                outputModalities: r.outputModalities ?? [],
+                                realtime: r.realtime ?? false,
                                 serviceTiers: (r.serviceTiers ?? []).map { $0.id })
         }
         return out
@@ -217,5 +246,15 @@ public enum ModelsCatalog {
     /// `400 Invalid value: 'custom'`).
     public static func supportsFreeformTools(_ slug: String) -> Bool {
         entries[slug]?.applyPatchToolType != nil
+    }
+
+    /// Whether `slug` is a realtime speech-to-speech voice model (served over
+    /// the OpenAI `/v1/realtime` WebSocket rather than the Responses API).
+    /// Catalog-driven via the `realtime` flag; falls back to the `gpt-realtime`
+    /// slug family so unknown dated snapshots (`gpt-realtime-2-2025-…`) still
+    /// resolve correctly.
+    public static func isRealtime(_ slug: String) -> Bool {
+        if let entry = entries[slug] { return entry.realtime }
+        return slug.lowercased().hasPrefix("gpt-realtime")
     }
 }
