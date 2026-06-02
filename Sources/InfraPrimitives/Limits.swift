@@ -53,8 +53,14 @@ public struct Limits: Sendable, Codable, Equatable {
     /// counter, so a long turn that legitimately needs many mid-turn
     /// compactions is not failed the way upstream would not fail it.
     public var maxCompactionsPerTurn: Int = 100
-    /// Identical-tool-call repetition cap before the loop guard fires.
-    public var maxIdenticalToolRepeats: Int = 8
+    /// Runaway-loop guard: fire after this many CONSECUTIVE iterations whose tool
+    /// call(s) are byte-identical (same name + arguments) with nothing changing —
+    /// the signature of an agent stuck doing the exact same thing. Generous on
+    /// purpose: normal long-horizon / multi-day work never repeats an IDENTICAL
+    /// call this many times in a row (even heavy polling/retry varies or is far
+    /// fewer), but a genuine runaway (the same call hundreds/thousands of times)
+    /// is bounded. A text-only or differing iteration resets the counter.
+    public var maxIdenticalToolRepeats: Int = 100
     /// Tool fan-out semaphore: max concurrent tool tasks per turn.
     public var maxConcurrentTools: Int = 8
 
@@ -129,7 +135,7 @@ public struct Limits: Sendable, Codable, Equatable {
         // non-progress-based (a productive compaction never advances it), so this
         // ceiling only needs to clear a genuine non-terminating compaction loop.
         l.maxCompactionsPerTurn = 1000
-        l.maxIdenticalToolRepeats = 64
+        l.maxIdenticalToolRepeats = 1000   // was 64 (< the 100 default → would clamp it down)
         l.maxConcurrentTools = 64
         l.streamMaxRetries = 12
         l.rolloutGroupCommitItems = 4096

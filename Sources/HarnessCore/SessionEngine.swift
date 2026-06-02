@@ -2614,6 +2614,12 @@ public actor SessionEngine {
         var errorBody: ErrorBody?
         var turnTokens = 0
         var compactions = 0
+        // Runaway-loop guard state (limits.maxIdenticalToolRepeats): the tool-call
+        // signature (sorted name+args) of the previous iteration, and how many
+        // CONSECUTIVE iterations have produced that identical signature. Reset by a
+        // differing or text-only iteration. See the check after the tool drain.
+        var lastToolSignature: String?
+        var identicalToolRepeats = 0
         var inputMessagesForAfterAgent = input.compactMap(\.text)
         var lastAssistantMessage: String?
 
@@ -3352,6 +3358,14 @@ public actor SessionEngine {
                         shouldEmitTurnDiff = true
                     }
                 }
+                // Runaway-loop guard: capture this iteration's tool-call signature
+                // (sorted name+args of every call) BEFORE the drain clears
+                // pendingTools. `nil` for a text-only / no-tool iteration, which
+                // resets the consecutive-identical counter below.
+                let iterationToolSignature: String? = pendingTools.isEmpty
+                    ? nil
+                    : pendingTools.map { $0.name + "\u{1}" + $0.args }
+                        .sorted().joined(separator: "\u{2}")
                 // Drain pending parallel tool calls in model-emit order.
                 // Tasks were spawned per-.toolCall above; here we await each
                 // and run the per-tool side effects (post-tool hook,
@@ -3448,6 +3462,34 @@ public actor SessionEngine {
                     followUp = true
                 }
                 pendingTools.removeAll(keepingCapacity: true)
+                // Runaway-loop guard (limits.maxIdenticalToolRepeats): an agent
+                // emitting the IDENTICAL tool call(s) every iteration with nothing
+                // changing is stuck (no progress). Count consecutive identical
+                // signatures; a differing or text-only iteration resets. The
+                // threshold is generous so legitimate repeated work (re-running
+                // tests, polling) never trips, but a true runaway is bounded and
+                // the turn fails cleanly instead of burning the (possibly
+                // multi-day) time budget. This is the pattern-based loop bound that
+                // lets `maxSamplingIterationsPerTurn` default high (deadline-bound).
+                if let sig = iterationToolSignature {
+                    if sig == lastToolSignature {
+                        identicalToolRepeats += 1
+                    } else {
+                        lastToolSignature = sig
+                        identicalToolRepeats = 1
+                    }
+                    if identicalToolRepeats > limits.maxIdenticalToolRepeats {
+                        status = .failed
+                        errorBody = ErrorBody(
+                            message: "identical tool-call loop guard fired: the same tool call "
+                                + "repeated \(identicalToolRepeats) times in a row with no change",
+                            codexErrorInfo: "LoopGuard")
+                        break loop
+                    }
+                } else {
+                    lastToolSignature = nil
+                    identicalToolRepeats = 0
+                }
                 // Final consolidated turn-diff re-emit after the in-flight tool
                 // drain (turn.rs:2306-2314). Upstream gates this on the
                 // `should_emit_turn_diff` flag (armed on `Completed`) AND the
