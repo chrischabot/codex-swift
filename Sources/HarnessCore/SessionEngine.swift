@@ -2649,6 +2649,12 @@ public actor SessionEngine {
         // differing or text-only iteration. See the check after the tool drain.
         var lastToolSignature: String?
         var identicalToolRepeats = 0
+        // Per-response stall guard: how many CONSECUTIVE sampling iterations have
+        // failed with a retryable stream error (mid-stream idle-timeout / dead
+        // connection / transient 5xx). Reset to 0 after any successful iteration,
+        // so it bounds a persistently-broken stream (limits.streamMaxRetries) but
+        // tolerates occasional recovered stalls over a long/multi-day turn.
+        var streamStallRetries = 0
         var inputMessagesForAfterAgent = input.compactMap(\.text)
         var lastAssistantMessage: String?
 
@@ -2973,6 +2979,24 @@ public actor SessionEngine {
                     // per-turn iteration budget. The retry does NOT advance the
                     // turn state (no new pending input drain, no compaction).
                     iterations -= 1
+                    continue
+                }
+                // Per-response stall guard: a RETRYABLE stream error — a connect/
+                // open-time transient (5xx, dropped connection) or, on the
+                // mid-stream path below, an idle-timeout from a silent stream
+                // (the machine slept or the connection stalled) — re-attempts the
+                // SAME sampling iteration with a FRESH connection rather than
+                // failing the whole turn. Bounded by streamMaxRetries CONSECUTIVE
+                // failures; robust to system sleep (the idle-timeout fires on wake
+                // via ContinuousClock, and this abandons the stale connection).
+                if e.retryable, streamStallRetries < limits.streamMaxRetries {
+                    streamStallRetries += 1
+                    emit(.error(threadId: config.threadId, turnId: turnId, willRetry: true,
+                                ErrorBody(message: "model stream error (\(e.message)) — retrying with a "
+                                    + "fresh connection (attempt \(streamStallRetries)/\(limits.streamMaxRetries))",
+                                    codexErrorInfo: "StreamRetry")))
+                    iterations -= 1
+                    try? await Task.sleep(for: .seconds(min(2 * streamStallRetries, 10)))
                     continue
                 }
                 status = .failed
@@ -3558,6 +3582,23 @@ public actor SessionEngine {
                     iterations -= 1
                     continue
                 }
+                // Per-response stall guard (mid-stream): a retryable stream error
+                // here is the idle-timeout firing because the stream went silent
+                // past streamIdleTimeout — the laptop slept mid-stream, or the
+                // connection stalled. Re-attempt the same sampling with a fresh
+                // connection instead of failing the turn (the exact failure that
+                // tanked the bench run after a commute-sleep). Same bound + sleep
+                // robustness as the stream-open path above.
+                if e.retryable, streamStallRetries < limits.streamMaxRetries {
+                    streamStallRetries += 1
+                    emit(.error(threadId: config.threadId, turnId: turnId, willRetry: true,
+                                ErrorBody(message: "model stream stalled (\(e.message)) — retrying with a "
+                                    + "fresh connection (attempt \(streamStallRetries)/\(limits.streamMaxRetries))",
+                                    codexErrorInfo: "StreamRetry")))
+                    iterations -= 1
+                    try? await Task.sleep(for: .seconds(min(2 * streamStallRetries, 10)))
+                    continue
+                }
                 status = .failed
                 errorBody = ErrorBody(message: e.message, codexErrorInfo: "StreamError")
                 break
@@ -3566,6 +3607,11 @@ public actor SessionEngine {
                 errorBody = ErrorBody(message: "\(error)", codexErrorInfo: "StreamError")
                 break
             }
+            // The iteration's stream completed without error → reset the
+            // consecutive stall-retry counter (it only bounds a persistently
+            // broken stream, so a long turn that recovers from an occasional
+            // stall keeps its full retry budget).
+            streamStallRetries = 0
 
             if Task.isCancelled { status = .interrupted; break }
 
