@@ -76,7 +76,10 @@ public protocol Tool: Sendable {
 /// inspect `call.argumentsJSON` to decide — e.g. a write verb vs. a read).
 public enum ToolApprovalRequirement: Sendable, Equatable {
     case none
-    case required
+    /// Requires human approval before the call runs. `summary` is a short
+    /// human-readable description of the action, shown to the approver
+    /// (e.g. "send an email to alice@example.com").
+    case required(summary: String)
 }
 
 public extension Tool {
@@ -350,6 +353,16 @@ public actor ToolRouter {
         let call = ToolCall(callId: "code-\(UUID().uuidString)",
                             name: name,
                             argumentsJSON: argumentsJSON)
+        // ADDONS Phase 0 #3 (CRITICAL): a tool that DECLARES it needs approval
+        // cannot be invoked from code-mode JS. This nested path has no approval
+        // coordinator and runs synchronously under the JS host, so a
+        // declared-destructive tool reached via `exec` would bypass the human
+        // gate enforced in `SessionEngine.runToolWithApproval`. Deny by
+        // declaration (fail-closed); the model must call such a tool directly,
+        // where the engine's approval gate fires.
+        if case .required = tool.approvalRequirement(call) {
+            return "tool '\(name)' requires approval and cannot be called from exec/code-mode"
+        }
         let started = MonotonicClock.now()
         do {
             let result = try await withThrowingTaskGroup(of: ToolResult.self) { group -> ToolResult in

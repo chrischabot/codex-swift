@@ -1019,21 +1019,29 @@ public actor SessionEngine {
         // declares `.required` for THIS call, route it through the canonical
         // `approvalDecision` path (extension review → guardian → human
         // coordinator) BEFORE any dispatch — regardless of op-kind or remote
-        // environment. `approvalDecision` returns `.decline` when nothing can
-        // approve, so an unattended session FAILS CLOSED (the cron "reduced
-        // capability set"). An explicit PermissionRequest-hook allow bypasses it.
+        // environment — using the upstream `item/permissions/requestApproval`
+        // request (a real approval request that returns an ApprovalDecision and
+        // flips the thread to waitingOnApproval; NOT `item/tool/call`, which
+        // asks the client to EXECUTE a dynamic tool). The `reason` carries the
+        // tool's summary + the raw (truncated) args so the approver sees exactly
+        // what will run.
+        //
+        // FAIL-CLOSED semantics: under the DEFAULT user-reviewer with no
+        // coordinator, `approvalDecision` returns `.decline` → the call is
+        // denied (the cron "reduced capability set"; cron #6 must keep the
+        // user-reviewer for this guarantee). Under `auto_review`, the guardian
+        // LLM decides — consistent with how it judges shell/patch/network — so
+        // it is NOT fail-closed; that is an explicit operator opt-in. An explicit
+        // PermissionRequest-hook allow (`permissionAllow`) bypasses the prompt.
         if !permissionAllow,
-           case .required = await router.approvalRequirement(
+           case let .required(summary) = await router.approvalRequirement(
                for: ToolCall(callId: callId, name: name, argumentsJSON: args)) {
-            let parsedArgs = (try? JSONDecoder().decode(JSONValue.self, from: Data(args.utf8))) ?? .null
+            let argsPreview = args.count > 500 ? String(args.prefix(500)) + "…" : args
+            let reason = "Tool '\(name)' requires approval: \(summary). Arguments: \(argsPreview)"
             let rid = "srv_\(UUID().uuidString.prefix(12))"
-            let request = ServerRequest.dynamicToolCall(.string(rid), DynamicToolCallParams(
-                threadId: config.threadId, turnId: turnId, callId: callId,
-                namespace: nil, tool: name, arguments: parsedArgs))
-            switch await approvalDecision(request) {
-            case .accept, .acceptForSession:
-                break   // approved → fall through to the normal dispatch tail
-            default:
+            let request = ServerRequest.permissionsApproval(.string(rid),
+                PermissionsApprovalParams(threadId: config.threadId, turnId: turnId, reason: reason))
+            guard await approvalDecision(request).isAccept else {
                 return (ToolResult(callId: callId,
                                    output: "Not approved by user: tool '\(name)' requires approval",
                                    success: false, truncated: false), .declined)

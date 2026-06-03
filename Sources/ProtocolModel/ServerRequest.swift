@@ -271,6 +271,9 @@ public struct PermissionsApprovalParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId
     public var turnId: TurnId
     public var reason: String?
+    public init(threadId: ThreadId, turnId: TurnId, reason: String? = nil) {
+        self.threadId = threadId; self.turnId = turnId; self.reason = reason
+    }
 }
 
 public struct ToolRequestUserInputParams: Sendable, Codable, Equatable {

@@ -88,6 +88,8 @@ let package = Package(
     ],
     products: [
         .library(name: "InfraPrimitives", targets: ["InfraPrimitives"]),
+        .library(name: "DeliveryCore", targets: ["DeliveryCore"]),
+        .library(name: "EgressGuard", targets: ["EgressGuard"]),
         .library(name: "Observability", targets: ["Observability"]),
         .library(name: "WireProtocol", targets: ["WireProtocol"]),
         .library(name: "ProtocolModel", targets: ["ProtocolModel"]),
@@ -148,6 +150,14 @@ let package = Package(
         .target(name: "CPTY"),
 
         .target(name: "InfraPrimitives", swiftSettings: strict),
+        // ADDONS Phase 0 #4: durable at-least-once outbound-delivery queue
+        // (recovery states + crash replay + backoff + idempotency dedup),
+        // shared by the Channels reply path (#1) and the Push sinks (#7).
+        .target(name: "DeliveryCore", dependencies: ["InfraPrimitives"], swiftSettings: strict),
+        // ADDONS Phase 0 #5: the egress chokepoint -- one allowlist + post-DNS IP
+        // checks every outbound HTTP (push #7, cron webhook #6, media #8) passes
+        // through, to defeat SSRF / DNS-rebinding to internal hosts.
+        .target(name: "EgressGuard", swiftSettings: strict),
         // Computer-use (OpenAI `computer` tool): macOS desktop control executor.
         // System frameworks only (AppKit/CoreGraphics/ApplicationServices/ImageIO).
         .target(name: "ComputerUse", swiftSettings: strict),
@@ -325,6 +335,10 @@ let package = Package(
 
         .testTarget(name: "InfraPrimitivesTests",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
+        .testTarget(name: "DeliveryCoreTests",
+                dependencies: ["DeliveryCore", "InfraPrimitives"], swiftSettings: strict),
+        .testTarget(name: "EgressGuardTests",
+                dependencies: ["EgressGuard"], swiftSettings: strict),
         .testTarget(name: "WireProtocolTests",
                 dependencies: ["WireProtocol", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "ProtocolModelTests",

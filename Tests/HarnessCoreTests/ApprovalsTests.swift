@@ -17,13 +17,16 @@ private func apTmp(_ tag: String) -> String {
 private actor MockApprover: ApprovalCoordinator {
     private let decision: ApprovalDecision
     private(set) var requests: [(method: String, id: String)] = []
+    private(set) var lastReason: String?
     init(_ d: ApprovalDecision) { decision = d }
     func requestApproval(_ request: ServerRequest) async -> ApprovalDecision {
         requests.append((request.method, request.id.description))
+        if case .permissionsApproval(_, let p) = request { lastReason = p.reason }
         return decision
     }
     func count() -> Int { requests.count }
     func methods() -> [String] { requests.map(\.method) }
+    func reason() -> String? { lastReason }
 }
 
 private struct StubShell: Tool {
@@ -40,7 +43,9 @@ private struct StubShell: Tool {
 private struct RequiredMarkerTool: Tool {
     let name = "destructive_op"; let parallelSafe = false
     let marker: String
-    func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement { .required }
+    func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement {
+        .required(summary: "perform a destructive operation")
+    }
     func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
         FileManager.default.createFile(atPath: marker, contents: Data("ran".utf8))
         return ToolResult(callId: call.callId, output: "DID-IT", success: true, truncated: false)
@@ -758,15 +763,46 @@ final class ApprovalsTests: XCTestCase {
                        "with no approver, a required tool FAILS CLOSED (does not run)")
     }
 
-    func testRequiredToolPromptUsesItemToolCallMethod() async throws {
+    func testRequiredToolPromptUsesPermissionsApprovalMethod() async throws {
         let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
         let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
         let marker = work + "/ran_\(UUID().uuidString)"
         let approver = MockApprover(.accept)
         _ = await runRequiredTool(coordinator: approver, marker: marker, work: work, store: store)
         let methods = await approver.methods()
-        XCTAssertEqual(methods, ["item/tool/call"],
-                       "tool approval reuses the dynamicToolCall request (item/tool/call)")
+        XCTAssertEqual(methods, ["item/permissions/requestApproval"],
+                       "tool approval uses a real approval request (returns a decision; flips status to waitingOnApproval) — NOT item/tool/call (which asks the client to EXECUTE a dynamic tool)")
+    }
+
+    /// The approval prompt's reason must carry the tool's summary AND the raw
+    /// args, so the approver sees exactly what will run.
+    func testRequiredToolApprovalReasonIncludesSummaryAndArgs() async throws {
+        let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let approver = MockApprover(.accept)
+        _ = await runRequiredTool(coordinator: approver, marker: marker, work: work, store: store)
+        let reason = await approver.reason()
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason?.contains("perform a destructive operation") ?? false,
+                      "reason carries the tool's summary")
+        XCTAssertTrue(reason?.contains("delete") ?? false,
+                      "reason carries the raw args (verb=delete) the tool will execute")
+    }
+
+    /// CRITICAL regression: a declared-required tool must NOT be reachable from
+    /// code-mode (`exec`) nested dispatch, which has no approval coordinator.
+    func testCodeModeNestedDispatchDeniesRequiredTool() async throws {
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let router = ToolRouter(limits: Limits())
+        await router.register(RequiredMarkerTool(marker: marker))
+        let out = await router.dispatchNestedFromCode(
+            name: "destructive_op", argumentsJSON: "{\"verb\":\"delete\"}", cwd: work, timeoutMs: 5000)
+        XCTAssertTrue(out.contains("requires approval"),
+                      "code-mode must refuse a declared-required tool (no bypass of the approval gate)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker),
+                       "a required tool must NOT run from code-mode/exec")
     }
 
     func testPlainToolRunsWithoutApprovalRequest() async throws {
