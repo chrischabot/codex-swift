@@ -42,8 +42,8 @@ public struct CurlFetcher: Fetcher {
                       state: SourceState,
                       deadline: Deadline) async -> FetchOutcome {
         switch spec.kind {
-        case .manual:
-            return .failed("manual sources are not auto-fetched")
+        case .manual, .claude:
+            return .failed("\(spec.kind.rawValue) sources are explicit import-only sources")
         case .x:
             // `x` traffic flows through `TwitterAPIFetcher`; if a caller wires
             // `CurlFetcher` directly for an `x` spec we surface the misconfig

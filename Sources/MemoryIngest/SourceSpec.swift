@@ -6,7 +6,7 @@ import MemoryStore
 /// `Config` profiles; this struct is the parsed shape the scheduler consumes.
 public struct SourceSpec: Sendable, Equatable {
     public enum Kind: String, Sendable, Codable {
-        case rss, arxiv, github, newsletter, x, manual, web
+        case rss, arxiv, github, newsletter, x, manual, web, claude
     }
 
     public var name: String          // unique within the running daemon
@@ -37,6 +37,7 @@ public struct SourceSpec: Sendable, Equatable {
         case .x:          return .x
         case .manual:     return .manual
         case .web:        return .web
+        case .claude:     return .claude
         }
     }
 
@@ -51,6 +52,9 @@ public struct SourceSpec: Sendable, Equatable {
     ///     kind = "github"
     ///     uri = "https://github.com/openai/codex"
     ///     min_interval_seconds = 1800
+    ///
+    /// Claude transcript exports are imported explicitly with
+    /// `codex-memory import-claude`; they are not polled by the scheduler.
     ///
     /// Unknown / malformed entries are skipped silently so a partial config
     /// doesn't stall the daemon — the missing source surfaces in the metrics
@@ -95,6 +99,7 @@ public struct SourceSpec: Sendable, Equatable {
         case .x:          return 60      // 1 min (tracked handles)
         case .manual:     return 86_400  // 24 hours (effectively manual-only)
         case .web:        return 1800    // 30 min
+        case .claude:     return 86_400  // explicit import-only source
         }
     }
 }

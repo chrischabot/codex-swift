@@ -380,12 +380,33 @@ public actor MemoryStore {
         return rows.first.map(Self.rowToDocument)
     }
 
-    /// Delete a document by id. The schema cascades to the document's chunks
-    /// (and through them to chunk_vec / chunk_fts via the same FK chain).
-    /// Insight rows do *not* cascade — see `recentInteresting` which uses a
-    /// LEFT JOIN so orphan insights stay surfaceable.
+    /// Delete a document by id. New databases cascade mentions and clear edge
+    /// evidence via FK actions, but older databases may have been created
+    /// before those actions existed. Perform the dependent-row cleanup
+    /// explicitly so document replacement is reliable across both shapes.
+    /// Insight rows do not cascade; the schema keeps them as historical records
+    /// by nulling `trigger_chunk_id`.
     public func deleteDocument(id: Int64) throws {
-        try run("DELETE FROM document WHERE id=?;", [.int(id)])
+        try execRaw("BEGIN IMMEDIATE;")
+        do {
+            try run("""
+            UPDATE edge SET evidence_chunk_id=NULL
+            WHERE evidence_chunk_id IN (
+              SELECT id FROM chunk WHERE document_id=?
+            );
+            """, [.int(id)])
+            try run("""
+            DELETE FROM mention
+            WHERE chunk_id IN (
+              SELECT id FROM chunk WHERE document_id=?
+            );
+            """, [.int(id)])
+            try run("DELETE FROM document WHERE id=?;", [.int(id)])
+            try execRaw("COMMIT;")
+        } catch {
+            try? execRaw("ROLLBACK;")
+            throw error
+        }
     }
 
     public func documentCount() throws -> Int {

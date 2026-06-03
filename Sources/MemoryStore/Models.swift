@@ -2,7 +2,7 @@ import Foundation
 
 /// Source kind for an ingested document (see schema §3 of the design doc).
 public enum MemorySource: String, Sendable, Codable, CaseIterable {
-    case rss, arxiv, github, newsletter, x, manual, web
+    case rss, arxiv, github, newsletter, x, manual, web, claude
 }
 
 public struct DocumentRow: Sendable, Equatable {

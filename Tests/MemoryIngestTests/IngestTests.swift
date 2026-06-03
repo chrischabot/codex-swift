@@ -36,6 +36,18 @@ final class IngestTests: XCTestCase {
         XCTAssertNotNil(dq)
     }
 
+    func testClaudeSourceIsImportOnlyAndMapsToStoreSource() async throws {
+        let spec = SourceSpec(name: "claude", kind: .claude,
+                              uri: "claude://conversation/1")
+        XCTAssertEqual(spec.storeSource, .claude)
+        let outcome = await CurlFetcher().fetch(
+            spec, state: SourceState(), deadline: .fromNow(.seconds(2)))
+        guard case .failed(let message) = outcome else {
+            return XCTFail("expected claude source fetch to fail explicitly")
+        }
+        XCTAssertTrue(message.contains("import-only"))
+    }
+
     func testSchedulerSkipsDueWhenCursorAhead() async throws {
         let path = NSTemporaryDirectory() + "ingest-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

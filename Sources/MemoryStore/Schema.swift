@@ -54,14 +54,14 @@ enum MemorySchema {
       first_seen  INTEGER NOT NULL,
       last_seen   INTEGER NOT NULL,
       weight      REAL NOT NULL DEFAULT 1.0,
-      evidence_chunk_id INTEGER REFERENCES chunk(id)
+      evidence_chunk_id INTEGER REFERENCES chunk(id) ON DELETE SET NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS edge_unique ON edge(src,dst,relation);
     CREATE INDEX IF NOT EXISTS edge_src ON edge(src);
     CREATE INDEX IF NOT EXISTS edge_dst ON edge(dst);
 
     CREATE TABLE IF NOT EXISTS mention (
-      chunk_id    INTEGER NOT NULL REFERENCES chunk(id),
+      chunk_id    INTEGER NOT NULL REFERENCES chunk(id) ON DELETE CASCADE,
       entity_id   INTEGER NOT NULL REFERENCES entity(id),
       span_start  INTEGER, span_end INTEGER, salience REAL,
       PRIMARY KEY (chunk_id, entity_id)

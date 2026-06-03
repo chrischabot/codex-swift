@@ -269,6 +269,7 @@ extension SourceSpec.Kind {
         case .x:          return .x
         case .manual:     return .manual
         case .web:        return .web
+        case .claude:     return .claude
         }
     }
 }

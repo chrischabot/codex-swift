@@ -43,16 +43,16 @@ final class EndToEndTests: XCTestCase {
         XCTAssertEqual(tools.count, 7)
         let names = tools.map(\.name).sorted()
         XCTAssertEqual(names, [
-            "memory.ask_local_brain",
-            "memory.escalate_to_brain",
-            "memory.graph_walk",
-            "memory.hybrid_search",
-            "memory.persona_lens",
-            "memory.recent_interesting",
-            "memory.set_persona",
+            "memory_ask_local_brain",
+            "memory_escalate_to_brain",
+            "memory_graph_walk",
+            "memory_hybrid_search",
+            "memory_persona_lens",
+            "memory_recent_interesting",
+            "memory_set_persona",
         ])
         // The escalation tool should refuse without an endpoint.
-        let escalate = tools.first(where: { $0.name == "memory.escalate_to_brain" })!
+        let escalate = tools.first(where: { $0.name == "memory_escalate_to_brain" })!
         let result = try await escalate.run(
             ToolCall(callId: "1", name: escalate.name,
                      argumentsJSON: #"{"question":"x","reason":"y"}"#),

@@ -87,6 +87,40 @@ final class MemoryStoreTests: XCTestCase {
         XCTAssertEqual(hits[0].chunkId, 1)
     }
 
+    func testDeleteDocumentCleansChunkReferences() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let cfg = MemoryStoreConfig(path: path, embeddingDimension: 4)
+        let store = try MemoryStore(cfg)
+        let sha = Data(count: 32)
+        let docId = try await store.upsertDocument(DocumentRow(
+            source: .claude, sourceURI: "claude://doc/1",
+            bodyPath: "rollout:claude", fetchedAt: 0,
+            contentSHA: sha, rawBytes: 1))
+        let chunkId = try await store.insertChunk(
+            ChunkRow(documentId: docId, idx: 0,
+                     text: "chunk", rawText: "chunk",
+                     tokenCount: 1, createdAt: 0),
+            embeddingValues: [1, 0, 0, 0])
+        let alice = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Alice", firstSeen: 0, lastSeen: 0))
+        let bob = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Bob", firstSeen: 0, lastSeen: 0))
+        try await store.insertMention(MentionRow(chunkId: chunkId, entityId: alice))
+        _ = try await store.upsertEdge(EdgeRow(
+            src: alice, dst: bob, relation: "mentions",
+            firstSeen: 0, lastSeen: 0, evidenceChunkId: chunkId))
+
+        try await store.deleteDocument(id: docId)
+
+        let deletedDoc = try await store.document(byURI: "claude://doc/1")
+        let chunkCount = try await store.chunkCount()
+        let edges = try await store.edges(fromOrTo: alice)
+        XCTAssertNil(deletedDoc)
+        XCTAssertEqual(chunkCount, 0)
+        XCTAssertEqual(edges.count, 1)
+        XCTAssertNil(edges.first?.evidenceChunkId)
+    }
+
     func testEntityEdgeAndTwoHop() async throws {
         let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
         let store = try MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: 4))

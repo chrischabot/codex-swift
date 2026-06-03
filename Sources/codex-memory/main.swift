@@ -51,6 +51,16 @@ case "snapshot":
         exit(2)
     }
 
+case "import-claude":
+    do {
+        let report = try await CodexMemoryClaudeImport.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(report.utf8))
+        exit(report.contains("FAIL ") ? 1 : 0)
+    } catch {
+        FileHandle.standardError.write(Data("import-claude failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "run":
     await CodexMemoryRun.runForever()
 
@@ -60,6 +70,7 @@ case "help", "--help", "-h":
 
       verify          Phase-0 self-check: probe deps, schema, pricing pins.
       tick            Run one ingest/process cycle then exit (useful in tests).
+      import-claude   Import Claude transcript memory documents from JSONL.
       run             Long-running daemon: ingest → process → score, with MCP.
 
     See docs/codex-swift-memory-wiki.md for the full design.

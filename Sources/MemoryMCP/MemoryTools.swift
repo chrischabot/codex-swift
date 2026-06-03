@@ -31,9 +31,9 @@ enum MCPJSON {
     }
 }
 
-/// memory.hybrid_search
+/// memory_hybrid_search
 public struct HybridSearchTool: Tool {
-    public let name = "memory.hybrid_search"
+    public let name = "memory_hybrid_search"
     public let parallelSafe = true
     public let toolDescription = "BM25 + sqlite-vec + RRF hybrid retrieval over the wiki, cross-encoder reranked."
     public let jsonSchema = """
@@ -74,9 +74,9 @@ public struct HybridSearchTool: Tool {
     }
 }
 
-/// memory.graph_walk
+/// memory_graph_walk
 public struct GraphWalkTool: Tool {
-    public let name = "memory.graph_walk"
+    public let name = "memory_graph_walk"
     public let parallelSafe = true
     public let toolDescription = "Two-hop graph walk from a seed entity (id or canonical name)."
     public let jsonSchema = """
@@ -167,9 +167,9 @@ public struct GraphWalkTool: Tool {
     }
 }
 
-/// memory.recent_interesting
+/// memory_recent_interesting
 public struct RecentInterestingTool: Tool {
-    public let name = "memory.recent_interesting"
+    public let name = "memory_recent_interesting"
     public let parallelSafe = true
     public let toolDescription = "Top scored chunks since a timestamp; uses the active persona's weights."
     public let jsonSchema = """
@@ -234,9 +234,9 @@ public struct RecentInterestingTool: Tool {
     }
 }
 
-/// memory.persona_lens
+/// memory_persona_lens
 public struct PersonaLensTool: Tool {
-    public let name = "memory.persona_lens"
+    public let name = "memory_persona_lens"
     public let parallelSafe = true
     public let toolDescription = "Return the active persona and weights."
     public let jsonSchema = #"{"type":"object","properties":{}}"#
@@ -252,9 +252,9 @@ public struct PersonaLensTool: Tool {
     }
 }
 
-/// memory.set_persona
+/// memory_set_persona
 public struct SetPersonaTool: Tool {
-    public let name = "memory.set_persona"
+    public let name = "memory_set_persona"
     public let parallelSafe = false
     public let toolDescription = "Switch the active persona (cto|cmo|designer|researcher|editor)."
     public let jsonSchema = """
@@ -277,9 +277,9 @@ public struct SetPersonaTool: Tool {
     }
 }
 
-/// memory.ask_local_brain
+/// memory_ask_local_brain
 public struct AskLocalBrainTool: Tool {
-    public let name = "memory.ask_local_brain"
+    public let name = "memory_ask_local_brain"
     public let parallelSafe = true
     public let toolDescription = "Answer a question via local extractor + retrieved chunks (no cloud spend)."
     public let jsonSchema = """
@@ -314,9 +314,9 @@ public struct AskLocalBrainTool: Tool {
     }
 }
 
-/// memory.escalate_to_brain
+/// memory_escalate_to_brain
 public struct EscalateToBrainTool: Tool {
-    public let name = "memory.escalate_to_brain"
+    public let name = "memory_escalate_to_brain"
     public let parallelSafe = false
     public let toolDescription = "Spend-gated GPT-5.5 escalation. Returns an insight card or a rate-limit reason."
     public let jsonSchema = """
