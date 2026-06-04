@@ -188,7 +188,7 @@ let package = Package(
         // ADDONS.md #4 — Google Workspace tool suite (the discovery-driven
         // google_api tool) over the #3 connector.
         .target(name: "GoogleWorkspace",
-                dependencies: ["Connectors", "Tools", "ProtocolModel", "HarnessCore"],
+                dependencies: ["Connectors", "Tools", "ProtocolModel", "HarnessCore", "Config", "EgressGuard"],
                 swiftSettings: strict),
         // ADDONS.md #5 — Gmail channel (inbound/outbound, non-owner by default).
         .target(name: "Gmail",
@@ -205,7 +205,7 @@ let package = Package(
         .target(name: "MCP",
                 dependencies: ["Tools", "InfraPrimitives", "ProtocolModel", "Config"], swiftSettings: strict),
         .target(name: "Skills", swiftSettings: strict),
-        .target(name: "Connectors", dependencies: ["EgressGuard"], swiftSettings: strict),
+        .target(name: "Connectors", dependencies: ["EgressGuard", "Config"], swiftSettings: strict),
         .target(name: "ExtensionAPI", swiftSettings: strict),
         .target(name: "HarnessCore",
                 dependencies: ["ProtocolModel", "WireProtocol", "ModelClient", "Persistence", "Tools", "InfraPrimitives", "Observability", "Prompts", "Sandbox", "Skills", "Connectors", "Config", "Tokenizer", "ExtensionAPI"],
@@ -248,7 +248,7 @@ let package = Package(
                                "ModelClient", "Tools", "Sandbox", "Prompts", "MCP", "Skills",
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
                                "Supervisor", "Transport", "Observability", "Auth", "Tokenizer", "Config", "Workflows",
-                               "MemoryExtension", "WebGateway", "Push"],
+                               "MemoryExtension", "WebGateway", "Push", "GoogleWorkspace"],
                 swiftSettings: strict),
         .executableTarget(name: "codex-broker",
                 dependencies: ["Broker", "Auth", "Observability"], swiftSettings: strict),
@@ -257,7 +257,7 @@ let package = Package(
                                "ModelClient", "Tools", "Sandbox", "Prompts", "MCP", "Skills",
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
                                "Observability", "Auth", "Tokenizer", "Config", "Workflows",
-                               "MemoryExtension", "Push"], swiftSettings: strict),
+                               "MemoryExtension", "Push", "GoogleWorkspace"], swiftSettings: strict),
         .executableTarget(name: "mock-responses",
                 dependencies: ["ModelClient", "InfraPrimitives"], swiftSettings: strict),
 
@@ -357,7 +357,7 @@ let package = Package(
                 dependencies: ["Push", "Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel", "HarnessCore"],
                 swiftSettings: strict),
         .testTarget(name: "GoogleWorkspaceTests",
-                dependencies: ["GoogleWorkspace", "Connectors", "EgressGuard", "Tools", "ProtocolModel", "HarnessCore"],
+                dependencies: ["GoogleWorkspace", "Connectors", "EgressGuard", "Tools", "ProtocolModel", "HarnessCore", "Config"],
                 swiftSettings: strict),
         .testTarget(name: "GmailTests",
                 dependencies: ["Gmail", "Channels", "GoogleWorkspace", "Connectors", "EgressGuard"],
@@ -418,7 +418,7 @@ let package = Package(
         .testTarget(name: "SkillsTests",
                 dependencies: ["Skills"], swiftSettings: strict),
         .testTarget(name: "ConnectorsTests",
-                dependencies: ["Connectors", "EgressGuard"], swiftSettings: strict),
+                dependencies: ["Connectors", "EgressGuard", "Config"], swiftSettings: strict),
         .testTarget(name: "ExtensionAPITests",
                 dependencies: ["ExtensionAPI"], swiftSettings: strict),
         .testTarget(name: "BrokerTests",

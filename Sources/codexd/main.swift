@@ -23,6 +23,7 @@ import Config
 import MemoryExtension
 import WebGateway
 import Push
+import GoogleWorkspace
 
 /// Fails clearly when no model credentials are configured. Set
 /// CODEXKIT_MOCK=1 to run the full pipeline against the deterministic mock.
@@ -244,6 +245,34 @@ struct CodexDaemon {
         let log = Log(category: "codexd")
         let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
             ?? (NSHomeDirectory() + "/.codex")
+
+        // Subcommands short-circuit the daemon: a one-shot routine + exit, BEFORE
+        // any socket/ThreadStore. `google-connect` obtains OAuth tokens via the
+        // loopback PKCE flow + writes a 0600 token file the worker reads — done
+        // out-of-band so the refresh-token secret never streams over the control
+        // plane (the reason it is a subcommand, not an RPC).
+        if let sub = CommandLine.arguments.dropFirst().first,
+           sub == "google-connect" || sub == "google-disconnect" {
+            let env = ProcessInfo.processInfo.environment
+            let addonConfig = ConfigLoader(codexHome: codexHome).load()
+            let emit: @Sendable (String) -> Void = { FileHandle.standardError.write(Data($0.utf8)) }
+            let code: Int32
+            if sub == "google-connect" {
+                code = await runGoogleConnect(
+                    addonConfig: addonConfig, codexHome: codexHome, env: env,
+                    openURL: { url in
+                        let p = Process()
+                        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                        p.arguments = [url.absoluteString]
+                        try? p.run()
+                    }, emit: emit)
+            } else {
+                code = await runGoogleDisconnect(
+                    addonConfig: addonConfig, codexHome: codexHome, env: env, emit: emit)
+            }
+            exit(code)
+        }
+
         // Apply optional `$CODEX_HOME/config.toml` overrides (F1).
         let limits = Limits.loadingOverrides(codexHome: codexHome).clamped()
 
@@ -419,9 +448,17 @@ struct CodexDaemon {
                         let pushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
                         toolPacks.append(PushToolPack(router: pushRouter))
                     }
-                    // #4 Google / #8 Media packs are ready (Google/MediaToolPack);
-                    // wiring them needs their config readers ([connectors.google]
-                    // creds; media provider keys) — tracked follow-on.
+                    // #4 Google: gated on [features].google + a [connectors.google]
+                    // table (deny-default). The pure GoogleWiring.toolPack helper
+                    // builds the OAuth connector + REST client; tokens are obtained
+                    // out-of-band via the `codexd google-connect` subcommand.
+                    if let gpack = GoogleWiring.toolPack(
+                        addonConfig: addonConfig, codexHome: codexHome,
+                        env: ProcessInfo.processInfo.environment) {
+                        toolPacks.append(gpack)
+                    }
+                    // #8 Media pack is ready (MediaToolPack); wiring it needs a
+                    // configured provider + the supervisor poller — tracked follow-on.
                     await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
                     let extRegistry = installAddons(
                         config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)

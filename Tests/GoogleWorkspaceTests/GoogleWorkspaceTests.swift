@@ -6,6 +6,7 @@ import Foundation
 @testable import Tools
 import ProtocolModel
 import HarnessCore
+import Config
 
 /// Severe tests for the ADDONS #4 google_api tool: service→host containment,
 /// bearer attachment + transparent auth, write-verb approval gating, and 429/5xx
@@ -169,6 +170,64 @@ final class GoogleWorkspaceTests: XCTestCase {
         XCTAssertEqual(pack.id, "google")
         XCTAssertEqual(pack.tools().map(\.name), ["google_api"])
         XCTAssertEqual(GoogleToolPack(client: nil).tools().count, 0)
+    }
+
+    // MARK: config reader + composition-root gate
+
+    private func cfg(_ values: [String: ConfigValue]) -> Config {
+        Config(layers: [ConfigLayer(name: "test", values: values)])
+    }
+
+    func testConnectorConfigRead() {
+        let c = cfg(["connectors": .object(["google": .object([
+            "client_id": .string("cid.apps.googleusercontent.com"),
+            "scopes": .array([.string("https://www.googleapis.com/auth/drive")]),
+            "token_store_path": .string("$CODEX_HOME/g/tok.json"),
+        ])])])
+        let gc = GoogleConnectorConfig.read(from: c, codexHome: "/home", env: [:])
+        XCTAssertEqual(gc?.clientId, "cid.apps.googleusercontent.com")
+        XCTAssertEqual(gc?.scopes, ["https://www.googleapis.com/auth/drive"])
+        XCTAssertEqual(gc?.tokenStorePath, "/home/g/tok.json", "$CODEX_HOME expanded")
+    }
+
+    func testConnectorConfigDefaultsAndMissing() {
+        let onlyId = cfg(["connectors": .object(["google": .object(["client_id": .string("x")])])])
+        let gc = GoogleConnectorConfig.read(from: onlyId, codexHome: "/h", env: [:])
+        XCTAssertEqual(gc?.scopes, GoogleConnectorConfig.defaultScopes, "default read scopes")
+        XCTAssertEqual(gc?.tokenStorePath, "/h/connectors/google/tokens.json")
+        XCTAssertNil(GoogleConnectorConfig.read(from: cfg([:]), codexHome: "/h", env: [:]),
+                     "no [connectors.google] → nil (deny-default)")
+        XCTAssertNil(GoogleConnectorConfig.read(
+            from: cfg(["connectors": .object(["google": .object([:])])]), codexHome: "/h", env: [:]),
+            "missing client_id → nil")
+    }
+
+    func testWiringGateDenyDefault() {
+        let configured = cfg([
+            "features": .object(["google": .bool(true)]),
+            "connectors": .object(["google": .object(["client_id": .string("x")])]),
+        ])
+        XCTAssertEqual(GoogleWiring.toolPack(addonConfig: configured, codexHome: "/h", env: [:])?.tools().map(\.name),
+                       ["google_api"], "feature on + config present → google_api")
+        // feature OFF → nil even with connector config (deny-default).
+        let featOff = cfg(["connectors": .object(["google": .object(["client_id": .string("x")])])])
+        XCTAssertNil(GoogleWiring.toolPack(addonConfig: featOff, codexHome: "/h", env: [:]))
+        // feature ON but no connector config → nil (self-prune).
+        XCTAssertNil(GoogleWiring.toolPack(
+            addonConfig: cfg(["features": .object(["google": .bool(true)])]), codexHome: "/h", env: [:]))
+        // env feature flag enables it.
+        XCTAssertEqual(GoogleWiring.toolPack(addonConfig: featOff, codexHome: "/h", env: ["CODEX_FEATURE_GOOGLE": "1"])?.tools().count,
+                       1, "CODEX_FEATURE_GOOGLE=1 enables")
+    }
+
+    func testOAuthEgressPinnedToTokenHost() {
+        // The OAuth EgressGuard must be pinned to EXACTLY oauth2.googleapis.com.
+        let eg = GoogleConnectorConfig.oauthEgress()
+        XCTAssertEqual(eg.policy.allowedHosts, ["oauth2.googleapis.com"])
+    }
+
+    func testOAuthFormEncoding() {
+        XCTAssertEqual(URLSessionOAuthHTTPClient.formEncode("a b&c=d"), "a%20b%26c%3Dd")
     }
 
     // MARK: tool surface

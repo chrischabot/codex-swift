@@ -20,6 +20,7 @@ import Auth
 import Config
 import MemoryExtension
 import Push
+import GoogleWorkspace
 
 /// Fails clearly until the production HTTP/WS Responses client is wired
 /// (parity with codexd). `CODEXKIT_MOCK=1` forces the deterministic mock.
@@ -389,6 +390,11 @@ struct SessionWorkerMain {
             if addonConfig.isFeatureEnabled("push") {
                 let pushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
                 toolPacks.append(PushToolPack(router: pushRouter))
+            }
+            if let gpack = GoogleWiring.toolPack(
+                addonConfig: addonConfig, codexHome: codexHome,
+                env: ProcessInfo.processInfo.environment) {
+                toolPacks.append(gpack)
             }
             await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
             let extRegistry = installAddons(
