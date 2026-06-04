@@ -136,6 +136,72 @@ final class CronTests: XCTestCase {
         let job = CronJob(id: "j", schedule: .every(60), prompt: "x", createdAt: 0)
         XCTAssertTrue(job.skipMemory, "unattended runs skip memory by default")
     }
+
+    func testJobAccessor() async {
+        let sched = CronScheduler(store: MemoryCronStore(), run: FireRecorder().run)
+        await sched.upsert(CronJob(id: "j", schedule: .every(60), prompt: "x", createdAt: 0))
+        let got = await sched.job("j")
+        XCTAssertEqual(got?.id, "j")
+        let missing = await sched.job("nope")
+        XCTAssertNil(missing)
+    }
+
+    // MARK: self-driving tick loop
+
+    func testStartDrivesTickAndStopHalts() async {
+        let store = MemoryCronStore()
+        let fired = FireRecorder()
+        let sched = CronScheduler(store: store, graceSeconds: 3600, run: fired.run)
+        // A one-shot `.at` 50s in the (relative) past, within the grace window of
+        // now=100, so the tick fires it once then disables it.
+        await sched.upsert(CronJob(id: "j", schedule: .at(50), prompt: "x", createdAt: 0))
+        await sched.start(tickSeconds: 0, now: { 100 })
+        var fires = 0
+        for _ in 0..<200 {
+            fires = await fired.count()
+            if fires >= 1 { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertGreaterThanOrEqual(fires, 1, "the tick loop fired the due job")
+        await sched.stop()
+        let running = await sched.isRunning
+        XCTAssertFalse(running, "stop() halts the loop")
+        let afterStop = await fired.count()
+        try? await Task.sleep(for: .milliseconds(30))
+        let later = await fired.count()
+        XCTAssertEqual(afterStop, later, "no ticks after stop()")
+    }
+
+    func testStartIsIdempotent() async {
+        let sched = CronScheduler(store: MemoryCronStore(), run: FireRecorder().run)
+        await sched.start(tickSeconds: 3600)
+        await sched.start(tickSeconds: 3600)   // a second call is a no-op
+        let running = await sched.isRunning
+        XCTAssertTrue(running)
+        await sched.stop()
+    }
+
+    // MARK: persist-on-change (the `|| true` → `changed` fix)
+
+    func testNoOpTickDoesNotPersistButFastForwardDoes() async {
+        // CLAIM: a tick with nothing due must NOT persist; a fast-forward tick
+        // MUST persist (else stale fires resurrect on restart).
+        let counting = CountingCronStore()
+        let sched = CronScheduler(store: counting, graceSeconds: 600, run: FireRecorder().run)
+        await sched.upsert(CronJob(id: "future", schedule: .every(3600),
+                                   prompt: "x", lastRunAt: 1000, createdAt: 0))
+        let baseline = await counting.saves()
+        _ = await sched.tick(now: 1500)          // next fire is 4600 → nothing due
+        let afterNoop = await counting.saves()
+        XCTAssertEqual(afterNoop, baseline, "a no-op tick does NOT persist")
+
+        await sched.upsert(CronJob(id: "stale", schedule: .every(60),
+                                   prompt: "x", lastRunAt: 0, createdAt: 0))
+        let before = await counting.saves()
+        _ = await sched.tick(now: 1_000_000)     // way past grace → fast-forward
+        let after = await counting.saves()
+        XCTAssertGreaterThan(after, before, "a fast-forward tick persists (no stale-fire resurrection)")
+    }
 }
 
 actor FireRecorder {
@@ -143,4 +209,13 @@ actor FireRecorder {
     nonisolated var run: CronScheduler.Runner { { [self] job in await self.record(job.id); return true } }
     private func record(_ id: String) { fired.append(id) }
     func count() -> Int { fired.count }
+}
+
+/// A CronStore that counts save() calls (to assert persist-on-change).
+actor CountingCronStore: CronStore {
+    private var jobs: [CronJob] = []
+    private var saveCount = 0
+    func load() -> [CronJob] { jobs }
+    func save(_ j: [CronJob]) { jobs = j; saveCount += 1 }
+    func saves() -> Int { saveCount }
 }

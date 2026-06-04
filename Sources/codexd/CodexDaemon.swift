@@ -25,20 +25,24 @@ import WebGateway
 import Push
 import GoogleWorkspace
 import Media
+import Cron
 
 /// #8 Media delivery (codexd): push a "ready" notification for a finished asset
 /// through the daemon-scope PushRouter (#7). Returns false → the ledger marks it
 /// undelivered and the poller retries (bounded). Local-path delivery for the
 /// MVP; a signed MediaToken URL needs the gateway signer shared — see
-/// MediaWiring (documented follow-on).
-@Sendable func mediaPushDeliver(_ task: MediaTask) async -> Bool {
-    guard let router = PushRouterHolder.shared.current(),
-          let target = task.deliverTo, let asset = task.assetPath else { return false }
-    let result = await router.send(
-        target: target,
-        text: "media \(task.kind.rawValue) ready: \(asset)",
-        idempotencyKey: "media-\(task.id)")
-    return result.ok
+/// MediaWiring (documented follow-on). Namespaced (not a top-level func) so the
+/// codexd module stays `@main`-compatible.
+enum MediaGlue {
+    @Sendable static func push(_ task: MediaTask) async -> Bool {
+        guard let router = PushRouterHolder.shared.current(),
+              let target = task.deliverTo, let asset = task.assetPath else { return false }
+        let result = await router.send(
+            target: target,
+            text: "media \(task.kind.rawValue) ready: \(asset)",
+            idempotencyKey: "media-\(task.id)")
+        return result.ok
+    }
 }
 
 /// Fails clearly when no model credentials are configured. Set
@@ -579,7 +583,7 @@ struct CodexDaemon {
                   let ledger = await MediaWiring.makeLedger(
                       addonConfig: appConfig, codexHome: codexHome,
                       env: ProcessInfo.processInfo.environment,
-                      inProcessWorkers: inProcessWorkers, deliver: mediaPushDeliver)
+                      inProcessWorkers: inProcessWorkers, deliver: MediaGlue.push)
             else { return nil }
             MediaLedgerHolder.shared.set(ledger)
             let poller = MediaPoller(ledger: ledger)
@@ -608,7 +612,33 @@ struct CodexDaemon {
         let automationScheduler = AutomationScheduler(
             store: automationStore, supervisor: supervisor, threadStore: store,
             defaultCwd: FileManager.default.currentDirectoryPath)
-        await automationScheduler.start()
+        // #6 Cron: when [features].cron is on, Cron is the SINGLE source of truth
+        // — migrate legacy automations ONCE and do NOT also start the
+        // AutomationScheduler (else the same job fires via both). Deny-default:
+        // nothing built when off; the AutomationScheduler keeps its old behavior.
+        let cronEnabled = appConfig.isFeatureEnabled("cron")
+        var cronSchedulerVar: CronScheduler?
+        if cronEnabled {
+            let migrated = CronGlue.migrateAutomationsToCron(codexHome: codexHome)
+            if migrated > 0 {
+                FileHandle.standardError.write(Data("codexd cron: migrated \(migrated) automations → cron_jobs.json\n".utf8))
+            }
+            let cronStore = FileCronStore(path: codexHome + "/cron_jobs.json")
+            let grace = appConfig.value("cron")?.objectValue?["grace_seconds"]?.intValue ?? 3600
+            let runner = CronGlue.makeCronRunner(
+                supervisor: supervisor,
+                defaultCwd: FileManager.default.currentDirectoryPath,
+                defaultModel: appConfig.value("model")?.stringValue ?? "gpt-5.5")
+            let scheduler = CronScheduler(store: cronStore, graceSeconds: grace, run: runner)
+            await scheduler.loadFromStore()
+            CronSchedulerHolder.shared.set(scheduler)
+            await scheduler.start()
+            cronSchedulerVar = scheduler
+            FileHandle.standardError.write(Data("codexd cron scheduler started\n".utf8))
+        } else {
+            await automationScheduler.start()
+        }
+        let cronScheduler = cronSchedulerVar   // immutable copy for the @Sendable shutdown closure
 
         // Web gateway (docs/webgateway/). Started alongside the app-server
         // transport, sharing this process's SessionSupervisor so web tabs and
@@ -669,6 +699,7 @@ struct CodexDaemon {
             // Spawn a detached Task so the signal handler returns promptly;
             // the actor's stop() drives child terminate + reap.
             Task.detached { @Sendable in
+                await cronScheduler?.stop()
                 await mediaPoller?.stop()
                 await memorySupervisor.stop()
                 Foundation.exit(0)

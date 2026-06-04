@@ -87,6 +87,28 @@ public actor CronScheduler {
     }
 
     public func list() -> [CronJob] { jobs.values.sorted { $0.id < $1.id } }
+    public func job(_ id: String) -> CronJob? { jobs[id] }
+
+    // MARK: self-driving tick loop
+
+    private var task: Task<Void, Never>?
+
+    /// Start ticking every `tickSeconds`. `now` is injected for testability.
+    /// Idempotent (a second call while running is a no-op). codexd calls this
+    /// when [features].cron is on, and `stop()` on SIGTERM/SIGINT.
+    public func start(tickSeconds: UInt64 = 30,
+                      now: @escaping @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970) }) {
+        guard task == nil else { return }
+        task = Task { [weak self, tickSeconds, now] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: tickSeconds * 1_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                _ = await self.tick(now: now())
+            }
+        }
+    }
+    public func stop() { task?.cancel(); task = nil }
+    public var isRunning: Bool { task != nil }
 
     /// The jobs that should FIRE at `now` (enabled, due, within the grace window).
     public func due(now: Int64) -> [CronJob] {
@@ -103,6 +125,7 @@ public actor CronScheduler {
     @discardableResult
     public func tick(now: Int64) async -> [String] {
         var ran: [String] = []
+        var changed = false
         for var job in jobs.values where job.enabled {
             let anchor = job.lastRunAt ?? job.createdAt
             guard let next = job.schedule.next(after: anchor), next <= now else { continue }
@@ -118,8 +141,10 @@ public actor CronScheduler {
                 if case .at = job.schedule { job.enabled = false }
             }
             jobs[job.id] = job
+            changed = true   // lastRunAt / one-shot disable / fast-forward all
+                             // MUST persist, or stale fires resurrect on restart.
         }
-        if !ran.isEmpty || true { await persist() }
+        if changed { await persist() }
         return ran
     }
 

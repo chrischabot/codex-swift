@@ -27,7 +27,9 @@ public struct Automation: Sendable, Codable, Equatable {
 }
 
 /// Parse a schedule string into a fire interval in seconds (nil = manual-only).
-func automationIntervalSeconds(_ schedule: String) -> Int64? {
+/// `public` so the #6 cron migration (in codexd) can reuse the exact mapping
+/// instead of duplicating it.
+public func automationIntervalSeconds(_ schedule: String) -> Int64? {
     switch schedule.lowercased() {
     case "hourly": return 3600
     case "daily": return 86400

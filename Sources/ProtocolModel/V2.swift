@@ -259,6 +259,55 @@ public struct OutboundSendResponse: Sendable, Codable, Equatable {
     public var detail: String
     public init(ok: Bool, detail: String) { self.ok = ok; self.detail = detail }
 }
+// ADDONS #6 cron/* wire shape. The domain `Cron.Schedule` is an enum whose
+// synthesized Codable is the fragile `{"every":{"_0":300}}` form — NOT
+// round-trippable by a client. CronScheduleWire is the stable wire projection
+// (kind + one value field); the Supervisor maps wire<->domain.
+public struct CronScheduleWire: Sendable, Codable, Equatable {
+    public var kind: String       // "at" | "every" | "cron"
+    public var at: Int64?         // epoch seconds (.at)
+    public var every: Int64?      // interval seconds (.every)
+    public var cron: String?      // cron expression (.cron)
+    public init(kind: String, at: Int64? = nil, every: Int64? = nil, cron: String? = nil) {
+        self.kind = kind; self.at = at; self.every = every; self.cron = cron
+    }
+}
+public struct CronListParams: Sendable, Codable, Equatable {
+    public var cursor: String?
+    public var limit: Int?
+}
+public struct CronAddParams: Sendable, Codable, Equatable {
+    public var id: String?
+    public var schedule: CronScheduleWire
+    public var prompt: String
+    public var enabled: Bool?
+    public var skipMemory: Bool?
+    public var deliverTo: String?
+}
+public struct CronRemoveParams: Sendable, Codable, Equatable {
+    public var id: String
+}
+/// Response projection of a CronJob with the schedule in the stable wire shape.
+public struct CronJobWire: Sendable, Codable, Equatable {
+    public var id: String
+    public var schedule: CronScheduleWire
+    public var prompt: String
+    public var enabled: Bool
+    public var skipMemory: Bool
+    public var deliverTo: String?
+    public var lastRunAt: Int64?
+    public var createdAt: Int64
+    public init(id: String, schedule: CronScheduleWire, prompt: String, enabled: Bool,
+                skipMemory: Bool, deliverTo: String?, lastRunAt: Int64?, createdAt: Int64) {
+        self.id = id; self.schedule = schedule; self.prompt = prompt; self.enabled = enabled
+        self.skipMemory = skipMemory; self.deliverTo = deliverTo
+        self.lastRunAt = lastRunAt; self.createdAt = createdAt
+    }
+}
+public struct CronListResponse: Sendable, Codable, Equatable {
+    public var data: [CronJobWire]
+    public init(data: [CronJobWire]) { self.data = data }
+}
 public struct ThreadCompactStartParams: Sendable, Codable, Equatable { public var threadId: ThreadId }
 public struct ThreadShellCommandParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId

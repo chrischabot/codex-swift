@@ -18,6 +18,36 @@ import Tools
 import Prompts
 import ModelClient
 import Push
+import Cron
+
+/// Wire<->domain mapping for the #6 cron RPC. Lives in Supervisor (the only place
+/// that imports BOTH ProtocolModel and Cron) so ProtocolModel stays a leaf and
+/// Cron stays dependency-light.
+extension CronScheduleWire {
+    /// Validate + project to the domain Schedule (nil → invalid request).
+    func toSchedule() -> Schedule? {
+        switch kind {
+        case "at":    guard let at else { return nil }; return .at(at)
+        case "every": guard let every, every > 0 else { return nil }; return .every(every)
+        case "cron":  guard let cron, !cron.isEmpty else { return nil }; return .cron(cron)
+        default:      return nil
+        }
+    }
+    init(_ s: Schedule) {
+        switch s {
+        case .at(let t):    self.init(kind: "at", at: t)
+        case .every(let n): self.init(kind: "every", every: n)
+        case .cron(let e):  self.init(kind: "cron", cron: e)
+        }
+    }
+}
+extension CronJobWire {
+    init(_ j: CronJob) {
+        self.init(id: j.id, schedule: CronScheduleWire(j.schedule), prompt: j.prompt,
+                  enabled: j.enabled, skipMemory: j.skipMemory, deliverTo: j.deliverTo,
+                  lastRunAt: j.lastRunAt, createdAt: j.createdAt)
+    }
+}
 
 private struct SimpleError: Error, LocalizedError {
     let message: String
@@ -1886,6 +1916,52 @@ public actor RequestRouter {
             let result = await pushRouter.send(target: target, text: p.text,
                                                idempotencyKey: p.idempotencyKey)
             await reply(conn, id, OutboundSendResponse(ok: result.ok, detail: result.detail))
+        case .cronList(let id, _):
+            // Deny-default: a nil holder (cron feature off) lists nothing rather
+            // than erroring, so an unconfigured daemon answers benignly.
+            guard let scheduler = CronSchedulerHolder.shared.current() else {
+                await reply(conn, id, CronListResponse(data: [])); break
+            }
+            let jobs = await scheduler.list().map(CronJobWire.init)
+            await reply(conn, id, CronListResponse(data: jobs))
+        case .cronAdd(let id, let p):
+            guard let scheduler = CronSchedulerHolder.shared.current() else {
+                await conn.send(WireError.invalidRequest(id: id, "cron feature is not enabled")); break
+            }
+            // Bound inputs before they hit the durable JSON store.
+            guard p.prompt.utf8.count <= 100_000 else {
+                await conn.send(WireError.invalidRequest(id: id, "prompt too long (max 100 KiB)")); break
+            }
+            // A deliverTo must be a well-formed, bounded PushTarget — validated
+            // here so a malformed target can't be persisted and fail every fire.
+            if let dt = p.deliverTo, !dt.isEmpty {
+                guard dt.utf8.count <= 1024 else {
+                    await conn.send(WireError.invalidRequest(id: id, "deliverTo too long")); break
+                }
+                guard PushTarget.parse(dt) != nil else {
+                    await conn.send(WireError.invalidRequest(id: id, "invalid deliverTo target")); break
+                }
+            }
+            guard let schedule = p.schedule.toSchedule() else {
+                await conn.send(WireError.invalidRequest(id: id, "invalid schedule")); break
+            }
+            let jid = p.id ?? UUID().uuidString
+            let existing = await scheduler.job(jid)
+            let job = CronJob(
+                id: jid, schedule: schedule, prompt: p.prompt,
+                enabled: p.enabled ?? existing?.enabled ?? true,
+                skipMemory: p.skipMemory ?? existing?.skipMemory ?? true,
+                deliverTo: (p.deliverTo?.isEmpty == true ? nil : p.deliverTo) ?? existing?.deliverTo,
+                lastRunAt: existing?.lastRunAt,
+                createdAt: existing?.createdAt ?? Int64(Date().timeIntervalSince1970))
+            await scheduler.upsert(job)
+            await reply(conn, id, CronJobWire(job))
+        case .cronRemove(let id, let p):
+            guard let scheduler = CronSchedulerHolder.shared.current() else {
+                await reply(conn, id, EmptyResponse()); break
+            }
+            await scheduler.remove(p.id)
+            await reply(conn, id, EmptyResponse())
         case .threadList(let id, let p):
             let list = (try? await store.list(archived: p.archived ?? false,
                                                limit: p.limit ?? 50)) ?? []
