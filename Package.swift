@@ -175,6 +175,11 @@ let package = Package(
                 dependencies: ["InfraPrimitives", "WireProtocol"], swiftSettings: strict),
         .target(name: "Sandbox",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
+        // ADDONS.md Phase 0 #6 — sandboxed media-decode helper. The library
+        // holds the header-only prober + the Seatbelt-spawning daemon API; the
+        // `codex-mediadecode` executable below is the short-lived child.
+        .target(name: "MediaDecode",
+                dependencies: ["Sandbox"], swiftSettings: strict),
         .target(name: "Tools",
                 dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
         .target(name: "MCP",
@@ -303,6 +308,9 @@ let package = Package(
         .executableTarget(name: "codex-bench",
                 dependencies: ["BenchKit", "InfraPrimitives", "Observability"],
                 swiftSettings: strict),
+        .executableTarget(name: "codex-mediadecode",
+                dependencies: ["MediaDecode"],
+                swiftSettings: strict),
         .executableTarget(name: "codex-computer",
                 dependencies: ["ComputerUse"],
                 swiftSettings: strict),
@@ -321,6 +329,9 @@ let package = Package(
         .testTarget(name: "CodexMemoryTests",
                 dependencies: ["codex-memory", "MemoryStore", "MemoryProcess",
                                "MemoryInfer", "MemoryIngest", "InfraPrimitives"],
+                swiftSettings: strict),
+        .testTarget(name: "MediaDecodeTests",
+                dependencies: ["MediaDecode", "codex-mediadecode"],
                 swiftSettings: strict),
         .testTarget(name: "MemoryScoreTests",
                 dependencies: ["MemoryScore", "MemoryStore", "MemoryInfer", "InfraPrimitives"],
