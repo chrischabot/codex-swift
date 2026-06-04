@@ -21,6 +21,22 @@ import Config
 import MemoryExtension
 import Push
 import GoogleWorkspace
+import Media
+
+/// #8 Media delivery (spawned worker): mirror codexd. Push a "ready"
+/// notification for a finished asset through this worker's PushRouter. Returns
+/// false → undelivered (the inline stub delivers synchronously so this is the
+/// only delivery; an async provider would need the daemon poller / in-process
+/// workers).
+@Sendable func sessionMediaPushDeliver(_ task: MediaTask) async -> Bool {
+    guard let router = PushRouterHolder.shared.current(),
+          let target = task.deliverTo, let asset = task.assetPath else { return false }
+    let result = await router.send(
+        target: target,
+        text: "media \(task.kind.rawValue) ready: \(asset)",
+        idempotencyKey: "media-\(task.id)")
+    return result.ok
+}
 
 /// Fails clearly until the production HTTP/WS Responses client is wired
 /// (parity with codexd). `CODEXKIT_MOCK=1` forces the deterministic mock.
@@ -389,6 +405,9 @@ struct SessionWorkerMain {
             var toolPacks: [any ToolPack] = []
             if addonConfig.isFeatureEnabled("push") {
                 let pushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
+                // Publish on the holder so the #8 media deliver closure (and any
+                // owner-path push) reach this worker's router.
+                PushRouterHolder.shared.set(pushRouter)
                 toolPacks.append(PushToolPack(router: pushRouter))
             }
             if let gpack = GoogleWiring.toolPack(
@@ -396,6 +415,17 @@ struct SessionWorkerMain {
                 env: ProcessInfo.processInfo.environment) {
                 toolPacks.append(gpack)
             }
+            // #8 Media: the spawned worker holds its OWN ledger (the daemon poller
+            // lives in another process and can't reach it — fine for the inline
+            // stub, which delivers synchronously inside submit). Build once per
+            // process; deny-default off when [features].media is unset.
+            if MediaLedgerHolder.shared.current() == nil,
+               let ledger = await MediaWiring.makeLedger(
+                   addonConfig: addonConfig, codexHome: codexHome,
+                   env: ProcessInfo.processInfo.environment, deliver: sessionMediaPushDeliver) {
+                MediaLedgerHolder.shared.set(ledger)
+            }
+            toolPacks.append(MediaToolPack(ledger: MediaLedgerHolder.shared.current()))
             await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
             let extRegistry = installAddons(
                 config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)

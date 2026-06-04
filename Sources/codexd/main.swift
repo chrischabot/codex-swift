@@ -24,6 +24,22 @@ import MemoryExtension
 import WebGateway
 import Push
 import GoogleWorkspace
+import Media
+
+/// #8 Media delivery (codexd): push a "ready" notification for a finished asset
+/// through the daemon-scope PushRouter (#7). Returns false → the ledger marks it
+/// undelivered and the poller retries (bounded). Local-path delivery for the
+/// MVP; a signed MediaToken URL needs the gateway signer shared — see
+/// MediaWiring (documented follow-on).
+@Sendable func mediaPushDeliver(_ task: MediaTask) async -> Bool {
+    guard let router = PushRouterHolder.shared.current(),
+          let target = task.deliverTo, let asset = task.assetPath else { return false }
+    let result = await router.send(
+        target: target,
+        text: "media \(task.kind.rawValue) ready: \(asset)",
+        idempotencyKey: "media-\(task.id)")
+    return result.ok
+}
 
 /// Fails clearly when no model credentials are configured. Set
 /// CODEXKIT_MOCK=1 to run the full pipeline against the deterministic mock.
@@ -457,8 +473,10 @@ struct CodexDaemon {
                         env: ProcessInfo.processInfo.environment) {
                         toolPacks.append(gpack)
                     }
-                    // #8 Media pack is ready (MediaToolPack); wiring it needs a
-                    // configured provider + the supervisor poller — tracked follow-on.
+                    // #8 Media: the daemon (in-process) already built the shared
+                    // ledger + poller above and published it on the holder; the
+                    // tool just reads it. nil holder (media off) → self-prunes.
+                    toolPacks.append(MediaToolPack(ledger: MediaLedgerHolder.shared.current()))
                     await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
                     let extRegistry = installAddons(
                         config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
@@ -549,6 +567,25 @@ struct CodexDaemon {
             let daemonPushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
             PushRouterHolder.shared.set(daemonPushRouter)
         }
+        // #8 Media: in IN-PROCESS worker mode, build the ONE shared ledger
+        // eagerly + run the daemon poller. Spawned workers hold their own
+        // per-process ledger (the inline stub delivers synchronously there, so
+        // no daemon poller is needed; an async provider, which WOULD need one,
+        // requires in-process workers). Deny-default: nothing is built when
+        // [features].media is off. Bound as a `let` so the shutdown handler can
+        // capture it.
+        let mediaPoller: MediaPoller? = await {
+            guard inProcessWorkers,
+                  let ledger = await MediaWiring.makeLedger(
+                      addonConfig: appConfig, codexHome: codexHome,
+                      env: ProcessInfo.processInfo.environment, deliver: mediaPushDeliver)
+            else { return nil }
+            MediaLedgerHolder.shared.set(ledger)
+            let poller = MediaPoller(ledger: ledger)
+            await poller.start()
+            FileHandle.standardError.write(Data("codexd media poller started\n".utf8))
+            return poller
+        }()
         // Realtime voice backend: live OpenAI Realtime bridge when opted in,
         // else nil (echo). Shared by the stdio/UDS router and every per-tab web
         // router; the factory builds a fresh session per `thread/realtime/start`.
@@ -631,6 +668,7 @@ struct CodexDaemon {
             // Spawn a detached Task so the signal handler returns promptly;
             // the actor's stop() drives child terminate + reap.
             Task.detached { @Sendable in
+                await mediaPoller?.stop()
                 await memorySupervisor.stop()
                 Foundation.exit(0)
             }
