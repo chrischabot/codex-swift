@@ -185,6 +185,11 @@ let package = Package(
         .target(name: "Push",
                 dependencies: ["Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel"],
                 swiftSettings: strict),
+        // ADDONS.md #4 — Google Workspace tool suite (the discovery-driven
+        // google_api tool) over the #3 connector.
+        .target(name: "GoogleWorkspace",
+                dependencies: ["Connectors", "Tools", "ProtocolModel"],
+                swiftSettings: strict),
         .target(name: "Tools",
                 dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
         .target(name: "MCP",
@@ -340,6 +345,9 @@ let package = Package(
                 swiftSettings: strict),
         .testTarget(name: "PushTests",
                 dependencies: ["Push", "Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel"],
+                swiftSettings: strict),
+        .testTarget(name: "GoogleWorkspaceTests",
+                dependencies: ["GoogleWorkspace", "Connectors", "EgressGuard", "Tools", "ProtocolModel"],
                 swiftSettings: strict),
         .testTarget(name: "MemoryScoreTests",
                 dependencies: ["MemoryScore", "MemoryStore", "MemoryInfer", "InfraPrimitives"],
