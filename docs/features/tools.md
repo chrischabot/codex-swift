@@ -100,6 +100,7 @@ Built-in Tools are the floor the rest of the agent stands on. Because every call
 - **Multi-agent work** (`spawn_agent`, `wait_agent`, …) lets a session delegate sub-tasks, each sub-agent getting the same tool surface.
 - **Remote and containerized execution** reuse the identical tool names over a WebSocket bridge (`Sources/Tools/RemoteExecServerTools.swift`), so the model's vocabulary is unchanged whether it runs locally or in a container.
 - **`computer_use`** extends the same gating model from files and shells out to the live desktop.
+- **Addon tool packs** join the same catalog through `ToolPackRegistry` — `push_send` ([push](push.md)), `media_generate` ([media](media.md)), and `google_api` ([Google Workspace](connectors.md)). Each is deny-default (gated on its `[features]` flag, self-pruning when unconfigured), registered *after* the built-ins so it can never shadow one, and inherits the same approval contract — e.g. `push_send` and a `media_generate` with a delivery target declare `.required` approval, and `google_api`'s write verbs are approval-gated.
 
 The deny-default sandboxing and path containment mean you can hand the agent a real repository and a real shell without handing it the keys to the whole machine.
 

@@ -107,7 +107,15 @@ Related pages: the existing memory and persona modules (`Sources/HarnessCore/Mem
 
 ## Status
 
-The extension **spine** is implemented and live (Phases 0–4 of the architecture doc: `ExtensionAPI` activated, `installAddons`, `ToolPack`/`ToolPackRegistry`, `MemoryProvider` slot, `Channel`/`ChannelHost` contracts, the four named Phase-0 foundations). What is **planned/partial**: the eight-addon portfolio in `ADDONS.md` is largely design + foundations — the `Connectors` module is still a 63-line discovery stub (no OAuth yet), no `Channel` is wired into the daemon (`toolPacks` is currently an empty array at both composition roots), and the production `SupervisorChannelHost`/`ChannelManager` are not yet built on top of `collectTurn`. Treat `ADDONS.md` as the roadmap and the seams above as the shipped, tested base they attach to.
+The extension **spine** is implemented and live (Phases 0–4 of the architecture doc: `ExtensionAPI` activated, `installAddons`, `ToolPack`/`ToolPackRegistry`, `MemoryProvider` slot, `Channel`/`ChannelHost` contracts, the four named Phase-0 foundations). And the addon **portfolio is now wired into the daemon**, each behind its seam, deny-default:
+
+- **[Push / outbound](../features/push.md)** — `PushToolPack` (`push_send`) + the owner-path `outbound/send` RPC + `codex-send` CLI, behind `[features].push`.
+- **[Google Workspace](../features/connectors.md)** — the `google_api` `ToolPack` over a built native OAuth-PKCE connector (`codexd google-connect`), behind `[features].google` + `[connectors.google]`.
+- **[Media](../features/media.md)** — `MediaToolPack` (`media_generate`) + a daemon-resident poller, behind `[features].media`.
+- **[Cron](../features/cron.md)** — `cron/*` RPC + a supervisor `CronScheduler` (single source of truth, migrating legacy automations), behind `[features].cron`.
+- **[Channels](../features/channels.md)** — `SupervisorChannelHost` + `ChannelManager` + `channels/*` RPC + a configured `TelegramChannel`, behind `[channels.telegram]`.
+
+Each was severe-tested and adversarially reviewed. Two patterns recur: owner-only control RPCs are gated by the transport (`allowsOwnerOnlyRPC`), and unattended/non-owner turns are locked down via the `SessionConfig` itself so the restriction crosses the spawned-worker process boundary. **Planned/descoped:** the Gmail channel (net-new OAuth), a generic non-Google connector OAuth runtime, live async media providers + signed-URL delivery, and inbound `pdf_read`/`transcribe`. Treat `ADDONS.md` as the now-largely-realized design doc and the seams above as the shipped, tested base.
 
 ## Go deeper
 

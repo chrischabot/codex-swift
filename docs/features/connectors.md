@@ -1,6 +1,6 @@
 # Connectors
 
-*OAuth-installed external services (the planned Google Workspace connector chief among them) that the agent can see and reason about — today the discovery + surfacing skeleton is built; the OAuth runtime that makes them actually callable is designed but not yet implemented.*
+*OAuth-installed external services (Google Workspace chief among them) that the agent can see, reason about, and now actually call — the discovery + surfacing skeleton, the native Swift OAuth-PKCE runtime, and a discovery-driven Google Workspace tool suite are all built and wired.*
 
 ## Why it matters
 
@@ -8,7 +8,7 @@ A personal agent that can only touch your local filesystem and shell is useful, 
 
 Imagine asking "summarize the three threads about the launch and draft a reply" and the agent simply does it, because Gmail is connected. Or "what's on my calendar before the 2pm, and pull the spec from Drive." That requires two things: a way to *install* an external service (an OAuth grant the agent holds credentials for) and a way for the model to *know that service exists* so it can decide to use it. Connectors is the surface that owns both halves.
 
-Be honest about the state: today codex-swift can **discover** connectors you've configured and **surface** them — to the protocol (so a UI can list them) and, by design, into the model's prompt. The piece that turns a listed connector into a *live, callable* integration (the OAuth login flow, token storage, refresh, and the Workspace tool suite) is **designed but not built**. This page covers both, clearly labeled.
+The state today: codex-swift can **discover** connectors you've configured and **surface** them to the protocol (so a UI can list them), AND — for Google — it ships the **live runtime**: a native Swift OAuth-2.0 PKCE login (a `codexd google-connect` subcommand), a 0600 on-disk token store with transparent refresh and real revocation, and a discovery-driven `google_api` tool suite the model can actually call against Gmail/Drive/Calendar/Sheets. This page covers the registry/surfacing layer and the Google runtime, clearly labeled.
 
 ## What it is
 
@@ -20,7 +20,7 @@ What's real today is the **registry and surfacing layer**:
 - The daemon discovers them at session start and exposes them over the protocol as **apps** (the `app/list` RPC), so a client UI can render the installed/available services with their names, logos, and enabled state.
 - The data model (`ConnectorRecord`) carries everything a UI or prompt needs: id, name, description, logos, install URL, accessibility, enabled state.
 
-What's **planned** is the runtime that gives those records teeth: a native Swift Google OAuth 2.0 flow (PKCE loopback login, Keychain-stored refresh tokens, silent coalesced refresh, multi-account, incremental scopes) and a discovery-driven Google Workspace **tool suite** so the model can actually call Gmail/Drive/Calendar/Sheets. See **Status** below.
+What gives those records teeth is **built** for Google: a native Swift OAuth-2.0 PKCE flow (ephemeral-port loopback login, a 0600 token file with transparent + coalesced refresh, real revoke-on-disconnect) and a discovery-driven Google Workspace `google_api` **tool suite** so the model calls Gmail/Drive/Calendar/Sheets through one host-pinned, approval-gated tool. See **Using it** and **Status** below.
 
 ## How it works
 
@@ -75,22 +75,45 @@ What you can do **today**:
 
    Or switch the whole surface off at runtime by setting the `apps` experimental feature to `false` (via `experimentalFeature/enablement/set`) — `app/list` then returns an empty list.
 
-What you **cannot** do yet: actually authenticate or call a connector's APIs. Declaring `google` in `connectors.json` makes it *listable*, not *usable* — there is no login flow, no token, and no Gmail/Drive/Calendar tools behind it. Those are the planned runtime (below).
+**Google Workspace — the live runtime.** Configure the connector under `[connectors.google]` and gate the tool with `[features].google` (deny-default):
+
+```toml
+[features]
+google = true
+
+[connectors.google]
+client_id = "<your-oauth-client-id>.apps.googleusercontent.com"
+client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET"   # env var NAME (web client); never the secret on disk
+scopes = ["https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/drive.readonly"]
+token_store_path = "$CODEX_HOME/connectors/google/tokens.json"
+```
+
+Authenticate **once**, out of band, via a subcommand (not an RPC — deliberately, so the refresh-token secret never streams over the control plane):
+
+```bash
+codexd google-connect      # opens the browser, runs the PKCE loopback flow, writes the 0600 token file
+codexd google-disconnect   # revokes the token with Google and clears the store
+```
+
+After connecting, a session with `[features].google` on advertises the `google_api` tool. Reads (GET) are ungated; write/destructive verbs (POST/PUT/PATCH/DELETE) are forced through the approval gate. The service→host mapping is an allowlist (the model can't name an arbitrary host), dot-segment paths are rejected, and redirects are disabled — all REST egress is host-pinned inside `GoogleAPIClient`, and all OAuth token/revoke egress goes through `EgressGuard`.
+
+The generic discovery-only registry remains: declaring a connector in `connectors.json` makes it *listable* over `app/list`; the **Google** entry additionally becomes *callable* once you've connected.
 
 ## What it enables
 
-Connectors is the foundation layer for the highest-value addition a personal agent can have: a deep, first-party Google integration. The planned chain (from `ADDONS.md`) is sequenced by dependency:
+Connectors is the foundation layer for the highest-value addition a personal agent can have: a deep, first-party Google integration. The chain (from `ADDONS.md`), by dependency:
 
-- **Google connector (native OAuth runtime)** — turns the stub into a real PKCE-loopback login, Keychain refresh tokens, coalesced silent refresh, multi-account, incremental scopes; surfaces a `google` `ConnectorRecord` whose `isAccessible` reflects token state, driven by `connector/google/login|status|logout` RPCs and a `codex google login` CLI.
-- **Google Workspace tool suite** — a discovery-driven `google_api` universal tool plus ergonomic typed helpers (`gmail_search`, `drive_get`, `calendar_agenda`, `sheets_append`, …) packaged as a `ToolPack`, self-pruning to the scopes you granted, with write/destructive verbs forced through an approval gate.
-- **Gmail channel** — email as a first-class, owner-stamped channel built on top of the connector.
+- **Google connector (native OAuth runtime) — built.** A real PKCE ephemeral-port loopback login (`codexd google-connect`), a 0600 token file with transparent + coalesced refresh and real revoke (`google-disconnect`), all endpoints `EgressGuard`-vetted.
+- **Google Workspace tool suite — built.** A discovery-driven `google_api` universal tool packaged as a `ToolPack`, gated on `[features].google` + a `[connectors.google]` table, with a service→host containment allowlist and write/destructive verbs forced through the approval gate.
+- **Gmail channel — descoped/planned.** Email as a first-class, owner-stamped [channel](channels.md) built on top of the connector (net-new inbound/outbound credential plumbing, deferred).
 
 It composes with the addon spine already present: connector-backed tool suites would register through the **`ToolPack` → `ToolRouter`** seam (`Sources/HarnessCore/ToolPackRegistry.swift`), gated by a coarse `[features]`/`[connectors.google]` switch and fine-grained self-pruning on granted scope. The `[Tool packs / addons](../../ADDONS.md)` model, the `Auth` Keychain store, and the `MCP` OAuth precedent are the pieces a real connector runtime stitches together.
 
 ## Status
 
-**Partial / mostly planned.** Built and tested: the `ConnectorRecord` model, `ConnectorsDiscovery`, the `app/list` protocol surface (pagination + per-connector enablement + runtime feature flag), the `ConnectorInjection` plumbing, and the `AppsInstructions` prompt fragment. Built but **not wired on the live path**: the connector list is plumbed into `SessionEngine` but not currently rendered into the model's context (the `AppsInstructions` fragment exists and is unit-tested, yet isn't instantiated from the threaded connectors during initial-context assembly). **Not built:** the Google OAuth runtime (login/refresh/storage/scopes), the `connector/*` RPCs, the `codex google` CLI, and the Workspace tool suite — all are design-only in `ADDONS.md`. The security review there is explicit that several guarantees (owner approval gating, egress chokepoint, real revocation) must be implemented as actual seams before any connector ships *writes*.
+**Discovery layer + Google runtime built; generic OAuth-for-arbitrary-services planned.** Built and tested: the `ConnectorRecord` model, `ConnectorsDiscovery`, the `app/list` protocol surface (pagination + per-connector enablement + runtime feature flag), the `ConnectorInjection` plumbing, and — for Google — the full OAuth-PKCE runtime (`GoogleOAuthCore`, loopback flow, `FileTokenStore` with refresh/revoke), the `URLSessionOAuthHTTPClient`, the `codexd google-connect`/`google-disconnect` subcommands, and the discovery-driven `google_api` Workspace tool wired into both composition roots behind `[features].google` + `[connectors.google]`. The security review's non-negotiables are honored: write verbs are approval-gated, all egress (REST host-pinned, OAuth via `EgressGuard`) goes through a chokepoint, and disconnect performs a real Google token revocation. Still partial: the connector list is plumbed into `SessionEngine` but the `AppsInstructions` fragment isn't yet instantiated from it during initial-context assembly. Not built: a *generic* OAuth runtime for arbitrary non-Google connectors, multi-account, and ergonomic typed helpers (`gmail_search`, etc.) beyond the universal `google_api`.
 
 ## Go deeper
 
-Internals, the four-surface taxonomy, the full Google connector + Workspace tool design, and the adversarial security review: `/Users/chabotc/Projects/codex-swift/ADDONS.md` (sections "3. Google connector (native OAuth runtime)" and "4. Google Workspace tool suite"). Source: `/Users/chabotc/Projects/codex-swift/Sources/Connectors/Connectors.swift`.
+Internals, the four-surface taxonomy, the full Google connector + Workspace tool design, and the adversarial security review: [ADDONS.md](../../ADDONS.md) (sections "3. Google connector (native OAuth runtime)" and "4. Google Workspace tool suite"). Source: `Sources/Connectors/` (discovery, `GoogleOAuthCore`, `GoogleConnectorConfig`, `GoogleConnectFlow`, `URLSessionOAuthHTTPClient`), `Sources/GoogleWorkspace/` (the `google_api` tool + `GoogleWiring`), and the `google-connect` subcommand in `Sources/codexd/CodexDaemon.swift`.

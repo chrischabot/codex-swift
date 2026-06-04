@@ -443,6 +443,30 @@ the `hooks` table. The harness executes them at the right lifecycle
 event; they are *not* run by the model. See `HOOKS.md` for the full
 configuration shape and the execution semantics.
 
+## Addon config (deny-default)
+
+The addon portfolio reads top-level tables that survive the raw merge
+(`config.value(...)` reads `resolved`, so these are not stripped by the
+`ConfigToml` projection). Every addon is **deny-default**: each needs both its
+`[features]` flag *and* its config to construct anything, and an unconfigured
+daemon is byte-identical. Secrets are always referenced by an env-var **name**,
+never stored in the TOML. `$CODEX_HOME` is expanded in addon path values.
+
+| Table / key | Read by | Notes |
+|---|---|---|
+| `features.push` | codexd | Builds the daemon `PushRouter`; advertises `push_send`; enables `outbound/send`. |
+| `features.cron` | codexd | Starts `CronScheduler` as the single scheduler (migrates `automations.json` once; the legacy automation scheduler is then *not* started). |
+| `features.media` | codexd / codex-session | Advertises `media_generate` + (in-process) the daemon poller. |
+| `features.google` | codexd / codex-session | Advertises `google_api` when `[connectors.google]` is present and a token exists. |
+| `[cron].grace_seconds` | codexd | Catch-up window for a missed fire (default `3600`). |
+| `[media].provider` / `.media_root` / `.api_key_env` | `MediaConfig.load` | `provider` defaults `"stub"`; a non-stub provider needs `api_key_env` set (and `CODEXKIT_IN_PROCESS_WORKERS=1`) or it fails closed. |
+| `[connectors.google].client_id` / `.client_secret_env` / `.scopes` / `.token_store_path` | `GoogleConnectorConfig.read` | `client_id` required; secret resolved from the named env var at runtime. Auth is the `codexd google-connect` subcommand, not an RPC. |
+| `[channels.telegram].enabled` / `.bot_token_env` / `.owners` / `.poll_timeout_seconds` | `TelegramConfig.load` | Token from the named env var only; `owners` are numeric ids (**empty ⇒ every sender is non-owner**, all turns locked down). |
+
+The owner-only control RPCs these enable (`outbound/send`, `cron/*`,
+`channels/*`) are transport-gated, not config-gated for *authorization* — see
+`docs/app-server-api.md` and `docs/guides/security.md`.
+
 ## Env overrides
 
 Two parallel env-var conventions:

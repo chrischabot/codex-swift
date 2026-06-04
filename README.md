@@ -36,15 +36,21 @@ The trade-off: production targets **macOS 14+**; the OS-agnostic core stays port
 - **Computer use** — the agent drives the real macOS desktop via OpenAI's `computer` tool, behind a dedicated host-control approval gate (off by default).
 - **Realtime voice** — talk to the agent by voice in the browser over OpenAI's Realtime API (echo mock by default; live behind `CODEXKIT_REALTIME_LIVE`).
 - **Workflows** — a JavaScript engine that fans work out across many GPT sub-agents deterministically (agent/parallel/pipeline primitives, token budgets, crash-resume).
-- **Channels** — reach the agent from chat apps (Telegram today) with server-stamped owner identity and a hard owner-gate.
+- **Channels** — reach the agent from chat apps (Telegram, wired into the daemon) with server-stamped owner identity and a hard owner-gate that stays enforced even when the turn runs in a separate worker process.
 - **MCP** — plug in external tools/resources over stdio and streaming-HTTP servers, with `mcp__server__tool` naming, PKCE/loopback OAuth, and per-session secret isolation.
+
+**Proactive (the agent reaches out)**
+- **Push / outbound** — durable, SSRF-screened delivery to your phone (ntfy) or a webhook, via a `push_send` tool (approval-gated) and an owner-path `outbound/send` RPC + `codex-send` CLI.
+- **Cron / scheduler** — run a prompt on a schedule as a locked-down, unattended turn (read-only, approval-`never`) and push the result; migrates the legacy automations store.
+- **Media** — `media_generate` runs async (image today; video/music/speech planned) without blocking the turn, with a crash-safe ledger + daemon poller and pushed delivery.
+- **Google Workspace** — a discovery-driven `google_api` tool over a native OAuth-PKCE connector (`codexd google-connect`), host-pinned, with write verbs approval-gated.
 
 **Operations & integration**
 - **Observability** — structured `os.Logger`/stderr logs, `os_signpost` spans, a non-blocking metrics ring, and an opt-in OTLP/JSON exporter.
 - **Token usage & cost** — per-turn input/cached/output/reasoning accounting, per-model pricing, surfaced in notifications, rollouts, and benchmark reports.
 - **Benchmarks** — a native runner (`codex-bench`/BenchKit) scoring the 113-task DeepSWE benchmark in air-gapped `apple/container` VMs (Pass@1 + confidence intervals).
 - **App-server protocol** — the upstream-compatible Codex JSON-RPC surface (methods, items, streaming notifications, correlated server requests).
-- **Connectors** — OAuth-installed external services surfaced to the agent (discovery + `app/list` skeleton built; Google Workspace runtime planned).
+- **Connectors** — OAuth-installed external services surfaced to the agent; the Google Workspace runtime (native OAuth-PKCE + the `google_api` tool) is built, the generic discovery + `app/list` skeleton covers the rest.
 - **Skills, lifecycle hooks & the addon layer** — on-disk `SKILL.md` procedures discovered at startup; `hooks.json` shell hooks at agent lifecycle points; and a "reverse the pyramid" addon model where new capabilities attach to existing seams as one safe file.
 
 ---
@@ -90,8 +96,13 @@ That smoke script drives the real `codexd` binary over stdio and runs one full s
 - **[Computer Use (Desktop Control)](docs/features/computer-use.md)** — The agent drives the real macOS desktop via the `computer` tool, behind a host-control approval gate; off by default.
 - **[Realtime Voice](docs/features/realtime-voice.md)** — Voice in the browser over OpenAI's Realtime API, bridged through the WebGateway, gated behind `CODEXKIT_REALTIME_LIVE`.
 - **[Workflows](docs/features/workflows.md)** — A JavaScript engine fanning work across many GPT sub-agents deterministically, with token budgets, background execution, and crash-resume.
-- **[Channels (Reach the Agent via Chat)](docs/features/channels.md)** — Reach the agent from chat apps (Telegram today): inbound message → turn → reply, server-stamped owner identity, hard owner-gate, per-conversation isolation.
-- **[Connectors](docs/features/connectors.md)** — OAuth-installed external services surfaced to the agent (discovery + `app/list` skeleton built; Google Workspace runtime planned).
+- **[Channels (Reach the Agent via Chat)](docs/features/channels.md)** — Reach the agent from chat apps (Telegram, wired into the daemon): inbound message → turn → reply, server-stamped owner identity, a hard owner-gate enforced even across the spawned worker, per-conversation isolation, `channels/*` control RPC.
+- **[Connectors](docs/features/connectors.md)** — OAuth-installed external services; the native Google OAuth-PKCE runtime + the `google_api` Workspace tool are built (`codexd google-connect`), the generic `app/list` discovery skeleton covers the rest.
+
+### Proactive
+- **[Push & Outbound Delivery](docs/features/push.md)** — Durable, SSRF-screened delivery to ntfy/webhook via the approval-gated `push_send` tool and the owner-path `outbound/send` RPC + `codex-send` CLI.
+- **[Cron & Scheduled Jobs](docs/features/cron.md)** — Run a prompt on a schedule as a locked-down, unattended turn (read-only, approval-`never`) whose result is pushed; `cron/*` RPC + automations migration.
+- **[Media Generation](docs/features/media.md)** — `media_generate` runs async without blocking the turn — crash-safe ledger, daemon poller, bounded-retry pushed delivery.
 
 ### Operations
 - **[Observability](docs/features/observability.md)** — Structured logs, `os_signpost` spans, a non-blocking metrics ring, and an opt-in OTLP/JSON exporter.

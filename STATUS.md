@@ -101,6 +101,24 @@ surface gated (`// MACOS-COMPLETION:`) · ⛔ not started.
   contributor-registry seam, external-agent
   CONFIG/MCP_SERVER_CONFIG/HOOKS/SKILLS/COMMANDS/SUBAGENTS/AGENTS_MD/
   PLUGINS/SESSIONS detect / import / idempotency.
+- **Addon portfolio (deny-default, wired into the daemon, severe-tested +
+  adversarially reviewed)** — **Push** (`push_send` tool + owner-path
+  `outbound/send` RPC + `codex-send` CLI; durable `DeliveryCore` queue,
+  `EgressGuard`-screened ntfy/webhook sinks). **Google Workspace**
+  (`google_api` tool over a native OAuth-PKCE connector;
+  `codexd google-connect`/`-disconnect` subcommands, 0600 token store with
+  refresh/revoke, host-pinned REST). **Cron** (`cron/*` RPC + supervisor
+  `CronScheduler` with grace-window catch-up, automations→cron migration as
+  the single source of truth, locked-down unattended turns). **Channels**
+  (`channels/*` RPC + `SupervisorChannelHost`/`ChannelManager` +
+  Telegram transport; server-stamped owner identity). **Media**
+  (`media_generate` tool + daemon-resident poller; durable ledger,
+  bounded-retry delivery). Cross-cutting: owner-only control RPCs gated by
+  transport (`allowsOwnerOnlyRPC`), and unattended/non-owner turns locked
+  down via `SessionConfig` (`.never`/`.readOnly`/no-network) so the
+  restriction crosses the spawned-worker boundary. See
+  [`docs/features/`](docs/features/) (push / cron / media / channels /
+  connectors) and [`ADDONS.md`](ADDONS.md).
 
 ## Macos-completion punch list
 

@@ -103,7 +103,9 @@ that registry is a known Codex method. A method outside that registry returns
 
 Typed, high-traffic methods include initialization, thread/turn lifecycle,
 model list, account read/rate-limits read, skills list, MCP server status,
-apps list, config read, collaboration modes, and config requirements.
+apps list, config read, collaboration modes, config requirements, and the
+owner-only addon control methods (`outbound/send`, `cron/*`, `channels/*` —
+see "Addon control APIs" below).
 
 Known generic methods include long-tail app-server APIs such as plugin,
 marketplace, config writes, filesystem operations, command/process execution,
@@ -353,6 +355,39 @@ Implemented app-server surfaces include:
 External-agent import coverage includes config, MCP server config, hooks,
 skills, commands, subagents, `AGENTS.md`, plugins, and sessions, with
 idempotency coverage.
+
+## Addon control APIs (owner-only)
+
+The addon portfolio adds five owner-only control methods. They are **transport-
+gated**: the daemon-level router (stdio / Unix socket / loopback) serves them;
+the per-tab WebGateway routers refuse them with `-32600 "method not available
+on this transport"`, and they are excluded from the WebGateway method allowlist.
+Each is **deny-default** — if its feature is off (no holder), the method either
+answers benignly empty or replies `-32600 "<feature> is not enabled"`.
+
+- **`outbound/send`** — durably deliver `{ target, text, idempotency_key? }`
+  through the push router (`target` is a `"scheme:rest"` PushTarget). Returns
+  `{ ok, detail }`. Gated on `[features].push`. The deny reason for an
+  SSRF-blocked target is not surfaced (only `ok=false` + a generic detail).
+  Also reachable via the `codex-send` CLI. See
+  [`docs/features/push.md`](features/push.md).
+- **`cron/list`** / **`cron/add`** / **`cron/remove`** — manage scheduled jobs.
+  `cron/add` takes `{ id?, schedule, prompt, deliverTo?, skipMemory? }` where
+  `schedule` is the stable `{ kind: "at"|"every"|"cron", at?, every?, cron? }`
+  wire shape (not the synthesized enum form), validated server-side
+  (`every > 0`, bounded prompt, parseable `deliverTo`). `cron/list` tolerates
+  absent params. Gated on `[features].cron`. See
+  [`docs/features/cron.md`](features/cron.md).
+- **`channels/list`** / **`channels/start`** / **`channels/stop`** /
+  **`channels/status`** — control the daemon `ChannelManager`. `list`/`status`
+  return `{ data: [{ id, state, attempt, lastError? }] }` (`status` accepts an
+  optional `id` filter); `start`/`stop` take `{ id }` and reject an unknown
+  channel. Gated on `[channels.telegram]`. See
+  [`docs/features/channels.md`](features/channels.md).
+
+The one-time Google OAuth grant is intentionally **not** an RPC — it is a
+`codexd google-connect` / `codexd google-disconnect` subcommand, so the
+refresh-token secret never streams over the control plane.
 
 ## Model and feature discovery
 

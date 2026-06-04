@@ -110,6 +110,40 @@ export CODEX_FEATURE_MULTI_AGENT_V2=1
 
 The env var always wins over the file, so you can flip a single feature for one run.
 
+### Addon configuration
+
+The addon portfolio (channels, Google Workspace, cron, push, media) is **deny-default**: each capability is off until you both flip its `[features]` flag *and* supply its config. An unconfigured daemon is byte-identical to one without the addon. Secrets are always read from an environment variable **named** in config — never the secret value in the TOML, so nothing sensitive lands on disk.
+
+```toml
+[features]
+push   = true       # outbound/push delivery (ntfy + webhook)         → docs/features/push.md
+media  = true       # media_generate tool + daemon poller             → docs/features/media.md
+cron   = true       # cron/* RPC + scheduler (single source of truth)  → docs/features/cron.md
+google = true       # google_api Workspace tool                        → docs/features/connectors.md
+
+[cron]
+grace_seconds = 3600                       # catch-up window for a missed fire
+
+[media]
+provider   = "stub"                        # async providers need CODEXKIT_IN_PROCESS_WORKERS=1
+media_root = "$CODEX_HOME/media"
+# api_key_env = "OPENAI_API_KEY"           # required for a non-stub provider
+
+[connectors.google]
+client_id         = "<id>.apps.googleusercontent.com"
+client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET"   # env var NAME, not the secret
+scopes            = ["https://www.googleapis.com/auth/gmail.readonly"]
+token_store_path  = "$CODEX_HOME/connectors/google/tokens.json"
+
+[channels.telegram]
+enabled              = true
+bot_token_env        = "TELEGRAM_BOT_TOKEN"        # env var NAME, not the token
+owners               = ["123456789"]               # numeric ids; EMPTY ⇒ every sender is non-owner
+poll_timeout_seconds = 30
+```
+
+`$CODEX_HOME` is expanded in the addon path keys (`media_root`, `token_store_path`). One-time Google auth is a subcommand, not a config key: `codexd google-connect` / `codexd google-disconnect`. Cron jobs persist to `$CODEX_HOME/cron_jobs.json` (migrated once from `automations.json` when cron is first enabled).
+
 ### A note on `CODEXKIT_*`
 
 A separate family of `CODEXKIT_*` env vars (e.g. `CODEXKIT_MOCK`, `CODEXKIT_LISTEN`, `CODEXKIT_OTLP_ENDPOINT`) controls process startup and codex-swift-specific plumbing. These are **not** config keys — they don't appear in inspected config and don't participate in the layer stack.

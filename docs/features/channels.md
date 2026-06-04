@@ -47,7 +47,9 @@ Telegram getUpdates  →  mapTelegramUpdate  →  InboundMessage{
 
 The advisory fragment alone is inert — it only discourages the model. `installChannelGate` bundles both registrations so you cannot accidentally ship the soft half without the teeth.
 
-**The turn-collector (daemon path).** The production daemon (`codexd`) runs many sessions through a `SessionSupervisor`, which is fire-and-forget: `submit(...)` returns a `Bool` and turn output arrives asynchronously via a broadcast notification sink. To run "one turn and get the reply" against it, `SupervisorTurnCollector.swift` adds `supervisor.collectTurn(...)`: subscribe a transient sink, submit the turn with a concrete `turnId`, then fold `ServerNotification`s — matching on `(threadId, turnId)` so concurrent turns on the same thread never cross-wire — into a neutral `CollectedTurn{text, status}`. It honors caller cancellation, hard-interrupts an abandoned turn on timeout, and always removes its sink. This is the engine-path collection logic re-expressed over the supervisor's broadcast stream.
+**5. The owner gate that survives a separate process (daemon path).** The `ChannelAuthorityBox` gate above is an *in-process* mechanism — it lives next to the engine. But the production daemon spawns each session as a **separate worker process** by default, which that in-process gate can't reach, so on the spawned path it would be inert. The daemon therefore bakes the restriction into the **`SessionConfig` itself**, which travels *with* the turn to the worker: a non-owner sender's turn is built with `approvalPolicy = .never` (privileged/destructive tools are denied inline), `sandboxMode = .readOnly`, and no network — while an owner's turn gets a normal config. Because the lockdown is part of the config the worker builds its engine from, the owner-gate is enforced in **both** the in-process and the spawned worker mode, with no cross-process authority box required (`ChannelGlue.channelSessionConfig`). The conversation thread stays *durable* (per-conversation continuity), not ephemeral.
+
+**The turn-collector (daemon path).** The production daemon (`codexd`) runs many sessions through a `SessionSupervisor`, which is fire-and-forget: `submit(...)` returns a `Bool` and turn output arrives asynchronously via a broadcast notification sink. To run "one turn and get the reply" against it, `SupervisorTurnCollector.swift` adds `supervisor.collectTurn(...)`: subscribe a transient sink, submit the turn with a concrete `turnId`, then fold `ServerNotification`s — matching on `(threadId, turnId)` so concurrent turns on the same thread never cross-wire — into a neutral `CollectedTurn{text, status}`. It honors caller cancellation, hard-interrupts an abandoned turn on timeout, and always removes its sink. The daemon's `SupervisorChannelHost` resolves each conversation to a durable thread (`ChannelThreadStore`) and runs it through this collector.
 
 ## Using it
 
@@ -65,30 +67,39 @@ let router = ConversationRoutingHost { channelId, conversationId in
 }
 ```
 
-**Telegram (scaffold, opt-in, default OFF).** Configuration is parsed by the pure resolver `TelegramConfig.load`:
+**Telegram (wired into the daemon, opt-in, default OFF).** Configure the channel under `[channels.telegram]`; the secret is resolved at runtime by the pure resolver `TelegramConfig.load`:
 
-- Enable via `[channels.telegram].enabled = true`.
-- The bot token is read from the environment (`TELEGRAM_BOT_TOKEN` by default, or a configured var name) — **never** from the config TOML, so the secret stays off disk.
-- `owners` is the list of numeric Telegram user ids allowed to drive privileged actions (your own id, from @BotFather setup).
+```toml
+[channels.telegram]
+enabled = true
+bot_token_env = "TELEGRAM_BOT_TOKEN"   # env var NAME holding the secret — never the token itself
+owners = ["123456789"]                 # numeric Telegram user ids that count as OWNER
+poll_timeout_seconds = 30
+```
+
+- The bot token is read from the named environment variable — **never** from the config TOML, so the secret stays off disk.
+- `owners` is the list of numeric Telegram user ids allowed to drive privileged actions (your own id, from @BotFather setup). **If `owners` is empty, every sender is a non-owner** — all turns are locked down — and the daemon logs a warning.
 - `poll_timeout_seconds` (default 30) sets the long-poll hold.
 
-If the feature is disabled or no token resolves, `load` returns `nil` and no channel is constructed. When started, `TelegramChannel` long-polls `getUpdates`, maps each text update through `mapTelegramUpdate`, calls `host.deliver`, and relays the reply via `sendMessage`. Non-text updates and sender-less (anonymous) posts are skipped. A non-completed turn surfaces a status note instead of silence, e.g. `(the agent did not respond in time)`.
+When `codexd` starts with the feature on, `ChannelsGlue.bootstrap` reads the config, builds a `TelegramChannel` bound to a `SupervisorChannelHost` whose runner applies the per-sender lockdown, registers it on a `ChannelManager`, and starts it (stopped cleanly on SIGTERM/SIGINT). If the feature is disabled or no token resolves, nothing is constructed — an unconfigured daemon is byte-identical to one without channels. `TelegramChannel` long-polls `getUpdates`, maps each text update through `mapTelegramUpdate` (server-stamping identity from `from.id`), runs `host.deliver`, and relays the reply via `sendMessage`. Non-text and anonymous posts are skipped; a non-completed turn surfaces a status note instead of silence.
 
-**What you see:** you text your bot "summarize the open PRs"; the agent runs a turn; the answer arrives as a Telegram message. If a stranger texts "delete the repo," the agent may *try*, but the dispatch gate denies the shell/file action with `non-owner channel sender may not run privileged/destructive actions (method=...)`.
+**Manage channels over the owner-only RPC.** `channels/list`, `channels/start`, `channels/stop`, and `channels/status` control the running manager. Like all owner-only control surfaces they are gated by transport — served on the owner-local stdio/Unix-socket router, refused on the browser tier (`allowsOwnerOnlyRPC`), and excluded from the WebGateway method allowlist.
+
+**What you see:** you text your bot "summarize the open PRs"; the agent runs a turn; the answer arrives as a Telegram message. If a stranger texts "delete the repo," their turn runs read-only with approval set to `never`, so the shell/file action is denied inline — no escalation, no hung prompt — regardless of which worker process ran it.
 
 ## What it enables
 
 - **A pocket-sized agent.** The lowest-friction path to a personal assistant you can reach anywhere — a bot token, your owner id, done.
 - **Safe public exposure.** Server-stamped identity plus the hard owner gate means a bot can sit on a public handle without handing strangers your shell. Group chats get isolated, owner-gated threads automatically via `ConversationRoutingHost`.
-- **A spine for every other surface.** The same `Channel`/`ChannelHost`/`InboundMessage` contract is what planned transports (Discord, Slack, email) and the proactive primitives (the [Cron scheduler](../../ADDONS.md), [Push / outbound delivery](../../ADDONS.md), the [media suite](../../ADDONS.md)) plug into. `collectTurn` is the shared turn-collector the scheduler also uses to fire isolated, unattended sessions.
+- **A spine for every other surface.** The same `Channel`/`ChannelHost`/`InboundMessage` contract is what planned transports (Discord, Slack, email) and the proactive primitives (the [Cron scheduler](cron.md), [Push / outbound delivery](push.md), the [media suite](media.md)) plug into. `collectTurn` is the shared turn-collector the scheduler also uses to fire isolated, unattended sessions, and the non-owner lockdown is the same `SessionConfig`-baked pattern the cron unattended turn uses.
 
 ## Status
 
 Honest accounting of built vs planned:
 
-- **Built and unit-tested:** the `Channels` spine (`Channel`, `ChannelHost`, `InboundMessage`, `ChannelIdentity`, `ChannelReply`), `EngineChannelHost`, `ConversationRoutingHost`, the advisory + hard owner gate (`installChannelGate`), the Telegram long-poll scaffold and its pure mapping/owner-stamping (`mapTelegramUpdate` / `mapTelegramBatch` / `TelegramConfig.load`), and the supervisor turn-collector (`collectTurn` → `CollectedTurn`).
-- **Planned (the ADDONS roadmap, not yet wired):** the daemon-resident production path. There is **no** `SupervisorChannelHost` yet (the `Channels` target deliberately does not depend on `Supervisor`; the adapter is meant to live in `Supervisor`/`codexd` and map `CollectedTurn` → `ChannelReply`). There is **no** `ChannelManager` for supervised start/stop/restart, **no** `channels/*` JSON-RPC, **no** durable per-conversation thread mapping across restarts, and **no** outbound seam (`ChannelOutbound`) for unsolicited pushes. Nothing in `main.swift` constructs a channel today. Telegram itself lacks webhook mode, media in/out, and formatting/chunking.
-- **Externally blocked verification:** a real Telegram run needs a live @BotFather token and outbound network, so only the network-free mapping and owner-stamping are exercised in tests.
+- **Built, tested, and wired into the daemon:** the `Channels` spine (`Channel`, `ChannelHost`, `InboundMessage`, `ChannelIdentity`, `ChannelReply`, `ChannelOutbound`), `EngineChannelHost`, `ConversationRoutingHost`, the advisory + hard in-process owner gate (`installChannelGate`), the supervisor turn-collector (`collectTurn` → `CollectedTurn`), the daemon-resident production path — `SupervisorChannelHost` over a durable `ChannelThreadStore`, `ChannelManager` (supervised start/stop/restart with backoff), the `channels/*` owner-gated JSON-RPC family, and `ChannelsGlue.bootstrap` wiring a configured `TelegramChannel` at the codexd composition root — plus the process-agnostic non-owner lockdown baked into `SessionConfig` (`ChannelGlue.channelSessionConfig`). The Telegram mapping/owner-stamping (`mapTelegramUpdate` / `TelegramConfig.load`) is network-free unit-tested; an adversarial review confirmed `senderIsOwner` is unforgeable and the non-owner lockdown holds in spawned-worker mode.
+- **Descoped / planned:** the **Gmail** channel is net-new OAuth/credential plumbing on top of the [Google connector](connectors.md) and is deferred. The `ChannelOutbound` seam exists (and powers [push](push.md)) but channels don't yet *initiate* unsolicited pushes. Telegram lacks webhook mode, media in/out, and message chunking/formatting.
+- **Externally blocked verification:** a live end-to-end Telegram run needs a real @BotFather token and outbound network, so the long-poll loop's network path is exercised only against stubs; the identity, gating, and lockdown logic are fully tested.
 
 ## Go deeper
 
