@@ -26,6 +26,7 @@ import Push
 import GoogleWorkspace
 import Media
 import Cron
+import Channels
 
 /// #8 Media delivery (codexd): push a "ready" notification for a finished asset
 /// through the daemon-scope PushRouter (#7). Returns false → the ledger marks it
@@ -42,6 +43,50 @@ enum MediaGlue {
             text: "media \(task.kind.rawValue) ready: \(asset)",
             idempotencyKey: "media-\(task.id)")
         return result.ok
+    }
+}
+
+/// #1/#2 Channels composition root (Telegram MVP). Deny-default behind
+/// `[channels.telegram].enabled`. The TurnRunner bakes the non-owner lockdown
+/// into SessionConfig (ChannelGlue.channelSessionConfig) so the owner-gate is
+/// enforced in BOTH in-process and spawned worker modes.
+enum ChannelsGlue {
+    static func bootstrap(config: Config, codexHome: String, supervisor: SessionSupervisor,
+                          defaultModel: String, env: [String: String]) async -> ChannelManager? {
+        guard let obj = config.value("channels.telegram")?.objectValue,
+              obj["enabled"]?.boolValue == true else { return nil }
+        var owners: [String] = []
+        if case .array(let a)? = obj["owners"] { owners = a.compactMap { $0.stringValue } }
+        guard let tgConfig = TelegramConfig.load(
+            enabled: true,
+            botTokenEnvVar: obj["bot_token_env"]?.stringValue,
+            owners: owners,
+            pollTimeoutSeconds: obj["poll_timeout_seconds"]?.intValue.map(Int.init),
+            apiBase: obj["api_base"]?.stringValue,
+            env: env) else {
+            FileHandle.standardError.write(Data(
+                "codexd channels: telegram enabled but no bot token resolved; skipping\n".utf8))
+            return nil
+        }
+        let threadStore = ChannelThreadStore(
+            path: codexHome + "/channels/telegram-threads.json",
+            mint: { ThreadId.generate().raw })
+        let runner = ChannelGlue.makeTurnRunner(
+            supervisor: supervisor,
+            defaultCwd: FileManager.default.currentDirectoryPath,
+            defaultModel: defaultModel)
+        let host = SupervisorChannelHost(threadStore: threadStore, runTurn: runner)
+        let manager = ChannelManager(host: host)
+        await manager.register(TelegramChannel(config: tgConfig))
+        ChannelManagerHolder.shared.set(manager)
+        await manager.startAll()
+        if owners.isEmpty {
+            FileHandle.standardError.write(Data(
+                "codexd channels: telegram has NO owners — every sender is NON-OWNER (read-only, locked-down turns)\n".utf8))
+        }
+        FileHandle.standardError.write(Data(
+            "codexd channels: telegram started (\(owners.count) owner(s))\n".utf8))
+        return manager
     }
 }
 
@@ -640,6 +685,15 @@ struct CodexDaemon {
         }
         let cronScheduler = cronSchedulerVar   // immutable copy for the @Sendable shutdown closure
 
+        // #1/#2 Channels (Telegram MVP): deny-default behind
+        // [channels.telegram].enabled. The TurnRunner bakes the non-owner
+        // lockdown into SessionConfig so the owner-gate holds in both worker
+        // modes. Stopped on SIGTERM/SIGINT.
+        let channelManager = await ChannelsGlue.bootstrap(
+            config: appConfig, codexHome: codexHome, supervisor: supervisor,
+            defaultModel: appConfig.value("model")?.stringValue ?? "gpt-5.5",
+            env: ProcessInfo.processInfo.environment)
+
         // Web gateway (docs/webgateway/). Started alongside the app-server
         // transport, sharing this process's SessionSupervisor so web tabs and
         // local stdio/UDS clients see the same session pool. Each browser tab
@@ -699,6 +753,7 @@ struct CodexDaemon {
             // Spawn a detached Task so the signal handler returns promptly;
             // the actor's stop() drives child terminate + reap.
             Task.detached { @Sendable in
+                await channelManager?.stopAll()
                 await cronScheduler?.stop()
                 await mediaPoller?.stop()
                 await memorySupervisor.stop()

@@ -308,6 +308,31 @@ public struct CronListResponse: Sendable, Codable, Equatable {
     public var data: [CronJobWire]
     public init(data: [CronJobWire]) { self.data = data }
 }
+// ADDONS #1/#2 channels/* wire shape. Owner-only control surface for the
+// daemon-resident ChannelManager (Telegram MVP).
+public struct ChannelsListParams: Sendable, Codable, Equatable {
+    public var cursor: String?
+    public var limit: Int?
+}
+public struct ChannelActionParams: Sendable, Codable, Equatable {
+    public var id: String
+}
+public struct ChannelStatusParams: Sendable, Codable, Equatable {
+    public var id: String?
+}
+public struct ChannelStatusWire: Sendable, Codable, Equatable {
+    public var id: String
+    public var state: String            // stopped | starting | running | backoff | stopping
+    public var attempt: Int
+    public var lastError: String?
+    public init(id: String, state: String, attempt: Int, lastError: String?) {
+        self.id = id; self.state = state; self.attempt = attempt; self.lastError = lastError
+    }
+}
+public struct ChannelStatusListResponse: Sendable, Codable, Equatable {
+    public var data: [ChannelStatusWire]
+    public init(data: [ChannelStatusWire]) { self.data = data }
+}
 public struct ThreadCompactStartParams: Sendable, Codable, Equatable { public var threadId: ThreadId }
 public struct ThreadShellCommandParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId

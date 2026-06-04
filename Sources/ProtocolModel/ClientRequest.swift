@@ -609,6 +609,10 @@ public enum ClientRequest: Sendable {
     case cronList(RequestId, CronListParams)
     case cronAdd(RequestId, CronAddParams)
     case cronRemove(RequestId, CronRemoveParams)
+    case channelsList(RequestId, ChannelsListParams)
+    case channelStart(RequestId, ChannelActionParams)
+    case channelStop(RequestId, ChannelActionParams)
+    case channelStatus(RequestId, ChannelStatusParams)
     case threadList(RequestId, ThreadListParams)
     case threadLoadedList(RequestId, ThreadLoadedListParams)
     case threadRead(RequestId, ThreadReadParams)
@@ -652,6 +656,7 @@ public enum ClientRequest: Sendable {
         "thread/start", "thread/resume", "thread/fork", "thread/archive",
         "thread/unarchive", "thread/unsubscribe", "thread/name/set", "thread/pin/set", "git/action", "automation/action", "outbound/send",
         "cron/list", "cron/add", "cron/remove",
+        "channels/list", "channels/start", "channels/stop", "channels/status",
         "thread/list", "thread/loaded/list", "thread/read",
         "thread/turns/list", "thread/turns/items/list", "thread/inject_items",
         "thread/rollback", "thread/compact/start", "thread/shellCommand",
@@ -669,7 +674,9 @@ public enum ClientRequest: Sendable {
         case .initialize(let i, _), .threadStart(let i, _), .threadResume(let i, _),
              .threadFork(let i, _), .threadArchive(let i, _), .threadUnarchive(let i, _),
              .threadUnsubscribe(let i, _), .threadSetName(let i, _), .threadPinSet(let i, _), .gitAction(let i, _), .automationAction(let i, _), .outboundSend(let i, _),
-             .cronList(let i, _), .cronAdd(let i, _), .cronRemove(let i, _), .threadList(let i, _),
+             .cronList(let i, _), .cronAdd(let i, _), .cronRemove(let i, _),
+             .channelsList(let i, _), .channelStart(let i, _), .channelStop(let i, _), .channelStatus(let i, _),
+             .threadList(let i, _),
              .threadLoadedList(let i, _), .threadRead(let i, _), .threadTurnsList(let i, _),
              .threadTurnsItemsList(let i, _), .threadInjectItems(let i, _),
              .threadRollback(let i, _), .threadCompactStart(let i, _),
@@ -705,6 +712,10 @@ public enum ClientRequest: Sendable {
         case .cronList: return "cron/list"
         case .cronAdd: return "cron/add"
         case .cronRemove: return "cron/remove"
+        case .channelsList: return "channels/list"
+        case .channelStart: return "channels/start"
+        case .channelStop: return "channels/stop"
+        case .channelStatus: return "channels/status"
         case .threadList: return "thread/list"
         case .threadLoadedList: return "thread/loaded/list"
         case .threadRead: return "thread/read"
@@ -758,6 +769,12 @@ public enum ClientRequest: Sendable {
                 CronListParams.self, from: r.params, default: CronListParams()))
         case "cron/add": return .cronAdd(r.id, try p(CronAddParams.self))
         case "cron/remove": return .cronRemove(r.id, try p(CronRemoveParams.self))
+        case "channels/list": return .channelsList(r.id, try JSONBridge.paramsAllowingEmpty(
+                ChannelsListParams.self, from: r.params, default: ChannelsListParams()))
+        case "channels/start": return .channelStart(r.id, try p(ChannelActionParams.self))
+        case "channels/stop": return .channelStop(r.id, try p(ChannelActionParams.self))
+        case "channels/status": return .channelStatus(r.id, try JSONBridge.paramsAllowingEmpty(
+                ChannelStatusParams.self, from: r.params, default: ChannelStatusParams()))
         case "thread/list":
             return .threadList(r.id, try JSONBridge.paramsAllowingEmpty(
                 ThreadListParams.self, from: r.params, default: ThreadListParams()))

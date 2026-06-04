@@ -19,6 +19,7 @@ import Prompts
 import ModelClient
 import Push
 import Cron
+import Channels
 
 /// Wire<->domain mapping for the #6 cron RPC. Lives in Supervisor (the only place
 /// that imports BOTH ProtocolModel and Cron) so ProtocolModel stays a leaf and
@@ -1974,6 +1975,44 @@ public actor RequestRouter {
                 await reply(conn, id, EmptyResponse()); break
             }
             await scheduler.remove(p.id)
+            await reply(conn, id, EmptyResponse())
+        case .channelsList(let id, _), .channelStatus(let id, _):
+            // OWNER PATH (#1): channels run UNTRUSTED inbound senders against the
+            // daemon; their control surface (list/start/stop/status) is owner-only.
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport")); break
+            }
+            // Deny-default: a nil holder (channels off) lists nothing.
+            guard let manager = ChannelManagerHolder.shared.current() else {
+                await reply(conn, id, ChannelStatusListResponse(data: [])); break
+            }
+            // Optional id filter (channels/status with an id).
+            var statuses = await manager.status().map(ChannelGlue.wire)
+            if case .channelStatus(_, let p) = parsed, let wanted = p.id {
+                statuses = statuses.filter { $0.id == wanted }
+            }
+            await reply(conn, id, ChannelStatusListResponse(data: statuses))
+        case .channelStart(let id, let p):
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport")); break
+            }
+            guard let manager = ChannelManagerHolder.shared.current() else {
+                await conn.send(WireError.invalidRequest(id: id, "channels feature is not enabled")); break
+            }
+            guard await manager.registered().contains(p.id) else {
+                await conn.send(WireError.invalidRequest(id: id, "unknown channel '\(p.id)'")); break
+            }
+            await manager.start(p.id)
+            let status = await manager.status(p.id).map { [ChannelGlue.wire($0)] } ?? []
+            await reply(conn, id, ChannelStatusListResponse(data: status))
+        case .channelStop(let id, let p):
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport")); break
+            }
+            guard let manager = ChannelManagerHolder.shared.current() else {
+                await reply(conn, id, EmptyResponse()); break
+            }
+            await manager.stop(p.id)
             await reply(conn, id, EmptyResponse())
         case .threadList(let id, let p):
             let list = (try? await store.list(archived: p.archived ?? false,
