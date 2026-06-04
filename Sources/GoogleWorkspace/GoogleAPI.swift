@@ -59,9 +59,23 @@ public protocol GoogleHTTPClient: Sendable {
 public enum GoogleAPIError: Error, Sendable, Equatable {
     case notAuthorized(String)
     case disallowedHost(String)
+    case invalidPath(String)
     case badMethod(String)
     case http(status: Int, body: String)
     case transport(String)
+}
+
+/// Redact any `Bearer <token>` from a string before it is surfaced (a lower HTTP
+/// layer that echoes request headers in an error must not leak the access token).
+func redactBearer(_ s: String) -> String {
+    guard let r = s.range(of: "Bearer ") else { return s }
+    var out = String(s[..<r.upperBound])
+    var rest = s[r.upperBound...]
+    // Drop the token chars up to the next whitespace/quote.
+    let stop = rest.firstIndex { $0 == " " || $0 == "\"" || $0 == "\n" || $0 == "'" } ?? rest.endIndex
+    rest = rest[stop...]
+    out += "[redacted]" + rest
+    return out
 }
 
 public struct GoogleAPIResponse: Sendable, Equatable {
@@ -109,35 +123,79 @@ public actor GoogleAPIClient {
         case .failure(let e): return .failure(.notAuthorized("\(e)"))
         }
         // Build the URL from the SERVICE host + base path (model can't inject a host).
+        let p = path.hasPrefix("/") ? path : "/" + path
+        let fullPath = service.basePath + p
+        // Confine to the service basePath: reject DOT-SEGMENTS — the server
+        // normalizes `..`, and www.googleapis.com serves several services, so
+        // `/drive/v3/../../calendar/v3/x` would escape `drive` to `calendar` while
+        // the host stays allowlisted. Every segment must be a real, non-dot name.
+        let segments = fullPath.split(separator: "/", omittingEmptySubsequences: false)
+        if segments.contains(".") || segments.contains("..") {
+            return .failure(.invalidPath("dot segments are not allowed"))
+        }
         var comps = URLComponents()
         comps.scheme = "https"
         comps.host = service.host
-        let p = path.hasPrefix("/") ? path : "/" + path
-        comps.path = service.basePath + p
+        comps.path = fullPath
         if !query.isEmpty {
             comps.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         }
-        guard let url = comps.url, let host = url.host, GoogleService.allowedHosts.contains(host) else {
+        guard let url = comps.url, let host = url.host, GoogleService.allowedHosts.contains(host),
+              url.path == service.basePath || url.path.hasPrefix(service.basePath + "/") else {
             return .failure(.disallowedHost(comps.host ?? "?"))
         }
         var headers = ["Authorization": "Bearer \(token)", "Accept": "application/json"]
         if body != nil { headers["Content-Type"] = "application/json" }
 
+        // Idempotency-aware retry: a 429 means the request was REJECTED (safe to
+        // resend any verb), but a 5xx or transport error may have applied a write
+        // — so only SAFE/IDEMPOTENT verbs are retried on those. POST/PATCH never
+        // auto-retry on 5xx/transport, to avoid duplicate cloud mutations.
+        let idempotent = ["GET", "HEAD", "PUT", "DELETE"].contains(verb)
         var attempt = 0
         while true {
             switch await http.request(method: verb, url: url, headers: headers, body: body) {
             case .failure(let e):
-                if attempt < maxRetries { attempt += 1; await sleep(attempt); continue }
-                return .failure(.transport(e))
+                if idempotent, attempt < maxRetries { attempt += 1; await sleep(attempt); continue }
+                return .failure(.transport(redactBearer(e)))
             case .response(let status, let respBody):
-                if (status == 429 || (500..<600).contains(status)), attempt < maxRetries {
-                    attempt += 1; await sleep(attempt); continue
-                }
+                let retryable = (status == 429) || ((500..<600).contains(status) && idempotent)
+                if retryable, attempt < maxRetries { attempt += 1; await sleep(attempt); continue }
                 if (200..<300).contains(status) {
                     return .success(GoogleAPIResponse(status: status, body: respBody))
                 }
-                return .failure(.http(status: status, body: String(data: respBody, encoding: .utf8) ?? ""))
+                return .failure(.http(status: status, body: redactBearer(String(data: respBody, encoding: .utf8) ?? "")))
             }
         }
+    }
+}
+
+/// Production HTTP client that DISABLES redirects — a Google host that 3xx'd to
+/// an off-allowlist location would otherwise bypass the pre-request host check.
+public final class URLSessionGoogleHTTPClient: NSObject, GoogleHTTPClient, URLSessionTaskDelegate, @unchecked Sendable {
+    private let timeout: TimeInterval
+    public init(timeout: TimeInterval = 30) { self.timeout = timeout; super.init() }
+
+    public func request(method: String, url: URL, headers: [String: String], body: Data?) async -> GoogleHTTPResult {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.httpBody = body
+        req.timeoutInterval = timeout
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        let s = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
+        defer { s.finishTasksAndInvalidate() }
+        do {
+            let (data, resp) = try await s.data(for: req)
+            return .response(status: (resp as? HTTPURLResponse)?.statusCode ?? 0, body: data)
+        } catch {
+            return .failure("\(error)")
+        }
+    }
+
+    public func urlSession(_ session: URLSession, task: URLSessionTask,
+                           willPerformHTTPRedirection response: HTTPURLResponse,
+                           newRequest request: URLRequest,
+                           completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)   // never follow a redirect off the vetted host
     }
 }

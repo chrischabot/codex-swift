@@ -85,6 +85,7 @@ public struct GoogleAPITool: Tool {
         switch e {
         case .notAuthorized(let m): return "not authorized (\(m)) — connect the Google account first"
         case .disallowedHost(let h): return "refused host '\(h)'"
+        case .invalidPath(let m):   return "invalid path: \(m)"
         case .badMethod(let m):     return "unsupported method '\(m)'"
         case .http(let s, let b):   return "HTTP \(s): \(b.prefix(500))"
         case .transport(let m):     return "transport: \(m)"

@@ -100,6 +100,49 @@ final class GoogleWorkspaceTests: XCTestCase {
         XCTAssertEqual(n, 1, "a 4xx is not retried")
     }
 
+    func testPathTraversalRejected() async {
+        let http = StubGoogleHTTP(scripted: [.response(status: 200, body: Data("{}".utf8))])
+        // `..` would normalize on the server to escape /drive/v3 to another API
+        // on the same host — must be rejected before any request.
+        let r = await client(http).call(service: .drive, method: "GET", path: "/../../calendar/v3/calendars")
+        guard case .failure(.invalidPath) = r else { return XCTFail("dot-segment path must be rejected, got \(r)") }
+        let n = await http.count()
+        XCTAssertEqual(n, 0, "no request is made for a traversal path")
+    }
+
+    func testWriteNotRetriedOn5xx() async {
+        // A POST that 5xx's may have applied the write — must NOT be resent.
+        let http = StubGoogleHTTP(scripted: [
+            .response(status: 503, body: Data()),
+            .response(status: 200, body: Data("{}".utf8)),
+        ])
+        let r = await client(http).call(service: .calendar, method: "POST", path: "/calendars/primary/events",
+                                        body: Data("{}".utf8))
+        guard case .failure(.http(let s, _)) = r else { return XCTFail("POST 5xx must surface, not retry, got \(r)") }
+        XCTAssertEqual(s, 503)
+        let n = await http.count()
+        XCTAssertEqual(n, 1, "a non-idempotent POST is not retried on 5xx (no duplicate write)")
+    }
+
+    func testWriteRetriedOn429() async {
+        // A 429 means the request was REJECTED (not applied) → safe to resend.
+        let http = StubGoogleHTTP(scripted: [
+            .response(status: 429, body: Data()),
+            .response(status: 200, body: Data("{}".utf8)),
+        ])
+        let r = await client(http).call(service: .calendar, method: "POST", path: "/calendars/primary/events",
+                                        body: Data("{}".utf8))
+        guard case .success = r else { return XCTFail("a 429'd POST is safely retried, got \(r)") }
+        let n = await http.count()
+        XCTAssertEqual(n, 2)
+    }
+
+    func testBearerRedactedInErrors() {
+        let s = redactBearer("failed: header Authorization: Bearer ya29.SECRET-TOKEN-abc more")
+        XCTAssertFalse(s.contains("ya29.SECRET-TOKEN-abc"), "the bearer is redacted")
+        XCTAssertTrue(s.contains("Bearer [redacted]"))
+    }
+
     func testBadMethodRejected() async {
         let http = StubGoogleHTTP(scripted: [])
         let r = await client(http).call(service: .drive, method: "FROBNICATE", path: "/files")
