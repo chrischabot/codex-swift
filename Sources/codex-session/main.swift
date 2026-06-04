@@ -419,10 +419,14 @@ struct SessionWorkerMain {
             // lives in another process and can't reach it — fine for the inline
             // stub, which delivers synchronously inside submit). Build once per
             // process; deny-default off when [features].media is unset.
+            // A spawned worker has NO daemon poller in-process, so async
+            // providers self-prune here (inProcessWorkers: false); the inline
+            // stub still works (synchronous delivery).
             if MediaLedgerHolder.shared.current() == nil,
                let ledger = await MediaWiring.makeLedger(
                    addonConfig: addonConfig, codexHome: codexHome,
-                   env: ProcessInfo.processInfo.environment, deliver: sessionMediaPushDeliver) {
+                   env: ProcessInfo.processInfo.environment,
+                   inProcessWorkers: false, deliver: sessionMediaPushDeliver) {
                 MediaLedgerHolder.shared.set(ledger)
             }
             toolPacks.append(MediaToolPack(ledger: MediaLedgerHolder.shared.current()))

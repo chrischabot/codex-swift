@@ -578,7 +578,8 @@ struct CodexDaemon {
             guard inProcessWorkers,
                   let ledger = await MediaWiring.makeLedger(
                       addonConfig: appConfig, codexHome: codexHome,
-                      env: ProcessInfo.processInfo.environment, deliver: mediaPushDeliver)
+                      env: ProcessInfo.processInfo.environment,
+                      inProcessWorkers: inProcessWorkers, deliver: mediaPushDeliver)
             else { return nil }
             MediaLedgerHolder.shared.set(ledger)
             let poller = MediaPoller(ledger: ledger)

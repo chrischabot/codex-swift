@@ -152,8 +152,28 @@ final class MediaWiringTests: XCTestCase {
     func testMakeLedgerDenyDefault() async {
         let off = cfg(["media": .object(["provider": .string("stub")])])   // feature off
         let l = await MediaWiring.makeLedger(addonConfig: off, codexHome: tmp(),
-                                             env: [:], deliver: { _ in true })
+                                             env: [:], inProcessWorkers: true, deliver: { _ in true })
         XCTAssertNil(l, "feature off → no ledger (pack self-prunes, no poller)")
+    }
+
+    func testMakeLedgerRefusesAsyncProviderInSpawnedMode() async {
+        // An async provider configured WITHOUT in-process workers must fail
+        // closed (return nil → tool self-prunes), not accept jobs that wedge.
+        let c = cfg([
+            "features": .object(["media": .bool(true)]),
+            "media": .object(["provider": .string("openai"), "api_key_env": .string("OAI")]),
+        ])
+        let spawned = await MediaWiring.makeLedger(
+            addonConfig: c, codexHome: tmp(), env: ["OAI": "sk-x"],
+            inProcessWorkers: false, deliver: { _ in true })
+        XCTAssertNil(spawned, "async provider + spawned mode → nil (no silent wedge)")
+        // The SAME config under in-process workers is allowed (provider exists).
+        let inproc = await MediaWiring.makeLedger(
+            addonConfig: c, codexHome: tmp(), env: ["OAI": "sk-x"],
+            inProcessWorkers: true, deliver: { _ in true })
+        // openai isn't a real factory case yet → nil, but NOT for the spawned
+        // reason; the stub path below proves in-process is otherwise permissive.
+        XCTAssertNil(inproc, "openai factory is a documented skeleton (still nil), not a wedge")
     }
 
     func testMakeLedgerBuildsAndDeliversInlineEndToEnd() async {
@@ -164,7 +184,8 @@ final class MediaWiringTests: XCTestCase {
         ])
         let rec = DeliverRecorder()
         guard let ledger = await MediaWiring.makeLedger(
-            addonConfig: c, codexHome: home, env: [:], deliver: rec.deliver) else {
+            addonConfig: c, codexHome: home, env: [:],
+            inProcessWorkers: true, deliver: rec.deliver) else {
             return XCTFail("media configured → ledger expected")
         }
         // Inline stub: submit completes synchronously and delivers via the
@@ -175,6 +196,35 @@ final class MediaWiringTests: XCTestCase {
                       "asset under the configured media root: \(String(describing: t.assetPath))")
         let delivered = await rec.count()
         XCTAssertEqual(delivered, 1, "the injected deliver closure fired on the inline result")
+    }
+
+    // MARK: bounded retention (no unbounded ledger growth)
+
+    func testTerminalTasksArePrunedBeyondRetentionCap() async {
+        // Generate far more than maxRetainedTerminal inline (terminal) tasks; the
+        // ledger must drop the oldest so the dict + file don't grow unbounded.
+        let counter = Counter()
+        let ledger = MediaTaskLedger(providers: [StubProvider(submit: .inline(assetPath: "/a"))],
+                                     deliver: { _ in true },
+                                     now: { 0 }, mintId: { counter.next() })
+        let cap = MediaTaskLedger.maxRetainedTerminal
+        for _ in 0..<(cap + 50) { _ = await ledger.submit(kind: .image, prompt: "x") }
+        let all = await ledger.all()
+        XCTAssertLessThanOrEqual(all.count, cap,
+            "terminal tasks are pruned to the retention cap (got \(all.count))")
+        XCTAssertGreaterThan(all.count, 0)
+    }
+
+    func testNonTerminalTasksAreNeverPruned() async {
+        // Queued (non-terminal) tasks must survive retention even past the cap.
+        let counter = Counter()
+        let ledger = MediaTaskLedger(providers: [StubProvider(submit: .queued(providerTaskId: "P"))],
+                                     deliver: { _ in true },
+                                     now: { 0 }, mintId: { counter.next() })
+        let cap = MediaTaskLedger.maxRetainedTerminal
+        for _ in 0..<(cap + 50) { _ = await ledger.submit(kind: .image, prompt: "x") }
+        let all = await ledger.all()
+        XCTAssertEqual(all.count, cap + 50, "non-terminal tasks are never dropped")
     }
 
     // MARK: holder

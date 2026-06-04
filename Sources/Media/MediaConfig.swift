@@ -25,6 +25,11 @@ public struct MediaConfig: Sendable, Equatable {
         self.apiKeyEnv = apiKeyEnv
     }
 
+    /// A non-stub (async, `.queued`) provider needs the daemon poller to drive
+    /// jobs to completion — which only exists under in-process workers. The
+    /// inline stub completes synchronously and needs no poller.
+    public var requiresPoller: Bool { provider != "stub" }
+
     public static func load(config: Config, codexHome: String,
                             env: [String: String]) -> MediaConfig? {
         // Pass `env` through so the CODEX_FEATURE_MEDIA override honors the

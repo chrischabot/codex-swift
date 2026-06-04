@@ -20,21 +20,11 @@ public actor FileMediaStore: MediaStore {
 
     public func save(_ tasks: [MediaTask]) {
         guard let data = try? JSONEncoder().encode(tasks) else { return }
-        // Atomic replace: write a temp then rename, so a crash mid-write never
-        // leaves a half-written ledger that fails to decode on restart.
-        let tmp = path + ".tmp"
-        do {
-            try data.write(to: URL(fileURLWithPath: tmp))
-            _ = try? FileManager.default.replaceItemAt(
-                URL(fileURLWithPath: path), withItemAt: URL(fileURLWithPath: tmp))
-            // replaceItemAt removes the source on success; if the dest didn't
-            // exist it may leave tmp — best-effort move as a fallback.
-            if FileManager.default.fileExists(atPath: tmp) {
-                try? FileManager.default.removeItem(atPath: path)
-                try FileManager.default.moveItem(atPath: tmp, toPath: path)
-            }
-        } catch {
-            // Best-effort durability; a failed persist must not crash the poller.
-        }
+        // `.atomic` writes to a temp file then renames into place — atomic,
+        // correct for a non-existent destination (first save), and never leaves
+        // a half-written ledger that fails to decode on restart. A failed write
+        // is best-effort (leaves the prior file intact) and must not crash the
+        // poller.
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 }

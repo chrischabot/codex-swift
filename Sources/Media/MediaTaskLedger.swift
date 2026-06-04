@@ -74,8 +74,10 @@ public actor MediaTaskLedger {
             task.error = why
             tasks[task.id] = task
         }
+        let result = tasks[task.id] ?? task   // capture before retention may prune
+        enforceRetention()
         await persist()
-        return tasks[task.id] ?? task
+        return result
     }
 
     /// Poll every non-terminal task once; complete + deliver the finished ones.
@@ -112,11 +114,29 @@ public actor MediaTaskLedger {
             await finishDelivery(task.id)
             changed = true
         }
+        if enforceRetention() { changed = true }
         if changed { await persist() }
         return settled
     }
 
     static let maxDeliveryAttempts = 10
+    /// Cap on retained TERMINAL tasks. A long-running daemon generates terminal
+    /// tasks indefinitely; without a cap the dict + the durable file grow without
+    /// bound. Non-terminal tasks are never dropped.
+    static let maxRetainedTerminal = 500
+
+    /// Drop the oldest terminal tasks beyond `maxRetainedTerminal`. A dropped
+    /// task loses its idempotency-dedup history (acceptable for old tasks).
+    /// Returns true if anything was dropped (→ caller persists).
+    @discardableResult
+    private func enforceRetention() -> Bool {
+        let terminal = tasks.values.filter { $0.isTerminal }
+        guard terminal.count > Self.maxRetainedTerminal else { return false }
+        let drop = terminal.sorted { $0.createdAt < $1.createdAt }
+            .prefix(terminal.count - Self.maxRetainedTerminal)
+        for t in drop { tasks.removeValue(forKey: t.id) }
+        return true
+    }
 
     private func finishDelivery(_ id: String) async {
         guard var task = tasks[id], task.status == .done, task.deliverTo != nil,
