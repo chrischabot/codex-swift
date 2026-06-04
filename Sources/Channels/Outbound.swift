@@ -55,12 +55,26 @@ public struct SinkCapabilities: Sendable, Equatable, Codable {
 }
 
 /// A transport's immediate acknowledgement of one outbound send attempt.
+/// `permanent` distinguishes a non-retryable failure (an egress deny, an invalid
+/// destination, a 4xx client error) from a transient one (5xx / transport) so a
+/// durable retry layer dead-letters the former immediately instead of hammering
+/// — critical so a blocked SSRF target is not re-attempted N times.
 public struct OutboundReceipt: Sendable, Equatable, Codable {
     public let ok: Bool
     public let detail: String
-    public init(ok: Bool, detail: String = "") { self.ok = ok; self.detail = detail }
+    public let permanent: Bool
+    public init(ok: Bool, detail: String = "", permanent: Bool = false) {
+        self.ok = ok; self.detail = detail; self.permanent = permanent
+    }
     public static let delivered = OutboundReceipt(ok: true, detail: "delivered")
-    public static func failed(_ why: String) -> OutboundReceipt { OutboundReceipt(ok: false, detail: why) }
+    /// A TRANSIENT failure — worth retrying.
+    public static func failed(_ why: String) -> OutboundReceipt {
+        OutboundReceipt(ok: false, detail: why, permanent: false)
+    }
+    /// A PERMANENT failure — must NOT be retried (deny / invalid / 4xx).
+    public static func failedPermanent(_ why: String) -> OutboundReceipt {
+        OutboundReceipt(ok: false, detail: why, permanent: true)
+    }
 }
 
 /// A transport that can push an UNSOLICITED message. A `Channel` that is also a

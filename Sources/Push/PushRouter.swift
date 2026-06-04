@@ -39,7 +39,11 @@ struct PushDeliveryExecutor: DeliveryExecutor {
             return .permanentFailure
         }
         let receipt = await sink.send(message)
-        return receipt.ok ? .acked : .retry
+        if receipt.ok { return .acked }
+        // A PERMANENT failure (egress deny / invalid target / 4xx) must NOT be
+        // retried — otherwise a blocked SSRF target is re-attempted maxAttempts
+        // times. Only a transient failure (5xx / transport) retries.
+        return receipt.permanent ? .permanentFailure : .retry
     }
 }
 
@@ -79,6 +83,9 @@ public actor PushRouter {
     /// job reaches a terminal state (acked / failed) — the reply path wants the
     /// result; a fire-and-forget caller can ignore it.
     public func send(target: String, text: String, idempotencyKey: String? = nil) async -> SendResult {
+        // Bound the inputs before they hit the durable JSON payload + log write.
+        guard target.utf8.count <= 1024 else { return SendResult(ok: false, detail: "target too long") }
+        guard text.utf8.count <= 64 * 1024 else { return SendResult(ok: false, detail: "message too long (max 64 KiB)") }
         guard let parsed = PushTarget.parse(target) else {
             return SendResult(ok: false, detail: "invalid target (expected \"scheme:rest\")")
         }
@@ -96,7 +103,13 @@ public actor PushRouter {
             idempotencyKey: idempotencyKey)
         let receipt = await queue.enqueue(job)
         if receipt.deduped {
-            return SendResult(ok: true, detail: "deduped (already delivered/in-flight)")
+            // A deduped receipt's finalState may be NON-terminal (the queue
+            // contract): the collapsed job could still be in flight. Only report
+            // success when it actually acked; otherwise it's pending, not done.
+            let acked = receipt.finalState == .acked
+            return SendResult(ok: acked,
+                              detail: acked ? "deduped (already delivered)"
+                                            : "deduped (in flight, not yet confirmed)")
         }
         return SendResult(ok: receipt.finalState == .acked,
                           detail: receipt.finalState == .acked ? "delivered" : "failed after \(receipt.attempts) attempts")

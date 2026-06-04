@@ -111,6 +111,17 @@ final class PushTests: XCTestCase {
         XCTAssertEqual(got.count, 2, "delivered on the 2nd attempt (1 transient failure)")
     }
 
+    func testRouterDoesNotRetryPermanentFailure() async {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let router = PushRouter(directory: dir, maxAttempts: 5)
+        let sink = RecordingSink(id: "ntfy", permanent: true)   // permanent failure
+        await router.register(scheme: "ntfy", sink: sink)
+        let r = await router.send(target: "ntfy:alerts", text: "x")
+        XCTAssertFalse(r.ok)
+        let got = await sink.received()
+        XCTAssertEqual(got.count, 1, "a permanent failure (e.g. egress deny / 4xx) must NOT be retried")
+    }
+
     // MARK: push_send tool
 
     func testPushSendToolRequiresApproval() {
@@ -157,7 +168,7 @@ actor StubHTTP: PushHTTPClient {
     private let statuses: [Int]
     private var idx = 0
     init(statuses: [Int]) { self.statuses = statuses }
-    func post(url: URL, body: Data, contentType: String) async -> PushHTTPResult {
+    func post(url: URL, body: Data, contentType: String, pinnedIPs: [String]) async -> PushHTTPResult {
         _calls.append((url, body, contentType))
         let s = statuses[Swift.min(idx, statuses.count - 1)]; idx += 1
         return .status(s)
@@ -171,9 +182,13 @@ actor RecordingSink: ChannelOutbound {
     nonisolated let id: String
     private var messages: [OutboundMessage] = []
     private var remainingFailures: Int
-    init(id: String, failFirst: Int = 0) { self.id = id; self.remainingFailures = failFirst }
+    private let permanent: Bool
+    init(id: String, failFirst: Int = 0, permanent: Bool = false) {
+        self.id = id; self.remainingFailures = failFirst; self.permanent = permanent
+    }
     func send(_ message: OutboundMessage) async -> OutboundReceipt {
         messages.append(message)
+        if permanent { return .failedPermanent("nope") }
         if remainingFailures > 0 { remainingFailures -= 1; return .failed("transient") }
         return .delivered
     }
