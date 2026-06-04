@@ -242,6 +242,23 @@ public struct AutomationActionParams: Sendable, Codable, Equatable {
     public var cwd: String?
     public var model: String?
 }
+/// ADDONS #7 owner-path push. `target` is a PushTarget string ("ntfy:topic" /
+/// "webhook:https://..."); delivery routes through the daemon's durable
+/// PushRouter (EgressGuard-fronted sinks). Owner-gated by transport — see the
+/// `outbound/send` dispatch arm.
+public struct OutboundSendParams: Sendable, Codable, Equatable {
+    public var target: String
+    public var text: String
+    public var idempotencyKey: String?
+    public init(target: String, text: String, idempotencyKey: String? = nil) {
+        self.target = target; self.text = text; self.idempotencyKey = idempotencyKey
+    }
+}
+public struct OutboundSendResponse: Sendable, Codable, Equatable {
+    public var ok: Bool
+    public var detail: String
+    public init(ok: Bool, detail: String) { self.ok = ok; self.detail = detail }
+}
 public struct ThreadCompactStartParams: Sendable, Codable, Equatable { public var threadId: ThreadId }
 public struct ThreadShellCommandParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId

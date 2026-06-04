@@ -538,15 +538,29 @@ struct CodexDaemon {
         }
 
         let appMemory = MemoryStore(codexHome: codexHome)
+        // ADDONS #7 owner-path push. When [features].push is on, build the
+        // DAEMON-scope durable PushRouter (ntfy + webhook sinks behind the
+        // EgressGuard chokepoint) and publish it via the process-global holder
+        // so the owner-only `outbound/send` RPC handler (and the #8 Media deliver
+        // closure) can reach it WITHOUT a second makeDefault on the same dir.
+        // Deny-default: the holder stays nil otherwise and the dispatch arm
+        // refuses with "push feature is not enabled".
+        if appConfig.isFeatureEnabled("push") {
+            let daemonPushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
+            PushRouterHolder.shared.set(daemonPushRouter)
+        }
         // Realtime voice backend: live OpenAI Realtime bridge when opted in,
         // else nil (echo). Shared by the stdio/UDS router and every per-tab web
         // router; the factory builds a fresh session per `thread/realtime/start`.
         let realtimeFactory = Self.realtimeBackendFactory()
+        // OWNER-TRUSTED daemon router: stdio / UDS / loopback socket. Serves
+        // owner-only RPCs (outbound/send). allowsOwnerOnlyRPC defaults to true.
         let router = RequestRouter(supervisor: supervisor, store: store,
                                    codexHome: codexHome, auth: authManager,
                                    config: appConfig,
                                    memoryResetHandler: { await appMemory.reset() },
-                                   realtimeBackendFactory: realtimeFactory)
+                                   realtimeBackendFactory: realtimeFactory,
+                                   allowsOwnerOnlyRPC: true)
 
         // Automations: persistent store + interval scheduler (fires saved
         // prompts on a schedule). Shared with the RequestRouter handler via the
@@ -569,11 +583,16 @@ struct CodexDaemon {
                 config: webGatewayConfig,
                 limits: limits,
                 routerFactory: {
+                    // UNTRUSTED browser surface: a LOWER trust tier than
+                    // owner-local stdio/UDS. allowsOwnerOnlyRPC:false so a web
+                    // origin can NOT reach owner-only RPCs (outbound/send) even
+                    // though the PushRouterHolder is process-global.
                     RequestRouter(supervisor: supervisor, store: store,
                                   codexHome: codexHome, auth: authManager,
                                   config: appConfig,
                                   memoryResetHandler: { await appMemory.reset() },
-                                  realtimeBackendFactory: realtimeFactory)
+                                  realtimeBackendFactory: realtimeFactory,
+                                  allowsOwnerOnlyRPC: false)
                 })
             Task {
                 do { try await gateway.run() }

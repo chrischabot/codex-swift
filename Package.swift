@@ -129,6 +129,7 @@ let package = Package(
         .executable(name: "mock-responses", targets: ["mock-responses"]),
         .executable(name: "codex-bench", targets: ["codex-bench"]),
         .executable(name: "codex-computer", targets: ["codex-computer"]),
+        .executable(name: "codex-send", targets: ["codex-send"]),
     ],
     dependencies: mlxDependencies + webDependencies,
     targets: [
@@ -232,7 +233,7 @@ let package = Package(
         .target(name: "SessionWorkerCore",
                 dependencies: ["HarnessCore", "IPC", "ProtocolModel"], swiftSettings: strict),
         .target(name: "Supervisor",
-                dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools", "Prompts", "ModelClient"],
+                dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools", "Prompts", "ModelClient", "Push"],
                 swiftSettings: strict),
         .target(name: "Broker",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
@@ -333,6 +334,11 @@ let package = Package(
                 swiftSettings: strict),
         .executableTarget(name: "codex-computer",
                 dependencies: ["ComputerUse"],
+                swiftSettings: strict),
+        // ADDONS #7 owner-path CLI: `codex send <target> <text>` spawns a
+        // codexd over stdio (an owner-local channel) and issues outbound/send.
+        .executableTarget(name: "codex-send",
+                dependencies: ["ProtocolModel", "WireProtocol", "InfraPrimitives"],
                 swiftSettings: strict),
 
         .testTarget(name: "WorkflowsTests",
@@ -439,7 +445,8 @@ let package = Package(
         .testTarget(name: "IntegrationTests",
                 dependencies: ["Supervisor", "SessionWorkerCore", "HarnessCore", "ModelClient",
                                "Persistence", "Tools", "IPC", "ProtocolModel", "WireProtocol",
-                               "InfraPrimitives", "Observability"],
+                               "InfraPrimitives", "Observability",
+                               "Push", "Channels", "DeliveryCore", "EgressGuard"],
                 swiftSettings: strict),
         .testTarget(name: "LiveTests",
                 dependencies: ["HarnessCore", "ModelClient", "Persistence", "Tools",

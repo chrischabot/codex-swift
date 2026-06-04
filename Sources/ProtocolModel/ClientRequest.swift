@@ -605,6 +605,7 @@ public enum ClientRequest: Sendable {
     case threadPinSet(RequestId, ThreadPinSetParams)
     case gitAction(RequestId, GitActionParams)
     case automationAction(RequestId, AutomationActionParams)
+    case outboundSend(RequestId, OutboundSendParams)
     case threadList(RequestId, ThreadListParams)
     case threadLoadedList(RequestId, ThreadLoadedListParams)
     case threadRead(RequestId, ThreadReadParams)
@@ -646,7 +647,7 @@ public enum ClientRequest: Sendable {
     public static let typedMethods: Set<String> = [
         "initialize",
         "thread/start", "thread/resume", "thread/fork", "thread/archive",
-        "thread/unarchive", "thread/unsubscribe", "thread/name/set", "thread/pin/set", "git/action", "automation/action",
+        "thread/unarchive", "thread/unsubscribe", "thread/name/set", "thread/pin/set", "git/action", "automation/action", "outbound/send",
         "thread/list", "thread/loaded/list", "thread/read",
         "thread/turns/list", "thread/turns/items/list", "thread/inject_items",
         "thread/rollback", "thread/compact/start", "thread/shellCommand",
@@ -663,7 +664,7 @@ public enum ClientRequest: Sendable {
         switch self {
         case .initialize(let i, _), .threadStart(let i, _), .threadResume(let i, _),
              .threadFork(let i, _), .threadArchive(let i, _), .threadUnarchive(let i, _),
-             .threadUnsubscribe(let i, _), .threadSetName(let i, _), .threadPinSet(let i, _), .gitAction(let i, _), .automationAction(let i, _), .threadList(let i, _),
+             .threadUnsubscribe(let i, _), .threadSetName(let i, _), .threadPinSet(let i, _), .gitAction(let i, _), .automationAction(let i, _), .outboundSend(let i, _), .threadList(let i, _),
              .threadLoadedList(let i, _), .threadRead(let i, _), .threadTurnsList(let i, _),
              .threadTurnsItemsList(let i, _), .threadInjectItems(let i, _),
              .threadRollback(let i, _), .threadCompactStart(let i, _),
@@ -695,6 +696,7 @@ public enum ClientRequest: Sendable {
         case .threadPinSet: return "thread/pin/set"
         case .gitAction: return "git/action"
         case .automationAction: return "automation/action"
+        case .outboundSend: return "outbound/send"
         case .threadList: return "thread/list"
         case .threadLoadedList: return "thread/loaded/list"
         case .threadRead: return "thread/read"
@@ -743,6 +745,7 @@ public enum ClientRequest: Sendable {
         case "thread/pin/set": return .threadPinSet(r.id, try p(ThreadPinSetParams.self))
         case "git/action": return .gitAction(r.id, try p(GitActionParams.self))
         case "automation/action": return .automationAction(r.id, try p(AutomationActionParams.self))
+        case "outbound/send": return .outboundSend(r.id, try p(OutboundSendParams.self))
         case "thread/list":
             return .threadList(r.id, try JSONBridge.paramsAllowingEmpty(
                 ThreadListParams.self, from: r.params, default: ThreadListParams()))

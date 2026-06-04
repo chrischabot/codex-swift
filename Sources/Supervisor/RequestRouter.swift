@@ -17,6 +17,7 @@ import IPC
 import Tools
 import Prompts
 import ModelClient
+import Push
 
 private struct SimpleError: Error, LocalizedError {
     let message: String
@@ -345,6 +346,13 @@ public actor RequestRouter {
 
     private let supervisor: SessionSupervisor
     private let store: ThreadStore
+    /// Owner-boundary flag (ADDONS #7). codex-swift has no per-RPC owner token —
+    /// the owner boundary IS the transport. The daemon-level router (stdio / UDS
+    /// / loopback socket) is owner-trusted (true); the per-tab WebGateway routers
+    /// are a LOWER trust tier (false). Owner-only methods like `outbound/send`
+    /// refuse when this is false. Default true so all existing call sites stay
+    /// owner-trusted; the WebGateway routerFactory MUST pass false.
+    private let allowsOwnerOnlyRPC: Bool
     private let gate = ExperimentalGate()
     private var caps = ClientCapabilities()
     private var initialized = false
@@ -819,9 +827,11 @@ public actor RequestRouter {
                 remoteControlEnroller: RemoteControlEnroller? = nil,
                 remoteControlWebSocketConnector: RemoteControlWebSocketConnector? = nil,
                 memoryResetHandler: (@Sendable () async -> Void)? = nil,
-                realtimeBackendFactory: RealtimeBackendFactory? = nil) {
+                realtimeBackendFactory: RealtimeBackendFactory? = nil,
+                allowsOwnerOnlyRPC: Bool = true) {
         self.supervisor = supervisor
         self.store = store
+        self.allowsOwnerOnlyRPC = allowsOwnerOnlyRPC
         self.codexHome = codexHome
         self.auth = auth
         self.config = config
@@ -1842,6 +1852,40 @@ public actor RequestRouter {
             default:
                 await reply(conn, id, ["automations": await astore.list()])
             }
+        case .outboundSend(let id, let p):
+            // OWNER PATH (#7): owner-trusted only. The browser/WebGateway routers
+            // are a lower trust tier (allowsOwnerOnlyRPC=false) and must refuse —
+            // a process-global PushRouterHolder is reachable from every per-tab
+            // router, so this gate is the only thing keeping a web origin from
+            // sending owner-authorized push. NOT routed into the WebGateway
+            // routerFactory, but the transport flag is the load-bearing guard.
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport"))
+                break
+            }
+            // DENY-DEFAULT: only enabled when codexd built a router (gated on
+            // [features].push). A nil holder means the feature is off.
+            guard let pushRouter = PushRouterHolder.shared.current() else {
+                await conn.send(WireError.invalidRequest(id: id, "push feature is not enabled"))
+                break
+            }
+            let target = p.target.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !target.isEmpty else {
+                await conn.send(WireError.invalidRequest(id: id, "target is required"))
+                break
+            }
+            guard !p.text.isEmpty else {
+                await conn.send(WireError.invalidRequest(id: id, "text is required"))
+                break
+            }
+            // All SSRF/egress containment lives in the PushRouter sinks
+            // (EgressGuard chokepoint); the deny REASON is intentionally not
+            // surfaced to the caller (info-disclosure) — only ok + a generic
+            // detail. Keyless sends are at-least-once-without-dedup; pass an
+            // idempotency_key for crash-safe dedup.
+            let result = await pushRouter.send(target: target, text: p.text,
+                                               idempotencyKey: p.idempotencyKey)
+            await reply(conn, id, OutboundSendResponse(ok: result.ok, detail: result.detail))
         case .threadList(let id, let p):
             let list = (try? await store.list(archived: p.archived ?? false,
                                                limit: p.limit ?? 50)) ?? []
