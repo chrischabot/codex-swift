@@ -412,6 +412,24 @@ public actor TelegramChannel: Channel {
     }
 }
 
+// ADDONS.md #2/#1 — surface Telegram's `sendMessage` through the shared OUTBOUND
+// seam so the same transport that runs INBOUND turns is also a delivery SINK for
+// push (#7), cron (#6), and media (#8). Text-only for now (Bot API `sendMessage`);
+// photo/document attachments are a follow-on (`sendPhoto`/`sendDocument`).
+extension TelegramChannel: ChannelOutbound {
+    public nonisolated var capabilities: SinkCapabilities {
+        // Telegram caps a message at 4096 UTF-16 chars; we send text only.
+        SinkCapabilities(supportsAttachments: false, maxTextBytes: 4096)
+    }
+
+    public func send(_ message: OutboundMessage) async -> OutboundReceipt {
+        switch await sendMessage(chatId: message.conversationId, text: message.text) {
+        case .success:        return .delivered
+        case .failure(let e): return .failed("\(e)")
+        }
+    }
+}
+
 /// Transport-layer error for the scaffold (the loop treats all of these as
 /// retryable; `stop()`/cancellation is the only clean exit).
 public enum TelegramTransportError: Error, Sendable, Equatable {

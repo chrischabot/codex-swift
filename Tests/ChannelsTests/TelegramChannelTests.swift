@@ -318,6 +318,28 @@ final class TelegramChannelTests: XCTestCase {
         let delivered = await host.count()
         XCTAssertEqual(delivered, 0, "a batch with no text messages never calls host.deliver")
     }
+
+    /// ADDONS #2/#1: Telegram is a `ChannelOutbound` SINK — an unsolicited
+    /// `send` (a push / cron / media delivery) POSTs `sendMessage` to the target
+    /// conversation, independent of the inbound long-poll loop.
+    func testOutboundSendDeliversToConversation() async throws {
+        TelegramStubURLProtocol.reset()
+        let urlCfg = URLSessionConfiguration.ephemeral
+        urlCfg.protocolClasses = [TelegramStubURLProtocol.self]
+        let session = URLSession(configuration: urlCfg)
+        let channel = TelegramChannel(
+            config: TelegramConfig(botToken: "stub-token", owners: ["999"]),
+            session: session)
+
+        let receipt = await channel.send(OutboundMessage(conversationId: "chat-42", text: "ping"))
+        XCTAssertTrue(receipt.ok, "a stubbed 200 sendMessage is delivered")
+
+        let sent = TelegramStubURLProtocol.lastSendMessage()
+        XCTAssertEqual(sent?.chatId, "chat-42", "the message goes to the target conversation")
+        XCTAssertEqual(sent?.text, "ping")
+        XCTAssertEqual(channel.id, "telegram")
+        XCTAssertFalse(channel.capabilities.supportsAttachments, "text-only sink for now")
+    }
 }
 
 /// A host that fails the test if `deliver` is ever called.
