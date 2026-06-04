@@ -113,6 +113,12 @@ public actor DurableDeliveryQueue {
     /// Bytes appended since the last compaction — drives `maybeCompact` without a
     /// per-ack `stat()`.
     private var appendedBytes: Int          // seeded from the log size in init
+    /// In-memory mirror of the log's latest-record-per-id (the live backlog).
+    /// Maintained in lockstep with the durable log — every successful `persist`
+    /// updates it and `compact` rebuilds it, both within the synchronous actor —
+    /// so `status`/`failedJobs`/`compact` never re-parse queue.jsonl. Seeded from
+    /// the log exactly once, at init.
+    private var latestPerJob: [String: OutboundJob]
     private var fh: FileHandle? = nil
     private let encoder = JSONEncoder()
 
@@ -139,7 +145,7 @@ public actor DurableDeliveryQueue {
         // recover() can't reuse a seq already in the log (which would make the
         // seq-ordered recovery ambiguous), and seed the append-bytes counter from
         // the current size so compaction triggers without a per-ack stat().
-        let scan = DurableDeliveryQueue.scanLog(at: path)
+        let folded = DurableDeliveryQueue.fold(logPath: path)
         self.dir = directory
         self.logPath = path
         self.executor = executor
@@ -149,8 +155,9 @@ public actor DurableDeliveryQueue {
         self.dedupWindowSeconds = dedupWindowSeconds
         self.compactThresholdBytes = Swift.max(4096, compactThresholdBytes)
         self.now = now
-        self.seqCounter = scan.maxSeq
-        self.appendedBytes = scan.bytes
+        self.seqCounter = folded.latest.values.map(\.seq).max() ?? 0
+        self.appendedBytes = folded.bytes
+        self.latestPerJob = folded.latest
         // All stored properties are initialized → safe to call an instance method.
         if !existed { fsyncDirectory() }
     }
@@ -175,15 +182,28 @@ public actor DurableDeliveryQueue {
         do {
             try fh.write(contentsOf: line)
         } catch { return false }
-        // F_FULLFSYNC flushes the drive cache (plain fsync/synchronize does not
-        // on Apple platforms). Fall back to synchronize() elsewhere.
-        #if canImport(Darwin)
-        if fcntl(fh.fileDescriptor, F_FULLFSYNC) == -1 { try? fh.synchronize() }
-        #else
-        try? fh.synchronize()
-        #endif
+        // The line is now in the file. Advance the byte counter + in-memory mirror
+        // to match the file's CONTENTS — `fold()`/recovery read written bytes
+        // whether or not they've been flushed, so the mirror must too (this is
+        // what keeps map == log). The DURABILITY flush is a separate concern:
         appendedBytes += line.count
-        return true
+        latestPerJob[job.id] = job
+        // Flush to stable storage. A flush failure means the record may not
+        // survive a crash, so the CALLER must NOT perform the side effect — report
+        // it by returning false. The line stays in the file + mirror (consistent)
+        // and is re-driven on the next recover().
+        return Self.flush(fh)
+    }
+
+    /// Flush `fh` to stable storage. F_FULLFSYNC flushes the drive cache (plain
+    /// fsync/synchronize does not on Apple platforms); fall back to
+    /// `synchronize()` if it fails or off-Darwin. Returns whether the flush made
+    /// the bytes durable.
+    private static func flush(_ fh: FileHandle) -> Bool {
+        #if canImport(Darwin)
+        if fcntl(fh.fileDescriptor, F_FULLFSYNC) != -1 { return true }
+        #endif
+        do { try fh.synchronize(); return true } catch { return false }
     }
 
     private nonisolated func fsyncDirectory() {
@@ -251,11 +271,11 @@ public actor DurableDeliveryQueue {
 
     /// Dead-letter inspection: jobs whose last persisted state is `.failed`.
     public func failedJobs() -> [OutboundJob] {
-        loadLatestPerJob().values.filter { $0.state == .failed }.sorted { $0.seq < $1.seq }
+        latestPerJob.values.filter { $0.state == .failed }.sorted { $0.seq < $1.seq }
     }
 
     /// Last persisted state of a job id (nil if unknown).
-    public func status(_ id: String) -> DeliveryState? { loadLatestPerJob()[id]?.state }
+    public func status(_ id: String) -> DeliveryState? { latestPerJob[id]?.state }
 
     // MARK: core state machine
 
@@ -345,7 +365,7 @@ public actor DurableDeliveryQueue {
     /// kept set so `recover()` reuses it without a second parse.
     @discardableResult
     private func compact() -> [OutboundJob] {
-        let live = loadLatestPerJob().values
+        let live = latestPerJob.values
             .filter { $0.state != .acked }
             .sorted { $0.seq < $1.seq }
         guard !live.isEmpty || FileManager.default.fileExists(atPath: logPath) else { return live }
@@ -357,25 +377,34 @@ public actor DurableDeliveryQueue {
             // Flush the temp's CONTENTS to disk BEFORE the destructive rename:
             // `.atomic` only renames, it does not F_FULLFSYNC the data, so a crash
             // after the rename could otherwise leave an empty/torn log with the
-            // original already unlinked — whole-backlog loss. (Same fsync-before-
-            // side-effect contract `persist` upholds.)
-            if let tfh = FileHandle(forWritingAtPath: tmp) {
-                #if canImport(Darwin)
-                if fcntl(tfh.fileDescriptor, F_FULLFSYNC) == -1 { try? tfh.synchronize() }
-                #else
-                try? tfh.synchronize()
-                #endif
-                try? tfh.close()
-            }
-            try? fh?.close()
-            _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: logPath),
-                                                       withItemAt: URL(fileURLWithPath: tmp))
+            // original already unlinked — whole-backlog loss. If we cannot make the
+            // compacted copy durable, ABORT into `catch` rather than destroy the
+            // original. (Close the temp handle either way — no leak on the abort.)
+            let tfh = FileHandle(forWritingAtPath: tmp)
+            let durable = tfh.map { Self.flush($0) } ?? false
+            try? tfh?.close()
+            guard durable else { throw CompactionAborted() }
+            // Drop the old handle so the rename can replace the file; `fh = nil`
+            // makes the state honest so `catch`/next persist reopens cleanly on
+            // whichever log is actually in place.
+            try? fh?.close(); fh = nil
+            // `try` (NOT try?) so a failed replace enters `catch` with the map +
+            // byte counter still matching the UN-replaced (old) log — no drift.
+            try FileManager.default.replaceItemAt(URL(fileURLWithPath: logPath),
+                                                  withItemAt: URL(fileURLWithPath: tmp))
             fsyncDirectory()
             fh = FileHandle(forWritingAtPath: logPath)
             _ = try? fh?.seekToEnd()
             appendedBytes = data.count
+            // The log now holds exactly `live` (acked records dropped); mirror it
+            // in memory so a compacted-away acked job reports `nil` status, just as
+            // a fresh re-parse would. Reached ONLY when the replace succeeded.
+            latestPerJob = Dictionary(uniqueKeysWithValues: live.map { ($0.id, $0) })
         } catch {
-            // Compaction is best-effort; on failure keep appending to the old fh.
+            // Compaction is best-effort and the rewrite did NOT take effect: the
+            // old log, the in-memory mirror, and appendedBytes are all left
+            // untouched and consistent. Clean up the temp and ensure an open
+            // append handle on the (still-original) log.
             try? FileManager.default.removeItem(atPath: tmp)
             if fh == nil { fh = FileHandle(forWritingAtPath: logPath); _ = try? fh?.seekToEnd() }
         }
@@ -384,20 +413,9 @@ public actor DurableDeliveryQueue {
 
     /// Fold the JSONL log to the latest record per job id. A torn final line
     /// (no trailing newline, partial JSON) fails to decode and is dropped — the
-    /// prior complete record for that id correctly remains authoritative.
-    /// `nonisolated` (reads only the immutable `logPath` + a local decoder) so
-    /// `init` and the scan helper can use it.
-    private nonisolated func loadLatestPerJob() -> [String: OutboundJob] {
-        DurableDeliveryQueue.fold(logPath: logPath).latest
-    }
-
-    /// Pure log scan used by `init` (seq/byte seeding) and `loadLatestPerJob`.
-    private nonisolated static func scanLog(at logPath: String) -> (maxSeq: Int64, bytes: Int) {
-        let r = fold(logPath: logPath)
-        let maxSeq = r.latest.values.map(\.seq).max() ?? 0
-        return (maxSeq, r.bytes)
-    }
-
+    /// prior complete record for that id correctly remains authoritative. Used
+    /// once, by `init`, to seed the in-memory mirror + the seq/byte counters;
+    /// steady-state reads go through `latestPerJob`, not the log.
     private nonisolated static func fold(logPath: String) -> (latest: [String: OutboundJob], bytes: Int) {
         let decoder = JSONDecoder()
         guard let data = FileManager.default.contents(atPath: logPath),
@@ -411,6 +429,10 @@ public actor DurableDeliveryQueue {
         return (latest, data.count)
     }
 }
+
+/// Thrown by `compact()` when the compacted temp could not be made durable, so
+/// the destructive rename is aborted and the original log is kept intact.
+private struct CompactionAborted: Error {}
 
 /// A one-shot async value: the first `resume` wins, `wait` returns it. Used to
 /// race a delivery attempt against a timeout WITHOUT a structured task group

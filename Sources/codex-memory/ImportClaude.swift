@@ -37,6 +37,21 @@ public enum CodexMemoryClaudeImport {
         }
 
         let bundle = try await CodexMemoryRun.assemble()
+        return await importDocuments(text: text, extractMode: extractMode,
+                                     store: bundle.store, processor: bundle.processor)
+    }
+
+    /// The per-document import loop, factored out so it depends ONLY on the store
+    /// + processor (not a full AssembledMemory bundle) and can be driven directly
+    /// in tests. Decodes one ClaudeImportDocument per line, drops any prior
+    /// version of the source (idempotent re-import — process() upserts the
+    /// document but does NOT clear its old chunks, so re-importing without this
+    /// would duplicate every chunk), then runs the one shared pipeline with LLM
+    /// extraction toggled by --extract: default = cheap (split + embed raw
+    /// chunks); --extract = full (contextualise + entity/edge graph).
+    static func importDocuments(text: String, extractMode: Bool,
+                                store: MemoryStore,
+                                processor: MemoryProcessor) async -> String {
         let decoder = JSONDecoder()
         var imported = 0
         var failed = 0
@@ -61,20 +76,10 @@ public enum CodexMemoryClaudeImport {
                     canonicalText: canonical,
                     rawBytes: Int64(canonical.utf8.count),
                     contentSHA: sha)
-                let report: ProcessReport
-                if extractMode {
-                    // Delete any prior version of this source first, exactly like
-                    // importCanonical does (below). Processor.process upserts the
-                    // document but does NOT clear its old chunks, so re-importing
-                    // the same URI without this would duplicate every chunk
-                    // (stacking FTS/vec rows and skewing retrieval).
-                    if let existing = try await bundle.store.document(byURI: ingestDoc.sourceURI) {
-                        try await bundle.store.deleteDocument(id: existing.id)
-                    }
-                    report = try await bundle.processor.process(ingestDoc)
-                } else {
-                    report = try await importCanonical(doc: ingestDoc, bundle: bundle)
+                if let existing = try await store.document(byURI: ingestDoc.sourceURI) {
+                    try await store.deleteDocument(id: existing.id)
                 }
+                let report = try await processor.process(ingestDoc, extract: extractMode)
                 imported += 1
                 linesOut.append("OK \(idx + 1) document_id=\(report.documentId) chunks=\(report.chunksWritten) uri=\(doc.sourceURI)")
             } catch {
@@ -85,71 +90,5 @@ public enum CodexMemoryClaudeImport {
 
         linesOut.append("import-claude summary: imported=\(imported) failed=\(failed)")
         return linesOut.joined(separator: "\n") + "\n"
-    }
-
-    private static func importCanonical(doc: IngestedDocument,
-                                        bundle: CodexMemoryRun.AssembledMemory) async throws -> ProcessReport {
-        if let existing = try await bundle.store.document(byURI: doc.sourceURI) {
-            try await bundle.store.deleteDocument(id: existing.id)
-        }
-
-        let bodyPath = bundle.archive.bodyPath(
-            sourceURI: doc.sourceURI,
-            ts: doc.fetchedAt,
-            contentSHA: doc.contentSHA)
-        let row = DocumentRow(
-            source: .claude,
-            sourceURI: doc.sourceURI,
-            title: doc.title,
-            bodyPath: bodyPath,
-            fetchedAt: doc.fetchedAt,
-            publishedAt: doc.publishedAt,
-            contentSHA: doc.contentSHA,
-            rawBytes: doc.rawBytes)
-        let documentId = try await bundle.store.upsertDocument(row)
-        _ = try? await bundle.archive.writeDocument(
-            sourceURI: doc.sourceURI,
-            documentID: documentId,
-            ts: doc.fetchedAt,
-            bodyText: doc.canonicalText,
-            contentSHA: doc.contentSHA)
-
-        let splitter = ChunkSplitter()
-        let pieces = splitter.split(doc.canonicalText)
-        guard !pieces.isEmpty else {
-            return ProcessReport(documentId: documentId)
-        }
-
-        var report = ProcessReport(documentId: documentId)
-        let now = Int64(Date().timeIntervalSince1970)
-        let embedBatchSize = 64
-        var offset = 0
-        while offset < pieces.count {
-            let end = min(offset + embedBatchSize, pieces.count)
-            let batch = Array(pieces[offset..<end])
-            let embeddings = try await bundle.inference.embed(
-                batch.map(\.text),
-                deadline: .fromNow(.seconds(30)))
-            guard embeddings.count == batch.count else {
-                throw InferenceError.malformedResponse(
-                    "embedding count \(embeddings.count) != chunks \(batch.count)")
-            }
-
-            for (piece, embedding) in zip(batch, embeddings) {
-                let chunk = ChunkRow(
-                    documentId: documentId,
-                    idx: piece.idx,
-                    text: piece.text,
-                    rawText: piece.text,
-                    tokenCount: piece.tokens,
-                    createdAt: now)
-                _ = try await bundle.store.insertChunk(
-                    chunk,
-                    embeddingValues: embedding.values)
-                report.chunksWritten += 1
-            }
-            offset = end
-        }
-        return report
     }
 }

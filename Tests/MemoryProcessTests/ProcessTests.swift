@@ -82,4 +82,48 @@ final class ProcessTests: XCTestCase {
                        "delete-then-process should yield exactly one clean copy")
         XCTAssertEqual(docCount, 1)
     }
+
+    /// #15: importCanonical was folded into this one pipeline via `extract:`.
+    /// The cheap path (`extract: false`, the canonical import-claude default)
+    /// must skip ALL LLM enrichment — no per-chunk contextualise (chunk.text
+    /// stays RAW) and no entity/edge extraction — while `extract: true` runs the
+    /// full pipeline. Both write the same chunks + embeddings.
+    func testProcessExtractFlagGatesLLMEnrichment() async throws {
+        let path = NSTemporaryDirectory() + "proc-extract-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: 8))
+        let processor = MemoryProcessor(
+            store: store, inference: MockInferenceProvider(embeddingDimension: 8))
+        let text = "Alice met Bob at Acme. The Foo Bar Baz convention."
+        let cheap = IngestedDocument(
+            sourceName: "manual", sourceKind: .manual, sourceURI: "memo://cheap",
+            title: "Cheap", publishedAt: nil, fetchedAt: 1,
+            canonicalText: text, rawBytes: 42, contentSHA: Data(count: 32))
+        let full = IngestedDocument(
+            sourceName: "manual", sourceKind: .manual, sourceURI: "memo://full",
+            title: "Full", publishedAt: nil, fetchedAt: 1,
+            canonicalText: text, rawBytes: 42, contentSHA: Data(count: 32))
+
+        let cheapReport = try await processor.process(cheap, extract: false)
+        let fullReport = try await processor.process(full, extract: true)
+
+        // Same chunks written either way; only the full path runs extraction.
+        XCTAssertGreaterThan(cheapReport.chunksWritten, 0)
+        XCTAssertEqual(cheapReport.chunksWritten, fullReport.chunksWritten)
+        XCTAssertEqual(cheapReport.entitiesUpserted, 0, "cheap path runs no extraction")
+        XCTAssertEqual(cheapReport.edgesUpserted, 0)
+        XCTAssertGreaterThan(fullReport.entitiesUpserted, 0, "full path extracts entities")
+
+        // Cheap path stores RAW chunk text; full path stores contextualised text
+        // (the Mock contextualiser prefixes 'From "<title>" (chunk N):').
+        let cheapChunks = try await store.chunks(forDocument: cheapReport.documentId)
+        let fullChunks = try await store.chunks(forDocument: fullReport.documentId)
+        XCTAssertFalse(cheapChunks.isEmpty)
+        for c in cheapChunks {
+            XCTAssertEqual(c.text, c.rawText, "cheap path stores raw, un-contextualised text")
+            XCTAssertFalse(c.text.contains("From \""), "no contextualise prefix on the cheap path")
+        }
+        XCTAssertTrue(fullChunks.contains { $0.text.contains("From \"") },
+                      "full path stores contextualised text")
+    }
 }

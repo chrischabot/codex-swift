@@ -33,6 +33,15 @@ public actor MemoryProcessor {
         public var contextualiseDeadline: Duration
         public var extractDeadline: Duration
         public var embedDeadline: Duration
+        /// Embed deadline for the CHEAP path (`extract: false`). The canonical
+        /// claude-import path historically allowed 30s per embed batch; the full
+        /// path's `embedDeadline` is tighter (10s) because its chunks are already
+        /// contextualised. Kept separate so neither mode regresses the other.
+        public var cheapEmbedDeadline: Duration
+        /// Embeddings are requested in batches of this size so a large document
+        /// doesn't become one oversized inference call (the bound the canonical
+        /// claude-import path used before it was folded into this pipeline).
+        public var embedBatchSize: Int
         public var clock: @Sendable () -> Int64
 
         public init(splitter: ChunkSplitter = ChunkSplitter(),
@@ -40,6 +49,8 @@ public actor MemoryProcessor {
                     contextualiseDeadline: Duration = .seconds(15),
                     extractDeadline: Duration = .seconds(60),
                     embedDeadline: Duration = .seconds(10),
+                    cheapEmbedDeadline: Duration = .seconds(30),
+                    embedBatchSize: Int = 64,
                     clock: @escaping @Sendable () -> Int64 =
                         { Int64(Date().timeIntervalSince1970) }) {
             self.splitter = splitter
@@ -47,6 +58,8 @@ public actor MemoryProcessor {
             self.contextualiseDeadline = contextualiseDeadline
             self.extractDeadline = extractDeadline
             self.embedDeadline = embedDeadline
+            self.cheapEmbedDeadline = cheapEmbedDeadline
+            self.embedBatchSize = Swift.max(1, embedBatchSize)
             self.clock = clock
         }
     }
@@ -66,7 +79,14 @@ public actor MemoryProcessor {
         self.config = config
     }
 
-    public func process(_ doc: IngestedDocument) async throws -> ProcessReport {
+    /// Run the ingest pipeline for one document. `extract: true` (default) runs
+    /// the full contextualise → embed → extract → graph pipeline. `extract: false`
+    /// runs the CHEAP path — split + embed RAW chunks only, with NO per-chunk LLM
+    /// contextualise and NO entity/edge extraction — which is what the canonical
+    /// `import-claude` path uses. Both modes share document upsert, archiving,
+    /// chunk indexing, and batched embedding; the flag only gates the LLM
+    /// enrichment, so this is the single pipeline both import paths now go through.
+    public func process(_ doc: IngestedDocument, extract: Bool = true) async throws -> ProcessReport {
         let span = Span("mem.process", tag: doc.sourceURI,
                         sink: MemoryMetrics.sink, category: "com.codexkit.memory")
         defer { _ = span }
@@ -122,37 +142,64 @@ public actor MemoryProcessor {
         for piece in pieces {
             let chunk = Chunk(localId: "\(documentId)-\(piece.idx)",
                               rawText: piece.text, idx: piece.idx)
-            let context = (try? await inference.contextualize(
-                chunk, in: digest,
-                deadline: .fromNow(config.contextualiseDeadline))) ?? ""
+            // Contextualise is an LLM call per chunk; the cheap path (extract:
+            // false) skips it, leaving context empty so `contextualised` == rawText
+            // — exactly the raw text that lands in chunk.text + the embed input.
+            let context = extract
+                ? ((try? await inference.contextualize(
+                    chunk, in: digest,
+                    deadline: .fromNow(config.contextualiseDeadline))) ?? "")
+                : ""
             chunks.append(Chunk(localId: chunk.localId,
                                 rawText: chunk.rawText,
                                 context: context, idx: chunk.idx))
         }
+        // Embed in bounded batches so a large document doesn't become one
+        // oversized inference call; each batch carries its own deadline. The
+        // cheap path gets the more forgiving budget the old import-claude path
+        // used (raw 64-chunk batches can take longer than the full path's
+        // already-contextualised chunks).
         let texts = chunks.map { $0.contextualised }
-        let embeddings = try await inference.embed(
-            texts, deadline: .fromNow(config.embedDeadline))
-        guard embeddings.count == chunks.count else {
-            throw InferenceError.malformedResponse(
-                "embedding count \(embeddings.count) != chunks \(chunks.count)")
+        let perBatchEmbedDeadline = extract ? config.embedDeadline : config.cheapEmbedDeadline
+        var embeddings: [MemoryInfer.Embedding] = []
+        embeddings.reserveCapacity(texts.count)
+        var embOffset = 0
+        while embOffset < texts.count {
+            let end = Swift.min(embOffset + config.embedBatchSize, texts.count)
+            let slice = Array(texts[embOffset..<end])
+            let batchEmb = try await inference.embed(
+                slice, deadline: .fromNow(perBatchEmbedDeadline))
+            guard batchEmb.count == slice.count else {
+                throw InferenceError.malformedResponse(
+                    "embedding count \(batchEmb.count) != chunks \(slice.count)")
+            }
+            embeddings.append(contentsOf: batchEmb)
+            embOffset = end
         }
 
         // 3. Extract entities/edges for the whole batch in one prompt — this
-        //    is the single largest token saving the design doc highlights.
-        let batch = ChunkBatch(documentTitle: doc.title,
-                               documentURI: doc.sourceURI,
-                               chunks: chunks)
-        let extractSpan = Span("mem.process.extract", tag: doc.sourceURI,
-                                sink: MemoryMetrics.sink,
-                                category: "com.codexkit.memory")
-        let extraction = try await inference.extract(
-            batch, schema: config.extractionSchema,
-            deadline: .fromNow(config.extractDeadline))
-        _ = extractSpan
-        MemoryMetrics.extractTokens(
-            input: extraction.tokensInput,
-            output: extraction.tokensOutput,
-            model: "extractor")
+        //    is the single largest token saving the design doc highlights. The
+        //    cheap path (extract: false) skips it entirely; the empty result
+        //    makes the per-chunk indexing + entity/edge loops below no-op.
+        let extraction: ExtractionResult
+        if extract {
+            let batch = ChunkBatch(documentTitle: doc.title,
+                                   documentURI: doc.sourceURI,
+                                   chunks: chunks)
+            let extractSpan = Span("mem.process.extract", tag: doc.sourceURI,
+                                    sink: MemoryMetrics.sink,
+                                    category: "com.codexkit.memory")
+            extraction = try await inference.extract(
+                batch, schema: config.extractionSchema,
+                deadline: .fromNow(config.extractDeadline))
+            _ = extractSpan
+            MemoryMetrics.extractTokens(
+                input: extraction.tokensInput,
+                output: extraction.tokensOutput,
+                model: "extractor")
+        } else {
+            extraction = ExtractionResult(perChunk: [], tokensInput: 0, tokensOutput: 0)
+        }
 
         // 4. Index per-chunk: insert chunk row + embedding, then write mentions.
         let now = config.clock()
@@ -239,8 +286,9 @@ public actor MemoryProcessor {
             }
         }
         // 6. Mirror the extraction into the JSONL archive so replays are
-        //    deterministic without re-querying the inference provider.
-        if let archive {
+        //    deterministic without re-querying the inference provider. Only the
+        //    full path produces an extraction worth archiving.
+        if extract, let archive {
             let summary: [String: Any] = [
                 "chunks": report.chunksWritten,
                 "entities": report.entitiesUpserted,

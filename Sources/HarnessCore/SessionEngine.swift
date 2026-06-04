@@ -1062,26 +1062,26 @@ public actor SessionEngine {
         // path. Hooks and the dispatch gate already ran in `toolPreflight`, so
         // this only skips the local sandbox/approval tail.
         if config.remoteEnvironment != nil {
-            let r = await router.dispatch(
+            let r = await router.dispatchApproved(
                 ToolCall(callId: callId, name: name, argumentsJSON: args),
                 cwd: config.cwd, deadline: deadline)
             return (r, r.success ? .completed : .failed)
         }
         guard opKind != .none else {
-            let r = await router.dispatch(
+            let r = await router.dispatchApproved(
                 ToolCall(callId: callId, name: name, argumentsJSON: args),
                 cwd: config.cwd, deadline: deadline)
             return (r, r.success ? .completed : .failed)
         }
         // PermissionRequest hook said allow: skip approval gating entirely.
         if permissionAllow {
-            let r = await router.dispatch(
+            let r = await router.dispatchApproved(
                 ToolCall(callId: callId, name: name, argumentsJSON: args),
                 cwd: config.cwd, deadline: deadline)
             return (r, r.success ? .completed : .failed)
         }
         guard approvals != nil || isAutoReviewEnabled else {
-            let r = await router.dispatch(
+            let r = await router.dispatchApproved(
                 ToolCall(callId: callId, name: name, argumentsJSON: args),
                 cwd: config.cwd, deadline: deadline)
             return (r, r.success ? .completed : .failed)
@@ -1094,7 +1094,9 @@ public actor SessionEngine {
                         success: false, truncated: false), .declined)
         }
         func sandboxed() async -> ToolResult {
-            await router.dispatch(
+            // dispatchApproved: the declared-`.required` gate already ran at the
+            // top of runToolWithApproval; this is the post-approval dispatch.
+            await router.dispatchApproved(
                 ToolCall(callId: callId, name: name, argumentsJSON: args),
                 cwd: config.cwd, deadline: deadline)
         }

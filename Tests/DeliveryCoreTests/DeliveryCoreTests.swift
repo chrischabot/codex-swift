@@ -335,4 +335,111 @@ final class DeliveryCoreTests: XCTestCase {
         let order = await exec.order()
         XCTAssertEqual(order, ["a", "b", "c"], "recovery re-drives in enqueue (seq) order, not dictionary order")
     }
+
+    // MARK: #13 — in-memory latest-per-job mirror
+
+    /// Acks anything, permanently-fails ids prefixed "bad" — gives one queue a
+    /// mix of terminal states without per-call scripting.
+    private actor ByIdExecutor: DeliveryExecutor {
+        func deliver(_ job: OutboundJob) async -> DeliveryOutcome {
+            job.id.hasPrefix("bad") ? .permanentFailure : .acked
+        }
+    }
+
+    /// #13: status()/failedJobs() read an in-memory mirror instead of re-parsing
+    /// queue.jsonl. The mirror must be a FAITHFUL copy of the durable log — so a
+    /// live (map-backed) queue and a FRESH queue that re-seeds its map from the
+    /// same log file via fold() must report identical results. If the live map
+    /// had drifted from what was persisted, these would diverge.
+    func testInMemoryMapMatchesFreshReparse() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let exec = ByIdExecutor()
+        // High threshold → no compaction, so acked records stay in log + map.
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     compactThresholdBytes: 1 << 20)
+        for i in 0..<5 { _ = await q.enqueue(job("ok\(i)")) }
+        _ = await q.enqueue(job("bad1"))
+        _ = await q.enqueue(job("bad2"))
+
+        let liveFailed = await q.failedJobs().map(\.id).sorted()
+        let liveOk0 = await q.status("ok0")
+        let liveBad1 = await q.status("bad1")
+
+        // A fresh queue on the same dir re-seeds its map from the log in init.
+        let fresh = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                         compactThresholdBytes: 1 << 20)
+        let freshFailed = await fresh.failedJobs().map(\.id).sorted()
+        let freshOk0 = await fresh.status("ok0")
+        let freshBad1 = await fresh.status("bad1")
+
+        XCTAssertEqual(liveFailed, ["bad1", "bad2"])
+        XCTAssertEqual(liveOk0, .acked)
+        XCTAssertEqual(liveBad1, .failed)
+        XCTAssertEqual(liveFailed, freshFailed, "map-backed failedJobs must equal a fresh re-parse")
+        XCTAssertEqual(liveOk0, freshOk0, "map-backed status must equal a fresh re-parse")
+        XCTAssertEqual(liveBad1, freshBad1)
+    }
+
+    /// #13: compaction drops acked records from the log; the in-memory mirror
+    /// must drop them in lockstep, so a compacted-away acked job reports nil
+    /// status from memory exactly as a fresh re-parse of the compacted log would.
+    func testMapTracksCompactionLikeReparse() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let exec = ByIdExecutor()
+        // Low threshold → acked records are compacted away during the run.
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     compactThresholdBytes: 200)
+        for i in 0..<20 { _ = await q.enqueue(job("ok\(i)")) }
+        _ = await q.enqueue(job("bad1"))
+
+        let liveOk0 = await q.status("ok0")        // first acked → long since compacted
+        let liveBad1 = await q.status("bad1")
+        let liveFailed = await q.failedJobs().map(\.id)
+
+        let fresh = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff)
+        let freshOk0 = await fresh.status("ok0")
+        let freshBad1 = await fresh.status("bad1")
+        let freshFailed = await fresh.failedJobs().map(\.id)
+
+        XCTAssertNil(liveOk0, "an acked job compacted out of the log reports nil from the map too")
+        XCTAssertEqual(liveOk0, freshOk0, "no drift through compaction vs a fresh re-parse")
+        XCTAssertEqual(liveBad1, .failed)
+        XCTAssertEqual(liveBad1, freshBad1)
+        XCTAssertEqual(liveFailed, ["bad1"])
+        XCTAssertEqual(liveFailed, freshFailed)
+    }
+
+    #if canImport(Darwin)
+    /// #13 (failure path): if `compact()`'s rewrite FAILS, the in-memory mirror
+    /// must NOT drift from the on-disk log. We force the failure by making the
+    /// queue directory read-only so the compacted temp can't be created/renamed,
+    /// then assert the live (map-backed) status still matches a fresh re-fold of
+    /// the un-rewritten log. Without the `try` (vs `try?`) on replaceItemAt + the
+    /// abort-on-undurable-temp, the map would drop the acked job while the log
+    /// still held it.
+    func testCompactFailureDoesNotDriftMapFromLog() async throws {
+        try XCTSkipIf(geteuid() == 0, "read-only-dir fault injection needs a non-root euid")
+        let dir = tmpDir()
+        defer { chmod(dir, 0o755); try? FileManager.default.removeItem(atPath: dir) }
+        let exec = ByIdExecutor()
+        // High threshold → the ack does NOT auto-compact; we trigger compaction
+        // explicitly via recover() once the dir is read-only.
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     compactThresholdBytes: 1 << 20)
+        _ = await q.enqueue(job("keep"))          // acked → log + map both hold it
+        let beforeStatus = await q.status("keep")
+        XCTAssertEqual(beforeStatus, .acked)
+
+        XCTAssertEqual(chmod(dir, 0o500), 0)       // read-only: temp create/rename will fail
+        _ = await q.recover()                      // recover() → compact() → rewrite FAILS → catch
+        let liveStatus = await q.status("keep")
+
+        chmod(dir, 0o755)                          // restore so a fresh queue can fold the intact log
+        let fresh = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff)
+        let freshStatus = await fresh.status("keep")
+
+        XCTAssertEqual(liveStatus, .acked, "a failed compaction must leave the acked record in the mirror")
+        XCTAssertEqual(liveStatus, freshStatus, "map must still match a fresh re-fold after compact failure")
+    }
+    #endif
 }

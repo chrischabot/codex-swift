@@ -269,11 +269,48 @@ public actor ToolRouter {
         }
     }
 
+    /// Shared approval gate for the dispatch surfaces (ADDONS Phase 0 #3 / #14).
+    /// Returns a denial reason when `call` targets a tool that DECLARES it needs
+    /// approval. Neither the bare `dispatch` entry nor the code-mode nested path
+    /// can prompt, so both FAIL CLOSED through this ONE check rather than each
+    /// re-implementing it (or, as bare dispatch previously did, omitting it and
+    /// trusting the caller). The engine's `runToolWithApproval` resolves approval
+    /// up front and opts out via `dispatch(..., approvalResolved: true)` — the
+    /// single, explicit, greppable sanctioned bypass.
+    func approvalGateDenialReason(_ call: ToolCall) -> String? {
+        if case .required = approvalRequirement(for: call) {
+            return "tool '\(call.name)' requires approval and was not routed through the approval gate"
+        }
+        return nil
+    }
+
     /// Dispatch one call with gating, fan-out cap, timeout, and a head/tail
     /// output ring so a chatty tool can't exhaust memory. Abort/failure
     /// shaping matches Codex `tools/parallel.rs`.
+    ///
+    /// Public dispatch: FAILS CLOSED on a declared-`.required` tool — there is no
+    /// approval resolution on this entry. This is the only dispatch surface
+    /// external/host code can reach, so it can never bypass approval.
     public func dispatch(_ call: ToolCall, cwd: String,
                          deadline: Deadline) async -> ToolResult {
+        await dispatchGated(call, cwd: cwd, deadline: deadline, approvalResolved: false)
+    }
+
+    /// The sanctioned POST-approval dispatch. `package`-scoped so ONLY in-package
+    /// callers — `SessionEngine.runToolWithApproval`, after it has resolved a
+    /// declared-`.required` call through the human/guardian path — can opt out of
+    /// the gate. An external host embedding this module cannot forge the opt-out.
+    package func dispatchApproved(_ call: ToolCall, cwd: String,
+                                  deadline: Deadline) async -> ToolResult {
+        await dispatchGated(call, cwd: cwd, deadline: deadline, approvalResolved: true)
+    }
+
+    private func dispatchGated(_ call: ToolCall, cwd: String,
+                               deadline: Deadline,
+                               approvalResolved: Bool) async -> ToolResult {
+        if !approvalResolved, let reason = approvalGateDenialReason(call) {
+            return ToolResult(callId: call.callId, output: reason, success: false, truncated: false)
+        }
         guard let tool = tools[call.name] ?? deferred[call.name] ?? hidden[call.name] else {
             // Upstream `registry.rs::unsupported_tool_call_message`: an
             // unrecognized tool name yields "unsupported call: <name>" (and
@@ -353,15 +390,15 @@ public actor ToolRouter {
         let call = ToolCall(callId: "code-\(UUID().uuidString)",
                             name: name,
                             argumentsJSON: argumentsJSON)
-        // ADDONS Phase 0 #3 (CRITICAL): a tool that DECLARES it needs approval
-        // cannot be invoked from code-mode JS. This nested path has no approval
-        // coordinator and runs synchronously under the JS host, so a
-        // declared-destructive tool reached via `exec` would bypass the human
-        // gate enforced in `SessionEngine.runToolWithApproval`. Deny by
-        // declaration (fail-closed); the model must call such a tool directly,
-        // where the engine's approval gate fires.
-        if case .required = tool.approvalRequirement(call) {
-            return "tool '\(name)' requires approval and cannot be called from exec/code-mode"
+        // ADDONS Phase 0 #3 / #14: a tool that DECLARES it needs approval cannot
+        // be invoked from code-mode JS. This nested path has no approval
+        // coordinator and runs synchronously under the JS host, so a declared-
+        // destructive tool reached via `exec` would bypass the human gate. It
+        // shares the SAME fail-closed check the bare `dispatch` entry uses (the
+        // model must call such a tool directly, where the engine's approval gate
+        // fires) — one enforcement point, not a per-call-site re-implementation.
+        if let reason = approvalGateDenialReason(call) {
+            return reason
         }
         let started = MonotonicClock.now()
         do {

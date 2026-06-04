@@ -805,6 +805,48 @@ final class ApprovalsTests: XCTestCase {
                        "a required tool must NOT run from code-mode/exec")
     }
 
+    /// #14: the bare `ToolRouter.dispatch` entry now FAILS CLOSED on a declared-
+    /// `.required` tool — a direct dispatch surface that hasn't resolved approval
+    /// can no longer silently bypass the gate. The sanctioned post-approval path
+    /// (`approvalResolved: true`, used by SessionEngine.runToolWithApproval after
+    /// it prompts) still runs the tool.
+    func testBareDispatchFailsClosedForRequiredTool() async throws {
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let router = ToolRouter(limits: Limits())
+        await router.register(RequiredMarkerTool(marker: marker))
+        let call = ToolCall(callId: "c", name: "destructive_op", argumentsJSON: "{\"verb\":\"delete\"}")
+
+        // Default dispatch: gate fires, tool is denied and never runs.
+        let denied = await router.dispatch(call, cwd: work, deadline: .fromNow(.seconds(10)))
+        XCTAssertFalse(denied.success)
+        XCTAssertTrue(denied.output.contains("requires approval"),
+                      "bare dispatch must fail closed on a declared-required tool")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker),
+                       "the required tool must NOT have executed via bare dispatch")
+
+        // Sanctioned post-approval dispatch (package-scoped opt-out): runs.
+        let allowed = await router.dispatchApproved(call, cwd: work, deadline: .fromNow(.seconds(10)))
+        XCTAssertTrue(allowed.success)
+        XCTAssertEqual(allowed.output, "DID-IT")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker),
+                      "dispatchApproved is the sanctioned path and DOES run the tool")
+    }
+
+    /// #14 control: a normal `.none`-approval tool is unaffected by the gate —
+    /// bare dispatch runs it as before (the gate only fires on `.required`).
+    func testBareDispatchRunsPlainToolUnchanged() async throws {
+        let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
+        let marker = work + "/ran_\(UUID().uuidString)"
+        let router = ToolRouter(limits: Limits())
+        await router.register(PlainMarkerTool(marker: marker))
+        let call = ToolCall(callId: "c", name: "plain_op", argumentsJSON: "{}")
+        let r = await router.dispatch(call, cwd: work, deadline: .fromNow(.seconds(10)))
+        XCTAssertTrue(r.success)
+        XCTAssertEqual(r.output, "PLAIN")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker))
+    }
+
     func testPlainToolRunsWithoutApprovalRequest() async throws {
         let (store, home) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: home) }
         let work = apTmp("w"); defer { try? FileManager.default.removeItem(atPath: work) }
