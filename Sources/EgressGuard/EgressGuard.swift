@@ -71,6 +71,7 @@ public enum ParsedIP: Equatable, Sendable {
     public var isBlocked: Bool {
         switch self {
         case .v4(let b):
+            guard b.count == 4 else { return true }                         // malformed → fail-closed
             if b[0] == 0 || b[0] == 127 || b[0] == 10 { return true }       // unspecified / loopback / 10/8
             if b[0] == 172 && (16...31).contains(b[1]) { return true }      // 172.16/12
             if b[0] == 192 && b[1] == 168 { return true }                   // 192.168/16
@@ -80,6 +81,7 @@ public enum ParsedIP: Equatable, Sendable {
             if b[0] >= 224 { return true }                                  // 224/4 multicast + 240/4 reserved
             return false
         case .v6(let b):
+            guard b.count == 16 else { return true }                       // malformed → fail-closed
             if b == [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1] { return true }       // ::1 loopback
             if b.allSatisfy({ $0 == 0 }) { return true }                    // :: unspecified
             if b[0] == 0xfe && (b[1] & 0xc0) == 0x80 { return true }        // fe80::/10 link-local
@@ -106,6 +108,18 @@ public enum ParsedIP: Equatable, Sendable {
             return false
         }
     }
+
+    /// Canonical form for equality: an ::ffff:a.b.c.d v4-mapped address folds to
+    /// its .v4 so a pinned `1.2.3.4` matches a peer reported as `::ffff:1.2.3.4`.
+    /// Other v6 textual variants (zero-compression, case) already normalize via
+    /// `parse`'s inet_pton, so byte-equality suffices.
+    public var canonical: ParsedIP {
+        if case .v6(let b) = self, b.count == 16,
+           b[0..<10].allSatisfy({ $0 == 0 }), b[10] == 0xff, b[11] == 0xff {
+            return .v4(Array(b[12..<16]))
+        }
+        return self
+    }
 }
 
 /// Outcome of validating one outbound URL (simple form).
@@ -123,7 +137,13 @@ public struct EgressApproval: Equatable, Sendable {
     /// True iff `peerIP` is one of the vetted pins — the caller's connection
     /// delegate uses this to enforce the socket actually connected to a vetted
     /// address (the real rebinding defense, stronger than `isPeerAllowed`).
-    public func allows(peerIP: String) -> Bool { pinnedIPs.contains(peerIP) }
+    /// Compares NORMALIZED addresses (parse → canonical), not raw strings, so an
+    /// IPv6 peer rendered differently than the pin (zero-compression, case, or
+    /// ::ffff: v4-mapped) still matches.
+    public func allows(peerIP: String) -> Bool {
+        guard let peer = ParsedIP.parse(peerIP)?.canonical else { return false }
+        return pinnedIPs.contains { ParsedIP.parse($0)?.canonical == peer }
+    }
 }
 
 /// Connect-bound vetting result.

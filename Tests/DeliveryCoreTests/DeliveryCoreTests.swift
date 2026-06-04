@@ -263,6 +263,66 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(st, .failed)
     }
 
+    /// An executor that NEVER returns and ignores cancellation (awaits a
+    /// never-resumed continuation) — models a non-cooperative blocking sink.
+    private actor StuckExecutor: DeliveryExecutor {
+        private(set) var calls = 0
+        func deliver(_ job: OutboundJob) async -> DeliveryOutcome {
+            calls += 1
+            await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+            return .acked
+        }
+        func count() -> Int { calls }
+    }
+
+    private func seqOf(_ dir: String, _ id: String) -> Int64? {
+        let dec = JSONDecoder()
+        guard let t = try? String(contentsOfFile: dir + "/queue.jsonl", encoding: .utf8) else { return nil }
+        return t.split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { try? dec.decode(OutboundJob.self, from: Data($0.utf8)) }
+            .filter { $0.id == id }.map(\.seq).max()
+    }
+
+    /// #2: a non-cooperative (uncancellable) sink must NOT wedge the queue — the
+    /// per-attempt timeout returns .retry and the job dead-letters; enqueue
+    /// RETURNS instead of hanging forever (a structured task group would hang).
+    func testNonCooperativeExecutorTimesOutWithoutWedging() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let exec = StuckExecutor()
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     maxAttempts: 2, attemptTimeout: .milliseconds(40))
+        let r = await q.enqueue(job("j1"))
+        XCTAssertEqual(r.finalState, .failed, "the stuck attempts time out and dead-letter")
+        XCTAssertEqual(r.attempts, 2, "enqueue returned (no wedge) after maxAttempts timeouts")
+    }
+
+    /// #5: recover() applies the idempotency dedup window, so two persisted
+    /// same-key jobs deliver only once on recovery (not both).
+    func testRecoverAppliesIdempotencyDedup() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var a = job("a", key: "K"); a.seq = 1
+        var b = job("b", key: "K"); b.seq = 2
+        writeLog(dir, [a, b])
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff)
+        _ = await q.recover()
+        let n = await exec.count()
+        XCTAssertEqual(n, 1, "recover() must not re-send a key it already acked this run")
+    }
+
+    /// #10: seqCounter is seeded from the log at init, so an enqueue() BEFORE
+    /// recover() does not reuse a seq already present in the log.
+    func testSeqSeededFromLogAvoidsCollision() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var existing = job("old"); existing.seq = 5; existing.state = .enqueued
+        writeLog(dir, [existing])
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff)
+        _ = await q.enqueue(job("new"))   // enqueue BEFORE recover
+        let newSeq = seqOf(dir, "new") ?? 0
+        XCTAssertGreaterThan(newSeq, 5, "new job's seq must be seeded past the persisted seq=5, not reset to 1")
+    }
+
     func testRecoverDrivesInSeqOrder() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         var a = job("a"); a.seq = 1

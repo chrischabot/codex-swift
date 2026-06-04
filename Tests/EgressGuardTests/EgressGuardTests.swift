@@ -247,4 +247,37 @@ final class EgressGuardTests: XCTestCase {
         XCTAssertTrue(approval.allows(peerIP: "1.2.3.4"))
         XCTAssertFalse(approval.allows(peerIP: "9.9.9.9"), "a peer NOT among the vetted pins is rejected")
     }
+
+    // MARK: v3 — code-review fixes (#8 normalized pin compare, #12 length guard)
+
+    /// allows(peerIP:) compares NORMALIZED addresses, so an IPv6 peer rendered
+    /// differently than the pin (zero-compression, ::ffff: v4-mapping) matches.
+    func testAllowsPeerNormalizesIPv6AndV4Mapped() {
+        let v6 = guardResolving(["2606:4700:4700::1111"])
+        guard case let .allow(a6) = v6.vet(URL(string: "https://example.com/")!) else {
+            return XCTFail("expected allow")
+        }
+        XCTAssertTrue(a6.allows(peerIP: "2606:4700:4700:0:0:0:0:1111"),
+                      "expanded form of the same address must match the compressed pin")
+        XCTAssertFalse(a6.allows(peerIP: "2606:4700:4700::1112"))
+
+        let v4 = guardResolving(["1.2.3.4"])
+        guard case let .allow(a4) = v4.vet(URL(string: "https://example.com/")!) else {
+            return XCTFail("expected allow")
+        }
+        XCTAssertTrue(a4.allows(peerIP: "::ffff:1.2.3.4"), "v4-mapped peer matches the plain-v4 pin")
+        XCTAssertTrue(a4.allows(peerIP: "1.2.3.4"))
+        XCTAssertFalse(a4.allows(peerIP: "1.2.3.5"))
+        XCTAssertFalse(a4.allows(peerIP: "garbage"))
+    }
+
+    /// A malformed (wrong-length) ParsedIP must FAIL CLOSED (treated as blocked),
+    /// never crash with an out-of-bounds index — the public cases have no length
+    /// invariant.
+    func testMalformedParsedIPFailsClosed() {
+        XCTAssertTrue(ParsedIP.v6([]).isBlocked)
+        XCTAssertTrue(ParsedIP.v4([1, 2]).isBlocked)
+        XCTAssertTrue(ParsedIP.v6(Array(repeating: 0, count: 5)).isBlocked)
+        XCTAssertTrue(ParsedIP.v4([]).isBlocked)
+    }
 }

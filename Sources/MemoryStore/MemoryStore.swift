@@ -389,9 +389,41 @@ public actor MemoryStore {
     public func deleteDocument(id: Int64) throws {
         try execRaw("BEGIN IMMEDIATE;")
         do {
+            // Purge the FTS5 (external-content) and vec0 virtual-table rows for
+            // this document's chunks. Neither is reachable by a FK cascade and
+            // there are no sync triggers, so without this they accumulate orphan
+            // rows: stale BM25 hits in search, dangling ANN vectors, and —
+            // because both index by chunk.id — desync when a re-imported
+            // document reuses a recycled rowid. Must run while the chunk rows
+            // still exist, because the FTS5 external-content 'delete' command
+            // needs the originally-indexed text.
+            let staleChunks = try run(
+                "SELECT id, text FROM chunk WHERE document_id=?;", [.int(id)])
+            for row in staleChunks {
+                guard let cid = row["id"] as? Int64 else { continue }
+                let text = (row["text"] as? String) ?? ""
+                try run(
+                    "INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES('delete', ?, ?);",
+                    [.int(cid), .text(text)])
+                if vecAvailable {
+                    try run("DELETE FROM chunk_vec WHERE rowid=?;", [.int(cid)])
+                }
+            }
             try run("""
             UPDATE edge SET evidence_chunk_id=NULL
             WHERE evidence_chunk_id IN (
+              SELECT id FROM chunk WHERE document_id=?
+            );
+            """, [.int(id)])
+            // insight.trigger_chunk_id is ON DELETE SET NULL by design — an
+            // insight outlives its triggering chunk as a historical record that
+            // recentInteresting() LEFT JOINs through. Null it explicitly for the
+            // same legacy-cascade reason as edge above: on a DB predating the FK
+            // action the cascade is silently ignored, so the later DELETE FROM
+            // chunk would orphan the reference (or fail the FK check).
+            try run("""
+            UPDATE insight SET trigger_chunk_id=NULL
+            WHERE trigger_chunk_id IN (
               SELECT id FROM chunk WHERE document_id=?
             );
             """, [.int(id)])
@@ -401,6 +433,24 @@ public actor MemoryStore {
               SELECT id FROM chunk WHERE document_id=?
             );
             """, [.int(id)])
+            // Delete chunk_embedding + chunk rows explicitly rather than relying
+            // on document→chunk→chunk_embedding ON DELETE CASCADE: the cascade is
+            // declared under CREATE TABLE IF NOT EXISTS, so on a database created
+            // before these FK actions existed SQLite silently ignores them and
+            // the rows would orphan (or the document delete would fail FK checks).
+            // Doing it by hand makes deleteDocument correct on legacy and fresh
+            // DBs alike; on fresh DBs the later cascade just no-ops on gone rows.
+            // chunk_embedding only exists on the non-vec build (vec0 stores
+            // vectors in chunk_vec, purged above), so guard on vecAvailable.
+            if !vecAvailable {
+                try run("""
+                DELETE FROM chunk_embedding
+                WHERE chunk_id IN (
+                  SELECT id FROM chunk WHERE document_id=?
+                );
+                """, [.int(id)])
+            }
+            try run("DELETE FROM chunk WHERE document_id=?;", [.int(id)])
             try run("DELETE FROM document WHERE id=?;", [.int(id)])
             try execRaw("COMMIT;")
         } catch {

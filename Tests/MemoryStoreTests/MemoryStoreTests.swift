@@ -121,6 +121,63 @@ final class MemoryStoreTests: XCTestCase {
         XCTAssertNil(edges.first?.evidenceChunkId)
     }
 
+    /// deleteDocument must purge the FTS5 + vec0 index rows for the document's
+    /// chunks — the chunk FK cascade can't reach those virtual tables, so a
+    /// naive delete leaves stale lexical/vector hits and (worse) corrupts the
+    /// FTS index when a re-import recycles the rowid. Black-box: search must
+    /// return nothing for the deleted text, and a fresh chunk that reuses the
+    /// recycled rowid must be findable by its own text and ONLY its own text.
+    func testDeleteDocumentPurgesSearchIndexes() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: 4))
+        let sha = Data(count: 32)
+        let docId = try await store.upsertDocument(DocumentRow(
+            source: .claude, sourceURI: "claude://doc/purge",
+            bodyPath: "rollout:claude", fetchedAt: 0,
+            contentSHA: sha, rawBytes: 1))
+        let chunkId = try await store.insertChunk(
+            ChunkRow(documentId: docId, idx: 0,
+                     text: "zebraphone unicorn", rawText: "zebraphone unicorn",
+                     tokenCount: 2, createdAt: 0),
+            embeddingValues: [1, 0, 0, 0])
+
+        // Indexed and findable before delete.
+        let lexBefore = try await store.searchLexical("zebraphone", k: 5)
+        XCTAssertEqual(lexBefore.map(\.chunkId), [chunkId])
+        if store.vecAvailable {
+            let vecBefore = try await store.searchVectorValues([1, 0, 0, 0], k: 5)
+            XCTAssertEqual(vecBefore.first?.chunkId, chunkId)
+        }
+
+        try await store.deleteDocument(id: docId)
+
+        // No orphan hits survive in either index.
+        let lexAfter = try await store.searchLexical("zebraphone", k: 5)
+        XCTAssertEqual(lexAfter, [], "stale FTS row survived deleteDocument")
+        if store.vecAvailable {
+            let vecAfter = try await store.searchVectorValues([1, 0, 0, 0], k: 5)
+            XCTAssertEqual(vecAfter, [], "stale vec0 row survived deleteDocument")
+        }
+
+        // Re-import: the new chunk recycles the freed rowid. The FTS index must
+        // not be corrupted — the old term must stay gone, the new term must hit.
+        let doc2 = try await store.upsertDocument(DocumentRow(
+            source: .claude, sourceURI: "claude://doc/purge2",
+            bodyPath: "rollout:claude", fetchedAt: 0,
+            contentSHA: sha, rawBytes: 1))
+        let chunk2 = try await store.insertChunk(
+            ChunkRow(documentId: doc2, idx: 0,
+                     text: "octopusneon", rawText: "octopusneon",
+                     tokenCount: 1, createdAt: 0),
+            embeddingValues: [0, 1, 0, 0])
+        XCTAssertEqual(chunk2, chunkId, "expected rowid recycling to exercise desync")
+        let staleTerm = try await store.searchLexical("zebraphone", k: 5)
+        let freshTerm = try await store.searchLexical("octopusneon", k: 5)
+        XCTAssertEqual(staleTerm, [],
+                       "deleted term reappeared after rowid recycle (FTS desync)")
+        XCTAssertEqual(freshTerm.map(\.chunkId), [chunk2])
+    }
+
     func testEntityEdgeAndTwoHop() async throws {
         let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
         let store = try MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: 4))

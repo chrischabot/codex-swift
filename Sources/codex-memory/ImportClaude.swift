@@ -63,6 +63,14 @@ public enum CodexMemoryClaudeImport {
                     contentSHA: sha)
                 let report: ProcessReport
                 if extractMode {
+                    // Delete any prior version of this source first, exactly like
+                    // importCanonical does (below). Processor.process upserts the
+                    // document but does NOT clear its old chunks, so re-importing
+                    // the same URI without this would duplicate every chunk
+                    // (stacking FTS/vec rows and skewing retrieval).
+                    if let existing = try await bundle.store.document(byURI: ingestDoc.sourceURI) {
+                        try await bundle.store.deleteDocument(id: existing.id)
+                    }
                     report = try await bundle.processor.process(ingestDoc)
                 } else {
                     report = try await importCanonical(doc: ingestDoc, bundle: bundle)

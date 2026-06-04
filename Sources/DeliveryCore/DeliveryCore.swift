@@ -63,27 +63,36 @@ public protocol DeliveryExecutor: Sendable {
     func deliver(_ job: OutboundJob) async -> DeliveryOutcome
 }
 
-/// Terminal outcome handed back to the enqueuer.
+/// Outcome handed back to the enqueuer.
+///
+/// CONTRACT: when `deduped == false`, `finalState` is terminal — either `.acked`
+/// or `.failed`. When `deduped == true` the call was COLLAPSED (its
+/// idempotencyKey was acked within the window, is already in flight, or a
+/// recover()/enqueue() race already claimed the id); in that case `finalState`
+/// is the last-known persisted state and may be NON-terminal, so callers must
+/// check `deduped` before treating `finalState` as this call's delivery outcome.
 public struct DeliveryReceipt: Sendable, Equatable {
     public let id: String
-    public let finalState: DeliveryState   // .acked or .failed (or current, if skipped)
+    public let finalState: DeliveryState
     public let attempts: Int
-    public let deduped: Bool               // skipped: idempotency window OR already in-flight
+    public let deduped: Bool
 }
 
 /// A durable, at-least-once delivery queue. Each state transition is appended
 /// (fsync'd via F_FULLFSYNC) to a JSONL log BEFORE the corresponding side
 /// effect, so a crash leaves a recoverable record. `recover()` re-drives every
-/// job whose last persisted state is non-terminal (in `seq` order). The log is
-/// compacted (terminal records dropped) on recover and when it crosses a size
-/// threshold, so it tracks the LIVE backlog, not lifetime history.
+/// job whose last persisted state is non-terminal (in `seq` order, applying the
+/// same idempotency dedup the enqueue path does). The log is compacted (acked
+/// records dropped; failed kept as dead-letter) on recover and when it crosses
+/// a size threshold, so it tracks the LIVE backlog, not lifetime history.
 ///
-/// Concurrency: the actor serializes log writes. An `inFlight` id set ensures
-/// at most ONE driver per job id, so a double `recover()` (or `recover()`
-/// racing a live `enqueue()` for the same id) does NOT fork into two senders.
-/// `enqueue` awaits `drive` to a terminal state (the reply path #1 wants the
-/// result); #7's fire-and-forget submit layer wraps `enqueue` in a Task and
-/// adds BoundedChannel admission control on top of this core.
+/// Concurrency: the actor serializes log writes. An `inFlight` id set ensures at
+/// most ONE driver per job id, and an `inFlightKeys` set collapses concurrent
+/// same-key deliveries; `drive` releases the caller-reserved key on EVERY exit
+/// (including the single-driver early-return). `enqueue` awaits `drive` to a
+/// terminal state (the reply path #1 wants the result); a fire-and-forget
+/// submit layer (#7) wraps `enqueue` in a Task and adds BoundedChannel
+/// admission control on top of this core.
 public actor DurableDeliveryQueue {
     private let dir: String
     private let logPath: String
@@ -96,12 +105,14 @@ public actor DurableDeliveryQueue {
     private let now: @Sendable () -> Double
     /// idempotencyKey → monotonic time it was acked (in-memory dedup window).
     private var ackedKeys: [String: Double] = [:]
-    /// idempotencyKeys currently being driven (so two concurrent same-key
-    /// enqueues don't both deliver before either acks).
+    /// idempotencyKeys currently being driven (collapse concurrent same-key sends).
     private var inFlightKeys: Set<String> = []
     /// job ids currently being driven (single-driver-per-id guard).
     private var inFlight: Set<String> = []
-    private var seqCounter: Int64 = 0
+    private var seqCounter: Int64           // seeded from the log in init
+    /// Bytes appended since the last compaction — drives `maybeCompact` without a
+    /// per-ack `stat()`.
+    private var appendedBytes: Int          // seeded from the log size in init
     private var fh: FileHandle? = nil
     private let encoder = JSONEncoder()
 
@@ -115,8 +126,22 @@ public actor DurableDeliveryQueue {
                 now: @escaping @Sendable () -> Double = { MonotonicClock.now() }) {
         try? FileManager.default.createDirectory(atPath: directory,
                                                  withIntermediateDirectories: true)
+        let path = directory + "/queue.jsonl"
+        // Pre-create the log so `persist` always appends through one durable
+        // FileHandle (no whole-file fallback that could clobber it). The handle
+        // is opened lazily on first persist (a nonisolated init can't store a
+        // non-Sendable FileHandle into actor-isolated state). The dedup window is
+        // in-memory; the durable LOG guards against LOST delivery (receiver
+        // idempotency handles cross-restart DUPLICATEs — standard at-least-once).
+        let existed = FileManager.default.fileExists(atPath: path)
+        if !existed { FileManager.default.createFile(atPath: path, contents: nil) }
+        // Seed the seq counter past any persisted record so an enqueue() BEFORE a
+        // recover() can't reuse a seq already in the log (which would make the
+        // seq-ordered recovery ambiguous), and seed the append-bytes counter from
+        // the current size so compaction triggers without a per-ack stat().
+        let scan = DurableDeliveryQueue.scanLog(at: path)
         self.dir = directory
-        self.logPath = directory + "/queue.jsonl"
+        self.logPath = path
         self.executor = executor
         self.backoff = backoff
         self.maxAttempts = Swift.max(1, maxAttempts)
@@ -124,18 +149,10 @@ public actor DurableDeliveryQueue {
         self.dedupWindowSeconds = dedupWindowSeconds
         self.compactThresholdBytes = Swift.max(4096, compactThresholdBytes)
         self.now = now
-        // Pre-create + open the log once, so `persist` ALWAYS appends through a
-        // single durable FileHandle (no brittle whole-file fallback that could
-        // clobber the log). The dedup window is in-memory; the durable LOG is
-        // the cross-restart guarantee against LOST delivery (receiver
-        // idempotency handles cross-restart DUPLICATEs — standard at-least-once).
-        if !FileManager.default.fileExists(atPath: logPath) {
-            FileManager.default.createFile(atPath: logPath, contents: nil)
-            fsyncDirectory()   // make the new file's directory entry durable
-        }
-        // The append FileHandle is opened lazily on first persist (an
-        // actor-isolated context); a nonisolated init can't store a non-Sendable
-        // FileHandle into actor-isolated state.
+        self.seqCounter = scan.maxSeq
+        self.appendedBytes = scan.bytes
+        // All stored properties are initialized → safe to call an instance method.
+        if !existed { fsyncDirectory() }
     }
 
     /// Lazily open (and cache) the append handle, seeked to end. Actor-isolated.
@@ -165,6 +182,7 @@ public actor DurableDeliveryQueue {
         #else
         try? fh.synchronize()
         #endif
+        appendedBytes += line.count
         return true
     }
 
@@ -189,7 +207,7 @@ public actor DurableDeliveryQueue {
             // Reserve the key SYNCHRONOUSLY (before any await) so a concurrent
             // same-key enqueue is deduped rather than racing to a second send.
             if inFlightKeys.contains(key) {
-                return DeliveryReceipt(id: job0.id, finalState: .enqueued, attempts: 0, deduped: true)
+                return DeliveryReceipt(id: job0.id, finalState: job0.state, attempts: 0, deduped: true)
             }
             inFlightKeys.insert(key)
         }
@@ -206,19 +224,22 @@ public actor DurableDeliveryQueue {
 
     /// Replay the durable log and re-drive every job whose last persisted state
     /// is non-terminal, in `seq` order. A `sendAttemptStarted` job becomes
-    /// `unknownAfterSend` (crash mid-send → at-least-once). Idempotent: a job
-    /// already in-flight (from a prior recover or a live enqueue) is skipped.
-    /// Compacts the log first (drops terminal records).
+    /// `unknownAfterSend` (crash mid-send → at-least-once). Applies the SAME
+    /// idempotency dedup the enqueue path does, so recovery can't re-send a key
+    /// just acked this run or one a live enqueue is already driving. Compacts
+    /// first and reuses the result (single parse).
     @discardableResult
     public func recover() async -> [DeliveryReceipt] {
-        compact()
-        let pending = loadLatestPerJob().values
-            .filter { $0.state != .acked && $0.state != .failed }
-            .sorted { $0.seq < $1.seq }
+        let live = compact()
+        let pending = live.filter { $0.state != .failed }.sorted { $0.seq < $1.seq }
         var receipts: [DeliveryReceipt] = []
         for var job in pending {
-            // keep the running seq monotonic past recovered ids
             seqCounter = Swift.max(seqCounter, job.seq)
+            if let key = job.idempotencyKey {
+                if let t = ackedKeys[key], now() - t < dedupWindowSeconds { continue }   // recently acked
+                if inFlightKeys.contains(key) { continue }                                // a live enqueue owns it
+                inFlightKeys.insert(key)                                                   // reserve so a concurrent enqueue is collapsed
+            }
             if job.state == .sendAttemptStarted {
                 job.state = .unknownAfterSend
                 _ = persist(job)
@@ -239,15 +260,18 @@ public actor DurableDeliveryQueue {
     // MARK: core state machine
 
     private func drive(_ job0: OutboundJob) async -> DeliveryReceipt {
+        // ALWAYS release the caller-reserved idempotency key on ANY exit,
+        // including the single-driver early-return below. Declaring this defer
+        // BEFORE the guard is the fix: a defer placed after the guard would not
+        // run on the early-return path, permanently poisoning the key.
+        defer { if let key = job0.idempotencyKey { inFlightKeys.remove(key) } }
         // Single-driver-per-id: a second recover()/enqueue() for an id already
-        // being driven is a no-op (prevents concurrent self-duplication).
+        // being driven is a no-op. The deduped receipt's finalState is the
+        // last-known state (possibly non-terminal) — callers must check `deduped`.
         guard inFlight.insert(job0.id).inserted else {
             return DeliveryReceipt(id: job0.id, finalState: job0.state, attempts: job0.attempts, deduped: true)
         }
-        defer {
-            inFlight.remove(job0.id)
-            if let key = job0.idempotencyKey { inFlightKeys.remove(key) }
-        }
+        defer { inFlight.remove(job0.id) }
         var job = job0
         while true {
             job.state = .sendAttemptStarted
@@ -284,18 +308,23 @@ public actor DurableDeliveryQueue {
         return DeliveryReceipt(id: job.id, finalState: .failed, attempts: job.attempts, deduped: false)
     }
 
-    /// Race the transport send against a per-attempt deadline so a hung sink
-    /// can never wedge the queue; a timeout is a synthetic `.retry`.
+    /// Race the transport send against a per-attempt deadline, returning as soon
+    /// as EITHER completes — WITHOUT awaiting the loser. A structured task group
+    /// implicitly awaits all children at scope exit, so a sink that ignores
+    /// cancellation would wedge the actor despite the timeout. Using unstructured
+    /// tasks + a one-shot gate means a hung send is abandoned (it leaks until it
+    /// eventually returns, but never blocks the queue) and the attempt becomes a
+    /// `.retry`. `work.cancel()` lets a cooperative sink stop early.
     private func deliverWithTimeout(_ job: OutboundJob) async -> DeliveryOutcome {
         let exec = executor
         let timeout = attemptTimeout
-        return await withTaskGroup(of: DeliveryOutcome?.self) { group -> DeliveryOutcome in
-            group.addTask { await exec.deliver(job) }
-            group.addTask { try? await Task.sleep(for: timeout); return nil }
-            let first = await group.next() ?? .some(.retry)
-            group.cancelAll()
-            return first ?? .retry   // nil sentinel = timeout → retry
-        }
+        let gate = SingleResume()
+        let work = Task { let o = await exec.deliver(job); await gate.resume(o) }
+        let timer = Task { try? await Task.sleep(for: timeout); await gate.resume(.retry) }
+        let outcome = await gate.wait()
+        work.cancel()
+        timer.cancel()
+        return outcome
     }
 
     // MARK: dedup pruning + compaction
@@ -307,53 +336,94 @@ public actor DurableDeliveryQueue {
     }
 
     private func maybeCompact() {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: logPath)
-        let size = (attrs?[.size] as? Int) ?? 0
-        if size > compactThresholdBytes { compact() }
+        // Use the bytes we appended (tracked in persist) instead of a stat() per ack.
+        if appendedBytes > compactThresholdBytes { _ = compact() }
     }
 
-    /// Rewrite the log keeping only the latest record per NON-terminal id, so it
-    /// tracks the live backlog. In-flight jobs are non-terminal → preserved;
-    /// their next `persist` appends to the reopened handle.
-    private func compact() {
-        // Drop only acked (delivered) records — the bulk of the log. KEEP failed
-        // jobs as a dead-letter for failedJobs()/status() retrieval (a TTL is
-        // future work). In-flight (non-terminal) jobs are preserved too.
+    /// Rewrite the log keeping only the latest record per NON-acked id (failed
+    /// jobs are KEPT as dead-letter), so it tracks the live backlog. Returns the
+    /// kept set so `recover()` reuses it without a second parse.
+    @discardableResult
+    private func compact() -> [OutboundJob] {
         let live = loadLatestPerJob().values
             .filter { $0.state != .acked }
             .sorted { $0.seq < $1.seq }
-        guard !live.isEmpty || FileManager.default.fileExists(atPath: logPath) else { return }
+        guard !live.isEmpty || FileManager.default.fileExists(atPath: logPath) else { return live }
         var data = Data()
         for job in live { if let l = try? encoder.encode(job) { data.append(l); data.append(0x0A) } }
         let tmp = logPath + ".compact"
         do {
             try data.write(to: URL(fileURLWithPath: tmp), options: .atomic)
+            // Flush the temp's CONTENTS to disk BEFORE the destructive rename:
+            // `.atomic` only renames, it does not F_FULLFSYNC the data, so a crash
+            // after the rename could otherwise leave an empty/torn log with the
+            // original already unlinked — whole-backlog loss. (Same fsync-before-
+            // side-effect contract `persist` upholds.)
+            if let tfh = FileHandle(forWritingAtPath: tmp) {
+                #if canImport(Darwin)
+                if fcntl(tfh.fileDescriptor, F_FULLFSYNC) == -1 { try? tfh.synchronize() }
+                #else
+                try? tfh.synchronize()
+                #endif
+                try? tfh.close()
+            }
             try? fh?.close()
             _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: logPath),
                                                        withItemAt: URL(fileURLWithPath: tmp))
             fsyncDirectory()
             fh = FileHandle(forWritingAtPath: logPath)
             _ = try? fh?.seekToEnd()
+            appendedBytes = data.count
         } catch {
             // Compaction is best-effort; on failure keep appending to the old fh.
             try? FileManager.default.removeItem(atPath: tmp)
             if fh == nil { fh = FileHandle(forWritingAtPath: logPath); _ = try? fh?.seekToEnd() }
         }
+        return live
     }
 
     /// Fold the JSONL log to the latest record per job id. A torn final line
     /// (no trailing newline, partial JSON) fails to decode and is dropped — the
     /// prior complete record for that id correctly remains authoritative.
-    private func loadLatestPerJob() -> [String: OutboundJob] {
+    /// `nonisolated` (reads only the immutable `logPath` + a local decoder) so
+    /// `init` and the scan helper can use it.
+    private nonisolated func loadLatestPerJob() -> [String: OutboundJob] {
+        DurableDeliveryQueue.fold(logPath: logPath).latest
+    }
+
+    /// Pure log scan used by `init` (seq/byte seeding) and `loadLatestPerJob`.
+    private nonisolated static func scanLog(at logPath: String) -> (maxSeq: Int64, bytes: Int) {
+        let r = fold(logPath: logPath)
+        let maxSeq = r.latest.values.map(\.seq).max() ?? 0
+        return (maxSeq, r.bytes)
+    }
+
+    private nonisolated static func fold(logPath: String) -> (latest: [String: OutboundJob], bytes: Int) {
         let decoder = JSONDecoder()
         guard let data = FileManager.default.contents(atPath: logPath),
-              let text = String(data: data, encoding: .utf8) else { return [:] }
+              let text = String(data: data, encoding: .utf8) else { return ([:], 0) }
         var latest: [String: OutboundJob] = [:]
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             if let job = try? decoder.decode(OutboundJob.self, from: Data(line.utf8)) {
                 latest[job.id] = job
             }
         }
-        return latest
+        return (latest, data.count)
+    }
+}
+
+/// A one-shot async value: the first `resume` wins, `wait` returns it. Used to
+/// race a delivery attempt against a timeout WITHOUT a structured task group
+/// (which would await the losing/hung child at scope exit and defeat the timeout).
+private actor SingleResume {
+    private var cont: CheckedContinuation<DeliveryOutcome, Never>?
+    private var pending: DeliveryOutcome?
+    func wait() async -> DeliveryOutcome {
+        if let p = pending { return p }
+        return await withCheckedContinuation { cont = $0 }
+    }
+    func resume(_ o: DeliveryOutcome) {
+        if let c = cont { cont = nil; c.resume(returning: o) }
+        else if pending == nil { pending = o }
     }
 }
