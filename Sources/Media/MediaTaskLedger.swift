@@ -83,6 +83,7 @@ public actor MediaTaskLedger {
     @discardableResult
     public func advance() async -> [String] {
         var settled: [String] = []
+        var changed = false
         for var task in tasks.values where !task.isTerminal {
             guard let provider = providers[task.provider], let pid = task.providerTaskId else { continue }
             switch await provider.poll(providerTaskId: pid) {
@@ -93,20 +94,35 @@ public actor MediaTaskLedger {
                 task.assetPath = path
                 tasks[task.id] = task
                 await finishDelivery(task.id)
-                settled.append(task.id)
+                settled.append(task.id); changed = true
             case .failed(let why):
                 task.status = .failed
                 task.error = why
                 tasks[task.id] = task
-                settled.append(task.id)
+                settled.append(task.id); changed = true
             }
         }
-        if !settled.isEmpty { await persist() }
+        // Re-attempt delivery for DONE-but-UNDELIVERED tasks: delivery is
+        // decoupled from terminal status, so a transient push failure (5xx /
+        // SSRF-blocked) is retried on a later pass instead of silently dropping
+        // the generated asset. Bounded by deliveryAttempts.
+        for task in tasks.values
+            where task.status == .done && task.deliverTo != nil
+                && task.deliveredAt == nil && task.deliveryAttempts < Self.maxDeliveryAttempts {
+            await finishDelivery(task.id)
+            changed = true
+        }
+        if changed { await persist() }
         return settled
     }
 
+    static let maxDeliveryAttempts = 10
+
     private func finishDelivery(_ id: String) async {
-        guard var task = tasks[id], task.status == .done, task.deliverTo != nil, task.deliveredAt == nil else { return }
+        guard var task = tasks[id], task.status == .done, task.deliverTo != nil,
+              task.deliveredAt == nil, task.deliveryAttempts < Self.maxDeliveryAttempts else { return }
+        task.deliveryAttempts += 1
+        tasks[id] = task
         if await deliver(task) {
             task.deliveredAt = now()
             tasks[id] = task

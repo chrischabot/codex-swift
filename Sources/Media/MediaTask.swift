@@ -32,16 +32,20 @@ public struct MediaTask: Sendable, Codable, Equatable {
     public var error: String?
     public var createdAt: Int64
     public var deliveredAt: Int64?
+    /// Delivery attempts so far — bounds re-delivery so a permanently-bad
+    /// deliverTo doesn't retry forever (delivery is decoupled from terminal
+    /// status, so a transient push failure is retried, not silently dropped).
+    public var deliveryAttempts: Int
 
     public init(id: String, kind: MediaKind, provider: String, prompt: String,
                 status: MediaTaskStatus = .queued, providerTaskId: String? = nil,
                 assetPath: String? = nil, idempotencyKey: String? = nil,
                 deliverTo: String? = nil, error: String? = nil,
-                createdAt: Int64, deliveredAt: Int64? = nil) {
+                createdAt: Int64, deliveredAt: Int64? = nil, deliveryAttempts: Int = 0) {
         self.id = id; self.kind = kind; self.provider = provider; self.prompt = prompt
         self.status = status; self.providerTaskId = providerTaskId; self.assetPath = assetPath
         self.idempotencyKey = idempotencyKey; self.deliverTo = deliverTo; self.error = error
-        self.createdAt = createdAt; self.deliveredAt = deliveredAt
+        self.createdAt = createdAt; self.deliveredAt = deliveredAt; self.deliveryAttempts = deliveryAttempts
     }
 
     public var isTerminal: Bool { status == .done || status == .failed }

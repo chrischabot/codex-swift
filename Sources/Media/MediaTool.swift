@@ -40,10 +40,19 @@ public struct MediaGenerateTool: Tool {
         return try? JSONDecoder().decode(Args.self, from: d)
     }
 
+    /// A deliver_to of "" / whitespace is NOT an outbound target — normalize it
+    /// to nil so an empty value can't slip through as ungated generate-and-hold
+    /// while LATER being treated as a (broken) delivery, AND so the approval
+    /// decision is consistent.
+    private func deliverTarget(_ args: Args) -> String? {
+        guard let raw = args.deliver_to?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        return raw
+    }
+
     public func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement {
         // Only the OUTBOUND-delivering variant needs consent.
-        guard let args = parse(call), args.deliver_to != nil else { return .none }
-        return .required(summary: "generate \(args.kind) and push to '\(args.deliver_to!)'")
+        guard let args = parse(call), let target = deliverTarget(args) else { return .none }
+        return .required(summary: "generate \(args.kind) and push to '\(target)'")
     }
 
     public func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
@@ -54,7 +63,7 @@ public struct MediaGenerateTool: Tool {
                               success: false, truncated: false)
         }
         let task = await ledger.submit(kind: kind, prompt: args.prompt,
-                                       idempotencyKey: args.idempotency_key, deliverTo: args.deliver_to)
+                                       idempotencyKey: args.idempotency_key, deliverTo: deliverTarget(args))
         let status: String
         switch task.status {
         case .done:   status = task.assetPath.map { "done: \($0)" } ?? "done"

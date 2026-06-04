@@ -10,10 +10,10 @@ import HarnessCore
 /// the media_generate tool's approval gating.
 final class MediaTests: XCTestCase {
 
-    private func ledger(_ provider: any MediaProvider, deliver: MediaTaskLedger.Deliver? = nil)
+    private func ledger(_ provider: any MediaProvider, failFirst: Int = 0)
     -> (MediaTaskLedger, DeliverRecorder) {
-        let rec = DeliverRecorder()
-        let l = MediaTaskLedger(providers: [provider], deliver: deliver ?? rec.deliver,
+        let rec = DeliverRecorder(failFirst: failFirst)
+        let l = MediaTaskLedger(providers: [provider], deliver: rec.deliver,
                                 now: { 1000 }, mintId: counterId())
         return (l, rec)
     }
@@ -92,6 +92,61 @@ final class MediaTests: XCTestCase {
         XCTAssertNil(held?.deliveredAt)
     }
 
+    func testDeliveryRetriedOnTransientFailure() async {
+        // CLAIM: a .done task whose first push fails is NOT silently dropped —
+        // advance() re-attempts delivery on a later pass, exactly once more.
+        // ORACLE: DeliverRecorder counts both attempts and successes.
+        let (l, rec) = ledger(StubProvider(submit: .inline(assetPath: "/a")), failFirst: 1)
+        let t = await l.submit(kind: .image, prompt: "x", deliverTo: "ntfy:t")
+        XCTAssertEqual(t.status, .done)
+        let after1 = await l.task(t.id)
+        XCTAssertNil(after1?.deliveredAt, "first delivery failed → not marked delivered")
+        XCTAssertEqual(after1?.deliveryAttempts, 1, "one attempt charged on the failed push")
+        // advance() re-attempts the undelivered-but-done task.
+        _ = await l.advance()
+        let after2 = await l.task(t.id)
+        XCTAssertNotNil(after2?.deliveredAt, "delivery is retried on a later advance, not dropped")
+        let cnt = await rec.count()
+        XCTAssertEqual(cnt, 1, "delivered exactly once (the retry)")
+        let att = await rec.attemptCount()
+        XCTAssertEqual(att, 2, "two attempts total: one fail + one success")
+    }
+
+    func testDeliveryRetriesAreBounded() async {
+        // CLAIM: a permanently-bad deliverTo cannot retry forever — the attempt
+        // count is capped at maxDeliveryAttempts even across many advance passes.
+        let (l, rec) = ledger(StubProvider(submit: .inline(assetPath: "/a")), failFirst: 10_000)
+        let t = await l.submit(kind: .image, prompt: "x", deliverTo: "ntfy:dead")
+        for _ in 0..<(MediaTaskLedger.maxDeliveryAttempts + 5) { _ = await l.advance() }
+        let att = await rec.attemptCount()
+        XCTAssertEqual(att, MediaTaskLedger.maxDeliveryAttempts, "retries are bounded, no infinite loop")
+        let final = await l.task(t.id)
+        XCTAssertNil(final?.deliveredAt, "never delivered (permanent failure)")
+        XCTAssertEqual(final?.deliveryAttempts, MediaTaskLedger.maxDeliveryAttempts)
+    }
+
+    func testEmptyDeliverToIsUngatedAndNotPushed() async throws {
+        // CLAIM: deliver_to="" / whitespace is NOT an outbound target — it must
+        // be ungated (no approval) AND it must not push. A whitespace value that
+        // skips the gate but still pushes would be an ungated-outbound hole.
+        let (l, rec) = ledger(StubProvider(submit: .inline(assetPath: "/a")))
+        let tool = MediaGenerateTool(ledger: l)
+        let call = ToolCall(callId: "c", name: "media_generate",
+                            argumentsJSON: #"{"kind":"image","prompt":"x","deliver_to":"   "}"#)
+        if case .none = tool.approvalRequirement(call) {} else {
+            XCTFail("empty/whitespace deliver_to must be ungated, not .required")
+        }
+        let r = try await tool.run(call, cwd: "/")
+        XCTAssertTrue(r.success)
+        let cnt = await rec.count()
+        XCTAssertEqual(cnt, 0, "an empty/whitespace deliver_to does not push")
+        // And the stored task must not carry a bogus deliverTo target.
+        let id = String(r.output.split(separator: " ").first { $0.hasPrefix("task_id=") }?
+            .dropFirst("task_id=".count) ?? "")
+        let stored = await l.task(id)
+        XCTAssertNil(stored?.deliverTo, "normalized away — stored as generate-and-hold")
+    }
+
     func testMediaToolPackEmitsToolOrSelfPrunes() {
         let (l, _) = ledger(StubProvider(submit: .inline(assetPath: "/a")))
         let pack = MediaToolPack(ledger: l)
@@ -144,10 +199,18 @@ final class Counter: @unchecked Sendable {
 }
 
 actor DeliverRecorder {
-    private var delivered: [String] = []
-    nonisolated var deliver: MediaTaskLedger.Deliver { { [self] task in await self.record(task.id); return true } }
-    private func record(_ id: String) { delivered.append(id) }
+    private var delivered: [String] = []   // ids that were delivered SUCCESSFULLY
+    private var attempts: [String] = []     // every deliver() call (incl. failed)
+    private var failFirst: Int              // fail the first N delivery attempts
+    init(failFirst: Int = 0) { self.failFirst = failFirst }
+    nonisolated var deliver: MediaTaskLedger.Deliver { { [self] task in await self.attempt(task.id) } }
+    private func attempt(_ id: String) -> Bool {
+        attempts.append(id)
+        if failFirst > 0 { failFirst -= 1; return false }
+        delivered.append(id); return true
+    }
     func count() -> Int { delivered.count }
+    func attemptCount() -> Int { attempts.count }
 }
 
 actor StubProvider: MediaProvider {
