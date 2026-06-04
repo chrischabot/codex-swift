@@ -194,6 +194,8 @@ let package = Package(
         .target(name: "Gmail",
                 dependencies: ["Channels", "GoogleWorkspace"],
                 swiftSettings: strict),
+        // ADDONS.md #6 — cron/scheduler (at/every + UTC cron, grace-window catch-up).
+        .target(name: "Cron", swiftSettings: strict),
         .target(name: "Tools",
                 dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
         .target(name: "MCP",
@@ -356,6 +358,8 @@ let package = Package(
         .testTarget(name: "GmailTests",
                 dependencies: ["Gmail", "Channels", "GoogleWorkspace", "Connectors", "EgressGuard"],
                 swiftSettings: strict),
+        .testTarget(name: "CronTests",
+                dependencies: ["Cron"], swiftSettings: strict),
         .testTarget(name: "MemoryScoreTests",
                 dependencies: ["MemoryScore", "MemoryStore", "MemoryInfer", "InfraPrimitives"],
                 swiftSettings: strict),
