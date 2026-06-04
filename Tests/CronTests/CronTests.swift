@@ -181,6 +181,27 @@ final class CronTests: XCTestCase {
         await sched.stop()
     }
 
+    // MARK: actor reentrancy (concurrent remove during a fire)
+
+    func testJobRemovedDuringItsFireIsNotResurrected() async {
+        // CLAIM: `run(job)` is an await; a concurrent cron/remove during the fire
+        // must be respected — the tick must NOT write back the stale pre-await
+        // snapshot and resurrect the removed job.
+        final class Box: @unchecked Sendable { var sched: CronScheduler? }
+        let box = Box()
+        let runner: CronScheduler.Runner = { job in
+            await box.sched?.remove(job.id)   // remove DURING the fire (reentrant)
+            return true
+        }
+        let sched = CronScheduler(store: MemoryCronStore(), graceSeconds: 600, run: runner)
+        box.sched = sched
+        await sched.upsert(CronJob(id: "j", schedule: .every(60), prompt: "x",
+                                   lastRunAt: 0, createdAt: 0))
+        _ = await sched.tick(now: 100)
+        let gone = await sched.job("j")
+        XCTAssertNil(gone, "a job removed during its own fire stays removed (no stale resurrection)")
+    }
+
     // MARK: persist-on-change (the `|| true` → `changed` fix)
 
     func testNoOpTickDoesNotPersistButFastForwardDoes() async {

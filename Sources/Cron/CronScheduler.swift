@@ -126,21 +126,30 @@ public actor CronScheduler {
     public func tick(now: Int64) async -> [String] {
         var ran: [String] = []
         var changed = false
-        for var job in jobs.values where job.enabled {
-            let anchor = job.lastRunAt ?? job.createdAt
-            guard let next = job.schedule.next(after: anchor), next <= now else { continue }
-            if (now - next) <= graceSeconds {
-                // Due (or caught up within grace): run it.
-                _ = await run(job)
-                ran.append(job.id)
-                job.lastRunAt = now
-                if case .at = job.schedule { job.enabled = false }   // one-shot
-            } else {
-                // Stale missed fire: fast-forward without running.
-                job.lastRunAt = now
-                if case .at = job.schedule { job.enabled = false }
+        // Snapshot the keys: `run(job)` is an `await`, so a concurrent
+        // upsert/remove (cron/add, cron/remove) can mutate `jobs` mid-loop. We
+        // index by key each iteration and RE-FETCH after the await so we never
+        // (a) iterate a mutating collection or (b) clobber a concurrent edit with
+        // a stale snapshot.
+        for jobId in jobs.keys.sorted() {
+            guard let snapshot = jobs[jobId], snapshot.enabled else { continue }
+            let anchor = snapshot.lastRunAt ?? snapshot.createdAt
+            guard let next = snapshot.schedule.next(after: anchor), next <= now else { continue }
+            let due = (now - next) <= graceSeconds
+            if due {
+                // Due (or caught up within grace): run it. Stale missed fires
+                // (else) are fast-forwarded without running.
+                _ = await run(snapshot)
+                ran.append(jobId)
             }
-            jobs[job.id] = job
+            // Re-fetch AFTER the await: a concurrent cron/remove during the fire
+            // must be respected (don't resurrect a removed job), and a concurrent
+            // cron/add edit must not be clobbered — apply lastRunAt / one-shot to
+            // the CURRENT version, not the pre-await snapshot.
+            guard var current = jobs[jobId] else { continue }   // removed mid-fire
+            current.lastRunAt = now
+            if case .at = current.schedule { current.enabled = false }   // one-shot
+            jobs[jobId] = current
             changed = true   // lastRunAt / one-shot disable / fast-forward all
                              // MUST persist, or stale fires resurrect on restart.
         }

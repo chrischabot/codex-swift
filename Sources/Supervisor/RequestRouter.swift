@@ -1917,6 +1917,13 @@ public actor RequestRouter {
                                                idempotencyKey: p.idempotencyKey)
             await reply(conn, id, OutboundSendResponse(ok: result.ok, detail: result.detail))
         case .cronList(let id, _):
+            // OWNER PATH (#6): cron schedules UNATTENDED turns + outbound
+            // delivery, so the whole family is owner-only — the web tier must not
+            // see/modify cron jobs (their prompts + deliverTo targets). Matches
+            // outbound/send; defense-in-depth with the WebGateway MethodGate.
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport")); break
+            }
             // Deny-default: a nil holder (cron feature off) lists nothing rather
             // than erroring, so an unconfigured daemon answers benignly.
             guard let scheduler = CronSchedulerHolder.shared.current() else {
@@ -1925,6 +1932,9 @@ public actor RequestRouter {
             let jobs = await scheduler.list().map(CronJobWire.init)
             await reply(conn, id, CronListResponse(data: jobs))
         case .cronAdd(let id, let p):
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport")); break
+            }
             guard let scheduler = CronSchedulerHolder.shared.current() else {
                 await conn.send(WireError.invalidRequest(id: id, "cron feature is not enabled")); break
             }
@@ -1957,6 +1967,9 @@ public actor RequestRouter {
             await scheduler.upsert(job)
             await reply(conn, id, CronJobWire(job))
         case .cronRemove(let id, let p):
+            guard allowsOwnerOnlyRPC else {
+                await conn.send(WireError.invalidRequest(id: id, "method not available on this transport")); break
+            }
             guard let scheduler = CronSchedulerHolder.shared.current() else {
                 await reply(conn, id, EmptyResponse()); break
             }

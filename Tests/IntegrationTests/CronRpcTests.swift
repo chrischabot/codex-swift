@@ -43,7 +43,7 @@ final class CronRpcTests: XCTestCase {
             CronSchedulerHolder.shared.reset()
         }
     }
-    private func makeStack() throws -> Stack {
+    private func makeStack(ownerTrusted: Bool = true) throws -> Stack {
         let home = NSTemporaryDirectory() + "cron-" + UUID().uuidString
         let limits = Limits()
         let store = try ThreadStore(codexHome: home, limits: limits)
@@ -57,7 +57,8 @@ final class CronRpcTests: XCTestCase {
             return WorkerHandle(link: link, task: Task { await rt.run() })
         }
         let supervisor = SessionSupervisor(factory: factory, maxSessions: 4)
-        let router = RequestRouter(supervisor: supervisor, store: store, codexHome: home)
+        let router = RequestRouter(supervisor: supervisor, store: store, codexHome: home,
+                                   allowsOwnerOnlyRPC: ownerTrusted)
         let conn = InMemoryConnection()
         let sink = Sink()
         let pump = Task { for await m in conn.incoming() { await router.handle(m, conn) } }
@@ -121,6 +122,34 @@ final class CronRpcTests: XCTestCase {
             "prompt": .string("x")]))
         let e = await awaitError(s, 3)
         XCTAssertEqual(e?.error.message, "cron feature is not enabled")
+    }
+
+    // MARK: owner gate (web tier refused)
+
+    func testOwnerGateWebTierRefused() async throws {
+        let s = try makeStack(ownerTrusted: false)   // the WebGateway tier
+        defer { s.teardown() }
+        let sched = installScheduler()
+        await sched.upsert(CronJob(id: "secret", schedule: .every(60),
+                                   prompt: "private", deliverTo: "ntfy:x", createdAt: 1))
+        await initialize(s)
+        // All three cron/* methods must refuse on a non-owner transport, even
+        // though the scheduler IS configured.
+        send(s, 2, "cron/list", .object([:]))
+        let e1 = await awaitError(s, 2)
+        XCTAssertEqual(e1?.error.message, "method not available on this transport",
+                       "cron/list must not leak jobs to the web tier")
+        send(s, 3, "cron/add", .object([
+            "schedule": .object(["kind": .string("every"), "every": .int(60)]),
+            "prompt": .string("x"), "deliverTo": .string("webhook:https://evil/")]))
+        let e2 = await awaitError(s, 3)
+        XCTAssertEqual(e2?.error.message, "method not available on this transport")
+        send(s, 4, "cron/remove", .object(["id": .string("secret")]))
+        let e3 = await awaitError(s, 4)
+        XCTAssertEqual(e3?.error.message, "method not available on this transport")
+        // Nothing was added or removed.
+        let still = await sched.job("secret")
+        XCTAssertNotNil(still, "a web-tier cron/remove must not delete an owner's job")
     }
 
     // MARK: add + wire round-trip
