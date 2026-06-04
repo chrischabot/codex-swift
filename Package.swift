@@ -196,6 +196,10 @@ let package = Package(
                 swiftSettings: strict),
         // ADDONS.md #6 — cron/scheduler (at/every + UTC cron, grace-window catch-up).
         .target(name: "Cron", swiftSettings: strict),
+        // ADDONS.md #8 — async media suite (task ledger + submit/poll lifecycle).
+        .target(name: "Media",
+                dependencies: ["Tools", "ProtocolModel"],
+                swiftSettings: strict),
         .target(name: "Tools",
                 dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
         .target(name: "MCP",
@@ -360,6 +364,8 @@ let package = Package(
                 swiftSettings: strict),
         .testTarget(name: "CronTests",
                 dependencies: ["Cron"], swiftSettings: strict),
+        .testTarget(name: "MediaTests",
+                dependencies: ["Media", "Tools", "ProtocolModel"], swiftSettings: strict),
         .testTarget(name: "MemoryScoreTests",
                 dependencies: ["MemoryScore", "MemoryStore", "MemoryInfer", "InfraPrimitives"],
                 swiftSettings: strict),
