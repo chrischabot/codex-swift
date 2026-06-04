@@ -180,6 +180,11 @@ let package = Package(
         // `codex-mediadecode` executable below is the short-lived child.
         .target(name: "MediaDecode",
                 dependencies: ["Sandbox"], swiftSettings: strict),
+        // ADDONS.md #7 — push/outbound primitive: ntfy/webhook/native sinks over
+        // the #4 durable core + #1 outbound seam, behind the #5 egress chokepoint.
+        .target(name: "Push",
+                dependencies: ["Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel"],
+                swiftSettings: strict),
         .target(name: "Tools",
                 dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
         .target(name: "MCP",
@@ -332,6 +337,9 @@ let package = Package(
                 swiftSettings: strict),
         .testTarget(name: "MediaDecodeTests",
                 dependencies: ["MediaDecode", "codex-mediadecode"],
+                swiftSettings: strict),
+        .testTarget(name: "PushTests",
+                dependencies: ["Push", "Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel"],
                 swiftSettings: strict),
         .testTarget(name: "MemoryScoreTests",
                 dependencies: ["MemoryScore", "MemoryStore", "MemoryInfer", "InfraPrimitives"],
