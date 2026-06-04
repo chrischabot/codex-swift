@@ -140,6 +140,9 @@ struct CodexSend {
             let deadline = Date().addingTimeInterval(2)
             while proc.isRunning && Date() < deadline { usleep(20_000) }
             if proc.isRunning { kill(pid, SIGKILL) }
+            // Reap so we never leave a zombie in the process table (the SIGKILL'd
+            // child dies near-instantly, so this returns promptly).
+            proc.waitUntilExit()
             exit(code)
         }
 
