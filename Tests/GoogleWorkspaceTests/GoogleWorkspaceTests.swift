@@ -5,6 +5,7 @@ import Foundation
 @testable import EgressGuard
 @testable import Tools
 import ProtocolModel
+import HarnessCore
 
 /// Severe tests for the ADDONS #4 google_api tool: service→host containment,
 /// bearer attachment + transparent auth, write-verb approval gating, and 429/5xx
@@ -161,6 +162,13 @@ final class GoogleWorkspaceTests: XCTestCase {
         guard case .failure(.notAuthorized) = r else { return XCTFail("no token → notAuthorized, got \(r)") }
         let n = await http.count()
         XCTAssertEqual(n, 0, "no request is made when unauthorized")
+    }
+
+    func testGoogleToolPackEmitsToolOrSelfPrunes() {
+        let pack = GoogleToolPack(client: client(StubGoogleHTTP(scripted: [])))
+        XCTAssertEqual(pack.id, "google")
+        XCTAssertEqual(pack.tools().map(\.name), ["google_api"])
+        XCTAssertEqual(GoogleToolPack(client: nil).tools().count, 0)
     }
 
     // MARK: tool surface

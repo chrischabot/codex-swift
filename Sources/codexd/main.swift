@@ -22,6 +22,7 @@ import Tokenizer
 import Config
 import MemoryExtension
 import WebGateway
+import Push
 
 /// Fails clearly when no model credentials are configured. Set
 /// CODEXKIT_MOCK=1 to run the full pipeline against the deterministic mock.
@@ -410,7 +411,17 @@ struct CodexDaemon {
                     // Workspace), #7 (Push), #8 (Media) construct their packs
                     // with deps and append here; each is gated by
                     // `[features].<pack.id>` and self-prunes when unconfigured.
-                    let toolPacks: [any ToolPack] = []
+                    var toolPacks: [any ToolPack] = []
+                    // #7 Push: when [features].push is on, wire the durable router
+                    // (ntfy + webhook sinks behind the egress chokepoint) so
+                    // `push_send` is advertised. Deny-default → off otherwise.
+                    if addonConfig.isFeatureEnabled("push") {
+                        let pushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
+                        toolPacks.append(PushToolPack(router: pushRouter))
+                    }
+                    // #4 Google / #8 Media packs are ready (Google/MediaToolPack);
+                    // wiring them needs their config readers ([connectors.google]
+                    // creds; media provider keys) — tracked follow-on.
                     await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
                     let extRegistry = installAddons(
                         config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)

@@ -3,6 +3,7 @@ import Foundation
 @testable import Media
 @testable import Tools
 import ProtocolModel
+import HarnessCore
 
 /// Severe tests for the ADDONS #8 media suite: the submit/poll lifecycle (fast
 /// inline path + async queued path), idempotency dedup, completion delivery, and
@@ -89,6 +90,14 @@ final class MediaTests: XCTestCase {
         XCTAssertEqual(nc, 0, "a generate-and-hold task is not pushed")
         let held = await l.task(t.id)
         XCTAssertNil(held?.deliveredAt)
+    }
+
+    func testMediaToolPackEmitsToolOrSelfPrunes() {
+        let (l, _) = ledger(StubProvider(submit: .inline(assetPath: "/a")))
+        let pack = MediaToolPack(ledger: l)
+        XCTAssertEqual(pack.id, "media")
+        XCTAssertEqual(pack.tools().map(\.name), ["media_generate"])
+        XCTAssertEqual(MediaToolPack(ledger: nil).tools().count, 0)
     }
 
     // MARK: tool

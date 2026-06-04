@@ -6,6 +6,7 @@ import Foundation
 @testable import DeliveryCore
 @testable import Tools
 import ProtocolModel
+import HarnessCore
 
 /// Severe tests for the ADDONS #7 push primitive: target parsing, EgressGuard
 /// SSRF rejection at the sinks, durable at-least-once routing + retry, and the
@@ -120,6 +121,16 @@ final class PushTests: XCTestCase {
         XCTAssertFalse(r.ok)
         let got = await sink.received()
         XCTAssertEqual(got.count, 1, "a permanent failure (e.g. egress deny / 4xx) must NOT be retried")
+    }
+
+    // MARK: tool pack
+
+    func testPushToolPackEmitsToolOrSelfPrunes() async {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let pack = PushToolPack(router: PushRouter(directory: dir))
+        XCTAssertEqual(pack.id, "push")
+        XCTAssertEqual(pack.tools().map(\.name), ["push_send"])
+        XCTAssertEqual(PushToolPack(router: nil).tools().count, 0, "self-prunes with no backend")
     }
 
     // MARK: push_send tool

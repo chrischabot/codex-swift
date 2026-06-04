@@ -19,6 +19,7 @@ import Observability
 import Auth
 import Config
 import MemoryExtension
+import Push
 
 /// Fails clearly until the production HTTP/WS Responses client is wired
 /// (parity with codexd). `CODEXKIT_MOCK=1` forces the deterministic mock.
@@ -384,7 +385,11 @@ struct SessionWorkerMain {
             // (Google Workspace), #7 (Push), #8 (Media) append their packs here;
             // each is gated by `[features].<pack.id>` and self-prunes when
             // unconfigured.
-            let toolPacks: [any ToolPack] = []
+            var toolPacks: [any ToolPack] = []
+            if addonConfig.isFeatureEnabled("push") {
+                let pushRouter = await PushRouter.makeDefault(directory: codexHome + "/push")
+                toolPacks.append(PushToolPack(router: pushRouter))
+            }
             await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
             let extRegistry = installAddons(
                 config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)

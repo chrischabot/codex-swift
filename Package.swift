@@ -183,12 +183,12 @@ let package = Package(
         // ADDONS.md #7 — push/outbound primitive: ntfy/webhook/native sinks over
         // the #4 durable core + #1 outbound seam, behind the #5 egress chokepoint.
         .target(name: "Push",
-                dependencies: ["Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel"],
+                dependencies: ["Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel", "HarnessCore"],
                 swiftSettings: strict),
         // ADDONS.md #4 — Google Workspace tool suite (the discovery-driven
         // google_api tool) over the #3 connector.
         .target(name: "GoogleWorkspace",
-                dependencies: ["Connectors", "Tools", "ProtocolModel"],
+                dependencies: ["Connectors", "Tools", "ProtocolModel", "HarnessCore"],
                 swiftSettings: strict),
         // ADDONS.md #5 — Gmail channel (inbound/outbound, non-owner by default).
         .target(name: "Gmail",
@@ -198,7 +198,7 @@ let package = Package(
         .target(name: "Cron", swiftSettings: strict),
         // ADDONS.md #8 — async media suite (task ledger + submit/poll lifecycle).
         .target(name: "Media",
-                dependencies: ["Tools", "ProtocolModel"],
+                dependencies: ["Tools", "ProtocolModel", "HarnessCore"],
                 swiftSettings: strict),
         .target(name: "Tools",
                 dependencies: ["ProtocolModel", "ModelClient", "InfraPrimitives", "Sandbox", "CPTY", "ComputerUse"], swiftSettings: strict),
@@ -248,7 +248,7 @@ let package = Package(
                                "ModelClient", "Tools", "Sandbox", "Prompts", "MCP", "Skills",
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
                                "Supervisor", "Transport", "Observability", "Auth", "Tokenizer", "Config", "Workflows",
-                               "MemoryExtension", "WebGateway"],
+                               "MemoryExtension", "WebGateway", "Push"],
                 swiftSettings: strict),
         .executableTarget(name: "codex-broker",
                 dependencies: ["Broker", "Auth", "Observability"], swiftSettings: strict),
@@ -257,7 +257,7 @@ let package = Package(
                                "ModelClient", "Tools", "Sandbox", "Prompts", "MCP", "Skills",
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
                                "Observability", "Auth", "Tokenizer", "Config", "Workflows",
-                               "MemoryExtension"], swiftSettings: strict),
+                               "MemoryExtension", "Push"], swiftSettings: strict),
         .executableTarget(name: "mock-responses",
                 dependencies: ["ModelClient", "InfraPrimitives"], swiftSettings: strict),
 
@@ -354,10 +354,10 @@ let package = Package(
                 dependencies: ["MediaDecode", "codex-mediadecode"],
                 swiftSettings: strict),
         .testTarget(name: "PushTests",
-                dependencies: ["Push", "Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel"],
+                dependencies: ["Push", "Channels", "DeliveryCore", "EgressGuard", "Tools", "ProtocolModel", "HarnessCore"],
                 swiftSettings: strict),
         .testTarget(name: "GoogleWorkspaceTests",
-                dependencies: ["GoogleWorkspace", "Connectors", "EgressGuard", "Tools", "ProtocolModel"],
+                dependencies: ["GoogleWorkspace", "Connectors", "EgressGuard", "Tools", "ProtocolModel", "HarnessCore"],
                 swiftSettings: strict),
         .testTarget(name: "GmailTests",
                 dependencies: ["Gmail", "Channels", "GoogleWorkspace", "Connectors", "EgressGuard"],
@@ -365,7 +365,7 @@ let package = Package(
         .testTarget(name: "CronTests",
                 dependencies: ["Cron"], swiftSettings: strict),
         .testTarget(name: "MediaTests",
-                dependencies: ["Media", "Tools", "ProtocolModel"], swiftSettings: strict),
+                dependencies: ["Media", "Tools", "ProtocolModel", "HarnessCore"], swiftSettings: strict),
         .testTarget(name: "MemoryScoreTests",
                 dependencies: ["MemoryScore", "MemoryStore", "MemoryInfer", "InfraPrimitives"],
                 swiftSettings: strict),
