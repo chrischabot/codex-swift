@@ -1,61 +1,46 @@
 # codex-swift
 
-**codex-swift is a native Swift port of OpenAI's Codex agentic coding harness, re-architected as a long-running, multi-process macOS daemon.** It speaks the upstream Codex `app-server` JSON-RPC protocol, so the clients you already use connect unchanged — but underneath it runs as a supervised constellation of processes with Seatbelt sandboxing, Keychain auth, and crash/reboot-durable persistence. It is deliberately built as a **hardened base layer** onto which capabilities (channels, connectors, tools, providers) are layered as addons.
+**A coding agent that runs as a long-lived service on your Mac — architected so one session can't freeze another, the agent is boxed in by the operating system itself, and you can teach it new tricks without forking it.**
+
+codex-swift is a native Swift port of [OpenAI's Codex](https://github.com/openai/codex) coding agent. It speaks the same protocol as upstream Codex, so the clients you already use connect to it unchanged. What's different is underneath: instead of a one-shot CLI, it's a small set of cooperating background processes you can leave running — with the Mac's own sandbox around every command, your logins in the Keychain, and memory that survives restarts.
+
+If you just want to try it, jump to **[Get started](#get-started)**. If you want to understand it first, read on — this page goes from the 30-second picture to as deep as you care to follow.
 
 ---
 
-## Why this exists
+## What it is, in plain words
 
-Upstream Codex is a Rust binary. A Swift port targeted at macOS buys things a generic build can't:
-
-- **Native macOS integration is the implementation, not a shim.** `launchd` lifecycle, ad-hoc + Developer ID signing, Hardened Runtime, Keychain-backed tokens, Seatbelt (`sandbox-exec`) sandboxing, `task_set_phys_footprint_limit` resource governance, `os_signpost` spans, and DispatchSource file watchers are first-class.
-- **One toolchain end-to-end.** Clients, daemon, and tooling share one Swift package and one set of `Codable`/`Sendable` types. The portable core (wire, protocol, persistence, model contract, turn loop, tools, supervisor/worker/broker) also builds and tests green on Linux for CI.
-- **Parity over invention.** Every decision is checked against the `codex-rs` source tree. On-disk rollouts are byte-compatible with the Rust reader, unknown methods get wire-correct defaults (`-32601` only for truly-unknown), and a schema-parity gate diffs the pinned upstream oracle on every release build. Point any Codex client at `codexd` and it should just work.
-
-The trade-off: production targets **macOS 14+**; the OS-agnostic core stays portable for Linux CI.
-
----
-
-## What it can do
-
-**Agent core**
-- **Agent turn loop** — one request becomes a streamed, durable, steerable model-and-tool loop, ported faithfully from upstream.
-- **Models & providers** — one Responses-API `ModelClient` protocol with three interchangeable transports (curl SSE, URLSession, WebSocket), session-sticky retry/WS→HTTPS fallback, a per-model capability catalog, a provider registry, and a separate cheap small-model lane.
-- **Built-in tools** — shell/exec, `apply_patch` edits, file read/write/list/search, `view_image`, `web_search`, `spawn_agent`, and JavaScript code-mode — all through one dispatcher that enforces parallel/serial gating, sandboxing, and approvals.
-- **Prompts, AGENTS.md & context** — model-specific system prompt + project `AGENTS.md` + skills/connectors injection + token-aware auto-compaction.
-- **Memory** — auto-consolidated per-thread `.md` notes plus an optional host-wide vector Memory Wiki, recalled into each turn as fenced, untrusted context.
-- **Authentication** — ChatGPT browser/device-code login or API key, Keychain-backed, with single-flight token refresh.
-
-**Durability & safety**
-- **Persistence & resume** — append-only rollout JSONL as source-of-truth (upstream byte-compatible) + group-commit fsync durability + crash/reboot resume by replaying the log.
-- **Security** — Seatbelt/bwrap kernel sandbox, writable-roots + network policy, the never/onFailure/onRequest/unlessTrusted/granular approval ladder, channel owner-gating, and an SSRF egress chokepoint.
-- **Multi-process architecture** — a `codexd` supervisor, disposable per-session workers, a shared `codex-broker`, and a `codex-memory` daemon, so one bad session can't take the rest down.
-
-**Surfaces (how you reach it)**
-- **Web Gateway & UI** — built-in web server serving the chat UI, bridging each tab over a same-origin TLS WebSocket with bearer auth, a deny-default method gate, signed media URLs, and uploads.
-- **Computer use** — the agent drives the real macOS desktop via OpenAI's `computer` tool, behind a dedicated host-control approval gate (off by default).
-- **Realtime voice** — talk to the agent by voice in the browser over OpenAI's Realtime API (echo mock by default; live behind `CODEXKIT_REALTIME_LIVE`).
-- **Workflows** — a JavaScript engine that fans work out across many GPT sub-agents deterministically (agent/parallel/pipeline primitives, token budgets, crash-resume).
-- **Channels** — reach the agent from chat apps (Telegram, wired into the daemon) with server-stamped owner identity and a hard owner-gate that stays enforced even when the turn runs in a separate worker process.
-- **MCP** — plug in external tools/resources over stdio and streaming-HTTP servers, with `mcp__server__tool` naming, PKCE/loopback OAuth, and per-session secret isolation.
-
-**Proactive (the agent reaches out)**
-- **Push / outbound** — durable, SSRF-screened delivery to your phone (ntfy) or a webhook, via a `push_send` tool (approval-gated) and an owner-path `outbound/send` RPC + `codex-send` CLI.
-- **Cron / scheduler** — run a prompt on a schedule as a locked-down, unattended turn (read-only, approval-`never`) and push the result; migrates the legacy automations store.
-- **Media** — `media_generate` runs async (image today; video/music/speech planned) without blocking the turn, with a crash-safe ledger + daemon poller and pushed delivery.
-- **Google Workspace** — a discovery-driven `google_api` tool over a native OAuth-PKCE connector (`codexd google-connect`), host-pinned, with write verbs approval-gated.
-
-**Operations & integration**
-- **Observability** — structured `os.Logger`/stderr logs, `os_signpost` spans, a non-blocking metrics ring, and an opt-in OTLP/JSON exporter.
-- **Token usage & cost** — per-turn input/cached/output/reasoning accounting, per-model pricing, surfaced in notifications, rollouts, and benchmark reports.
-- **Benchmarks** — a native runner (`codex-bench`/BenchKit) scoring the 113-task DeepSWE benchmark in air-gapped `apple/container` VMs (Pass@1 + confidence intervals).
-- **App-server protocol** — the upstream-compatible Codex JSON-RPC surface (methods, items, streaming notifications, correlated server requests).
-- **Connectors** — OAuth-installed external services surfaced to the agent; the Google Workspace runtime (native OAuth-PKCE + the `google_api` tool) is built, the generic discovery + `app/list` skeleton covers the rest.
-- **Skills, lifecycle hooks & the addon layer** — on-disk `SKILL.md` procedures discovered at startup; `hooks.json` shell hooks at agent lifecycle points; and a "reverse the pyramid" addon model where new capabilities attach to existing seams as one safe file.
+- **It's a little constellation of processes, not one big program.** Each chat session runs in its own worker, so a session that hangs or crashes can't stall or take down the others — a supervisor notices and restarts it. → [Multi-process architecture](docs/features/multi-process-architecture.md)
+- **The Mac's own security boxes the agent in.** Every command the agent runs is wrapped in the macOS sandbox (Seatbelt); your credentials live in the Keychain; by default it cannot write outside your project or reach the network. The dangerous knobs exist, but you turn them on deliberately. → [Security & sandboxing](docs/guides/security.md)
+- **It can run small models on-device.** Cheap, fast little jobs — and the memory system's embeddings — can run locally via Apple's MLX instead of a round-trip to the API, so not every tiny task costs a network call. → [Models & providers](docs/features/models-and-providers.md)
+- **It remembers across sessions.** Each thread keeps short notes, and an optional host-wide **memory wiki** — a local vector store — recalls the facts relevant to *this* turn, so the agent carries context forward instead of starting cold every time. → [Memory](docs/features/memory.md)
+- **You extend it without touching the core.** A new tool, a chat channel, a connector — each attaches to a seam that already exists, as one small file. The hardened base stays faithful to upstream Codex, so new capabilities pile on top without making upstream updates a fight. → [Addons & extensions](docs/guides/addons-and-plugins.md)
+- **You can reach it from anywhere — and it can reach you.** A built-in web UI, voice, and chat apps like Telegram on the way *in*; push notifications to your phone, scheduled jobs, and generated images on the way *out*. → [Channels](docs/features/channels.md) · [Push](docs/features/push.md) · [Cron](docs/features/cron.md)
+- **Your existing Codex clients just work.** It's wire-compatible with the upstream `app-server` protocol — point a client at it and go. → [App-server protocol](docs/features/protocol.md)
 
 ---
 
-## Quickstart
+## A closer look
+
+A paragraph each on the ideas that shape everything else. Follow any link to go all the way down.
+
+**Multi-process, so nothing blocks.** A single long-running daemon (`codexd`) supervises a disposable worker per session, a shared auth/catalog service (`codex-broker`), and a memory daemon (`codex-memory`). Because each session is its own process, a runaway turn, a wedged tool, or an out-of-memory worker is contained — the supervisor reaps and restarts it while every other session keeps going. It's the difference between "the app froze" and "one tab reloaded." → [Multi-process architecture](docs/features/multi-process-architecture.md)
+
+**Hardened by the operating system, not by hope.** Letting a model run a shell on your laptop is risky by default. codex-swift leans on the kernel: every spawned command is launched inside a macOS Seatbelt profile that denies everything except reads, writes under your project directory, and — only if you allow it — the network. Credentials live in the Keychain, not a dotfile. An approval ladder decides when *you* get asked before something runs unsandboxed. The conservative defaults are the point; the escape hatches are explicit. → [Security & sandboxing](docs/guides/security.md)
+
+**A local lane for the small stuff.** Not every task deserves a frontier model. codex-swift has a separate small-model lane and an optional on-device path (Apple's MLX-Swift) for quick classifications and for the embeddings that power memory — so the cheap, high-frequency work can stay local and fast while real coding turns go to the big model. → [Models & providers](docs/features/models-and-providers.md)
+
+**Memory that persists.** Each conversation keeps short markdown notes that are consolidated at the end of a turn. Beyond that, an optional **memory wiki** is a host-wide vector store the agent searches every turn, pulling in the handful of facts relevant to what you're doing now and injecting them as clearly-marked, untrusted context. The result is an agent that remembers your project's conventions and decisions across days, not just within one chat. → [Memory](docs/features/memory.md)
+
+**Capabilities are addons, not forks.** The base layer is deliberately heavy and hardened; everything else is layered on through one of five plug-in *seams* (a context module, a tool pack, an MCP server, a chat channel, or a model provider). Adding a capability means writing one folder and wiring it in one place — never editing the prompt composer or the tool loop. That keeps the core byte-faithful to upstream Codex (cheap merges) while the fun stuff accretes on top: chat channels, a Google Workspace connector, scheduled jobs, push, generated media. → [Addons & extensions](docs/guides/addons-and-plugins.md) · [the addon portfolio](ADDONS.md)
+
+**Reach it, and let it reach back.** On the way in: a built-in web chat UI, voice in the browser, and chat apps (Telegram) with a server-stamped owner check so a stranger can't make it do destructive things. On the way out: it can push a notification to your phone when a long job finishes, run a prompt on a schedule, or generate an image — each through one durable, SSRF-screened delivery path. → [Channels](docs/features/channels.md) · [Web Gateway](docs/features/web-gateway.md) · [Push](docs/features/push.md) · [Cron](docs/features/cron.md) · [Media](docs/features/media.md)
+
+**Why a Swift port at all?** Because targeting macOS specifically buys things a generic binary can't: `launchd` lifecycle, code signing + Hardened Runtime, Keychain, Seatbelt, and OS resource governance are first-class, not shims. And it's *parity-driven* — checked against the `codex-rs` source so on-disk session files stay byte-compatible and any Codex client connects unchanged. Production targets **macOS 14+**; the OS-agnostic core also builds and tests on Linux for CI.
+
+---
+
+## Get started
 
 ```sh
 git clone https://github.com/chrischabot/codex-swift.git
@@ -70,9 +55,11 @@ That smoke script drives the real `codexd` binary over stdio and runs one full s
 
 ---
 
-## Documentation
+## Dive deeper
 
-### Guides
+Every capability has a focused doc that opens with *why it matters* and a plain-English overview before the internals — written to be read top-to-bottom or skimmed. Start with **[Getting Started](docs/guides/getting-started.md)** or **[Multi-Process Architecture](docs/features/multi-process-architecture.md)** for the mental model; follow your curiosity from there.
+
+### Guides — how to use it
 - **[Getting Started — Build & Run](docs/guides/getting-started.md)** — Build the package and run your first streamed turn over stdio, Unix socket, or WebSocket; understand the codexd/codex-session/codex-broker/codex-memory layout; install under launchd.
 - **[Configuration](docs/guides/configuration.md)** — Layered TOML config: `config.toml` files, profiles, `[features]` flags, `CODEX_CFG_*`/`CODEX_FEATURE_*` overrides, `$CODEX_HOME`, model/provider/approval/sandbox keys, and inspecting the merged config.
 - **[Slash Commands](docs/guides/slash-commands.md)** — There's no in-band slash parser: `/review`, `/compact`, the shell affordance, and `/workflow` are client-side shortcuts mapped to RPC methods/turn kinds; custom `/<name>` commands are `prompts/` files; the word "workflow" auto-arms the workflow tool.
@@ -81,7 +68,7 @@ That smoke script drives the real `codexd` binary over stdio and runs one full s
 - **[Addons & Plugins](docs/guides/addons-and-plugins.md)** — The "reverse the pyramid" model: five plug-in surfaces (module, ToolPack, MCP, channel, provider), the `ExtensionAPI` registry wired by one `installAddons` root, the ToolPack→ToolRouter seam, and the Phase-0 foundations.
 - **[Security, Sandboxing & Approvals](docs/guides/security.md)** — Running real commands safely: the Seatbelt/bwrap kernel sandbox, writable-roots and network policy, the never/onFailure/onRequest/unlessTrusted/granular approval ladder, channel owner-gating, and the SSRF egress chokepoint.
 
-### Core
+### Core — how the agent works
 - **[The Agent Turn Loop](docs/features/agent-loop.md)** — How one user request becomes a streamed, durable, steerable model-and-tool loop.
 - **[Models & Providers](docs/features/models-and-providers.md)** — One `ModelClient` protocol, three transports, session-sticky retry/fallback, a capability catalog, a provider registry, and a cheap small-model lane.
 - **[Built-in Tools](docs/features/tools.md)** — The catalog of concrete actions — shell/exec, `apply_patch`, `web_search`, `view_image`, code-mode — through one parallel/serial-gating, sandboxing, approval-enforcing dispatcher.
@@ -91,7 +78,7 @@ That smoke script drives the real `codexd` binary over stdio and runs one full s
 - **[Prompts, AGENTS.md & Context](docs/features/prompts-and-context.md)** — The system prompt, `AGENTS.md`, skills/connectors injection, and token-aware auto-compaction.
 - **[Authentication](docs/features/auth.md)** — ChatGPT browser/device-code login or API key, Keychain-backed, single-flight refresh, transparent per-turn credential delivery.
 
-### Surfaces
+### Surfaces — how you reach it
 - **[Web Gateway & UI](docs/features/web-gateway.md)** — The built-in web server + same-origin TLS WebSocket bridge with bearer auth, a deny-default method gate, signed media URLs, and uploads.
 - **[Computer Use (Desktop Control)](docs/features/computer-use.md)** — The agent drives the real macOS desktop via the `computer` tool, behind a host-control approval gate; off by default.
 - **[Realtime Voice](docs/features/realtime-voice.md)** — Voice in the browser over OpenAI's Realtime API, bridged through the WebGateway, gated behind `CODEXKIT_REALTIME_LIVE`.
@@ -99,17 +86,17 @@ That smoke script drives the real `codexd` binary over stdio and runs one full s
 - **[Channels (Reach the Agent via Chat)](docs/features/channels.md)** — Reach the agent from chat apps (Telegram, wired into the daemon): inbound message → turn → reply, server-stamped owner identity, a hard owner-gate enforced even across the spawned worker, per-conversation isolation, `channels/*` control RPC.
 - **[Connectors](docs/features/connectors.md)** — OAuth-installed external services; the native Google OAuth-PKCE runtime + the `google_api` Workspace tool are built (`codexd google-connect`), the generic `app/list` discovery skeleton covers the rest.
 
-### Proactive
+### Proactive — how it reaches you
 - **[Push & Outbound Delivery](docs/features/push.md)** — Durable, SSRF-screened delivery to ntfy/webhook via the approval-gated `push_send` tool and the owner-path `outbound/send` RPC + `codex-send` CLI.
 - **[Cron & Scheduled Jobs](docs/features/cron.md)** — Run a prompt on a schedule as a locked-down, unattended turn (read-only, approval-`never`) whose result is pushed; `cron/*` RPC + automations migration.
 - **[Media Generation](docs/features/media.md)** — `media_generate` runs async without blocking the turn — crash-safe ledger, daemon poller, bounded-retry pushed delivery.
 
-### Operations
+### Operations — running it
 - **[Observability](docs/features/observability.md)** — Structured logs, `os_signpost` spans, a non-blocking metrics ring, and an opt-in OTLP/JSON exporter.
 - **[Token Usage & Cost](docs/features/usage-and-cost.md)** — Per-turn usage accounting, per-model pricing, and spend surfaced in notifications, rollouts, and benchmark reports.
 - **[Benchmarks (DeepSWE Runner)](docs/features/benchmarks.md)** — A native runner scoring the 113-task DeepSWE benchmark in air-gapped `apple/container` VMs (Pass@1 + cost/time/tokens).
 
-### For Integrators
+### For integrators — connecting to it
 - **[The App-Server Protocol](docs/features/protocol.md)** — Connecting a client over the upstream-compatible Codex JSON-RPC protocol: methods, items, streaming notifications, correlated server requests, wire rules, error codes.
 - **[Lifecycle Hooks](docs/features/hooks.md)** — Run your own shell commands at lifecycle points (PreToolUse, PermissionRequest, Stop, …) to block, rewrite, approve, or observe — configured via a trusted `hooks.json`.
 
