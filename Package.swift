@@ -17,18 +17,24 @@ let strict: [SwiftSetting] = [
     .enableUpcomingFeature("ExistentialAny"),
 ]
 
-// MLX Swift LM is gated on macOS (Apple Silicon). Linux builds skip the
-// dependency entirely. Enable by setting `CODEXKIT_MLX=1` in the environment
-// when invoking SwiftPM so CI builds without it stay fast.
-let mlxEnabled = (Context.environment["CODEXKIT_MLX"] == "1")
+// MLX Swift LM (on-device small models + embeddings) is enabled BY DEFAULT on
+// macOS — it is the on-device lane for memory embeddings + cheap small-model
+// tasks. It is Apple-silicon / Metal only, so Linux builds ALWAYS skip it
+// (the dependency does not build there). Opt out on macOS with `CODEXKIT_MLX=0`
+// for a faster, dependency-light build (e.g. a quick CI pass that doesn't
+// exercise the on-device lane); any other value — or unset — keeps it on.
+#if os(macOS)
+let mlxEnabled = (Context.environment["CODEXKIT_MLX"] != "0")
+#else
+let mlxEnabled = false
+#endif
 
 let mlxDependencies: [Package.Dependency] = mlxEnabled ? [
     .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.3"),
     .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
 ] : []
 
-// We only enable MLX when the user explicitly opts in via CODEXKIT_MLX=1,
-// which is only valid on macOS. Linux ignores the flag.
+// MLX is on by default on macOS (opt out with CODEXKIT_MLX=0); never on Linux.
 func makeMLXProducts() -> [Target.Dependency] {
     guard mlxEnabled else { return [] }
     var deps: [Target.Dependency] = []
