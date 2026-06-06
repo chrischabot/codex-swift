@@ -24,10 +24,18 @@ import MLXEmbedders
 /// remote/mock backend automatically.
 ///
 /// Model defaults (per the design doc):
-///   extractor: mlx-community/Qwen3-30B-A3B-4bit-MLX
+///   extractor: mlx-community/Qwen3-30B-A3B-4bit-MLX  (30B/3B-active MoE — the
+///              on-device triage/extraction lane; `extractorModelID` is a config
+///              knob, so any mlx-swift-lm-supported model can be substituted)
 ///   embedder:  nomic-ai/nomic-embed-text-v1.5
 ///   reranker:  not yet — see MLXLocalProvider+Reranker for the planned
 ///              hand-rolled BertForSequenceClassification head.
+///
+/// NOTE: `mlx-community/gemma-4-26b-a4b-it-4bit` does NOT load on the current
+/// mlx-swift-lm pin (its Gemma 4 support is dense-only; the 26B is MoE). Adopting
+/// it needs a registered MoE-aware "gemma4" model — full spec + exact weight keys
+/// in docs/notes/gemma4-moe-mlx-port.md. Deferred: the Qwen3 MoE above already
+/// covers this niche.
 public actor MLXLocalProvider: LocalInferenceProvider {
     public struct Config: Sendable {
         public var extractorModelID: String
