@@ -23,6 +23,11 @@ public actor GmailChannel: Channel, ChannelOutbound {
     private let fromAddress: String?
     private let pollMs: Int
     private var pollTask: Task<Void, Never>?
+    /// Backstop de-dup: ids we've already routed this run. Normally `markRead`
+    /// drops UNREAD so the `is:unread` query never returns them again — but if
+    /// the connected account lacks `gmail.modify`, markRead 403s and the same
+    /// ids would reprocess every poll. This bounded set prevents that loop.
+    private var seen: Set<String> = []
 
     public init(api: GoogleAPIClient,
                 ownerEmails: Set<String> = [],
@@ -64,13 +69,16 @@ public actor GmailChannel: Channel, ChannelOutbound {
               let obj = try? JSONSerialization.jsonObject(with: resp.body) as? [String: Any],
               let messages = obj["messages"] as? [[String: Any]] else { return }
         for m in messages {
-            guard let mid = m["id"] as? String else { continue }
+            guard let mid = m["id"] as? String, !seen.contains(mid) else { continue }
             let getRes = await api.call(service: .gmail, method: "GET",
                                         path: "/users/\(userId)/messages/\(mid)",
                                         query: ["format": "full"])
             guard case .success(let g) = getRes, let parsed = GmailParser.parse(g.body) else { continue }
             _ = await processInbound(parsed, host: host)
-            // Mark read regardless (so we don't reprocess), best-effort.
+            if seen.count > 5_000 { seen.removeAll(keepingCapacity: true) }   // bounded backstop
+            seen.insert(mid)
+            // Mark read so the next `is:unread` poll skips it (best-effort; needs
+            // gmail.modify — `seen` is the backstop when that scope isn't granted).
             await markRead(mid)
         }
     }

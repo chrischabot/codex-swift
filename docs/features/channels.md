@@ -83,6 +83,18 @@ poll_timeout_seconds = 30
 
 When `codexd` starts with the feature on, `ChannelsGlue.bootstrap` reads the config, builds a `TelegramChannel` bound to a `SupervisorChannelHost` whose runner applies the per-sender lockdown, registers it on a `ChannelManager`, and starts it (stopped cleanly on SIGTERM/SIGINT). If the feature is disabled or no token resolves, nothing is constructed — an unconfigured daemon is byte-identical to one without channels. `TelegramChannel` long-polls `getUpdates`, maps each text update through `mapTelegramUpdate` (server-stamping identity from `from.id`), runs `host.deliver`, and relays the reply via `sendMessage`. Non-text and anonymous posts are skipped; a non-completed turn surfaces a status note instead of silence.
 
+**Gmail (wired into the daemon, on the Google connector).** Email is a first-class owner-stamped channel that rides the SAME connected Google account as the [`google_api` tool](connectors.md) — connect once with `codexd google-connect`, then enable:
+
+```toml
+[channels.gmail]
+enabled      = true
+owner_emails = ["you@example.com"]   # who counts as OWNER (empty ⇒ everyone non-owner)
+from_address = "you@example.com"     # optional; the account's own address by default
+poll_ms      = 15000
+```
+
+`codexd` long-polls unread mail, server-stamps `senderIsOwner` from the authenticated **email address** vs. `owner_emails` (the `From` header is forgeable — DKIM/SPF authenticate the domain, not the operator), routes the body as one turn, and replies in-thread (`In-Reply-To`/`References`). Its own sends carry an `X-Codex-Channel: gmail` marker so they're never re-ingested. **Scope:** the Gmail channel needs `gmail.modify` granted on the connected account (to mark mail read + send) — add it to `[connectors.google].scopes` and re-connect; connector defaults are read-only (least privilege). Without it, reads still work but mark-read/send fail gracefully and an in-memory de-dup prevents reprocessing. Telegram and Gmail share one `ChannelManager` + thread store, namespaced by channel so they never collide.
+
 **Manage channels over the owner-only RPC.** `channels/list`, `channels/start`, `channels/stop`, and `channels/status` control the running manager. Like all owner-only control surfaces they are gated by transport — served on the owner-local stdio/Unix-socket router, refused on the browser tier (`allowsOwnerOnlyRPC`), and excluded from the WebGateway method allowlist.
 
 **What you see:** you text your bot "summarize the open PRs"; the agent runs a turn; the answer arrives as a Telegram message. If a stranger texts "delete the repo," their turn runs read-only with approval set to `never`, so the shell/file action is denied inline — no escalation, no hung prompt — regardless of which worker process ran it.
@@ -98,7 +110,8 @@ When `codexd` starts with the feature on, `ChannelsGlue.bootstrap` reads the con
 Honest accounting of built vs planned:
 
 - **Built, tested, and wired into the daemon:** the `Channels` spine (`Channel`, `ChannelHost`, `InboundMessage`, `ChannelIdentity`, `ChannelReply`, `ChannelOutbound`), `EngineChannelHost`, `ConversationRoutingHost`, the advisory + hard in-process owner gate (`installChannelGate`), the supervisor turn-collector (`collectTurn` → `CollectedTurn`), the daemon-resident production path — `SupervisorChannelHost` over a durable `ChannelThreadStore`, `ChannelManager` (supervised start/stop/restart with backoff), the `channels/*` owner-gated JSON-RPC family, and `ChannelsGlue.bootstrap` wiring a configured `TelegramChannel` at the codexd composition root — plus the process-agnostic non-owner lockdown baked into `SessionConfig` (`ChannelGlue.channelSessionConfig`). The Telegram mapping/owner-stamping (`mapTelegramUpdate` / `TelegramConfig.load`) is network-free unit-tested; an adversarial review confirmed `senderIsOwner` is unforgeable and the non-owner lockdown holds in spawned-worker mode.
-- **Descoped / planned:** the **Gmail** channel is net-new OAuth/credential plumbing on top of the [Google connector](connectors.md) and is deferred. The `ChannelOutbound` seam exists (and powers [push](push.md)) but channels don't yet *initiate* unsolicited pushes. Telegram lacks webhook mode, media in/out, and message chunking/formatting.
+- **Gmail — built + wired** (`[channels.gmail]`): the `Sources/Gmail` module (`GmailChannel`/`GmailMIME`/`GmailParser`, `GmailConfig`) is registered alongside Telegram by the multi-channel `ChannelsGlue.bootstrap`, owner-stamped from the authenticated email vs. `owner_emails`, with CRLF header-injection defense, self-loop marker, threaded replies, and a bounded de-dup backstop. 16 GmailTests + a `GMAIL_LIVE_TEST`-gated send e2e.
+- **Planned:** the `ChannelOutbound` seam exists (and powers [push](push.md)) but channels don't yet *initiate* unsolicited pushes. Telegram lacks webhook mode, media in/out, and message chunking/formatting. Gmail inbound poll-back isn't yet durable (DeliveryCore-backed) and read-marking on a failed process is an MVP limitation (the in-memory de-dup covers the loop).
 - **Externally blocked verification:** a live end-to-end Telegram run needs a real @BotFather token and outbound network, so the long-poll loop's network path is exercised only against stubs; the identity, gating, and lockdown logic are fully tested.
 
 ## Go deeper

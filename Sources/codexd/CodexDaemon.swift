@@ -21,12 +21,14 @@ import Auth
 import Tokenizer
 import Config
 import MemoryExtension
+import Mem0Extension
 import WebGateway
 import Push
 import GoogleWorkspace
 import Media
 import Cron
 import Channels
+import Gmail
 
 /// #8 Media delivery (codexd): push a "ready" notification for a finished asset
 /// through the daemon-scope PushRouter (#7). Returns false → the ledger marks it
@@ -51,41 +53,66 @@ enum MediaGlue {
 /// into SessionConfig (ChannelGlue.channelSessionConfig) so the owner-gate is
 /// enforced in BOTH in-process and spawned worker modes.
 enum ChannelsGlue {
+    private static func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
+
+    /// Build ONE ChannelManager over a shared host + thread store, then register
+    /// every ENABLED channel (Telegram, Gmail, …). The thread store keys by
+    /// channelId/conversationId (injective), so distinct transports never collide
+    /// on one shared store. Deny-default: returns nil (nothing started) when no
+    /// channel is enabled/resolvable — byte-identical to a daemon without channels.
     static func bootstrap(config: Config, codexHome: String, supervisor: SessionSupervisor,
                           defaultModel: String, env: [String: String]) async -> ChannelManager? {
-        guard let obj = config.value("channels.telegram")?.objectValue,
-              obj["enabled"]?.boolValue == true else { return nil }
-        var owners: [String] = []
-        if case .array(let a)? = obj["owners"] { owners = a.compactMap { $0.stringValue } }
-        guard let tgConfig = TelegramConfig.load(
-            enabled: true,
-            botTokenEnvVar: obj["bot_token_env"]?.stringValue,
-            owners: owners,
-            pollTimeoutSeconds: obj["poll_timeout_seconds"]?.intValue.map(Int.init),
-            apiBase: obj["api_base"]?.stringValue,
-            env: env) else {
-            FileHandle.standardError.write(Data(
-                "codexd channels: telegram enabled but no bot token resolved; skipping\n".utf8))
-            return nil
-        }
-        let threadStore = ChannelThreadStore(
-            path: codexHome + "/channels/telegram-threads.json",
-            mint: { ThreadId.generate().raw })
         let runner = ChannelGlue.makeTurnRunner(
             supervisor: supervisor,
             defaultCwd: FileManager.default.currentDirectoryPath,
             defaultModel: defaultModel)
+        let threadStore = ChannelThreadStore(
+            path: codexHome + "/channels/threads.json",
+            mint: { ThreadId.generate().raw })
         let host = SupervisorChannelHost(threadStore: threadStore, runTurn: runner)
         let manager = ChannelManager(host: host)
-        await manager.register(TelegramChannel(config: tgConfig))
+        var registered = 0
+
+        // --- Telegram ---
+        if let obj = config.value("channels.telegram")?.objectValue, obj["enabled"]?.boolValue == true {
+            var owners: [String] = []
+            if case .array(let a)? = obj["owners"] { owners = a.compactMap { $0.stringValue } }
+            if let tg = TelegramConfig.load(
+                enabled: true, botTokenEnvVar: obj["bot_token_env"]?.stringValue, owners: owners,
+                pollTimeoutSeconds: obj["poll_timeout_seconds"]?.intValue.map(Int.init),
+                apiBase: obj["api_base"]?.stringValue, env: env) {
+                await manager.register(TelegramChannel(config: tg))
+                registered += 1
+                log("codexd channels: telegram started (\(owners.count) owner(s))")
+                if owners.isEmpty { log("codexd channels: telegram has NO owners — every sender is NON-OWNER (read-only, locked-down)") }
+            } else {
+                log("codexd channels: telegram enabled but no bot token resolved; skipping")
+            }
+        }
+
+        // --- Gmail (#5) — rides the SAME connected Google account as google_api ---
+        if let obj = config.value("channels.gmail")?.objectValue, obj["enabled"]?.boolValue == true {
+            var ownerEmails: [String] = []
+            if case .array(let a)? = obj["owner_emails"] { ownerEmails = a.compactMap { $0.stringValue } }
+            if let gm = GmailConfig.load(
+                enabled: true, ownerEmails: ownerEmails,
+                fromAddress: obj["from_address"]?.stringValue,
+                pollMs: obj["poll_ms"]?.intValue.map(Int.init)),
+               let client = GoogleWiring.makeAPIClient(addonConfig: config, codexHome: codexHome, env: env) {
+                await manager.register(GmailChannel(
+                    api: client, ownerEmails: Set(gm.ownerEmails),
+                    fromAddress: gm.fromAddress, pollMs: gm.pollMs))
+                registered += 1
+                log("codexd channels: gmail started (\(gm.ownerEmails.count) owner(s)); needs gmail.modify scope on the connected account")
+                if gm.ownerEmails.isEmpty { log("codexd channels: gmail has NO owner_emails — every sender is NON-OWNER (read-only, locked-down)") }
+            } else {
+                log("codexd channels: gmail enabled but no [connectors.google] connection resolved; run `codexd google-connect`. skipping")
+            }
+        }
+
+        guard registered > 0 else { return nil }   // deny-default
         ChannelManagerHolder.shared.set(manager)
         await manager.startAll()
-        if owners.isEmpty {
-            FileHandle.standardError.write(Data(
-                "codexd channels: telegram has NO owners — every sender is NON-OWNER (read-only, locked-down turns)\n".utf8))
-        }
-        FileHandle.standardError.write(Data(
-            "codexd channels: telegram started (\(owners.count) owner(s))\n".utf8))
         return manager
     }
 }
@@ -363,7 +390,11 @@ struct CodexDaemon {
         let useMock = ProcessInfo.processInfo.environment["CODEXKIT_MOCK"] == "1"
         let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"]
         let model: any ModelClient
+        let mem0AuthProvider: Mem0SessionAuthProvider?
+        let wikiAuthProvider: WikiMemoryAuthProvider?
         if useMock {
+            mem0AuthProvider = nil
+            wikiAuthProvider = nil
             if ProcessInfo.processInfo.environment["CODEXKIT_MOCK_SCENARIO"] == "tool-loop-compact" {
                 model = MockModelClient(MockScenario.toolLoopCompactionSequence(repetitions: 256))
             } else {
@@ -371,22 +402,38 @@ struct CodexDaemon {
                                         times: 1024)
             }
         } else if let apiKey, !apiKey.isEmpty {
+            mem0AuthProvider = .staticToken(apiKey)
+            wikiAuthProvider = .staticToken(apiKey)
             model = openAIClient(apiKey: apiKey, limits: limits)
             log.info("codexd using OpenAI Responses client from OPENAI_API_KEY")
         } else if let brokerAuth = brokerAuthClient(codexHome: codexHome),
                   let token = await brokerAuth.validAccessToken() {
+            mem0AuthProvider = Mem0SessionAuthProvider(
+                accessToken: { await brokerAuth.validAccessToken() },
+                refreshToken: { await brokerAuth.refreshAccessToken() })
+            wikiAuthProvider = WikiMemoryAuthProvider(
+                accessToken: { await brokerAuth.validAccessToken() },
+                refreshToken: { await brokerAuth.refreshAccessToken() })
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token, limits: limits),
                 refreshToken: { await brokerAuth.refreshAccessToken() },
                 makeClient: { openAIClient(apiKey: $0, limits: limits) })
             log.info("codexd using OpenAI Responses client from broker auth with 401 refresh")
         } else if let token = await authManager.validAccessToken() {
+            mem0AuthProvider = Mem0SessionAuthProvider(
+                accessToken: { await authManager.validAccessToken() },
+                refreshToken: { await authManager.refreshAccessToken() })
+            wikiAuthProvider = WikiMemoryAuthProvider(
+                accessToken: { await authManager.validAccessToken() },
+                refreshToken: { await authManager.refreshAccessToken() })
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token, limits: limits),
                 refreshToken: { await authManager.refreshAccessToken() },
                 makeClient: { openAIClient(apiKey: $0, limits: limits) })
             log.info("codexd using OpenAI Responses client from stored auth with 401 refresh")
         } else {
+            mem0AuthProvider = nil
+            wikiAuthProvider = nil
             model = NotConfiguredModelClient()
         }
 
@@ -476,31 +523,40 @@ struct CodexDaemon {
                     let approved = ApprovedRuleStore(codexHome: codexHome)
                     // Extension spine (ARCHITECTURE.md §5.4 / Phase 0): mirror
                     // the codex-session wiring (this is the in-process worker
-                    // path). nil registry → byte-identical core.
+                    // path). General manifests are feature-gated; memory can
+                    // install independently because mem0 is the default
+                    // personal-memory path.
                     let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
-                    // Phase 1 (ARCHITECTURE.md §7.1): core `.md` memories as the
-                    // default MemoryProvider slot candidate; `[memory].provider`
-                    // selects/disables. Recall+capture wire into the registry.
+                    // Phase 1 (ARCHITECTURE.md §7.1): memory slot candidates.
+                    // mem0 is the default personal-memory provider when
+                    // `[memory].provider` is unset; "core", "wiki", and "none"
+                    // remain explicit choices. Recall+capture wire into the
+                    // registry.
                     // The vector "Memory Wiki" candidate is built ONLY when
                     // `[memory].provider == "wiki"` (constructing it opens a
                     // SQLite handle on the wiki DB). It reuses this session's
                     // `ModelClient` for its own text inference (D1) and returns
-                    // nil if the DB can't be opened (degrade to core).
+                    // nil if the DB can't be opened, so a configured-but-
+                    // unavailable wiki disables recall rather than crashing.
                     var memoryCandidates: [any MemoryProvider] = [CoreMemoriesProvider(store: memory)]
-                    if addonConfig.value("memory")?.objectValue?["provider"]?.stringValue == "wiki",
-                       let wiki = makeWikiMemoryProvider(config: addonConfig, modelClient: model) {
+                    let configuredMemoryProvider = addonConfig.value("memory")?.objectValue?["provider"]?.stringValue
+                    if (configuredMemoryProvider == nil || configuredMemoryProvider == "mem0"),
+                       let mem0 = makeMem0MemoryProvider(config: addonConfig,
+                                                         authProvider: mem0AuthProvider) {
+                        memoryCandidates.append(mem0)
+                    }
+                    if configuredMemoryProvider == "wiki",
+                       let wiki = makeWikiMemoryProvider(config: addonConfig,
+                                                         modelClient: model,
+                                                         authProvider: wikiAuthProvider) {
                         memoryCandidates.append(wiki)
                     }
                     let memoryProvider = selectMemoryProvider(
                         config: addonConfig, candidates: memoryCandidates)
-                    // Gate the provider's tools on the SAME `extensions` feature
-                    // that gates its recall/capture (installAddons, below) — see
-                    // codex-session/main.swift: registering provider tools while
-                    // recall stayed off leaked e.g. wiki tools into an
-                    // extensions-off session (asymmetry → tool-list divergence).
-                    if addonConfig.isFeatureEnabled("extensions") {
-                        for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
-                    }
+                    // Register the selected provider's tools. Memory is no
+                    // longer gated by the general `extensions` feature because
+                    // mem0 is the default personal-memory product path.
+                    for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
                     // ADDONS Phase 0 #2: addon tool-pack seam. #4 (Google
                     // Workspace), #7 (Push), #8 (Media) construct their packs
                     // with deps and append here; each is gated by

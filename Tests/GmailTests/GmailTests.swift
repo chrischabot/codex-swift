@@ -83,6 +83,16 @@ final class GmailTests: XCTestCase {
         XCTAssertTrue(got!.senderIsOwner, "an explicitly allowlisted address is owner")
     }
 
+    func testOwnerMatchIsCaseInsensitive() async {
+        // The allowlist is normalized on BOTH sides (channel lowercases owners;
+        // the parser lowercases the From address), so a mixed-case config still
+        // matches a mixed-case sender.
+        let (chan, host, _) = makeChannel(owners: ["Boss@Corp.com"])
+        _ = await chan.processInbound(inbound(from: "BOSS@corp.COM"), host: host)
+        let got = await host.last()
+        XCTAssertTrue(got!.senderIsOwner, "owner match is case-insensitive on both sides")
+    }
+
     func testReplyIsThreadedAndSent() async throws {
         let (chan, host, http) = makeChannel(reply: "the answer")
         _ = await chan.processInbound(inbound(from: "alice@example.com", messageId: "<orig@example.com>"), host: host)
