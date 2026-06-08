@@ -1,5 +1,5 @@
 import * as React from "react";
-import { EditorState, Compartment } from "@codemirror/state";
+import { EditorState, Compartment, type Extension } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
@@ -11,6 +11,14 @@ interface Props {
   value: string;
   onChange: (v: string) => void;
   className?: string;
+  /**
+   * Extra CM6 extensions appended after the base config (autocomplete, live
+   * preview, vim, folding, …). Reconfigured in place via a Compartment when the
+   * array identity changes, so the host can toggle features without rebuilding
+   * the view (which would lose the caret/undo history). Pass a stable/memoized
+   * array — a new array every render triggers a reconfigure each time.
+   */
+  extensions?: Extension[];
 }
 
 // Bridges www's design tokens into CodeMirror's chrome so the editor reads as
@@ -66,14 +74,20 @@ function themeExtensions(dark: boolean) {
  *   documentElement's class — so toggling the app's .dark class re-themes the
  *   editor in place without rebuilding it.
  */
-export function CodeMirrorEditor({ value, onChange, className }: Props) {
+export function CodeMirrorEditor({ value, onChange, className, extensions }: Props) {
   const hostRef = React.useRef<HTMLDivElement>(null);
   const viewRef = React.useRef<EditorView | null>(null);
   const themeCompartment = React.useRef(new Compartment());
+  // Holds the host-supplied extras so they can be reconfigured in place when
+  // the `extensions` prop changes, without rebuilding the view.
+  const extrasCompartment = React.useRef(new Compartment());
   // Keep the latest onChange reachable from the (stable) updateListener without
   // re-creating the view when the callback identity changes.
   const onChangeRef = React.useRef(onChange);
   onChangeRef.current = onChange;
+  // Latest extras captured for the create-once effect (which has empty deps).
+  const extensionsRef = React.useRef(extensions);
+  extensionsRef.current = extensions;
 
   React.useEffect(() => {
     const host = hostRef.current;
@@ -86,6 +100,10 @@ export function CodeMirrorEditor({ value, onChange, className }: Props) {
         extensions: [
           history(),
           lineNumbers(),
+          // Host extras (autocomplete / live preview / vim / folding) sit ahead
+          // of the base keymap so vim/search/fold bindings win over the
+          // defaults; vim() in particular must outrank defaultKeymap.
+          extrasCompartment.current.of(extensionsRef.current ?? []),
           keymap.of([...defaultKeymap, ...historyKeymap]),
           markdown({ base: markdownLanguage }),
           EditorView.lineWrapping,
@@ -136,6 +154,16 @@ export function CodeMirrorEditor({ value, onChange, className }: Props) {
       selection: { anchor: Math.min(sel.anchor, len), head: Math.min(sel.head, len) },
     });
   }, [value]);
+
+  // Swap host extras in place when the prop array changes (feature toggles)
+  // without rebuilding the view, preserving caret + undo history.
+  React.useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: extrasCompartment.current.reconfigure(extensions ?? []),
+    });
+  }, [extensions]);
 
   return (
     <div

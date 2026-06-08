@@ -7,6 +7,10 @@ import { toast } from "@/components/ui/sonner";
 import { cn } from "@/lib/utils";
 import { WikiMarkdown } from "@/components/wiki/WikiMarkdown";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
+import { livePreview } from "./livePreview";
+import { wikiAutocomplete } from "./autocomplete";
+import { editorExtensions } from "./extensions";
+import "./livePreview.css";
 
 interface Props {
   /** Existing page to edit; omit for a new (blank) page. */
@@ -39,6 +43,37 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
   const [loading, setLoading] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [dirty, setDirty] = React.useState(false);
+
+  // Known page titles (for `[[` autocomplete + unresolved-link styling).
+  const [knownTitles, setKnownTitles] = React.useState<Set<string>>(new Set());
+  React.useEffect(() => {
+    if (!connector.listWikiPages || !connected) return;
+    let alive = true;
+    connector.listWikiPages({ limit: 1000 })
+      .then((ps) => { if (alive) setKnownTitles(new Set(ps.map((p) => p.title.toLowerCase()))); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [connector, connected]);
+
+  // CM6 extension bundle for the editor: Live Preview (render-as-you-type) +
+  // autocomplete ([[ / # / /) + folding + multi-cursor. Memoized so the editor
+  // only reconfigures when the providers/resolver change.
+  const cmExtensions = React.useMemo(() => [
+    livePreview({ isLinkResolved: (t) => knownTitles.has(t.split(/[#|]/)[0].trim().toLowerCase()) }),
+    wikiAutocomplete({
+      pages: async () => {
+        if (!connector.listWikiPages) return [];
+        const ps = await connector.listWikiPages({ limit: 1000 });
+        return ps.map((p) => ({ id: p.id, title: p.title }));
+      },
+      tags: async () => {
+        if (!connector.getWikiTags) return [];
+        const t = await connector.getWikiTags();
+        return t.map((x) => x.tag);
+      },
+    }),
+    editorExtensions({ fold: true }),
+  ], [connector, knownTitles]);
 
   // Load the existing page (edit mode). New-page mode resets to a blank draft.
   React.useEffect(() => {
@@ -185,6 +220,7 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
           <CodeMirrorEditor
             value={body}
             onChange={onBodyChange}
+            extensions={cmExtensions}
             className={cn("h-full rounded-md")}
           />
         )}
