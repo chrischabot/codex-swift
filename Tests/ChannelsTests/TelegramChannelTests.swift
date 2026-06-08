@@ -30,6 +30,43 @@ import FoundationNetworking
 /// token) is externally blocked — see the test class doc and the task report.
 final class TelegramChannelTests: XCTestCase {
 
+    // MARK: reply chunking (#11) — the Bot API caps sendMessage at 4096 chars
+
+    func testChunkShortTextIsOnePiece() {
+        XCTAssertEqual(TelegramChannel.chunk("hello"), ["hello"])
+        XCTAssertEqual(TelegramChannel.chunk(""), [], "empty stays silent")
+    }
+
+    func testChunkSplitsAndPreservesEveryCharacter() {
+        let text = String(repeating: "a", count: 9_500)   // no break chars → hard cuts
+        let parts = TelegramChannel.chunk(text, limit: 4000)
+        XCTAssertEqual(parts.count, 3, "9500 / 4000 → 3 chunks")
+        XCTAssertTrue(parts.allSatisfy { $0.count <= 4000 }, "every chunk under the cap")
+        XCTAssertEqual(parts.joined(), text, "concatenation reconstructs the input exactly")
+    }
+
+    func testChunkBoundsByUTF16NotCharacterCount() {
+        // 3000 rocket emoji = 6000 UTF-16 units (2 each). Chunking by Character
+        // (3000 < 4096) would wrongly leave ONE oversized message; bounding by
+        // UTF-16 must split it — and never split an emoji grapheme.
+        let text = String(repeating: "🚀", count: 3_000)
+        let parts = TelegramChannel.chunk(text)
+        XCTAssertGreaterThan(parts.count, 1, "emoji text is split by UTF-16 length, not char count")
+        XCTAssertTrue(parts.allSatisfy { $0.utf16.count <= 4096 }, "every chunk under the UTF-16 cap")
+        XCTAssertEqual(parts.joined(), text, "no emoji grapheme split; content preserved")
+    }
+
+    func testChunkPrefersNewlineThenSpaceBoundary() {
+        // A block of 3990 'a's, a newline, then more — the first chunk should end
+        // at the newline, not mid-word.
+        let head = String(repeating: "a", count: 3_990)
+        let tail = String(repeating: "b", count: 100)
+        let parts = TelegramChannel.chunk(head + "\n" + tail, limit: 4000)
+        XCTAssertEqual(parts.count, 2)
+        XCTAssertTrue(parts[0].hasSuffix("\n"), "broke on the newline boundary")
+        XCTAssertEqual(parts.joined(), head + "\n" + tail)
+    }
+
     // MARK: canned getUpdates JSON
 
     /// A realistic `getUpdates` envelope with two text messages from two

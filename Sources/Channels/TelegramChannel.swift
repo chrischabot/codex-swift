@@ -282,8 +282,11 @@ public actor TelegramChannel: Channel {
                     let reply = await host.deliver(inbound)
                     // Relay the agent's reply text (skip empty tool-only turns).
                     let outgoing = outgoingText(for: reply)
-                    if !outgoing.isEmpty {
-                        _ = await sendMessage(chatId: inbound.conversationId, text: outgoing)
+                    // Telegram's sendMessage caps at 4096 chars — a long agent
+                    // reply must be split or the Bot API rejects it (400). Send
+                    // each chunk in order.
+                    for part in TelegramChannel.chunk(outgoing) {
+                        _ = await sendMessage(chatId: inbound.conversationId, text: part)
                     }
                 }
                 if let nextOffset { offset = nextOffset }
@@ -304,6 +307,46 @@ public actor TelegramChannel: Channel {
         case "interrupted": return "(the agent run was interrupted)"
         default:          return ""
         }
+    }
+
+    /// Split a reply into chunks each ≤`limit` **UTF-16 code units** (Telegram's
+    /// sendMessage cap is 4096 UTF-16 units, NOT characters), preferring to break
+    /// on a newline, else a space, else a grapheme-aligned hard cut. Never splits
+    /// a grapheme cluster (an emoji stays whole), and concatenating the chunks
+    /// reconstructs the input exactly. Pure + nonisolated → unit-testable. An
+    /// empty string sends nothing (a genuine tool-only turn stays silent).
+    nonisolated static func chunk(_ text: String, limit: Int = 4096) -> [String] {
+        if text.isEmpty { return [] }
+        if text.utf16.count <= limit { return [text] }
+        var chunks: [String] = []
+        var remaining = Substring(text)
+        while remaining.utf16.count > limit {
+            // Largest grapheme-aligned prefix whose UTF-16 length fits `limit`.
+            var idx = remaining.startIndex
+            var u16 = 0
+            var cut = remaining.startIndex
+            while idx < remaining.endIndex {
+                let next = String(remaining[idx]).utf16.count
+                if u16 + next > limit { break }
+                u16 += next
+                idx = remaining.index(after: idx)
+                cut = idx
+            }
+            if cut == remaining.startIndex {   // a single grapheme bigger than the limit
+                cut = remaining.index(after: remaining.startIndex)
+            }
+            // Prefer a newline, else a space, boundary within the window.
+            let window = remaining[remaining.startIndex..<cut]
+            if let nl = window.lastIndex(of: "\n") {
+                cut = remaining.index(after: nl)
+            } else if let sp = window.lastIndex(of: " ") {
+                cut = remaining.index(after: sp)
+            }
+            chunks.append(String(remaining[remaining.startIndex..<cut]))
+            remaining = remaining[cut...]
+        }
+        if !remaining.isEmpty { chunks.append(String(remaining)) }
+        return chunks
     }
 
     // MARK: HTTP (Bot API)
