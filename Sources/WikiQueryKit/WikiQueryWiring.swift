@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 import Config
 import WireProtocol
 import Supervisor
@@ -42,13 +43,16 @@ public enum WikiQueryWiring {
             }
         }
         guard let store = opened else { return nil }
+        // Body files for manually-edited pages live next to the DB.
+        let bodyRoot = (path as NSString).deletingLastPathComponent + "/wiki-bodies"
         return WikiQueryHandle(
             list:      { try await WikiJSON.list(store, limit: $0) },
             pageGet:   { try await WikiJSON.pageGet(store, id: $0) },
             search:    { try await WikiJSON.search(store, query: $0, k: $1) },
             graph:     { try await WikiJSON.graph(store, seed: $0, depth: $1) },
             backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
-            tags:      { try await WikiJSON.tags(store) })
+            tags:      { try await WikiJSON.tags(store) },
+            upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) })
     }
 }
 
@@ -223,6 +227,34 @@ public enum WikiJSON {
             ])
         }
         return .object(["data": .array(items)])
+    }
+
+    /// Insert/overwrite a manually-authored page. Writes the body to a content-
+    /// addressed file under `bodyRoot`, then `rewriteManualPage` upserts the doc +
+    /// re-chunks for lexical search. Returns `{id}`.
+    public static func upsert(_ store: MemoryStore, bodyRoot: String,
+                              id: Int64?, title: String?, body: String) async throws -> JSONValue {
+        let now = Int64(Date().timeIntervalSince1970)
+        // Reuse the existing sourceURI when overwriting; mint one for a new page.
+        let sourceURI: String
+        if let id, let existing = try await store.document(id: id) {
+            sourceURI = existing.sourceURI
+        } else {
+            sourceURI = "wiki://manual/\(UUID().uuidString)"
+        }
+        let data = Data(body.utf8)
+        let shaHex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let contentSHA = Data(SHA256.hash(data: data))
+        try FileManager.default.createDirectory(atPath: bodyRoot, withIntermediateDirectories: true)
+        let bodyPath = bodyRoot + "/" + shaHex + ".md"
+        try body.write(toFile: bodyPath, atomically: true, encoding: .utf8)
+        // Chunk on blank lines (paragraph-ish) for lexical indexing.
+        let chunks = body.components(separatedBy: "\n\n")
+        let newId = try await store.rewriteManualPage(
+            sourceURI: sourceURI, title: (title?.isEmpty == false ? title : nil),
+            bodyPath: bodyPath, contentSHA: contentSHA, rawBytes: Int64(data.count),
+            now: now, chunkTexts: chunks)
+        return .object(["id": .int(newId)])
     }
 
     public static func tags(_ store: MemoryStore) async throws -> JSONValue {

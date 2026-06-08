@@ -498,6 +498,17 @@ public actor MemoryStore {
         // reuses a recycled rowid. Must run while the chunk rows still exist,
         // because the FTS5 external-content 'delete' command needs the
         // originally-indexed text.
+        try purgeChunks(documentId: id)
+        try run("DELETE FROM document WHERE id=?;", [.int(id)])
+    }
+
+    /// Purge a document's chunk rows + their derived index rows (FTS5, vec0,
+    /// chunk_embedding) and null any edge/insight references — WITHOUT deleting
+    /// the document itself. Shared by `deleteDocument` (which then drops the doc)
+    /// and `rewriteManualPage` (which then re-inserts fresh chunks). Must run
+    /// while the chunk rows still exist (the FTS5 external-content 'delete' needs
+    /// the originally-indexed text).
+    private func purgeChunks(documentId id: Int64) throws {
         let staleChunks = try run(
             "SELECT id, text FROM chunk WHERE document_id=?;", [.int(id)])
         for row in staleChunks {
@@ -516,10 +527,6 @@ public actor MemoryStore {
           SELECT id FROM chunk WHERE document_id=?
         );
         """, [.int(id)])
-        // insight.trigger_chunk_id is ON DELETE SET NULL by design — an
-        // insight outlives its triggering chunk as a historical record that
-        // recentInteresting() LEFT JOINs through. Null it explicitly for the
-        // same legacy-cascade reason as edge above.
         try run("""
         UPDATE insight SET trigger_chunk_id=NULL
         WHERE trigger_chunk_id IN (
@@ -532,10 +539,6 @@ public actor MemoryStore {
           SELECT id FROM chunk WHERE document_id=?
         );
         """, [.int(id)])
-        // Delete chunk_embedding + chunk rows explicitly rather than relying
-        // on document→chunk→chunk_embedding ON DELETE CASCADE: the cascade is
-        // declared under CREATE TABLE IF NOT EXISTS, so on a database created
-        // before these FK actions existed SQLite silently ignores them.
         if !vecAvailable {
             try run("""
             DELETE FROM chunk_embedding
@@ -545,7 +548,38 @@ public actor MemoryStore {
             """, [.int(id)])
         }
         try run("DELETE FROM chunk WHERE document_id=?;", [.int(id)])
-        try run("DELETE FROM document WHERE id=?;", [.int(id)])
+    }
+
+    /// Insert-or-replace a manually-authored wiki page: upsert the document by
+    /// `sourceURI`, then REPLACE its chunks with lexically-indexed chunks of the
+    /// body (zero embedding vectors — BM25/FTS search works immediately; full
+    /// embedding + entity extraction is a later background re-process). Returns
+    /// the document id. The whole operation runs in one transaction.
+    /// NOTE: not wrapped in an outer transaction — `insertChunk` opens its own
+    /// `BEGIN IMMEDIATE` per chunk (SQLite has no nested transactions), so the
+    /// sub-operations each commit independently. A mid-write failure can leave a
+    /// partially re-chunked page; the next save corrects it (purgeChunks clears
+    /// the prior set first). Acceptable for a single-operator edit surface.
+    @discardableResult
+    public func rewriteManualPage(sourceURI: String, title: String?, bodyPath: String,
+                                  contentSHA: Data, rawBytes: Int64, now: Int64,
+                                  chunkTexts: [String]) throws -> Int64 {
+        let id = try upsertDocument(DocumentRow(
+            source: .manual, sourceURI: sourceURI, title: title, bodyPath: bodyPath,
+            fetchedAt: now, contentSHA: contentSHA, rawBytes: rawBytes))
+        try purgeChunks(documentId: id)
+        let zero = [Float](repeating: 0, count: config.embeddingDimension)
+        var idx = 0
+        for raw in chunkTexts {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            _ = try insertChunk(ChunkRow(
+                documentId: id, idx: idx, text: t, rawText: t,
+                tokenCount: max(1, t.split(whereSeparator: { $0 == " " || $0 == "\n" }).count),
+                createdAt: now), embeddingValues: zero)
+            idx += 1
+        }
+        return id
     }
 
     public func documentCount() throws -> Int {

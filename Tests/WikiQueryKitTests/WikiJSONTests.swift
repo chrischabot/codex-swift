@@ -193,6 +193,41 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(count, liveDegree.map(Int64.init))
     }
 
+    // MARK: - upsert (write path)
+
+    /// CLAIM: upsert creates a page (body written, doc + lexical chunks inserted),
+    /// it's then listable/gettable/searchable, and a second upsert with the id
+    /// OVERWRITES the body + re-chunks (no stale chunks). SEVERITY: severe — this
+    /// is the edit environment's write path against a real store.
+    func testUpsertCreatesThenOverwrites() async throws {
+        let root = dir + "/bodies"
+        // Create a new page.
+        let created = try await WikiJSON.upsert(store, bodyRoot: root, id: nil, title: "My Note",
+                                                body: "First body about penguins and pelicans.")
+        let newId = created.obj?["id"]?.int
+        XCTAssertNotNil(newId)
+        // page/get returns the body + title.
+        let page = try await WikiJSON.pageGet(store, id: newId!)
+        XCTAssertEqual(page?.obj?["title"]?.str, "My Note")
+        XCTAssertTrue((page?.obj?["content"]?.str ?? "").contains("penguins"))
+        // It is lexically searchable (zero-embedding chunks still index in FTS).
+        let hits = try await WikiJSON.search(store, query: "penguins", k: 10)
+        let hitIds = (hits.obj?["data"]?.arr ?? []).compactMap { $0.obj?["id"]?.int }
+        XCTAssertTrue(hitIds.contains(newId!), "the new page is found by full-text search")
+
+        // Overwrite the SAME page by id — body replaced, old chunks gone.
+        let updated = try await WikiJSON.upsert(store, bodyRoot: root, id: newId, title: "My Note v2",
+                                                body: "Second body about wardrobes entirely.")
+        XCTAssertEqual(updated.obj?["id"]?.int, newId, "overwrite keeps the same document id")
+        let page2 = try await WikiJSON.pageGet(store, id: newId!)
+        XCTAssertEqual(page2?.obj?["title"]?.str, "My Note v2")
+        XCTAssertTrue((page2?.obj?["content"]?.str ?? "").contains("wardrobes"))
+        // The OLD term no longer matches this page (stale chunks were purged).
+        let staleHits = try await WikiJSON.search(store, query: "penguins", k: 10)
+        let staleIds = (staleHits.obj?["data"]?.arr ?? []).compactMap { $0.obj?["id"]?.int }
+        XCTAssertFalse(staleIds.contains(newId!), "old chunks purged — no stale search hit")
+    }
+
     // MARK: - deny-default
 
     func testMakeDenyDefaultWithoutEnvFlag() {

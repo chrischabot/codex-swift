@@ -634,6 +634,7 @@ public enum ClientRequest: Sendable {
     case wikiGraph(RequestId, WikiGraphParams)
     case wikiBacklinks(RequestId, WikiBacklinksParams)
     case wikiTags(RequestId)
+    case wikiPageUpsert(RequestId, WikiPageUpsertParams)
     case turnStart(RequestId, TurnStartParams)
     case turnInterrupt(RequestId, TurnInterruptParams)
     case turnSteer(RequestId, TurnSteerParams)
@@ -670,7 +671,7 @@ public enum ClientRequest: Sendable {
         "thread/goal/set", "thread/goal/get", "thread/goal/clear",
         "thread/memoryMode/set", "memory/reset",
         "wiki/list", "wiki/page/get", "wiki/search",
-        "wiki/graph", "wiki/backlinks", "wiki/tags",
+        "wiki/graph", "wiki/backlinks", "wiki/tags", "wiki/page/upsert",
         "turn/start", "turn/interrupt", "turn/steer", "review/start",
         "model/list", "modelProvider/capabilities/read", "config/read",
         "account/read", "account/rateLimits/read", "skills/list",
@@ -694,6 +695,7 @@ public enum ClientRequest: Sendable {
              .threadMemoryModeSet(let i, _), .memoryReset(let i),
              .wikiList(let i, _), .wikiPageGet(let i, _), .wikiSearch(let i, _),
              .wikiGraph(let i, _), .wikiBacklinks(let i, _), .wikiTags(let i),
+             .wikiPageUpsert(let i, _),
              .turnStart(let i, _), .turnInterrupt(let i, _), .turnSteer(let i, _),
              .reviewStart(let i, _), .modelList(let i, _),
              .modelProviderCapabilitiesRead(let i), .configRead(let i, _),
@@ -747,6 +749,7 @@ public enum ClientRequest: Sendable {
         case .wikiGraph: return "wiki/graph"
         case .wikiBacklinks: return "wiki/backlinks"
         case .wikiTags: return "wiki/tags"
+        case .wikiPageUpsert: return "wiki/page/upsert"
         case .turnStart: return "turn/start"
         case .turnInterrupt: return "turn/interrupt"
         case .turnSteer: return "turn/steer"
@@ -821,6 +824,7 @@ public enum ClientRequest: Sendable {
                 WikiGraphParams.self, from: r.params, default: WikiGraphParams()))
         case "wiki/backlinks":  return .wikiBacklinks(r.id, try p(WikiBacklinksParams.self))
         case "wiki/tags":       return .wikiTags(r.id)
+        case "wiki/page/upsert": return .wikiPageUpsert(r.id, try p(WikiPageUpsertParams.self))
         case "turn/start":      return .turnStart(r.id, try p(TurnStartParams.self))
         case "turn/interrupt":  return .turnInterrupt(r.id, try p(TurnInterruptParams.self))
         case "turn/steer":      return .turnSteer(r.id, try p(TurnSteerParams.self))

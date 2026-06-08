@@ -37,3 +37,14 @@ public struct WikiBacklinksParams: Decodable, Sendable, Equatable {
     public var entityId: Int64
     public init(entityId: Int64) { self.entityId = entityId }
 }
+
+public struct WikiPageUpsertParams: Decodable, Sendable, Equatable {
+    /// Existing page (DocumentRow) id to overwrite; nil → create a new page.
+    public var id: Int64?
+    public var title: String?
+    /// The markdown body to persist.
+    public var body: String
+    public init(id: Int64? = nil, title: String? = nil, body: String) {
+        self.id = id; self.title = title; self.body = body
+    }
+}

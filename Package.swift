@@ -252,7 +252,8 @@ let package = Package(
         // Supervisor so the MemoryStore import (whose type name clashes with
         // HarnessCore.MemoryStore) stays isolated; the injected handle is JSONValue-only.
         .target(name: "WikiQueryKit",
-                dependencies: ["WireProtocol", "Config", "Supervisor", "MemoryStore", "MemoryExtension"],
+                dependencies: ["WireProtocol", "Config", "Supervisor", "MemoryStore", "MemoryExtension",
+                               .product(name: "Crypto", package: "swift-crypto")],
                 swiftSettings: strict),
         .target(name: "Broker",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
