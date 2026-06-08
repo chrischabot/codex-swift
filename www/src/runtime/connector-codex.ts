@@ -988,6 +988,17 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         return (r.data ?? []).map((t) => ({ tag: pick(t, "tag", "name"), count: numOrU(t.count) ?? 0 })).filter((t) => t.tag);
       } catch { return []; }
     },
+    saveWikiPage: async (input) => {
+      const params: Record<string, unknown> = { body: input.body };
+      if (input.title != null) params.title = input.title;
+      if (input.id) {
+        const n = Number(input.id);
+        if (Number.isInteger(n)) params.id = n;   // omit id → create new page
+      }
+      const r = (await rpc("wiki/page/upsert", params)) as { id?: unknown };
+      const id = idStr(r?.id);
+      return id ? { id } : null;
+    },
   };
 }
 

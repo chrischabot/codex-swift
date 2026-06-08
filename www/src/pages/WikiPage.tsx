@@ -1,5 +1,9 @@
+import * as React from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { Pencil, FilePlus2 } from "lucide-react";
 import { useWikiPage, useWikiRecents } from "@/state/wiki";
+import { Button } from "@/components/ui/button";
+import { WikiEditor } from "@/components/wiki/editor/WikiEditor";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { WikiReadingView } from "@/components/wiki/WikiReadingView";
@@ -22,11 +26,17 @@ export function WikiPage() {
   const { pageId } = useParams();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { page, loading } = useWikiPage(pageId);
+  const [reloadKey, setReloadKey] = React.useState(0);
+  const [editing, setEditing] = React.useState(false);
+  const { page, loading } = useWikiPage(pageId, reloadKey);
   const switcher = useWikiSwitcherHotkey(); // Cmd/Ctrl-O quick switcher (wiki-scoped)
 
   const q = searchParams.get("q") ?? "";
   const setQ = (next: string) => setSearchParams(next ? { q: next } : {}, { replace: true });
+  // Leave edit mode whenever the route changes (new page / back to index).
+  React.useEffect(() => { setEditing(false); }, [pageId]);
+  // `/wiki/new` is the create surface (no pageId, not a real page).
+  const creating = pageId === "new";
 
   // Wikilinks + tags route to a search query; the outline jumps to in-page
   // heading anchors (ids added by rehypeHeadingIds).
@@ -38,10 +48,20 @@ export function WikiPage() {
   return (
     <div className="flex min-h-0 flex-1">
       <WikiQuickSwitcher open={switcher.open} onOpenChange={switcher.setOpen} />
-      {/* MAIN PANE — search / index / reading view */}
+      {/* MAIN PANE — editor / search / index / reading view */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {!pageId && q ? (
-          // Search surface owns full height (its own internal scroll).
+        {creating || (pageId && editing) ? (
+          // Editor owns full height (its own internal scroll).
+          <WikiEditor
+            pageId={creating ? undefined : pageId}
+            onSaved={(id) => {
+              setEditing(false);
+              if (creating || id !== pageId) navigate(`/wiki/${id}`);
+              else setReloadKey((k) => k + 1); // same page → force a refetch
+            }}
+            onCancel={() => (creating ? navigate("/wiki") : setEditing(false))}
+          />
+        ) : !pageId && q ? (
           <WikiSearchView query={q} onQueryChange={setQ} />
         ) : (
           <ScrollArea className="flex-1">
@@ -53,7 +73,14 @@ export function WikiPage() {
               ) : !page ? (
                 <div className="text-[13px] text-[color:var(--color-text-secondary)]">Page not found.</div>
               ) : (
-                <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} />
+                <div>
+                  <div className="mb-2 flex justify-end">
+                    <Button variant="outline" size="xs" onClick={() => setEditing(true)}>
+                      <Pencil className="mr-1 size-3" /> Edit
+                    </Button>
+                  </div>
+                  <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} />
+                </div>
               )}
             </div>
           </ScrollArea>
@@ -61,7 +88,7 @@ export function WikiPage() {
       </div>
 
       {/* RIGHT RAIL — tabbed panels (M2: a Graph tab mounts here) */}
-      {pageId && page && (
+      {pageId && page && !editing && (
         <aside className="hidden w-[320px] shrink-0 flex-col border-l border-[color:var(--border)] lg:flex">
           <Tabs defaultValue="connections" className="flex min-h-0 flex-1 flex-col gap-0">
             <TabsList className="shrink-0 justify-start rounded-none border-b border-[color:var(--border)] bg-transparent px-2">
@@ -119,13 +146,18 @@ function WikiIndex() {
             Your Memory Wiki — browse, explore, and enrich curated knowledge.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => navigate("/wiki/graph")}
-          className="shrink-0 rounded-md border border-[color:var(--border)] px-3 py-1.5 text-[13px] text-foreground hover:bg-[color:var(--color-surface-hover)]"
-        >
-          Open graph
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="outline" size="xs" onClick={() => navigate("/wiki/new")}>
+            <FilePlus2 className="mr-1 size-3" /> New page
+          </Button>
+          <button
+            type="button"
+            onClick={() => navigate("/wiki/graph")}
+            className="rounded-md border border-[color:var(--border)] px-3 py-1.5 text-[13px] text-foreground hover:bg-[color:var(--color-surface-hover)]"
+          >
+            Open graph
+          </button>
+        </div>
       </div>
       <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[1fr_240px]">
         <div>

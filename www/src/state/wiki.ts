@@ -33,7 +33,9 @@ export function useWikiRecents(limit = 20, enabled = true): { pages: WikiPageSum
 /** Full page-detail hook. pageId undefined → index mode (no page loaded). The
  *  page payload already carries tags + entity connections, so no separate
  *  backlinks RPC is needed in M0. */
-export function useWikiPage(pageId?: string): { page: WikiPage | null; loading: boolean } {
+// `reloadKey` lets the caller force a refetch of the SAME page after an in-place
+// edit (where pageId is unchanged so the effect wouldn't otherwise re-run).
+export function useWikiPage(pageId?: string, reloadKey?: number): { page: WikiPage | null; loading: boolean } {
   const { connector, status } = useRuntime();
   const [page, setPage] = React.useState<WikiPage | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -50,7 +52,7 @@ export function useWikiPage(pageId?: string): { page: WikiPage | null; loading: 
       .catch(() => { if (alive) setPage(null); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [connector, status.kind, pageId]);
+  }, [connector, status.kind, pageId, reloadKey]);
   return { page, loading };
 }
 

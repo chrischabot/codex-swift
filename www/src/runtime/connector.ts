@@ -284,4 +284,6 @@ export interface Connector {
   // id — the backend graph is the entity/edge graph. Omit it for the whole graph.
   getWikiGraph?(opts?: { seedEntityId?: string; depth?: number }): Promise<WikiGraph>;
   getWikiTags?(): Promise<WikiTag[]>;
+  /** Create (id omitted) or overwrite a wiki page. Returns the page id. */
+  saveWikiPage?(input: { id?: string; title?: string; body: string }): Promise<{ id: string } | null>;
 }
