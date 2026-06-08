@@ -48,9 +48,10 @@ export function Sidebar({ onToggle }: SidebarProps) {
 
   // When the Wiki section is active, the projects/chats area is repurposed to
   // show recent wiki pages (the granite "recent entries" pane, merged into the
-  // main nav). Recents are only fetched while in the section.
+  // main nav). Recents are fetched ONLY while in the section (the `enabled` gate),
+  // so unrelated sessions never query the wiki store.
   const inWikiSection = location.pathname === "/wiki" || location.pathname.startsWith("/wiki/");
-  const { pages: wikiPages } = useWikiRecents(20);
+  const { pages: wikiPages } = useWikiRecents(20, inWikiSection);
   const activeThreadId = params.threadId;
   const activeProjectId = params.projectId;
 

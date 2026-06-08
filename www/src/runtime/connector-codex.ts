@@ -945,8 +945,10 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       } catch { return []; }
     },
     getWikiPage: async (pageId) => {
+      const n = Number(pageId);
+      if (!Number.isInteger(n)) return null;   // non-numeric route → no round-trip
       try {
-        const r = (await rpc("wiki/page/get", { id: Number(pageId) })) as Record<string, unknown> | null;
+        const r = (await rpc("wiki/page/get", { id: n })) as Record<string, unknown> | null;
         return r ? mapWikiPage(r) : null;
       } catch { return null; }   // backend maps not-found to an error → null
     },
@@ -959,7 +961,10 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
     getWikiGraph: async (opts) => {
       try {
         const params: Record<string, unknown> = {};
-        if (opts?.pageId) params.seed = Number(opts.pageId);
+        if (opts?.seedEntityId) {
+          const s = Number(opts.seedEntityId);
+          if (Number.isInteger(s)) params.seed = s;   // entity id; skip if malformed
+        }
         if (opts?.depth != null) params.depth = opts.depth;
         const r = (await rpc("wiki/graph", params)) as { nodes?: Record<string, unknown>[]; edges?: Record<string, unknown>[] };
         return {

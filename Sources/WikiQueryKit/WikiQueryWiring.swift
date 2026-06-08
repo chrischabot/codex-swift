@@ -22,10 +22,26 @@ public enum WikiQueryWiring {
                             env: [String: String] = ProcessInfo.processInfo.environment) -> WikiQueryHandle? {
         guard env["CODEXKIT_MEMORY"] == "1" else { return nil }
         let wikiCfg = WikiMemoryConfig.fromConfig(config, env: env)
-        let storeConfig = MemoryStoreConfig(
-            path: wikiCfg.dbPath ?? MemoryStoreConfig.defaultPath(),
-            embeddingDimension: wikiCfg.embeddingDimension)
-        guard let store = try? MemoryStore(storeConfig) else { return nil }
+        let path = wikiCfg.dbPath ?? MemoryStoreConfig.defaultPath()
+        // MemoryStore validates the stamped embedding dimension on open and throws
+        // on mismatch. The wiki READ path (documents/entities/edges/lexical search)
+        // never touches vectors, so the dimension only has to MATCH the existing
+        // DB to open it. The configured default (1536, OpenAI) often disagrees with
+        // a DB built by the on-device embedder (768, Nomic), so try the configured
+        // dim first and then the common stamps — the matching one opens; the rest
+        // throw harmlessly. A genuinely absent/corrupt DB yields nil → wiki off.
+        let candidates: [Int] = {
+            var seen = Set<Int>(); var out: [Int] = []
+            for d in [wikiCfg.embeddingDimension, 768, 1536, 1024, 384, 3072] where seen.insert(d).inserted { out.append(d) }
+            return out
+        }()
+        var opened: MemoryStore?
+        for dim in candidates {
+            if let s = try? MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: dim)) {
+                opened = s; break
+            }
+        }
+        guard let store = opened else { return nil }
         return WikiQueryHandle(
             list:      { try await WikiJSON.list(store, limit: $0) },
             pageGet:   { try await WikiJSON.pageGet(store, id: $0) },

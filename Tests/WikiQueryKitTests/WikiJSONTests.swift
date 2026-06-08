@@ -188,6 +188,31 @@ final class WikiJSONTests: XCTestCase {
                      "wiki handle must be nil unless CODEXKIT_MEMORY=1")
         XCTAssertNil(WikiQueryWiring.make(config: cfg, env: ["CODEXKIT_MEMORY": "0"]))
     }
+
+    /// CLAIM: make() opens a store whose stamped embedding dimension differs from
+    /// the configured default — the wiki READ path doesn't use vectors, so the
+    /// candidate-dim fallback must still open it. (Reproduces the live failure: a
+    /// 768-dim Nomic DB vs the 1536 OpenAI default.) SEVERITY: strong — without
+    /// this the wiki silently disables itself on any real on-device DB.
+    func testMakeOpensDespiteDimensionMismatch() async throws {
+        let d = NSTemporaryDirectory() + "wikidim-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: d) }
+        let dbPath = d + "/m.db"
+        // Build a 768-dim store (NOT the 1536 default) and seed one page.
+        let seed = try MemoryStore(MemoryStoreConfig(path: dbPath, embeddingDimension: 768))
+        _ = try await seed.upsertDocument(DocumentRow(
+            source: .manual, sourceURI: "wiki://x", title: "X", bodyPath: d + "/b.md",
+            fetchedAt: 1, contentSHA: Data([1]), rawBytes: 1))
+        // fromConfig resolves embeddingDimension to the 1536 default (no override),
+        // which MISMATCHES the 768 store — the fallback must still open it.
+        let cfg = Config(layers: [ConfigLayer(
+            name: "test", values: ["memory": .object(["db_path": .string(dbPath)])])])
+        let handle = WikiQueryWiring.make(config: cfg, env: ["CODEXKIT_MEMORY": "1"])
+        let h = try XCTUnwrap(handle, "wiki handle must open despite the default-dim mismatch")
+        let listed = try await h.list(100)
+        XCTAssertEqual(listed.obj?["data"]?.arr?.count, 1, "the seeded page is listable")
+    }
 }
 
 // Minimal JSONValue accessors for assertions.

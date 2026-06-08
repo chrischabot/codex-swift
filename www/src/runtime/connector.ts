@@ -280,6 +280,8 @@ export interface Connector {
   listWikiPages?(opts?: { limit?: number }): Promise<WikiPageSummary[]>;
   getWikiPage?(pageId: string): Promise<WikiPage | null>;
   searchWiki?(query: string, opts?: { limit?: number }): Promise<WikiPageSummary[]>;
-  getWikiGraph?(opts?: { pageId?: string; depth?: number }): Promise<WikiGraph>;
+  // seedEntityId is an ENTITY id (e.g. a WikiConnection.entityId), NOT a page
+  // id — the backend graph is the entity/edge graph. Omit it for the whole graph.
+  getWikiGraph?(opts?: { seedEntityId?: string; depth?: number }): Promise<WikiGraph>;
   getWikiTags?(): Promise<WikiTag[]>;
 }

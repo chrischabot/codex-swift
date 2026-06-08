@@ -9,13 +9,15 @@ import type { WikiPage, WikiPageSummary, WikiGraph, WikiTag } from "@/runtime/co
 // (the connector queues pre-open RPCs, but wiki reads shouldn't race it).
 
 /** Recent wiki pages for the sidebar list. Empty + non-loading under the mock
- *  connector (which omits the wiki methods), so the sidebar shows nothing. */
-export function useWikiRecents(limit = 20): { pages: WikiPageSummary[]; loading: boolean } {
+ *  connector (which omits the wiki methods), so the sidebar shows nothing.
+ *  `enabled` gates the fetch so callers (e.g. the sidebar) don't query the wiki
+ *  store on every session when the Wiki section isn't open. */
+export function useWikiRecents(limit = 20, enabled = true): { pages: WikiPageSummary[]; loading: boolean } {
   const { connector, status } = useRuntime();
   const [pages, setPages] = React.useState<WikiPageSummary[]>([]);
   const [loading, setLoading] = React.useState(false);
   React.useEffect(() => {
-    if (!connector.listWikiPages || status.kind !== "connected") return;
+    if (!enabled || !connector.listWikiPages || status.kind !== "connected") return;
     let alive = true;
     setLoading(true);
     connector
@@ -24,7 +26,7 @@ export function useWikiRecents(limit = 20): { pages: WikiPageSummary[]; loading:
       .catch(() => { if (alive) setPages([]); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-  }, [connector, status.kind, limit]);
+  }, [connector, status.kind, limit, enabled]);
   return { pages, loading };
 }
 
@@ -65,20 +67,20 @@ export function useWikiTags(): WikiTag[] {
   return tags;
 }
 
-/** Entity/edge graph (M2 graph view). */
-export function useWikiGraph(opts?: { pageId?: string; depth?: number }): WikiGraph {
+/** Entity/edge graph (M2 graph view). seedEntityId is an ENTITY id. */
+export function useWikiGraph(opts?: { seedEntityId?: string; depth?: number }): WikiGraph {
   const { connector, status } = useRuntime();
   const [graph, setGraph] = React.useState<WikiGraph>({ nodes: [], edges: [] });
-  const pageId = opts?.pageId;
+  const seedEntityId = opts?.seedEntityId;
   const depth = opts?.depth;
   React.useEffect(() => {
     if (!connector.getWikiGraph || status.kind !== "connected") return;
     let alive = true;
     connector
-      .getWikiGraph({ pageId, depth })
+      .getWikiGraph({ seedEntityId, depth })
       .then((g) => alive && setGraph(g))
       .catch(() => alive && setGraph({ nodes: [], edges: [] }));
     return () => { alive = false; };
-  }, [connector, status.kind, pageId, depth]);
+  }, [connector, status.kind, seedEntityId, depth]);
   return graph;
 }

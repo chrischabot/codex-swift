@@ -12,7 +12,6 @@ import { Markdown } from "@/components/chat/Markdown";
  */
 export function WikiPage() {
   const { pageId } = useParams();
-  const navigate = useNavigate();
   const { page, loading } = useWikiPage(pageId);
 
   return (
