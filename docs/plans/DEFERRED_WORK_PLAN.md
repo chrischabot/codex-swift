@@ -172,3 +172,10 @@ from item 2. Bigger; sequence after Gmail + typed helpers prove the shape.
 ---
 
 *Progress is committed per item with its tests + doc. This file is updated as items land.*
+
+## Progress + re-scan (2026-06)
+
+- **#1 Gmail channel — DONE** (`3ba6b55`): wired into the daemon, 17 tests + live-gated e2e, 2 fresh adversarial reviewers (no findings).
+- **#5 mem0 bulk-import durability — COVERED** by the memory workstream: `Sources/codex-memory/ImportMarkdown.swift` ships `resume`, a content `manifest` + `manifestDigest`, `loadState`, and a deterministic job id (resumable/idempotent import). No separate work needed.
+- **#6 mem0 cursor pagination + category policy** and **#10 wiki claim schema** live inside the actively-developed mem0/wiki subsystem (Mem0Core / WikiProductionTools — the latter notes "durable claim records not implemented yet"). Tracked there as the **memory workstream**, not duplicated here.
+- Remaining in **this** lane (collision-free now that the tree is clean): **#2** typed Google helpers + AppsInstructions, **#3** live media provider, **#4** signed-URL media delivery, **#7** computer_use OAuth bearer, **#8** IP-pinned socket egress, **#9** generic connector OAuth, **#11** channel reply chunking.
