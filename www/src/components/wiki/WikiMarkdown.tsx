@@ -71,13 +71,16 @@ export function WikiMarkdown({ content, onWikiLink }: Props) {
           </a>
         );
       }
+      // In-document fragment links (#heading, GFM footnote refs/backrefs) must
+      // stay same-document — never open a new tab.
+      const isHash = typeof href === "string" && href.startsWith("#");
       return (
         <a
           {...rest}
           href={href}
           className="text-[color:var(--color-blue-400)] underline-offset-2 hover:underline"
-          target="_blank"
-          rel="noreferrer"
+          target={isHash ? undefined : "_blank"}
+          rel={isHash ? undefined : "noreferrer"}
         >
           {children}
         </a>
@@ -192,17 +195,17 @@ export function WikiMarkdown({ content, onWikiLink }: Props) {
       return <CodeBlock language={lang} code={text.replace(/\n$/, "")} />;
     },
     pre: ({ children }) => <>{children}</>,
-    h1: ({ children }) => <h1 className="mb-3 mt-4 text-[20px] font-semibold">{children}</h1>,
-    h2: ({ children }) => <h2 className="mb-2 mt-4 text-[16px] font-semibold">{children}</h2>,
-    h3: ({ children }) => <h3 className="mb-2 mt-3 text-[14px] font-semibold">{children}</h3>,
-    h4: ({ children }) => <h4 className="mb-2 mt-3 text-[13px] font-semibold">{children}</h4>,
-    h5: ({ children }) => (
-      <h5 className="mb-1 mt-2 text-[12.5px] font-semibold text-[color:var(--color-text-secondary)]">
+    h1: ({ children, node: _n, ...rest }) => <h1 {...rest} className="mb-3 mt-4 scroll-mt-4 text-[20px] font-semibold">{children}</h1>,
+    h2: ({ children, node: _n, ...rest }) => <h2 {...rest} className="mb-2 mt-4 scroll-mt-4 text-[16px] font-semibold">{children}</h2>,
+    h3: ({ children, node: _n, ...rest }) => <h3 {...rest} className="mb-2 mt-3 scroll-mt-4 text-[14px] font-semibold">{children}</h3>,
+    h4: ({ children, node: _n, ...rest }) => <h4 {...rest} className="mb-2 mt-3 scroll-mt-4 text-[13px] font-semibold">{children}</h4>,
+    h5: ({ children, node: _n, ...rest }) => (
+      <h5 {...rest} className="scroll-mt-4 mb-1 mt-2 text-[12.5px] font-semibold text-[color:var(--color-text-secondary)]">
         {children}
       </h5>
     ),
-    h6: ({ children }) => (
-      <h6 className="mb-1 mt-2 text-[12px] font-semibold uppercase tracking-wide text-[color:var(--color-text-tertiary)]">
+    h6: ({ children, node: _n, ...rest }) => (
+      <h6 {...rest} className="scroll-mt-4 mb-1 mt-2 text-[12px] font-semibold uppercase tracking-wide text-[color:var(--color-text-tertiary)]">
         {children}
       </h6>
     ),

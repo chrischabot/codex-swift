@@ -261,7 +261,19 @@ export function remarkWikilinks() {
         out.push(...splitText((child as MdastText).value));
       } else {
         if (!LITERAL_TYPES.has(child.type)) transform(child);
-        out.push(child);
+        // A paragraph that ends up containing ONLY embed(s) (e.g. a standalone
+        // `![[Note]]` line) is lifted to block level — WikiEmbed renders a block
+        // <div>, which is invalid React/DOM nesting inside the <p>.
+        if (
+          child.type === "paragraph" &&
+          isParent(child) &&
+          child.children.length > 0 &&
+          child.children.every((c) => c.type === "wikiEmbed")
+        ) {
+          out.push(...child.children);
+        } else {
+          out.push(child);
+        }
       }
     }
     node.children = out;
@@ -398,7 +410,19 @@ export function remarkHighlight() {
         out.push(...splitText((child as MdastText).value));
       } else {
         if (!LITERAL_TYPES.has(child.type)) transform(child);
-        out.push(child);
+        // A paragraph that ends up containing ONLY embed(s) (e.g. a standalone
+        // `![[Note]]` line) is lifted to block level — WikiEmbed renders a block
+        // <div>, which is invalid React/DOM nesting inside the <p>.
+        if (
+          child.type === "paragraph" &&
+          isParent(child) &&
+          child.children.length > 0 &&
+          child.children.every((c) => c.type === "wikiEmbed")
+        ) {
+          out.push(...child.children);
+        } else {
+          out.push(child);
+        }
       }
     }
     node.children = out;

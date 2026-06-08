@@ -1,22 +1,31 @@
 import { useMemo } from "react";
 import { cn } from "@/lib/utils";
+import { slugify } from "./markdown/wikiRemarkPlugins";
 
 /**
- * GitHub-style heading slug. MUST match the id algorithm the reading view
- * applies to its rendered headings (see integrationHints) so that
- * onJump(slug) → document.getElementById(slug) resolves.
- *
- * Lowercase, strip anything that isn't a word char / space / hyphen, then
- * collapse whitespace to single hyphens. Mirrors `github-slugger`'s base rule.
+ * Heading slug — delegates to the SAME `slugify` the reading view's
+ * rehypeHeadingIds uses, so onJump(slug) → document.getElementById(slug)
+ * resolves. (Kept as an export for back-compat.)
  */
 export function slug(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  return slugify(text);
+}
+
+/**
+ * Approximate the RENDERED text of a heading (what rehypeHeadingIds slugs) by
+ * stripping inline markdown from the raw heading source: wikilinks → display,
+ * `[txt](url)` → txt, inline code/emphasis/highlight markers removed. Without
+ * this the outline would slug `## [API](u)` as the raw string and never match
+ * the rendered id (which comes from the text "API").
+ */
+function renderedText(md: string): string {
+  return md
+    .replace(/!?\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, target, alias) => alias ?? target)
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/([*_~]{1,3})(.+?)\1/g, "$2")
+    .replace(/==(.+?)==/g, "$1")
+    .trim();
 }
 
 interface OutlineHeading {
@@ -53,9 +62,10 @@ function parseHeadings(content: string): OutlineHeading[] {
     const headingMatch = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*$/);
     if (!headingMatch) continue;
     const level = headingMatch[1].length;
-    const text = headingMatch[2].replace(/\s+#+\s*$/, "").trim();
+    const raw = headingMatch[2].replace(/\s+#+\s*$/, "").trim();
+    const text = renderedText(raw);
     if (!text) continue;
-    out.push({ level, text, slug: slug(text) });
+    out.push({ level, text, slug: slugify(text) });
   }
   return out;
 }
