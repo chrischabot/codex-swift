@@ -25,6 +25,8 @@ public struct WikiQueryHandle: Sendable {
     /// Insert/overwrite a page (id nil → create). Returns `{id}`. The wiki UI is
     /// the edit environment, so this WRITE lives on the same deny-default handle.
     public var upsert: @Sendable (_ id: Int64?, _ title: String?, _ body: String) async throws -> JSONValue
+    /// Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface).
+    public var brief: @Sendable (_ topic: String, _ k: Int) async throws -> JSONValue
 
     public init(
         list: @escaping @Sendable (Int) async throws -> JSONValue,
@@ -33,7 +35,8 @@ public struct WikiQueryHandle: Sendable {
         graph: @escaping @Sendable (Int64?, Int) async throws -> JSONValue,
         backlinks: @escaping @Sendable (Int64) async throws -> JSONValue,
         tags: @escaping @Sendable () async throws -> JSONValue,
-        upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue
+        upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue,
+        brief: @escaping @Sendable (String, Int) async throws -> JSONValue
     ) {
         self.list = list
         self.pageGet = pageGet
@@ -42,5 +45,6 @@ public struct WikiQueryHandle: Sendable {
         self.backlinks = backlinks
         self.tags = tags
         self.upsert = upsert
+        self.brief = brief
     }
 }

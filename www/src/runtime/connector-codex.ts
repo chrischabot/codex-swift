@@ -37,6 +37,7 @@ import type {
   SendOptions,
   ThreadStreamEvent,
   UploadedAttachment,
+  WikiBrief,
   WikiGraph,
   WikiPage,
   WikiPageSummary,
@@ -998,6 +999,13 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       const r = (await rpc("wiki/page/upsert", params)) as { id?: unknown };
       const id = idStr(r?.id);
       return id ? { id } : null;
+    },
+    getWikiBrief: async (topic, opts) => {
+      try {
+        // The backend returns the WikiBriefPayload object directly (parsed).
+        const r = (await rpc("wiki/brief", { topic, k: opts?.k ?? 8 })) as WikiBrief;
+        return r ?? null;
+      } catch { return null; }
     },
   };
 }

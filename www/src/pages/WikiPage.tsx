@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
-import { Pencil, FilePlus2 } from "lucide-react";
+import { Pencil, FilePlus2, Sparkles } from "lucide-react";
 import { useWikiPage, useWikiRecents } from "@/state/wiki";
 import { Button } from "@/components/ui/button";
 import { WikiEditor } from "@/components/wiki/editor/WikiEditor";
@@ -149,6 +149,9 @@ function WikiIndex() {
         <div className="flex shrink-0 items-center gap-2">
           <Button variant="outline" size="xs" onClick={() => navigate("/wiki/new")}>
             <FilePlus2 className="mr-1 size-3" /> New page
+          </Button>
+          <Button variant="outline" size="xs" onClick={() => navigate("/wiki/enrich")}>
+            <Sparkles className="mr-1 size-3" /> Enrich
           </Button>
           <button
             type="button"

@@ -228,6 +228,19 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertFalse(staleIds.contains(newId!), "old chunks purged — no stale search hit")
     }
 
+    // MARK: - brief (enrich)
+
+    /// CLAIM: wiki/brief produces a structured payload (object) from lexical
+    /// evidence without throwing, even when evidence is thin. SEVERITY: strong.
+    func testBriefReturnsStructuredPayload() async throws {
+        let r = try await WikiJSON.brief(store, topic: "penguins machine learning", k: 8)
+        // Must be a JSON object with at least a topic/summary/status field.
+        XCTAssertNotNil(r.obj, "brief returns a JSON object, got \(r)")
+        let keys = Set(r.obj?.keys ?? [:].keys)
+        XCTAssertTrue(keys.contains("summary") || keys.contains("topic") || keys.contains("status"),
+                      "payload carries brief fields; got keys \(keys)")
+    }
+
     // MARK: - deny-default
 
     func testMakeDenyDefaultWithoutEnvFlag() {

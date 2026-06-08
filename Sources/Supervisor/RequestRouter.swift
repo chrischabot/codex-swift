@@ -2175,6 +2175,8 @@ public actor RequestRouter {
             await replyWiki(conn, id) { try await $0.tags() }
         case .wikiPageUpsert(let id, let p):
             await replyWiki(conn, id) { try await $0.upsert(p.id, p.title, p.body) }
+        case .wikiBrief(let id, let p):
+            await replyWiki(conn, id) { try await $0.brief(p.topic, min(max(p.k ?? 8, 1), 20)) }
 
         // MARK: turns
         case .turnStart(let id, let p):

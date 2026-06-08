@@ -5,6 +5,8 @@ import WireProtocol
 import Supervisor
 import MemoryStore
 import MemoryExtension
+import MemoryMCP
+import Tools
 
 /// Builds the deny-default `WikiQueryHandle` injected into the `RequestRouter`,
 /// exposing the SQLite Memory Wiki store to the browser over read-only `wiki/*`
@@ -52,7 +54,8 @@ public enum WikiQueryWiring {
             graph:     { try await WikiJSON.graph(store, seed: $0, depth: $1) },
             backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
             tags:      { try await WikiJSON.tags(store) },
-            upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) })
+            upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
+            brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) })
     }
 }
 
@@ -255,6 +258,35 @@ public enum WikiJSON {
             bodyPath: bodyPath, contentSHA: contentSHA, rawBytes: Int64(data.count),
             now: now, chunkTexts: chunks)
         return .object(["id": .int(newId)])
+    }
+
+    /// "Enrich": a lexical, zero-spend, citation-first synthesis brief on a topic.
+    /// Invokes the existing WikiBriefTool and returns its structured payload as a
+    /// JSONValue (parsed from the tool's JSON output).
+    public static func brief(_ store: MemoryStore, topic: String, k: Int) async throws -> JSONValue {
+        let argsJSON = "{\"topic\": \(jsonString(topic)), \"k\": \(k)}"
+        let tool = WikiBriefTool(store: store)
+        let result = try await tool.run(ToolCall(callId: "wiki-brief", name: "wiki_brief",
+                                                 argumentsJSON: argsJSON), cwd: "")
+        // The tool emits a JSON payload string; decode it into a JSONValue so the
+        // browser gets structured data (summary/key_points/citations/…).
+        if let data = result.output.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(JSONValue.self, from: data) {
+            return payload
+        }
+        // Degrade to the raw text if it wasn't JSON (e.g. an error message).
+        return .object(["summary": .string(result.output), "status": .string(result.success ? "ok" : "error")])
+    }
+
+    /// Minimal JSON string escaping for embedding a topic into a literal.
+    private static func jsonString(_ s: String) -> String {
+        let escaped = s
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        return "\"\(escaped)\""
     }
 
     public static func tags(_ store: MemoryStore) async throws -> JSONValue {

@@ -187,6 +187,30 @@ export interface WikiGraph {
   edges: WikiGraphEdge[];
 }
 
+// ── Enrich: a lexical, cited synthesis brief (wiki/brief) ───────────────────
+export interface WikiCitation {
+  id: string;
+  doc_uri: string;
+  source_kind?: string;
+  score?: number;
+  snippet: string;
+}
+export interface WikiCitedPoint {
+  text: string;
+  citation_ids: string[];
+}
+export interface WikiBrief {
+  status?: string;
+  topic?: string;
+  summary?: string;
+  key_points?: WikiCitedPoint[];
+  citations?: WikiCitation[];
+  confidence?: string;
+  novelty_rationale?: WikiCitedPoint[];
+  what_would_change_my_mind?: string[];
+  limitations?: string[];
+}
+
 export interface Connector {
   /** Lifecycle. Mock implementations may be no-ops. */
   connect(): Promise<void>;
@@ -286,4 +310,6 @@ export interface Connector {
   getWikiTags?(): Promise<WikiTag[]>;
   /** Create (id omitted) or overwrite a wiki page. Returns the page id. */
   saveWikiPage?(input: { id?: string; title?: string; body: string }): Promise<{ id: string } | null>;
+  /** Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface). */
+  getWikiBrief?(topic: string, opts?: { k?: number }): Promise<WikiBrief | null>;
 }

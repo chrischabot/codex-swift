@@ -38,6 +38,14 @@ public struct WikiBacklinksParams: Decodable, Sendable, Equatable {
     public init(entityId: Int64) { self.entityId = entityId }
 }
 
+public struct WikiBriefParams: Decodable, Sendable, Equatable {
+    /// Topic/query to synthesize a cited brief for.
+    public var topic: String
+    /// Evidence count; router clamps 1...20 (default 8).
+    public var k: Int?
+    public init(topic: String, k: Int? = nil) { self.topic = topic; self.k = k }
+}
+
 public struct WikiPageUpsertParams: Decodable, Sendable, Equatable {
     /// Existing page (DocumentRow) id to overwrite; nil → create a new page.
     public var id: Int64?
