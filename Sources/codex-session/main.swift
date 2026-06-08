@@ -176,9 +176,17 @@ struct SessionWorkerMain {
         let model: any ModelClient
         let mem0AuthProvider: Mem0SessionAuthProvider?
         let wikiAuthProvider: WikiMemoryAuthProvider?
+        // Bearer source for the `computer_use` desktop loop. When the session
+        // authenticates with a ChatGPT OAuth token (broker / stored auth) rather
+        // than a raw OPENAI_API_KEY, this closure hands that token to the loop so
+        // desktop-control works without also exporting a separate API key. nil on
+        // the API-key path (ComputerUseTool falls back to env OPENAI_API_KEY) and
+        // when there's no auth at all. See ComputerUseTool.tokenProvider.
+        let computerUseBearer: (@Sendable () async -> String?)?
         if useMock {
             mem0AuthProvider = nil
             wikiAuthProvider = nil
+            computerUseBearer = nil
             let mockText = env["CODEXKIT_MOCK_TEXT"] ?? "Hello from codex-session (mock)."
             if env["CODEXKIT_MOCK_SCENARIO"] == "tool-loop-compact" {
                 model = MockModelClient(MockScenario.toolLoopCompactionSequence(repetitions: 256))
@@ -197,6 +205,7 @@ struct SessionWorkerMain {
         } else if let apiKey, !apiKey.isEmpty {
             mem0AuthProvider = .staticToken(apiKey)
             wikiAuthProvider = .staticToken(apiKey)
+            computerUseBearer = nil   // env OPENAI_API_KEY path; tool falls back to env
             model = openAIClient(apiKey: apiKey,
                                  limits: limits,
                                  attestationProvider: attestationProvider)
@@ -209,6 +218,7 @@ struct SessionWorkerMain {
             wikiAuthProvider = WikiMemoryAuthProvider(
                 accessToken: { await brokerAuth.validAccessToken() },
                 refreshToken: { await brokerAuth.refreshAccessToken() })
+            computerUseBearer = { await brokerAuth.validAccessToken() }
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token,
                                       limits: limits,
@@ -225,6 +235,7 @@ struct SessionWorkerMain {
             wikiAuthProvider = WikiMemoryAuthProvider(
                 accessToken: { await authManager.validAccessToken() },
                 refreshToken: { await authManager.refreshAccessToken() })
+            computerUseBearer = { await authManager.validAccessToken() }
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token,
                                       limits: limits,
@@ -237,6 +248,7 @@ struct SessionWorkerMain {
         } else {
             mem0AuthProvider = nil
             wikiAuthProvider = nil
+            computerUseBearer = nil
             model = SessionNotConfiguredModel()
         }
 
@@ -276,7 +288,12 @@ struct SessionWorkerMain {
                                         // only meaningful for a local (non-remote)
                                         // session, never one bound to a remote
                                         // exec container.
-                                        computerUseEnabled: c.remoteEnvironment == nil,
+                                        // Never under a mock model: with no live
+                                        // auth a mock session would still drive the
+                                        // REAL Responses API / desktop via the env
+                                        // OPENAI_API_KEY fallback — surprising.
+                                        computerUseEnabled: c.remoteEnvironment == nil && !useMock,
+                                        computerUseTokenProvider: computerUseBearer,
                                         spawnAgentOptions: spawnAgentOptions)
             // Dynamic workflows: enabled gate (the orchestrator is wired after
             // the engine exists, so progress can be pushed over its stream).

@@ -25,10 +25,19 @@ public struct MediaConfig: Sendable, Equatable {
         self.apiKeyEnv = apiKeyEnv
     }
 
-    /// A non-stub (async, `.queued`) provider needs the daemon poller to drive
-    /// jobs to completion — which only exists under in-process workers. The
-    /// inline stub completes synchronously and needs no poller.
-    public var requiresPoller: Bool { provider != "stub" }
+    /// Providers that complete INLINE inside `submit` (no `.queued` handle, no
+    /// daemon poller). "openai" (gpt-image-1) returns the PNG as base64 in the
+    /// response body, so it is inline despite the network round-trip — which
+    /// means it also works in the spawned worker mode. A truly async backend
+    /// (e.g. a future "fal" that returns a job id) would be OMITTED here and so
+    /// require the poller.
+    public static let inlineProviders: Set<String> = ["stub", "openai"]
+
+    /// An ASYNC (`.queued`) provider needs the daemon poller to drive jobs to
+    /// completion — which only exists under in-process workers. Inline providers
+    /// (stub, openai) complete synchronously and need no poller, so they run in
+    /// BOTH in-process and spawned modes.
+    public var requiresPoller: Bool { !MediaConfig.inlineProviders.contains(provider) }
 
     public static func load(config: Config, codexHome: String,
                             env: [String: String]) -> MediaConfig? {

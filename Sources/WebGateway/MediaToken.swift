@@ -14,10 +14,21 @@ public struct MediaToken {
     /// Signs/verifies media tokens. Hold ONE per gateway launch.
     public struct Signer: Sendable {
         private let key: SymmetricKey
+        /// The raw HMAC key bytes, exposed so the key can be PERSISTED (and a
+        /// signer reconstructed via `init(key:)`) — needed for stable
+        /// `/media/:token` URLs that survive a gateway restart. Treat as a
+        /// secret: anyone with these bytes can mint valid tokens.
+        public let keyBytes: [UInt8]
 
         public init(keyBytes: [UInt8]) {
             precondition(keyBytes.count >= 32, "HMAC key must be ≥ 32 bytes")
+            self.keyBytes = keyBytes
             self.key = SymmetricKey(data: Data(keyBytes))
+        }
+
+        /// Reconstruct a signer from a persisted key (alias of `init(keyBytes:)`).
+        public init(key: [UInt8]) {
+            self.init(keyBytes: key)
         }
 
         /// Fresh 256-bit key (per-launch rotation; old links die on restart).

@@ -65,6 +65,67 @@ final class ComputerUseToolTests: XCTestCase {
         }
     }
 
+    // MARK: - Bearer precedence (#7: session OAuth token preferred over env key)
+
+    /// CLAIM: `resolveBearer` prefers the injected (session OAuth) token over the
+    /// env `OPENAI_API_KEY`. ORACLE: an explicit precedence table. SEVERITY:
+    /// strong — this decides which credential drives the desktop loop.
+    func testResolveBearerPrefersProvidedOverEnv() {
+        XCTAssertEqual(ComputerUseTool.resolveBearer(provided: "oauth-tok", envKey: "env-key"), "oauth-tok",
+                       "a present session OAuth token must win over OPENAI_API_KEY")
+    }
+
+    /// A blank/absent provider (nil, empty, whitespace) must fall through to the
+    /// env key — never shadow it with an empty string.
+    func testResolveBearerFallsBackToEnvWhenProviderBlank() {
+        for blank in [nil, "", "   ", "\n\t"] as [String?] {
+            XCTAssertEqual(ComputerUseTool.resolveBearer(provided: blank, envKey: "env-key"), "env-key",
+                           "a blank provider (\(String(describing: blank))) must fall through to env")
+        }
+    }
+
+    /// Both blank → nil (the tool then emits the actionable no-bearer error).
+    func testResolveBearerNilWhenBothBlank() {
+        for p in [nil, "", "  "] as [String?] {
+            for e in [nil, "", "  "] as [String?] {
+                XCTAssertNil(ComputerUseTool.resolveBearer(provided: p, envKey: e),
+                             "blank/blank must be nil (p=\(String(describing: p)) e=\(String(describing: e)))")
+            }
+        }
+    }
+
+    /// Surrounding whitespace is trimmed off the chosen credential so a stray
+    /// newline from a token file never corrupts the Authorization header.
+    func testResolveBearerTrimsChosenCredential() {
+        XCTAssertEqual(ComputerUseTool.resolveBearer(provided: "  tok-123\n", envKey: nil), "tok-123")
+        XCTAssertEqual(ComputerUseTool.resolveBearer(provided: nil, envKey: " env-key "), "env-key")
+    }
+
+    /// CLAIM: the tool actually CONSULTS the injected provider, and when it (and
+    /// env) yield nothing, returns the actionable error naming BOTH credential
+    /// sources — never touching the desktop. ORACLE: the error text + a flag the
+    /// provider closure flips. SEVERITY: strong — proves the new auth seam is
+    /// wired, not dead code.
+    func testProviderConsultedAndNoBearerErrorNamesBothSources() async {
+        let consulted = ConsultFlag()
+        let tool = ComputerUseTool(env: [:], tokenProvider: {
+            await consulted.mark(); return nil   // present provider, but yields no token
+        })
+        let router = ToolRouter(limits: Limits())
+        await router.register(tool)
+        let r = await router.dispatch(
+            ToolCall(callId: "c1", name: "computer_use",
+                     argumentsJSON: #"{"task":"open Calculator"}"#),
+            cwd: "/tmp", deadline: .fromNow(.seconds(5)))
+        let wasConsulted = await consulted.value
+        XCTAssertTrue(wasConsulted, "the tokenProvider must be consulted during run()")
+        XCTAssertFalse(r.success)
+        XCTAssertTrue(r.output.contains("OPENAI_API_KEY"),
+                      "no-bearer error must name OPENAI_API_KEY; got: \(r.output)")
+        XCTAssertTrue(r.output.contains("OAuth"),
+                      "no-bearer error must name the session OAuth token path; got: \(r.output)")
+    }
+
     /// The model-visible spec carries a usable schema + description.
     func testSpecShape() {
         let t = ComputerUseTool()
@@ -75,5 +136,11 @@ final class ComputerUseToolTests: XCTestCase {
         // Schema must be valid JSON.
         XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(t.jsonSchema.utf8)))
     }
+}
+
+/// Observes whether the injected token provider was actually invoked.
+private actor ConsultFlag {
+    private(set) var value = false
+    func mark() { value = true }
 }
 #endif

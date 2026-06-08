@@ -33,7 +33,7 @@ public enum MediaWiring {
             FileHandle.standardError.write(Data(msg.utf8))
             return nil
         }
-        guard let provider = MediaProviderFactory.make(cfg) else { return nil }
+        guard let provider = MediaProviderFactory.make(cfg, env: env) else { return nil }
         // The asset write-root and (future) gateway serve-root MUST be the same
         // mediaRoot or a minted URL 404s; the provider writes under cfg.mediaRoot.
         try? FileManager.default.createDirectory(

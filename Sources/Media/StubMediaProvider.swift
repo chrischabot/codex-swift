@@ -39,13 +39,25 @@ public struct StubMediaProvider: MediaProvider {
 }
 
 /// Builds the concrete provider named in `[media].provider`. Returns nil for an
-/// unknown provider (deny-default — the caller treats nil as "not configured").
+/// unknown provider OR a non-stub provider whose key env is unset/empty
+/// (deny-default — the caller treats nil as "not configured"). `env` is threaded
+/// so the live "openai" provider resolves its key from `cfg.apiKeyEnv` against
+/// the SAME environment the rest of the read used — never from a literal key.
 public enum MediaProviderFactory {
-    public static func make(_ cfg: MediaConfig) -> (any MediaProvider)? {
+    public static func make(_ cfg: MediaConfig, env: [String: String]) -> (any MediaProvider)? {
         switch cfg.provider {
-        case "stub": return StubMediaProvider(mediaRoot: cfg.mediaRoot)
-        // case "openai": return OpenAIImagesProvider(...)  // async; needs poller
-        default: return nil
+        case "stub":
+            return StubMediaProvider(mediaRoot: cfg.mediaRoot)
+        case "openai":
+            // Resolve the key by NAME from env (never a literal key in config).
+            // MediaConfig.load already fails closed when this is unset, but we
+            // re-check here so the factory is safe to call directly.
+            guard let keyEnv = cfg.apiKeyEnv, let key = env[keyEnv], !key.isEmpty else {
+                return nil
+            }
+            return OpenAIImagesProvider(mediaRoot: cfg.mediaRoot, apiKey: key)
+        default:
+            return nil
         }
     }
 }

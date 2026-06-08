@@ -32,13 +32,23 @@ public struct ComputerUseTool: Tool {
     private let targetWidth: Int
     private let defaultMaxSteps: Int
     private let env: [String: String]
+    /// Optional source for the bearer used to drive the `computer` loop. When
+    /// present and it yields a non-empty token, it is PREFERRED over
+    /// `OPENAI_API_KEY` — this lets a session that authenticates with a ChatGPT
+    /// OAuth access token drive desktop-control without also exporting a separate
+    /// `OPENAI_API_KEY` (the loop hits the same `/v1/responses` endpoint the
+    /// session's chat uses, so the OAuth bearer authenticates it). Resolved fresh
+    /// per invocation so a rotated/refreshed token is always picked up.
+    private let tokenProvider: (@Sendable () async -> String?)?
 
     public init(targetWidth: Int = 1280,
                 defaultMaxSteps: Int = 25,
-                env: [String: String] = ProcessInfo.processInfo.environment) {
+                env: [String: String] = ProcessInfo.processInfo.environment,
+                tokenProvider: (@Sendable () async -> String?)? = nil) {
         self.targetWidth = targetWidth
         self.defaultMaxSteps = defaultMaxSteps
         self.env = env
+        self.tokenProvider = tokenProvider
     }
 
     public var toolDescription: String {
@@ -82,6 +92,20 @@ public struct ComputerUseTool: Tool {
 
     private struct Args: Decodable { var task: String; var max_steps: Int? }
 
+    /// Bearer precedence for the desktop loop, factored out so the policy is
+    /// independently testable (it decides auth — the highest-stakes branch).
+    /// The injected `provided` token (session OAuth) wins over the `envKey`
+    /// (`OPENAI_API_KEY`); each is trimmed and an empty/whitespace value counts
+    /// as absent, so a present-but-blank provider cleanly falls through to env,
+    /// and a blank env yields nil (→ the actionable "no bearer" error).
+    static func resolveBearer(provided: String?, envKey: String?) -> String? {
+        func nonBlank(_ s: String?) -> String? {
+            guard let t = s?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
+            return t
+        }
+        return nonBlank(provided) ?? nonBlank(envKey)
+    }
+
     public func run(_ call: ToolCall, cwd: String) async throws -> ToolResult {
         guard let data = call.argumentsJSON.data(using: .utf8),
               let args = try? JSONDecoder().decode(Args.self, from: data),
@@ -92,16 +116,19 @@ public struct ComputerUseTool: Tool {
                               success: false, truncated: false)
         }
 
-        // Surface the no-key case precisely, and BEFORE constructing the executor
-        // (which reads `NSScreen.main`) so a key-less environment never touches
-        // the display. The `computer` action loop uses a direct OpenAI key (the
-        // gpt-5.5 `computer` tool is separate from the session's chat auth).
-        guard let key = env["OPENAI_API_KEY"], !key.isEmpty else {
+        // Resolve the bearer, and BEFORE constructing the executor (which reads
+        // `NSScreen.main`) so a key-less environment never touches the display.
+        // Prefer the session's injected OAuth bearer (a ChatGPT access token
+        // authenticates the same `/v1/responses` endpoint the loop drives); fall
+        // back to a direct `OPENAI_API_KEY`. An empty/whitespace token from the
+        // provider is treated as absent so we cleanly fall through to the env key.
+        let provided = await tokenProvider?()
+        guard let key = ComputerUseTool.resolveBearer(provided: provided, envKey: env["OPENAI_API_KEY"]) else {
             return ToolResult(callId: call.callId,
-                              output: "computer_use is unavailable: OPENAI_API_KEY is not set in the "
-                                  + "session environment. The desktop-control loop needs a direct OpenAI "
-                                  + "API key (it drives the gpt-5.5 `computer` tool, which is separate "
-                                  + "from the session's chat authentication).",
+                              output: "computer_use is unavailable: no bearer is available — neither a "
+                                  + "session OAuth access token nor OPENAI_API_KEY is set. The desktop-control "
+                                  + "loop drives the gpt-5.5 `computer` tool against the OpenAI Responses API "
+                                  + "and needs one of them.",
                               success: false, truncated: false)
         }
 
@@ -127,13 +154,14 @@ public struct ComputerUseTool: Tool {
         options.log = { line in trace.append(line) }
 
         let executor = ComputerUseExecutor(targetWidth: targetWidth)
-        guard let loop = ComputerUseLoop(executor: executor, options: options, env: env) else {
-            // Unreachable given the key guard above (the only nil cause), but
-            // keep a faithful fallback rather than force-unwrapping.
-            return ToolResult(callId: call.callId,
-                              output: "computer_use is unavailable: the desktop-control loop could not be initialized.",
-                              success: false, truncated: false)
-        }
+        // Drive with the resolved bearer explicitly (not the env-reading init), so
+        // the session OAuth token is honored even when OPENAI_API_KEY is unset. Also
+        // pass the live `tokenProvider` so the loop RE-RESOLVES the bearer before
+        // each request — a long desktop run can outlive a single OAuth token, and
+        // the provider (e.g. validAccessToken()) refreshes it transparently. `key`
+        // is the fallback for a transient provider miss.
+        let loop = ComputerUseLoop(executor: executor, options: options, apiKey: key,
+                                   tokenProvider: tokenProvider)
 
         do {
             // `loop.run` performs its own TCC permission preflight and throws

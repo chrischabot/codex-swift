@@ -40,9 +40,16 @@ enum MediaGlue {
     @Sendable static func push(_ task: MediaTask) async -> Bool {
         guard let router = PushRouterHolder.shared.current(),
               let target = task.deliverTo, let asset = task.assetPath else { return false }
+        // #4: prefer a stable, signed `/media/:token` URL the recipient can open
+        // in a browser; fall back to the local asset path when there's no gateway
+        // signer published, or the asset resolves outside the gateway media root
+        // (the holder enforces the contained-under-root check). Deny-default: with
+        // no published signer (persist off / gateway not started) this is exactly
+        // the previous behavior — the local path.
+        let delivered = MediaTokenSignerHolder.shared.signedURL(forAssetPath: asset) ?? asset
         let result = await router.send(
             target: target,
-            text: "media \(task.kind.rawValue) ready: \(asset)",
+            text: "media \(task.kind.rawValue) ready: \(delivered)",
             idempotencyKey: "media-\(task.id)")
         return result.ok
     }
@@ -223,11 +230,21 @@ struct CodexDaemon {
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+        // #4: persist the `/media` signing key (deny-default) so signed media URLs
+        // survive a daemon restart. Off → a per-launch random key (path-only
+        // delivery, the previous behavior).
+        let persistSigner = env["CODEXKIT_WEB_PERSIST_MEDIA_SIGNER"] == "1"
+        // Browser-reachable origin for signed media URLs (required for a wildcard
+        // bind / reverse-proxy fronting). nil → derived from a concrete host:port.
+        let publicBase = (env["CODEXKIT_WEB_PUBLIC_BASE_URL"]?.isEmpty == false)
+            ? env["CODEXKIT_WEB_PUBLIC_BASE_URL"] : nil
         return WebGatewayConfig(host: host, port: port, wwwRoot: wwwRoot,
                                 certPath: certPath, keyPath: keyPath, tls: tls,
                                 requireAuth: requireAuth, bearerToken: token,
                                 allowedOrigins: origins,
-                                mediaRoot: codexHome + "/web-gateway/media")
+                                mediaRoot: codexHome + "/web-gateway/media",
+                                persistMediaSignerKey: persistSigner,
+                                publicBaseURL: publicBase)
     }
 
     /// A URL-safe random bearer token for the web gateway.
@@ -392,9 +409,15 @@ struct CodexDaemon {
         let model: any ModelClient
         let mem0AuthProvider: Mem0SessionAuthProvider?
         let wikiAuthProvider: WikiMemoryAuthProvider?
+        // Bearer source for the `computer_use` desktop loop when the session
+        // authenticates via a ChatGPT OAuth token (broker / stored auth) rather
+        // than a raw OPENAI_API_KEY. nil on the API-key path (the tool falls back
+        // to env OPENAI_API_KEY) and when unauthenticated. See ComputerUseTool.
+        let computerUseBearer: (@Sendable () async -> String?)?
         if useMock {
             mem0AuthProvider = nil
             wikiAuthProvider = nil
+            computerUseBearer = nil
             if ProcessInfo.processInfo.environment["CODEXKIT_MOCK_SCENARIO"] == "tool-loop-compact" {
                 model = MockModelClient(MockScenario.toolLoopCompactionSequence(repetitions: 256))
             } else {
@@ -404,6 +427,7 @@ struct CodexDaemon {
         } else if let apiKey, !apiKey.isEmpty {
             mem0AuthProvider = .staticToken(apiKey)
             wikiAuthProvider = .staticToken(apiKey)
+            computerUseBearer = nil   // env OPENAI_API_KEY path; tool falls back to env
             model = openAIClient(apiKey: apiKey, limits: limits)
             log.info("codexd using OpenAI Responses client from OPENAI_API_KEY")
         } else if let brokerAuth = brokerAuthClient(codexHome: codexHome),
@@ -414,6 +438,7 @@ struct CodexDaemon {
             wikiAuthProvider = WikiMemoryAuthProvider(
                 accessToken: { await brokerAuth.validAccessToken() },
                 refreshToken: { await brokerAuth.refreshAccessToken() })
+            computerUseBearer = { await brokerAuth.validAccessToken() }
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token, limits: limits),
                 refreshToken: { await brokerAuth.refreshAccessToken() },
@@ -426,6 +451,7 @@ struct CodexDaemon {
             wikiAuthProvider = WikiMemoryAuthProvider(
                 accessToken: { await authManager.validAccessToken() },
                 refreshToken: { await authManager.refreshAccessToken() })
+            computerUseBearer = { await authManager.validAccessToken() }
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token, limits: limits),
                 refreshToken: { await authManager.refreshAccessToken() },
@@ -434,6 +460,7 @@ struct CodexDaemon {
         } else {
             mem0AuthProvider = nil
             wikiAuthProvider = nil
+            computerUseBearer = nil
             model = NotConfiguredModelClient()
         }
 
@@ -470,7 +497,11 @@ struct CodexDaemon {
                                                 // computer_use drives THIS host's
                                                 // desktop — local (non-remote)
                                                 // sessions only.
-                                                computerUseEnabled: c.remoteEnvironment == nil,
+                                                // Never under a mock model (the env
+                                                // OPENAI_API_KEY fallback would else
+                                                // drive the REAL API/desktop).
+                                                computerUseEnabled: c.remoteEnvironment == nil && !useMock,
+                                                computerUseTokenProvider: computerUseBearer,
                                                 spawnAgentOptions: spawnAgentOptions)
                     // Dynamic workflows: enabled gate (the orchestrator is
                     // wired after the engine exists, so progress can be pushed

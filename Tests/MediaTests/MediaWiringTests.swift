@@ -87,9 +87,9 @@ final class MediaWiringTests: XCTestCase {
 
     func testProviderFactoryUnknownProviderIsNil() {
         XCTAssertNotNil(MediaProviderFactory.make(
-            MediaConfig(provider: "stub", mediaRoot: "/t", apiKeyEnv: nil)))
+            MediaConfig(provider: "stub", mediaRoot: "/t", apiKeyEnv: nil), env: [:]))
         XCTAssertNil(MediaProviderFactory.make(
-            MediaConfig(provider: "totally-unknown", mediaRoot: "/t", apiKeyEnv: nil)),
+            MediaConfig(provider: "totally-unknown", mediaRoot: "/t", apiKeyEnv: nil), env: [:]),
             "unknown provider → nil (deny-default)")
     }
 
@@ -156,9 +156,11 @@ final class MediaWiringTests: XCTestCase {
         XCTAssertNil(l, "feature off → no ledger (pack self-prunes, no poller)")
     }
 
-    func testMakeLedgerRefusesAsyncProviderInSpawnedMode() async {
-        // An async provider configured WITHOUT in-process workers must fail
-        // closed (return nil → tool self-prunes), not accept jobs that wedge.
+    func testMakeLedgerOpenAIIsInlineAndRunsInBothModes() async {
+        // openai (gpt-image-1) is INLINE — it returns base64 in the response
+        // body, so it needs no poller and runs in BOTH spawned and in-process
+        // modes. (A FUTURE truly-async backend omitted from inlineProviders would
+        // still fail closed in spawned mode; see requiresPoller.)
         let c = cfg([
             "features": .object(["media": .bool(true)]),
             "media": .object(["provider": .string("openai"), "api_key_env": .string("OAI")]),
@@ -166,14 +168,25 @@ final class MediaWiringTests: XCTestCase {
         let spawned = await MediaWiring.makeLedger(
             addonConfig: c, codexHome: tmp(), env: ["OAI": "sk-x"],
             inProcessWorkers: false, deliver: { _ in true })
-        XCTAssertNil(spawned, "async provider + spawned mode → nil (no silent wedge)")
-        // The SAME config under in-process workers is allowed (provider exists).
+        XCTAssertNotNil(spawned, "inline openai builds even in spawned mode (no poller needed)")
         let inproc = await MediaWiring.makeLedger(
             addonConfig: c, codexHome: tmp(), env: ["OAI": "sk-x"],
             inProcessWorkers: true, deliver: { _ in true })
-        // openai isn't a real factory case yet → nil, but NOT for the spawned
-        // reason; the stub path below proves in-process is otherwise permissive.
-        XCTAssertNil(inproc, "openai factory is a documented skeleton (still nil), not a wedge")
+        XCTAssertNotNil(inproc, "inline openai also builds under in-process workers")
+        // Missing key env → still nil (deny-default at the config layer).
+        let noKey = await MediaWiring.makeLedger(
+            addonConfig: c, codexHome: tmp(), env: [:],
+            inProcessWorkers: true, deliver: { _ in true })
+        XCTAssertNil(noKey, "openai without its key env → nil (fail closed)")
+    }
+
+    func testRequiresPollerFalseForOpenAI() {
+        let oai = MediaConfig(provider: "openai", mediaRoot: "/t", apiKeyEnv: "OAI")
+        XCTAssertFalse(oai.requiresPoller, "openai is inline → no poller required")
+        let stub = MediaConfig(provider: "stub", mediaRoot: "/t", apiKeyEnv: nil)
+        XCTAssertFalse(stub.requiresPoller)
+        let async = MediaConfig(provider: "fal", mediaRoot: "/t", apiKeyEnv: "FAL")
+        XCTAssertTrue(async.requiresPoller, "an unknown/async provider still requires the poller")
     }
 
     func testMakeLedgerBuildsAndDeliversInlineEndToEnd() async {

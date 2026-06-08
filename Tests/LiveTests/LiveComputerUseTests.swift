@@ -84,5 +84,32 @@ final class LiveComputerUseTests: XCTestCase {
         }
         XCTAssertEqual(lxLastTurnStatus(evs), .completed, "the turn must complete")
     }
+
+    /// Live #7: a bearer supplied ONLY via `tokenProvider` (env has NO
+    /// OPENAI_API_KEY) must authenticate the real `/v1/responses` desktop loop —
+    /// the proof that a ChatGPT-OAuth session can drive computer_use without
+    /// exporting a separate API key. Drives the real desktop, so it is double-
+    /// gated: a live key AND CODEX_LIVE_COMPUTER_USE=1 (the same desktop opt-in
+    /// the spy path uses). Skips cleanly otherwise.
+    func testProviderSuppliedBearerDrivesRealLoop() async throws {
+        try lxSkipUnlessLiveKey()
+        guard ProcessInfo.processInfo.environment["CODEX_LIVE_COMPUTER_USE"] == "1" else {
+            throw XCTSkip("set CODEX_LIVE_COMPUTER_USE=1 (and grant Screen Recording + Accessibility) to drive the real desktop")
+        }
+        let liveKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? ""
+        // env is EMPTY — the bearer can ONLY come from the injected provider, so a
+        // success here proves the OAuth-style provider path reached the live API.
+        let tool = ComputerUseTool(targetWidth: 1280, defaultMaxSteps: 8, env: [:],
+                                   tokenProvider: { liveKey })
+        let router = ToolRouter(limits: Limits())
+        await router.register(tool)
+        let r = await router.dispatch(
+            ToolCall(callId: "cu_oauth", name: "computer_use",
+                     argumentsJSON: #"{"task":"Open the macOS Calculator app.","max_steps":8}"#),
+            cwd: "/tmp", deadline: .fromNow(.seconds(180)))
+        XCTAssertFalse(r.output.contains("no bearer is available"),
+                       "the provider-supplied bearer must be used (env had no key); got: \(r.output)")
+        XCTAssertTrue(r.success, "the provider-bearer-driven loop must complete; got: \(r.output)")
+    }
 }
 #endif

@@ -894,6 +894,7 @@ public enum DefaultTools {
                                 requestPermissionsToolEnabled: Bool = defaultRequestPermissionsToolEnabled,
                                 toolSearchEnabled: Bool = defaultToolSearchEnabled,
                                 computerUseEnabled: Bool = false,
+                                computerUseTokenProvider: (@Sendable () async -> String?)? = nil,
                                 spawnAgentOptions: SpawnAgentToolOptions = SpawnAgentToolOptions()) async {
         let uem = UnifiedExecManager()
         // Under `dangerFullAccess` the model's exec tools must skip the
@@ -1074,7 +1075,7 @@ public enum DefaultTools {
         // ComputerUse module.
         #if canImport(AppKit)
         if computerUseEnabled {
-            await router.register(ComputerUseTool())
+            await router.register(ComputerUseTool(tokenProvider: computerUseTokenProvider))
         }
         #endif
         // tool_search discovery (audit tools-router finding 2). Upstream

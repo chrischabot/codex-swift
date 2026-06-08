@@ -50,6 +50,18 @@ public struct WebGatewayConfig: Sendable {
     public var maxUploadBytes: Int
     /// Per-thread cumulative upload quota (default 500 MiB).
     public var uploadQuotaBytes: Int
+    /// When true, persist the media-signing HMAC key to
+    /// `<mediaRoot>/media-signer.key` (0600) so signed `/media/:token` URLs
+    /// survive a restart. Deny-default false → per-launch random key (URLs die
+    /// on restart; media delivery falls back to local-path mode).
+    public var persistMediaSignerKey: Bool
+    /// Browser-reachable origin used to compose signed `/media/:token` URLs, e.g.
+    /// `https://media.example.com` or `https://1.2.3.4:8443`. Set this when the
+    /// gateway binds a WILDCARD address (`0.0.0.0`/`::`) or sits behind a reverse
+    /// proxy, so minted URLs carry a connectable authority instead of the raw
+    /// bind host. nil → derive from host:port (only safe for a concrete host;
+    /// a wildcard bind with no override DISABLES URL minting → path delivery).
+    public var publicBaseURL: String?
 
     public init(host: String = "127.0.0.1",
                 port: Int = 8443,
@@ -65,7 +77,9 @@ public struct WebGatewayConfig: Sendable {
                 allowedOrigins: [String] = [],
                 mediaRoot: String = "",
                 maxUploadBytes: Int = 50 * 1024 * 1024,
-                uploadQuotaBytes: Int = 500 * 1024 * 1024) {
+                uploadQuotaBytes: Int = 500 * 1024 * 1024,
+                persistMediaSignerKey: Bool = false,
+                publicBaseURL: String? = nil) {
         self.host = host
         self.port = port
         self.wwwRoot = wwwRoot
@@ -81,6 +95,24 @@ public struct WebGatewayConfig: Sendable {
         self.mediaRoot = mediaRoot
         self.maxUploadBytes = maxUploadBytes
         self.uploadQuotaBytes = uploadQuotaBytes
+        self.persistMediaSignerKey = persistMediaSignerKey
+        self.publicBaseURL = publicBaseURL
+    }
+
+    /// Resolve the browser-reachable origin for minting signed `/media` URLs, or
+    /// nil when none is safe to publish. An explicit `override` wins (verbatim,
+    /// trimmed). Otherwise a CONCRETE host yields `scheme://host:port`, but a
+    /// WILDCARD/empty bind (`0.0.0.0`, `::`, `[::]`, `*`, "") yields nil — the raw
+    /// wildcard is not a connectable authority, so minting a URL from it would
+    /// hand recipients a dead link. nil → callers degrade to local-path delivery.
+    public static func resolvePublicBaseURL(host: String, port: Int, tls: Bool,
+                                            override: String?) -> String? {
+        if let o = override?.trimmingCharacters(in: .whitespacesAndNewlines), !o.isEmpty {
+            return o
+        }
+        let wildcard: Set<String> = ["0.0.0.0", "::", "[::]", "*", ""]
+        guard !wildcard.contains(host) else { return nil }
+        return "\(tls ? "https" : "http")://\(host):\(port)"
     }
 
     /// Whether this bind is loopback-only.
@@ -164,14 +196,54 @@ public final class WebGateway: Sendable {
         router.get("healthz") { _, _ -> String in "ok" }
         router.get("readyz") { _, _ -> String in "ok" }
 
-        // Media + uploads. Per-launch HMAC signing key (links die on restart).
-        let mediaSigner = MediaToken.Signer.random()
+        // Media + uploads.
         let mediaRoot = config.mediaRoot.isEmpty
             ? (NSHomeDirectory() + "/.codex/web-gateway/media")
             : config.mediaRoot
         try? FileManager.default.createDirectory(
             atPath: mediaRoot, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
+
+        // Signing-key resolution (precedence):
+        //   1. A signer already published into the holder (the daemon minted +
+        //      published one before launching us) — adopt it so URLs the
+        //      deliver closure mints VERIFY here.
+        //   2. Deny-default: persistMediaSignerKey on → load/create a PERSISTED
+        //      key so `/media` URLs survive a restart.
+        //   3. Otherwise → per-launch random key (links die on restart;
+        //      delivery degrades to local-path mode).
+        let mediaSigner: MediaToken.Signer
+        if let published = MediaTokenSignerHolder.shared.current()?.signer {
+            mediaSigner = published
+        } else if config.persistMediaSignerKey {
+            if let persisted = try? MediaTokenSignerStore.loadOrCreate(directory: mediaRoot) {
+                mediaSigner = persisted
+            } else {
+                log.error("web gateway: failed to persist media signer key; using per-launch random key")
+                mediaSigner = .random()
+            }
+        } else {
+            mediaSigner = .random()
+        }
+
+        // Publish the live signer + public base URL + resolved media root so the
+        // codexd media deliver closure (MediaGlue.push) can mint `/media/:token`
+        // URLs that verify against the SAME key this route uses. A wildcard bind
+        // with no explicit public base URL yields nil → we DON'T publish a
+        // mint-capable context (delivery degrades to local-path) rather than mint
+        // unreachable `http://0.0.0.0:port/...` links.
+        let resolvedRoot = URL(fileURLWithPath: mediaRoot).resolvingSymlinksInPath().path
+        if let publicBase = WebGatewayConfig.resolvePublicBaseURL(
+            host: config.host, port: config.port, tls: config.tls, override: config.publicBaseURL) {
+            MediaTokenSignerHolder.shared.set(.init(
+                signer: mediaSigner, baseURL: publicBase, mediaRoot: resolvedRoot))
+        } else {
+            log.error("web gateway: bind host '\(config.host)' is a wildcard and no public base URL "
+                + "is set — signed /media URLs are DISABLED (media delivery falls back to the local "
+                + "path). Set CODEXKIT_WEB_PUBLIC_BASE_URL to a browser-reachable origin to enable them.")
+            MediaTokenSignerHolder.shared.reset()
+        }
+
         MediaRoute.install(on: router, mediaRoot: mediaRoot, signer: mediaSigner, log: log)
         UploadRoute.install(on: router, mediaRoot: mediaRoot, signer: mediaSigner,
                             security: security, maxUploadBytes: config.maxUploadBytes,

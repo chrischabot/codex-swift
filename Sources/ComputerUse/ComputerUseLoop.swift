@@ -30,7 +30,15 @@ public final class ComputerUseLoop: @unchecked Sendable {
         public init() {}
     }
 
+    /// Fallback bearer, used when no `tokenProvider` is set or it yields nothing.
     private let apiKey: String
+    /// Optional LIVE bearer source resolved fresh BEFORE EACH request. A session
+    /// OAuth token expires (≈minutes); a desktop run can span many steps over
+    /// several minutes, so caching one token at construction would 401 mid-run.
+    /// Re-resolving per-POST means an auto-refreshing provider (e.g.
+    /// `authManager.validAccessToken()`) always hands over a currently-valid
+    /// token. nil → the static `apiKey` is used (env keys don't expire).
+    private let tokenProvider: (@Sendable () async -> String?)?
     private let exec: ComputerUseExecutor
     private let opts: Options
     private let endpoint = URL(string: "https://api.openai.com/v1/responses")!
@@ -38,7 +46,31 @@ public final class ComputerUseLoop: @unchecked Sendable {
     public init?(executor: ComputerUseExecutor, options: Options = Options(),
                  env: [String: String] = ProcessInfo.processInfo.environment) {
         guard let key = env["OPENAI_API_KEY"], !key.isEmpty else { return nil }
-        self.apiKey = key; self.exec = executor; self.opts = options
+        self.apiKey = key; self.tokenProvider = nil; self.exec = executor; self.opts = options
+    }
+
+    /// Drive with an EXPLICIT bearer (e.g. the session's OAuth access token)
+    /// instead of reading `OPENAI_API_KEY` from the environment. The `computer`
+    /// loop hits the same `/v1/responses` endpoint the session's chat uses, so a
+    /// ChatGPT OAuth bearer authenticates it — no separate API key required.
+    ///
+    /// `apiKey` is the fallback; `tokenProvider`, when given, is consulted fresh
+    /// before each request so a refreshed OAuth token is always used (the
+    /// initially-resolved `apiKey` covers a transient provider miss).
+    public init(executor: ComputerUseExecutor, options: Options = Options(), apiKey: String,
+                tokenProvider: (@Sendable () async -> String?)? = nil) {
+        self.apiKey = apiKey; self.tokenProvider = tokenProvider
+        self.exec = executor; self.opts = options
+    }
+
+    /// The bearer for the NEXT request: a non-blank `tokenProvider` result wins
+    /// (fresh/refreshed), else the static `apiKey`.
+    private func currentBearer() async -> String {
+        if let tp = tokenProvider,
+           let t = (await tp())?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            return t
+        }
+        return apiKey
     }
 
     public enum LoopError: Error { case permissions(String), http(Int, String), badResponse(String), screenshot }
@@ -247,7 +279,8 @@ public final class ComputerUseLoop: @unchecked Sendable {
         var req = URLRequest(url: endpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        let bearer = await currentBearer()
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         req.timeoutInterval = 180
         let (data, resp) = try await URLSession.shared.data(for: req)
