@@ -179,7 +179,7 @@ struct CodexDaemon {
     /// Parse `--listen-web[=HOST:PORT]` / `CODEXKIT_LISTEN_WEB` into a gateway
     /// config, or nil when the web gateway is not requested. Defaults to
     /// loopback 127.0.0.1:8443. `wwwRoot`/cert/key are overridable via env.
-    private static func webGatewayConfig(codexHome: String) -> WebGatewayConfig? {
+    private static func webGatewayConfig(codexHome: String, config: Config) -> WebGatewayConfig? {
         let args = CommandLine.arguments
         var present = false
         var raw: String?
@@ -238,11 +238,19 @@ struct CodexDaemon {
         // bind / reverse-proxy fronting). nil → derived from a concrete host:port.
         let publicBase = (env["CODEXKIT_WEB_PUBLIC_BASE_URL"]?.isEmpty == false)
             ? env["CODEXKIT_WEB_PUBLIC_BASE_URL"] : nil
+        // Serve + sign media from the SAME root the media provider writes to
+        // (MediaConfig's resolution), so signed `/media/:token` delivery actually
+        // resolves. A divergent `web-gateway/media` default would make every
+        // minted URL fall back to the local path. Falls back to the legacy
+        // gateway dir only when [media] isn't configured at all.
+        let mediaRoot = config.value("media") != nil
+            ? MediaConfig.resolveMediaRoot(config: config, codexHome: codexHome)
+            : codexHome + "/web-gateway/media"
         return WebGatewayConfig(host: host, port: port, wwwRoot: wwwRoot,
                                 certPath: certPath, keyPath: keyPath, tls: tls,
                                 requireAuth: requireAuth, bearerToken: token,
                                 allowedOrigins: origins,
-                                mediaRoot: codexHome + "/web-gateway/media",
+                                mediaRoot: mediaRoot,
                                 persistMediaSignerKey: persistSigner,
                                 publicBaseURL: publicBase)
     }
@@ -784,7 +792,7 @@ struct CodexDaemon {
         // transport, sharing this process's SessionSupervisor so web tabs and
         // local stdio/UDS clients see the same session pool. Each browser tab
         // gets its OWN per-connection RequestRouter via the factory below.
-        let webGatewayConfig = Self.webGatewayConfig(codexHome: codexHome)
+        let webGatewayConfig = Self.webGatewayConfig(codexHome: codexHome, config: appConfig)
         let webGatewayEnabled = webGatewayConfig != nil
         if let webGatewayConfig {
             let gateway = WebGateway(

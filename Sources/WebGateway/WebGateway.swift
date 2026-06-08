@@ -300,31 +300,42 @@ public final class WebGateway: Sendable {
             })
 
         let wsBuilder = HTTPServerBuilder.http1WebSocketUpgrade(webSocketRouter: wsRouter)
-        let server: HTTPServerBuilder
-        if config.tls {
-            let certs = try NIOSSLCertificate.fromPEMFile(config.certPath)
-            let key = try NIOSSLPrivateKey(file: config.keyPath, format: .pem)
-            var tls = TLSConfiguration.makeServerConfiguration(
-                certificateChain: certs.map { .certificate($0) },
-                privateKey: .privateKey(key))
-            tls.minimumTLSVersion = .tlsv13
-            server = try .tls(wsBuilder, tlsConfiguration: tls)
-        } else {
-            server = wsBuilder
+        // From here on a throw means the gateway never serves (bad TLS files, port
+        // already bound) or has stopped serving. `codexd` catches this and keeps
+        // the daemon alive — so the published signer must be DROPPED, else
+        // `MediaGlue.push` would keep minting `<base>/media/...` URLs for a
+        // gateway that isn't running (the recipient gets a dead link instead of
+        // the local-path fallback).
+        do {
+            let server: HTTPServerBuilder
+            if config.tls {
+                let certs = try NIOSSLCertificate.fromPEMFile(config.certPath)
+                let key = try NIOSSLPrivateKey(file: config.keyPath, format: .pem)
+                var tls = TLSConfiguration.makeServerConfiguration(
+                    certificateChain: certs.map { .certificate($0) },
+                    privateKey: .privateKey(key))
+                tls.minimumTLSVersion = .tlsv13
+                server = try .tls(wsBuilder, tlsConfiguration: tls)
+            } else {
+                server = wsBuilder
+            }
+
+            let app = Application(
+                router: router,
+                server: server,
+                configuration: .init(
+                    address: .hostname(config.host, port: config.port),
+                    serverName: "codex-web-gateway"),
+                logger: logger)
+
+            let scheme = config.tls ? "https" : "http"
+            log.info("web gateway listening \(scheme)://\(config.host):\(config.port) (\(config.tls ? "TLS1.3, " : "")http1+ws), wwwRoot=\(config.wwwRoot)")
+            let group = ServiceGroup(services: [app], logger: logger)
+            try await group.run()
+        } catch {
+            MediaTokenSignerHolder.shared.reset()
+            throw error
         }
-
-        let app = Application(
-            router: router,
-            server: server,
-            configuration: .init(
-                address: .hostname(config.host, port: config.port),
-                serverName: "codex-web-gateway"),
-            logger: logger)
-
-        let scheme = config.tls ? "https" : "http"
-        log.info("web gateway listening \(scheme)://\(config.host):\(config.port) (\(config.tls ? "TLS1.3, " : "")http1+ws), wwwRoot=\(config.wwwRoot)")
-        let group = ServiceGroup(services: [app], logger: logger)
-        try await group.run()
     }
 
     /// Per-connection duplex bridge: a browser WebSocket ⇄ a fresh

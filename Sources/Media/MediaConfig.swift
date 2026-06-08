@@ -46,8 +46,7 @@ public struct MediaConfig: Sendable, Equatable {
         guard config.isFeatureEnabled("media", env: env) else { return nil }
         let obj = config.value("media")?.objectValue ?? [:]
         let provider = obj["provider"]?.stringValue ?? "stub"
-        let root = (obj["media_root"]?.stringValue).map { expandHome($0, codexHome) }
-            ?? (codexHome + "/media")
+        let root = resolveMediaRoot(config: config, codexHome: codexHome)
         let apiKeyEnv = obj["api_key_env"]?.stringValue
         // A non-stub (async, network) provider can't run without its key — fail
         // closed to nil rather than advertise a tool that errors every call.
@@ -55,6 +54,19 @@ public struct MediaConfig: Sendable, Equatable {
             guard let keyEnv = apiKeyEnv, let v = env[keyEnv], !v.isEmpty else { return nil }
         }
         return MediaConfig(provider: provider, mediaRoot: root, apiKeyEnv: apiKeyEnv)
+    }
+
+    /// The single source of truth for the server-owned media root: `[media]
+    /// media_root` (with `$CODEX_HOME` expanded) else `<codexHome>/media`. The
+    /// media provider WRITES here and the WebGateway `/media` route must SERVE +
+    /// sign from the SAME path, or a minted token resolves to nothing. Exposed so
+    /// the gateway composition root resolves an identical root (not a divergent
+    /// `web-gateway/media` default) — otherwise signed delivery silently never
+    /// fires and always falls back to the local path.
+    public static func resolveMediaRoot(config: Config, codexHome: String) -> String {
+        let obj = config.value("media")?.objectValue ?? [:]
+        return (obj["media_root"]?.stringValue).map { expandHome($0, codexHome) }
+            ?? (codexHome + "/media")
     }
 
     /// The config layer does NOT expand `$CODEX_HOME`; do it here.

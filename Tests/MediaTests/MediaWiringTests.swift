@@ -70,6 +70,27 @@ final class MediaWiringTests: XCTestCase {
         XCTAssertEqual(mc?.mediaRoot, "/home/u/assets", "$CODEX_HOME expanded")
     }
 
+    /// CLAIM: `resolveMediaRoot` is the single source of truth — it returns the
+    /// EXACT root `load` puts on the config, AND it resolves identically whether
+    /// or not [media] sets media_root. This is the invariant that keeps the
+    /// WebGateway serve/sign root aligned with where the provider writes (the
+    /// signed-URL delivery only fires when the two roots match). SEVERITY: strong
+    /// — a divergence here silently disables signed media delivery.
+    func testResolveMediaRootIsSingleSourceOfTruth() {
+        // Default (no media_root) → <codexHome>/media, and load() agrees.
+        let def = cfg(["media": .object(["provider": .string("stub")])])
+        XCTAssertEqual(MediaConfig.resolveMediaRoot(config: def, codexHome: "/home/u"), "/home/u/media")
+        let mcDef = MediaConfig.load(config: def, codexHome: "/home/u", env: ["CODEX_FEATURE_MEDIA": "1"])
+        XCTAssertEqual(mcDef?.mediaRoot, MediaConfig.resolveMediaRoot(config: def, codexHome: "/home/u"),
+                       "load() and resolveMediaRoot() must never diverge")
+        // Explicit override (with $CODEX_HOME) → same on both paths.
+        let ovr = cfg(["media": .object(["provider": .string("stub"),
+                                          "media_root": .string("$CODEX_HOME/assets")])])
+        XCTAssertEqual(MediaConfig.resolveMediaRoot(config: ovr, codexHome: "/home/u"), "/home/u/assets")
+        let mcOvr = MediaConfig.load(config: ovr, codexHome: "/home/u", env: ["CODEX_FEATURE_MEDIA": "1"])
+        XCTAssertEqual(mcOvr?.mediaRoot, "/home/u/assets")
+    }
+
     // MARK: stub provider
 
     func testStubProviderWritesAssetAndIsInline() async {
