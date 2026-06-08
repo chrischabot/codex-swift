@@ -15,6 +15,7 @@ import Workflows
 import IPC
 import SessionWorkerCore
 import Supervisor
+import WikiQueryKit
 import Transport
 import Observability
 import Auth
@@ -734,12 +735,17 @@ struct CodexDaemon {
         // else nil (echo). Shared by the stdio/UDS router and every per-tab web
         // router; the factory builds a fresh session per `thread/realtime/start`.
         let realtimeFactory = Self.realtimeBackendFactory()
+        // Read-only Memory Wiki browse surface (deny-default: nil unless
+        // CODEXKIT_MEMORY=1 and the SQLite store opens). Built once and shared
+        // across the daemon + per-tab web routers (the store actor serializes).
+        let wikiHandle = WikiQueryWiring.make(config: appConfig)
         // OWNER-TRUSTED daemon router: stdio / UDS / loopback socket. Serves
         // owner-only RPCs (outbound/send). allowsOwnerOnlyRPC defaults to true.
         let router = RequestRouter(supervisor: supervisor, store: store,
                                    codexHome: codexHome, auth: authManager,
                                    config: appConfig,
                                    memoryResetHandler: { await appMemory.reset() },
+                                   wikiQuery: wikiHandle,
                                    realtimeBackendFactory: realtimeFactory,
                                    allowsOwnerOnlyRPC: true)
 
@@ -807,6 +813,7 @@ struct CodexDaemon {
                                   codexHome: codexHome, auth: authManager,
                                   config: appConfig,
                                   memoryResetHandler: { await appMemory.reset() },
+                                  wikiQuery: wikiHandle,
                                   realtimeBackendFactory: realtimeFactory,
                                   allowsOwnerOnlyRPC: false)
                 })

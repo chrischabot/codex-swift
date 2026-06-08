@@ -396,6 +396,9 @@ public actor RequestRouter {
     private let remoteControlEnroller: RemoteControlEnroller
     private let remoteControlWebSocketConnector: RemoteControlWebSocketConnector
     private let memoryResetHandler: (@Sendable () async -> Void)?
+    /// Deny-default read handle into the Memory Wiki store. nil → `wiki/*` RPCs
+    /// are refused with "wiki is not enabled".
+    private let wikiQuery: WikiQueryHandle?
     /// Injected live realtime voice backend (OpenAI Realtime API). When nil,
     /// `thread/realtime/*` uses the built-in echo mock. See RealtimeBackend.swift.
     private let realtimeBackendFactory: RealtimeBackendFactory?
@@ -858,6 +861,7 @@ public actor RequestRouter {
                 remoteControlEnroller: RemoteControlEnroller? = nil,
                 remoteControlWebSocketConnector: RemoteControlWebSocketConnector? = nil,
                 memoryResetHandler: (@Sendable () async -> Void)? = nil,
+                wikiQuery: WikiQueryHandle? = nil,
                 realtimeBackendFactory: RealtimeBackendFactory? = nil,
                 allowsOwnerOnlyRPC: Bool = true) {
         self.supervisor = supervisor
@@ -873,6 +877,7 @@ public actor RequestRouter {
         self.remoteControlWebSocketConnector =
             remoteControlWebSocketConnector ?? Self.connectRemoteControlWebSocket
         self.memoryResetHandler = memoryResetHandler
+        self.wikiQuery = wikiQuery
         self.realtimeBackendFactory = realtimeBackendFactory
     }
 
@@ -943,6 +948,30 @@ public actor RequestRouter {
     private func reply(_ conn: any ClientConnection, _ id: RequestId, _ result: JSONValue) async {
         await conn.send(.response(JSONRPCResponse(id: id, result: result)))
     }
+
+    // MARK: wiki helpers
+    private struct WikiNotFound: Error {}
+
+    /// Centralizes the deny-default gate + error mapping for the `wiki/*` arms.
+    /// A nil handle (feature off) replies internalError "wiki is not enabled"
+    /// (NOT -32601, so a known-but-disabled method is distinct from an unknown
+    /// one); WikiNotFound → invalidRequest; any other throw → internalError.
+    private func replyWiki(_ conn: any ClientConnection, _ id: RequestId,
+                           _ body: @Sendable (WikiQueryHandle) async throws -> JSONValue) async {
+        guard let wiki = wikiQuery else {
+            await conn.send(WireError.internalError(id: id, "wiki is not enabled"))
+            return
+        }
+        do { await reply(conn, id, try await body(wiki)) }
+        catch is WikiNotFound { await conn.send(WireError.invalidRequest(id: id, "wiki page not found")) }
+        catch { await conn.send(WireError.internalError(id: id, String(describing: error))) }
+    }
+
+    // All wiki bounds are RE-clamped router-side so untrusted browser input can
+    // never reach an out-of-range store query (depth>4 throws; huge limit OOMs).
+    private static func clampWikiLimit(_ v: Int?) -> Int { min(max(v ?? 100, 1), 500) }
+    private static func clampWikiK(_ v: Int?) -> Int { min(max(v ?? 10, 1), 100) }
+    private static func clampWikiDepth(_ v: Int?) -> Int { min(max(v ?? 2, 1), 4) }
     private func reply<T: Encodable>(_ conn: any ClientConnection, _ id: RequestId, _ v: T) async {
         await reply(conn, id, (try? JSONBridge.value(v)) ?? .object([:]))
     }
@@ -2127,6 +2156,23 @@ public actor RequestRouter {
         case .memoryReset(let id):
             await memoryResetHandler?()
             await reply(conn, id, EmptyResponse())
+
+        // MARK: wiki (read-only Memory Wiki browse surface, M0)
+        case .wikiList(let id, let p):
+            await replyWiki(conn, id) { try await $0.list(Self.clampWikiLimit(p.limit)) }
+        case .wikiPageGet(let id, let p):
+            await replyWiki(conn, id) { h in
+                if let page = try await h.pageGet(p.id) { return page }
+                throw WikiNotFound()
+            }
+        case .wikiSearch(let id, let p):
+            await replyWiki(conn, id) { try await $0.search(p.query, Self.clampWikiK(p.k)) }
+        case .wikiGraph(let id, let p):
+            await replyWiki(conn, id) { try await $0.graph(p.seed, Self.clampWikiDepth(p.depth)) }
+        case .wikiBacklinks(let id, let p):
+            await replyWiki(conn, id) { try await $0.backlinks(p.entityId) }
+        case .wikiTags(let id):
+            await replyWiki(conn, id) { try await $0.tags() }
 
         // MARK: turns
         case .turnStart(let id, let p):
@@ -4187,7 +4233,8 @@ public actor RequestRouter {
             accountNudgeEmailSender: accountNudgeEmailSender,
             remoteControlEnroller: remoteControlEnroller,
             remoteControlWebSocketConnector: remoteControlWebSocketConnector,
-            memoryResetHandler: memoryResetHandler)
+            memoryResetHandler: memoryResetHandler,
+            wikiQuery: wikiQuery)
         let connection = RemoteControlVirtualConnection(
             clientId: envelope.clientId,
             streamId: streamId,

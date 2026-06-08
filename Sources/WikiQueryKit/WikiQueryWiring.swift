@@ -1,0 +1,220 @@
+import Foundation
+import Config
+import WireProtocol
+import Supervisor
+import MemoryStore
+import MemoryExtension
+
+/// Builds the deny-default `WikiQueryHandle` injected into the `RequestRouter`,
+/// exposing the SQLite Memory Wiki store to the browser over read-only `wiki/*`
+/// RPCs. Lives in `codexd` (not `Supervisor`) so the `MemoryStore` import — whose
+/// type name collides with `HarnessCore.MemoryStore` — stays localized; the
+/// handle traffics only in `JSONValue`.
+///
+/// A wiki "page" IS a `DocumentRow`: id = row id, title = title ?? sourceURI,
+/// content = the markdown at `bodyPath`, tags = mentioned `.tag` entities,
+/// connections = the entity edges its chunks participate in.
+public enum WikiQueryWiring {
+    /// Deny-default: returns nil unless `CODEXKIT_MEMORY=1` AND the store opens.
+    /// A missing/locked/corrupt DB must never crash codexd — nil ⇒ `wiki/*` RPCs
+    /// reply "wiki is not enabled".
+    public static func make(config: Config,
+                            env: [String: String] = ProcessInfo.processInfo.environment) -> WikiQueryHandle? {
+        guard env["CODEXKIT_MEMORY"] == "1" else { return nil }
+        let wikiCfg = WikiMemoryConfig.fromConfig(config, env: env)
+        let storeConfig = MemoryStoreConfig(
+            path: wikiCfg.dbPath ?? MemoryStoreConfig.defaultPath(),
+            embeddingDimension: wikiCfg.embeddingDimension)
+        guard let store = try? MemoryStore(storeConfig) else { return nil }
+        return WikiQueryHandle(
+            list:      { try await WikiJSON.list(store, limit: $0) },
+            pageGet:   { try await WikiJSON.pageGet(store, id: $0) },
+            search:    { try await WikiJSON.search(store, query: $0, k: $1) },
+            graph:     { try await WikiJSON.graph(store, seed: $0, depth: $1) },
+            backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
+            tags:      { try await WikiJSON.tags(store) })
+    }
+}
+
+/// `MemoryStore` → `JSONValue` shapers. All reads go through the store actor, so
+/// concurrent browser calls serialize safely. Mirrors `MemoryMCP/MemoryTools`.
+/// `public` so the wiki-RPC test target can drive the shapers against a temp DB.
+public enum WikiJSON {
+    // epoch SECONDS (store) → epoch MILLIS (the connector normalizes either way)
+    private static func ms(_ epochSeconds: Int64) -> JSONValue { .int(epochSeconds * 1000) }
+
+    public static func list(_ store: MemoryStore, limit: Int) async throws -> JSONValue {
+        let rows = try await store.documentChunkSummaries(limit: limit)
+        let items = rows.map { s -> JSONValue in
+            .object([
+                "id": .int(s.document.id),
+                "title": .string(s.document.title ?? s.document.sourceURI),
+                "source": .string(s.document.source.rawValue),
+                "sourceURI": .string(s.document.sourceURI),
+                "updatedAt": ms(s.document.fetchedAt),
+                "chunkCount": .int(Int64(s.chunkCount)),
+            ])
+        }
+        return .object(["data": .array(items)])
+    }
+
+    /// nil ⇒ not found (router maps to invalidRequest). The body file is read
+    /// best-effort: a relocated/deleted bodyPath degrades to "" rather than failing.
+    public static func pageGet(_ store: MemoryStore, id: Int64) async throws -> JSONValue? {
+        guard let doc = try await store.document(id: id) else { return nil }
+        let body = (try? String(contentsOfFile: doc.bodyPath, encoding: .utf8)) ?? ""
+
+        // Entities mentioned across this page's chunks → tags + connections.
+        let chunks = try await store.chunks(forDocument: id)
+        var entityIds = Set<Int64>()
+        for c in chunks {
+            for eid in (try? await store.entitiesForChunk(c.id)) ?? [] { entityIds.insert(eid) }
+        }
+        var tags: [JSONValue] = []
+        var connections: [JSONValue] = []
+        var seenEdge = Set<Int64>()
+        for eid in entityIds {
+            guard let ent = try await store.entity(id: eid) else { continue }
+            if ent.kind == .tag {
+                tags.append(.string(ent.canonical))
+            }
+            // Edges this entity participates in → "connections" to other entities.
+            for edge in (try? await store.edges(fromOrTo: eid)) ?? [] {
+                guard !seenEdge.contains(edge.id) else { continue }
+                seenEdge.insert(edge.id)
+                let otherId = edge.src == eid ? edge.dst : edge.src
+                guard let other = try? await store.entity(id: otherId) else { continue }
+                connections.append(.object([
+                    "entityId": .int(other.id),
+                    "canonical": .string(other.canonical),
+                    "kind": .string(other.kind.rawValue),
+                    "relation": .string(edge.relation),
+                    "weight": .double(edge.weight),
+                ]))
+            }
+        }
+
+        return .object([
+            "id": .int(doc.id),
+            "title": .string(doc.title ?? doc.sourceURI),
+            "source": .string(doc.source.rawValue),
+            "sourceURI": .string(doc.sourceURI),
+            "content": .string(body),
+            "tags": .array(tags),
+            "connections": .array(connections),
+            "updatedAt": ms(doc.fetchedAt),
+            "metadata": .object([
+                "source": .string(doc.source.rawValue),
+                "sourceURI": .string(doc.sourceURI),
+                "language": doc.language.map(JSONValue.string) ?? .null,
+                "publishedAt": doc.publishedAt.map(ms) ?? .null,
+                "fetchedAt": ms(doc.fetchedAt),
+                "rawBytes": .int(doc.rawBytes),
+            ]),
+        ])
+    }
+
+    /// Lexical (BM25) search grouped by document. Hybrid+rerank is a later
+    /// milestone (it needs the inference assembly); M0 stays embedding-free.
+    public static func search(_ store: MemoryStore, query: String, k: Int) async throws -> JSONValue {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return .object(["data": .array([])]) }
+        let hits = try await store.searchLexical(q, k: k)
+        // Group hits by document, keep the best score + a snippet from the top chunk.
+        struct Group { var doc: DocumentRow; var score: Double; var snippet: String }
+        var groups: [Int64: Group] = [:]
+        for hit in hits {
+            guard let chunk = try await store.chunk(id: hit.chunkId),
+                  let doc = try await store.document(id: chunk.documentId) else { continue }
+            let snippet = String(chunk.text.prefix(240))
+            if let existing = groups[doc.id] {
+                if hit.score > existing.score { groups[doc.id] = Group(doc: doc, score: hit.score, snippet: snippet) }
+            } else {
+                groups[doc.id] = Group(doc: doc, score: hit.score, snippet: snippet)
+            }
+        }
+        let items = groups.values
+            .sorted { $0.score > $1.score }
+            .map { g -> JSONValue in
+                .object([
+                    "id": .int(g.doc.id),
+                    "title": .string(g.doc.title ?? g.doc.sourceURI),
+                    "source": .string(g.doc.source.rawValue),
+                    "excerpt": .string(g.snippet),
+                    "updatedAt": ms(g.doc.fetchedAt),
+                    "score": .double(g.score),
+                ])
+            }
+        return .object(["data": .array(items)])
+    }
+
+    /// Entity/edge graph. seed == nil → capped whole-graph; else 2-hop walk.
+    public static func graph(_ store: MemoryStore, seed: Int64?, depth: Int) async throws -> JSONValue {
+        var nodeIds: [Int64]
+        if let seed {
+            let walked = try await store.twoHopNeighbours(seed: seed, depth: depth)
+            nodeIds = Array(Set(walked.map { $0.0 } + [seed]))
+        } else {
+            nodeIds = try await store.entities(limit: 2000).map { $0.id }
+        }
+        let nodeSet = Set(nodeIds)
+        var nodes: [JSONValue] = []
+        for eid in nodeIds {
+            guard let ent = try await store.entity(id: eid) else { continue }
+            nodes.append(.object([
+                "id": .int(ent.id),
+                "title": .string(ent.canonical),
+                "kind": .string(ent.kind.rawValue),
+                "weight": .int(Int64(ent.degree)),
+                "centrality": .double(ent.egoBetweennessCached ?? 0),
+            ]))
+        }
+        // Edges among the node set, deduped.
+        var edges: [JSONValue] = []
+        var seenEdge = Set<Int64>()
+        let candidateEdges: [EdgeRow]
+        if seed == nil {
+            candidateEdges = try await store.edges(limit: 5000)
+        } else {
+            var acc: [EdgeRow] = []
+            for eid in nodeIds { acc.append(contentsOf: (try? await store.edges(fromOrTo: eid)) ?? []) }
+            candidateEdges = acc
+        }
+        for edge in candidateEdges {
+            guard nodeSet.contains(edge.src), nodeSet.contains(edge.dst),
+                  !seenEdge.contains(edge.id) else { continue }
+            seenEdge.insert(edge.id)
+            edges.append(.object([
+                "source": .int(edge.src),
+                "target": .int(edge.dst),
+                "relation": .string(edge.relation),
+                "weight": .double(edge.weight),
+            ]))
+        }
+        return .object(["nodes": .array(nodes), "edges": .array(edges)])
+    }
+
+    public static func backlinks(_ store: MemoryStore, entityId: Int64) async throws -> JSONValue {
+        let edges = try await store.edges(fromOrTo: entityId)
+        let items = edges.map { e -> JSONValue in
+            .object([
+                "id": .int(e.id),
+                "src": .int(e.src),
+                "dst": .int(e.dst),
+                "relation": .string(e.relation),
+                "weight": .double(e.weight),
+            ])
+        }
+        return .object(["data": .array(items)])
+    }
+
+    public static func tags(_ store: MemoryStore) async throws -> JSONValue {
+        let ents = try await store.entities(limit: 5000).filter { $0.kind == .tag }
+        let items = ents
+            .sorted { $0.degree > $1.degree }
+            .map { e -> JSONValue in
+                .object(["tag": .string(e.canonical), "count": .int(Int64(e.degree))])
+            }
+        return .object(["data": .array(items)])
+    }
+}

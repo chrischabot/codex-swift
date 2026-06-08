@@ -1,0 +1,41 @@
+import Foundation
+import WireProtocol
+
+/// Deny-default read-only handle into the Memory Wiki store, injected by the
+/// composition root (codexd). All closures return wire-ready `JSONValue` so the
+/// `Supervisor` module never imports `MemoryStore`/`MemoryRetrieve` (whose
+/// `MemoryStore` type name collides with `HarnessCore.MemoryStore`). A `nil`
+/// handle means the wiki is not enabled → every `wiki/*` RPC is refused.
+///
+/// The closures capture the `MemoryStore`/`MemoryRetriever` actors, so the
+/// struct is trivially `Sendable` and safe to share across per-tab routers.
+public struct WikiQueryHandle: Sendable {
+    /// Recent/all pages (documents). `limit` is pre-clamped by the router.
+    public var list: @Sendable (_ limit: Int) async throws -> JSONValue
+    /// One page by document id; `nil` → not found (router maps to invalidRequest).
+    public var pageGet: @Sendable (_ id: Int64) async throws -> JSONValue?
+    /// Hybrid search, grouped by document. `k` is pre-clamped.
+    public var search: @Sendable (_ query: String, _ k: Int) async throws -> JSONValue
+    /// Entity/edge graph: seeded 2-hop walk, or capped whole-graph when `seed == nil`.
+    public var graph: @Sendable (_ seed: Int64?, _ depth: Int) async throws -> JSONValue
+    /// In/out edges for an entity.
+    public var backlinks: @Sendable (_ entityId: Int64) async throws -> JSONValue
+    /// Tag entities with counts.
+    public var tags: @Sendable () async throws -> JSONValue
+
+    public init(
+        list: @escaping @Sendable (Int) async throws -> JSONValue,
+        pageGet: @escaping @Sendable (Int64) async throws -> JSONValue?,
+        search: @escaping @Sendable (String, Int) async throws -> JSONValue,
+        graph: @escaping @Sendable (Int64?, Int) async throws -> JSONValue,
+        backlinks: @escaping @Sendable (Int64) async throws -> JSONValue,
+        tags: @escaping @Sendable () async throws -> JSONValue
+    ) {
+        self.list = list
+        self.pageGet = pageGet
+        self.search = search
+        self.graph = graph
+        self.backlinks = backlinks
+        self.tags = tags
+    }
+}

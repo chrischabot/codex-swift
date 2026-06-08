@@ -31,6 +31,9 @@ enum MethodGate {
         "thread/rollback", "thread/inject_items", "thread/shellCommand",
         "thread/goal/get", "thread/goal/set", "thread/goal/clear",
         "thread/memoryMode/set", "memory/reset",
+        // memory wiki (read-only browse/search/graph — reads only; mutation
+        // methods are deliberately NOT here until an opt-in write surface lands)
+        "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/tags",
         // turn lifecycle
         "turn/start", "turn/steer", "turn/interrupt", "review/start",
         // git diff-rail + automations

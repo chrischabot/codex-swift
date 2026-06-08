@@ -248,6 +248,12 @@ let package = Package(
         .target(name: "Supervisor",
                 dependencies: ["WireProtocol", "ProtocolModel", "Persistence", "IPC", "InfraPrimitives", "Skills", "MCP", "Connectors", "Auth", "Tokenizer", "Config", "Observability", "Tools", "Prompts", "ModelClient", "Push", "Cron", "Channels"],
                 swiftSettings: strict),
+        // Read-only Memory Wiki browse surface for the web RPC layer. Kept out of
+        // Supervisor so the MemoryStore import (whose type name clashes with
+        // HarnessCore.MemoryStore) stays isolated; the injected handle is JSONValue-only.
+        .target(name: "WikiQueryKit",
+                dependencies: ["WireProtocol", "Config", "Supervisor", "MemoryStore", "MemoryExtension"],
+                swiftSettings: strict),
         .target(name: "Broker",
                 dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "Auth",
@@ -263,7 +269,7 @@ let package = Package(
                                "Connectors", "HarnessCore", "IPC", "SessionWorkerCore",
                                "Supervisor", "Transport", "Observability", "Auth", "Tokenizer", "Config", "Workflows",
                                "MemoryExtension", "WebGateway", "Push", "GoogleWorkspace", "Media", "Cron", "Channels",
-                               "Mem0Extension", "Gmail"],
+                               "Mem0Extension", "Gmail", "WikiQueryKit"],
                 swiftSettings: strict),
         .executableTarget(name: "codex-broker",
                 dependencies: ["Broker", "Auth", "Observability"], swiftSettings: strict),
@@ -387,6 +393,8 @@ let package = Package(
                 dependencies: ["Workflows", "Tools", "ModelClient", "Persistence", "InfraPrimitives", "HarnessCore"], swiftSettings: strict),
         .testTarget(name: "MemoryStoreTests",
                 dependencies: ["MemoryStore", "InfraPrimitives"], swiftSettings: strict),
+        .testTarget(name: "WikiQueryKitTests",
+                dependencies: ["WikiQueryKit", "MemoryStore", "WireProtocol"], swiftSettings: strict),
         .testTarget(name: "MemoryInferTests",
                 dependencies: ["MemoryInfer", "ModelClient", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "MemoryIngestTests",
