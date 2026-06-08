@@ -415,13 +415,18 @@ public actor MemoryStore {
         """, [.int(Int64(limit))]).map(Self.rowToDocument)
     }
 
-    public func documentChunkSummaries(limit: Int = 10_000) throws -> [DocumentChunkSummary] {
+    /// `orderByRecency` sorts newest-first by `fetched_at` (for "recent pages"
+    /// surfaces); the default keeps the stable `source_uri` order. Either way the
+    /// ORDER BY is applied BEFORE the LIMIT so the cap selects the right rows.
+    public func documentChunkSummaries(limit: Int = 10_000,
+                                       orderByRecency: Bool = false) throws -> [DocumentChunkSummary] {
+        let order = orderByRecency ? "d.fetched_at DESC, d.id DESC" : "d.source_uri, d.id"
         let rows = try run("""
         SELECT d.*, COUNT(c.id) AS chunk_count
           FROM document d
           LEFT JOIN chunk c ON c.document_id=d.id
          GROUP BY d.id
-         ORDER BY d.source_uri, d.id
+         ORDER BY \(order)
          LIMIT ?;
         """, [.int(Int64(limit))])
         return rows.map { row in
@@ -766,6 +771,18 @@ public actor MemoryStore {
          ORDER BY kind, canonical, id
          LIMIT ?;
         """, [.int(Int64(limit))]).map(Self.rowToEntity)
+    }
+
+    /// Entities of a single `kind`, ordered by `degree` DESC (most-connected
+    /// first). The WHERE filter is applied in SQL so the LIMIT can't starve the
+    /// result (e.g. a tag cloud isn't crowded out by thousands of non-tag rows).
+    public func entities(kind: EntityKind, limit: Int = 10_000) throws -> [EntityRow] {
+        try run("""
+        SELECT * FROM entity
+         WHERE kind=?
+         ORDER BY degree DESC, canonical, id
+         LIMIT ?;
+        """, [.text(kind.rawValue), .int(Int64(limit))]).map(Self.rowToEntity)
     }
 
     public func setEgoBetweenness(entityId: Int64, value: Double) throws {

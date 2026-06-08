@@ -60,7 +60,8 @@ public enum WikiJSON {
     private static func ms(_ epochSeconds: Int64) -> JSONValue { .int(epochSeconds * 1000) }
 
     public static func list(_ store: MemoryStore, limit: Int) async throws -> JSONValue {
-        let rows = try await store.documentChunkSummaries(limit: limit)
+        // "Recent pages" → newest-first by fetched_at, ordered BEFORE the limit.
+        let rows = try await store.documentChunkSummaries(limit: limit, orderByRecency: true)
         let items = rows.map { s -> JSONValue in
             .object([
                 "id": .int(s.document.id),
@@ -225,12 +226,12 @@ public enum WikiJSON {
     }
 
     public static func tags(_ store: MemoryStore) async throws -> JSONValue {
-        let ents = try await store.entities(limit: 5000).filter { $0.kind == .tag }
-        let items = ents
-            .sorted { $0.degree > $1.degree }
-            .map { e -> JSONValue in
-                .object(["tag": .string(e.canonical), "count": .int(Int64(e.degree))])
-            }
+        // Filter to .tag in SQL (ordered by degree DESC) so a large non-tag
+        // entity population can't starve the tag cloud under the row cap.
+        let ents = try await store.entities(kind: .tag, limit: 5000)
+        let items = ents.map { e -> JSONValue in
+            .object(["tag": .string(e.canonical), "count": .int(Int64(e.degree))])
+        }
         return .object(["data": .array(items)])
     }
 }

@@ -91,6 +91,20 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(byTitle["Alpha"]?.obj?["updatedAt"]?.int, 1_700_000_000 * 1000)
     }
 
+    /// CLAIM: "recent pages" are ordered NEWEST-first by fetched_at, before the
+    /// limit — not by source_uri. (Fixes the codex-review P2 where the sidebar
+    /// showed an alphabetic, truncated list.) Fixture: doc1<doc2<doc3 by time.
+    func testListIsRecencyOrdered() async throws {
+        let r = try await WikiJSON.list(store, limit: 100)
+        let titles = (r.obj?["data"]?.arr ?? []).map { $0.obj?["title"]?.str ?? "" }
+        // doc3 (now+20, title nil→gamma URI), doc2 (now+10, Beta), doc1 (now, Alpha).
+        XCTAssertEqual(titles.first, "wiki://gamma", "newest page first")
+        XCTAssertEqual(titles, ["wiki://gamma", "Beta", "Alpha"], "strict newest→oldest order")
+        // The limit must select the NEWEST, not the alphabetically-first.
+        let top1 = try await WikiJSON.list(store, limit: 1)
+        XCTAssertEqual(top1.obj?["data"]?.arr?.first?.obj?["title"]?.str, "wiki://gamma")
+    }
+
     // MARK: - pageGet
 
     func testPageGetFull() async throws {
