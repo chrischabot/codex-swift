@@ -205,6 +205,7 @@
   --color-text-success: #006e2a;       /* 5.5:1 */
   --color-text-danger:  #b91c1c;       /* 5.5:1 */
   --color-surface-hover: rgba(13, 13, 13, 0.04);
+  --text-highlight-bg: rgba(250, 204, 21, 0.45);   /* search/term highlight (amber) */
   --color-surface-active: rgba(13, 13, 13, 0.07);
   --color-divider: rgba(13, 13, 13, 0.08);
 
@@ -313,6 +314,7 @@
   --color-text-success: #4ade80;       /* 8.3:1 */
   --color-text-danger:  #f87171;       /* 6:1 */
   --color-surface-hover: rgba(255, 255, 255, 0.05);
+  --text-highlight-bg: rgba(202, 138, 4, 0.40);    /* search/term highlight, dark */
   --color-surface-active: rgba(255, 255, 255, 0.08);
   --color-divider: rgba(255, 255, 255, 0.08);
 

@@ -1,4 +1,4 @@
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { useWikiPage, useWikiRecents } from "@/state/wiki";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -8,6 +8,9 @@ import { WikiPropertiesPanel } from "@/components/wiki/WikiPropertiesPanel";
 import { WikiOutlinePanel } from "@/components/wiki/WikiOutlinePanel";
 import { WikiTagsPanel } from "@/components/wiki/WikiTagsPanel";
 import { WikiGraphView } from "@/components/wiki/graph/WikiGraphView";
+import { WikiSearchView } from "@/components/wiki/WikiSearchView";
+import { WikiQuickSwitcher } from "@/components/wiki/WikiQuickSwitcher";
+import { useWikiSwitcherHotkey } from "@/components/wiki/useWikiSwitcherHotkey";
 
 /**
  * Full-screen Memory Wiki view (inside AppShell's <Outlet/>). M1: granite read
@@ -18,10 +21,15 @@ import { WikiGraphView } from "@/components/wiki/graph/WikiGraphView";
 export function WikiPage() {
   const { pageId } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { page, loading } = useWikiPage(pageId);
+  const switcher = useWikiSwitcherHotkey(); // Cmd/Ctrl-O quick switcher (wiki-scoped)
 
-  // M1: wikilinks + tags route to a search query (full search lands in M3). The
-  // outline jumps to in-page heading anchors (ids added by rehypeHeadingIds).
+  const q = searchParams.get("q") ?? "";
+  const setQ = (next: string) => setSearchParams(next ? { q: next } : {}, { replace: true });
+
+  // Wikilinks + tags route to a search query; the outline jumps to in-page
+  // heading anchors (ids added by rehypeHeadingIds).
   const onWikiLink = (target: string) => navigate(`/wiki?q=${encodeURIComponent(target)}`);
   const onTag = (tag: string) => navigate(`/wiki?q=${encodeURIComponent(`#${tag}`)}`);
   const onJump = (slug: string) =>
@@ -29,21 +37,27 @@ export function WikiPage() {
 
   return (
     <div className="flex min-h-0 flex-1">
-      {/* MAIN PANE — reading view */}
+      <WikiQuickSwitcher open={switcher.open} onOpenChange={switcher.setOpen} />
+      {/* MAIN PANE — search / index / reading view */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <ScrollArea className="flex-1">
-          <div className="mx-auto w-full max-w-[820px] px-6 pb-16 pt-6">
-            {!pageId ? (
-              <WikiIndex />
-            ) : loading ? (
-              <div className="text-[13px] text-[color:var(--color-text-secondary)]">Loading…</div>
-            ) : !page ? (
-              <div className="text-[13px] text-[color:var(--color-text-secondary)]">Page not found.</div>
-            ) : (
-              <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} />
-            )}
-          </div>
-        </ScrollArea>
+        {!pageId && q ? (
+          // Search surface owns full height (its own internal scroll).
+          <WikiSearchView query={q} onQueryChange={setQ} />
+        ) : (
+          <ScrollArea className="flex-1">
+            <div className="mx-auto w-full max-w-[820px] px-6 pb-16 pt-6">
+              {!pageId ? (
+                <WikiIndex />
+              ) : loading ? (
+                <div className="text-[13px] text-[color:var(--color-text-secondary)]">Loading…</div>
+              ) : !page ? (
+                <div className="text-[13px] text-[color:var(--color-text-secondary)]">Page not found.</div>
+              ) : (
+                <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} />
+              )}
+            </div>
+          </ScrollArea>
+        )}
       </div>
 
       {/* RIGHT RAIL — tabbed panels (M2: a Graph tab mounts here) */}
