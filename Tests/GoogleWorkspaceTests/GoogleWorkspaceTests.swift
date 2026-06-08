@@ -168,7 +168,7 @@ final class GoogleWorkspaceTests: XCTestCase {
     func testGoogleToolPackEmitsToolOrSelfPrunes() {
         let pack = GoogleToolPack(client: client(StubGoogleHTTP(scripted: [])))
         XCTAssertEqual(pack.id, "google")
-        XCTAssertEqual(pack.tools().map(\.name), ["google_api"])
+        XCTAssertEqual(pack.tools().map(\.name), ["google_api", "gmail_search", "drive_get", "calendar_agenda"])
         XCTAssertEqual(GoogleToolPack(client: nil).tools().count, 0)
     }
 
@@ -208,7 +208,8 @@ final class GoogleWorkspaceTests: XCTestCase {
             "connectors": .object(["google": .object(["client_id": .string("x")])]),
         ])
         XCTAssertEqual(GoogleWiring.toolPack(addonConfig: configured, codexHome: "/h", env: [:])?.tools().map(\.name),
-                       ["google_api"], "feature on + config present → google_api")
+                       ["google_api", "gmail_search", "drive_get", "calendar_agenda"],
+                       "feature on + config present → google_api + typed read helpers")
         // feature OFF → nil even with connector config (deny-default).
         let featOff = cfg(["connectors": .object(["google": .object(["client_id": .string("x")])])])
         XCTAssertNil(GoogleWiring.toolPack(addonConfig: featOff, codexHome: "/h", env: [:]))
@@ -217,7 +218,7 @@ final class GoogleWorkspaceTests: XCTestCase {
             addonConfig: cfg(["features": .object(["google": .bool(true)])]), codexHome: "/h", env: [:]))
         // env feature flag enables it.
         XCTAssertEqual(GoogleWiring.toolPack(addonConfig: featOff, codexHome: "/h", env: ["CODEX_FEATURE_GOOGLE": "1"])?.tools().count,
-                       1, "CODEX_FEATURE_GOOGLE=1 enables")
+                       4, "CODEX_FEATURE_GOOGLE=1 enables (google_api + 3 typed helpers)")
     }
 
     func testOAuthEgressPinnedToTokenHost() {

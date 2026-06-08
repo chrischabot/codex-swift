@@ -13,6 +13,14 @@ public struct GoogleToolPack: ToolPack {
 
     public func tools() -> [any Tool] {
         guard let client else { return [] }
-        return [GoogleAPITool(client: client)]
+        // The universal tool plus ergonomic typed READ helpers (sugar over the
+        // same host-pinned client; each fails closed with a clear "grant scope"
+        // message on a 403). Write helpers are a documented follow-on.
+        return [
+            GoogleAPITool(client: client),
+            GmailSearchTool(client: client),
+            DriveGetTool(client: client),
+            CalendarAgendaTool(client: client),
+        ]
     }
 }
