@@ -1,0 +1,412 @@
+/* ─────────────────────────────────────────────────────────────────────────
+ * wiki.css — styles for the ported granite "wiki" reading surface.
+ *
+ * This is the ONLY stylesheet for the wiki port. Everything is token-driven:
+ * it reads www's semantic CSS variables (from globals.css), which already
+ * carry paired light/dark values switched by `.dark` on <html>. There are NO
+ * hardcoded colors here, so the whole surface re-themes automatically with
+ * www's `@custom-variant dark (&:is(.dark *))` model.
+ *
+ * Scope discipline (per the conversion blueprint, §4 class-name policy):
+ *   - All reading-view typography niceties are scoped under `.wiki-reading`
+ *     and/or `.wiki-markdown` so they NEVER override www's global Markdown /
+ *     prose styling outside the wiki surface.
+ *   - Semantic element classes (`.wiki-callout`, `.wiki-link`, `.wiki-embed`,
+ *     highlight `mark`) are namespaced `wiki-*` so they don't collide with the
+ *     dropped Obsidian fallback or chat markdown classes.
+ *
+ * Token map (granite → www) reference: /tmp/wiki_bp_token-map.md
+ *   --interactive-accent / --text-accent  → var(--text-link) (links/accents)
+ *   --background-modifier-border           → var(--border)
+ *   --background-modifier-hover            → var(--color-surface-hover)
+ *   --background-secondary / -alt          → var(--code-surface) / var(--muted)
+ *   --text-muted                           → var(--color-text-secondary)
+ *   --text-faint                           → var(--color-text-quaternary)
+ *   callout type tints                     → www chart/status/risk tokens
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* ===========================================================================
+ * 1. CALLOUTS  ( > [!type] Title )
+ *
+ *   Markup contract (what the markdown agent should emit):
+ *     <div class="wiki-callout" data-callout="<canonical-type>">
+ *       <div class="wiki-callout-title">
+ *         <span class="wiki-callout-icon"><svg.../></span>
+ *         <span>Title text</span>
+ *       </div>
+ *       <div class="wiki-callout-body"> …rendered children… </div>
+ *     </div>
+ *
+ *   The base `.wiki-callout` uses a neutral accent. Per-type modifier classes
+ *   `.wiki-callout-{type}` (or matching `[data-callout="<type>"]`) recolor the
+ *   left border + tinted background + icon/title using www tokens. We support
+ *   both the modifier-class and the data-attribute selectors so the agent can
+ *   use whichever is convenient.
+ * ======================================================================== */
+
+.wiki-callout {
+  /* Per-type channel: each modifier sets --wiki-callout-color (the accent used
+     for border + icon + title) and --wiki-callout-tint (the faint background
+     wash). Base defaults to the neutral link accent. */
+  --wiki-callout-color: var(--text-link);
+  --wiki-callout-tint: var(--color-surface-hover);
+
+  margin: 1em 0;
+  padding: 0.75em 1em;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--wiki-callout-color);
+  border-radius: var(--radius-md);
+  background: var(--wiki-callout-tint);
+  color: var(--foreground);
+  overflow: hidden;
+}
+
+.wiki-callout-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--wiki-callout-color);
+}
+
+/* When the callout has a body, give the title a touch of breathing room. */
+.wiki-callout-title:not(:last-child) {
+  margin-bottom: 0.4em;
+}
+
+.wiki-callout-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1.1em;
+  height: 1.1em;
+  color: var(--wiki-callout-color);
+}
+
+.wiki-callout-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.wiki-callout-body {
+  color: var(--color-text-secondary);
+}
+
+/* Body text inherits the muted secondary tone but headings/strong stay normal. */
+.wiki-callout-body :where(strong, b, h1, h2, h3, h4, h5, h6) {
+  color: var(--foreground);
+}
+
+.wiki-callout-body > :first-child {
+  margin-top: 0;
+}
+.wiki-callout-body > :last-child {
+  margin-bottom: 0;
+}
+
+/* --- Per-type accents -----------------------------------------------------
+ * Each type binds --wiki-callout-color to a www status/chart/palette token and
+ * --wiki-callout-tint to a faint wash. Where www exposes a ready tint token
+ * (diff / risk) we reuse it; otherwise we derive a faint wash from the accent
+ * color via color-mix so it tracks light/dark automatically. */
+
+/* note — neutral/informational grey-blue */
+.wiki-callout-note,
+.wiki-callout[data-callout="note"] {
+  --wiki-callout-color: var(--color-text-link);
+  --wiki-callout-tint: color-mix(in oklab, var(--color-charts-blue) 8%, transparent);
+}
+
+/* info / abstract — blue */
+.wiki-callout-info,
+.wiki-callout[data-callout="info"] {
+  --wiki-callout-color: var(--color-charts-blue);
+  --wiki-callout-tint: color-mix(in oklab, var(--color-charts-blue) 8%, transparent);
+}
+
+/* tip / hint — green/teal (success family) */
+.wiki-callout-tip,
+.wiki-callout[data-callout="tip"] {
+  --wiki-callout-color: var(--color-text-success);
+  --wiki-callout-tint: var(--color-diff-added-bg);
+}
+
+/* success / check / done — green */
+.wiki-callout-success,
+.wiki-callout[data-callout="success"] {
+  --wiki-callout-color: var(--color-text-success);
+  --wiki-callout-tint: var(--color-diff-added-bg);
+}
+
+/* question / help / faq — purple */
+.wiki-callout-question,
+.wiki-callout[data-callout="question"] {
+  --wiki-callout-color: var(--color-charts-purple);
+  --wiki-callout-tint: color-mix(in oklab, var(--color-charts-purple) 10%, transparent);
+}
+
+/* warning / caution / attention — amber (reuse risk-modify tint) */
+.wiki-callout-warning,
+.wiki-callout[data-callout="warning"] {
+  --wiki-callout-color: var(--color-risk-modify-text);
+  --wiki-callout-tint: var(--color-risk-modify-bg);
+}
+
+/* danger / error / failure — red */
+.wiki-callout-danger,
+.wiki-callout[data-callout="danger"] {
+  --wiki-callout-color: var(--color-text-danger);
+  --wiki-callout-tint: var(--color-diff-deleted-bg);
+}
+
+/* bug — red (slightly distinct semantic, same red family) */
+.wiki-callout-bug,
+.wiki-callout[data-callout="bug"] {
+  --wiki-callout-color: var(--color-text-danger);
+  --wiki-callout-tint: var(--color-diff-deleted-bg);
+}
+
+/* example — purple-ish, neutral structural */
+.wiki-callout-example,
+.wiki-callout[data-callout="example"] {
+  --wiki-callout-color: var(--color-charts-purple);
+  --wiki-callout-tint: color-mix(in oklab, var(--color-charts-purple) 8%, transparent);
+}
+
+/* quote / cite — muted neutral, no strong color */
+.wiki-callout-quote,
+.wiki-callout[data-callout="quote"] {
+  --wiki-callout-color: var(--color-text-tertiary);
+  --wiki-callout-tint: var(--color-surface-hover);
+}
+
+/* ===========================================================================
+ * 2. HIGHLIGHT  ( ==text== → <mark> inside the wiki body )
+ *
+ *   Scoped so we don't restyle <mark> anywhere else in the app. Uses the
+ *   risk-modify (amber) tint which already has paired light/dark values, with
+ *   foreground text so it stays legible in both themes.
+ * ======================================================================== */
+
+.wiki-reading mark,
+.wiki-markdown mark,
+mark.wiki-highlight {
+  background: var(--color-risk-modify-bg);
+  color: var(--foreground);
+  border-radius: var(--radius-sm);
+  padding: 0.05em 0.25em;
+  /* don't let the browser default yellow leak through */
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+/* ===========================================================================
+ * 3. EMBED  ( ![[Note]] → bordered reference card stub )
+ *
+ *   Markup contract:
+ *     <div class="wiki-embed">
+ *       <div class="wiki-embed-title">…optional label…</div>
+ *       <div class="wiki-embed-body">…content / link…</div>
+ *     </div>
+ * ======================================================================== */
+
+.wiki-embed {
+  margin: 1em 0;
+  padding: 0.75em 1em;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--code-surface);
+  color: var(--foreground);
+}
+
+.wiki-embed:hover {
+  border-color: var(--input);
+  background: var(--color-surface-hover);
+}
+
+.wiki-embed-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 0.35em;
+}
+
+.wiki-embed-body {
+  color: var(--color-text-secondary);
+}
+
+.wiki-embed-body > :first-child {
+  margin-top: 0;
+}
+.wiki-embed-body > :last-child {
+  margin-bottom: 0;
+}
+
+/* ===========================================================================
+ * 4. INTERNAL LINKS  ( [[wikilinks]] and #hashtags rendered as <a>/<span> )
+ *
+ *   - `.wiki-link`            → resolved internal link: accent color.
+ *   - `.wiki-link-unresolved` → target doesn't exist yet: muted + dashed
+ *                               underline, no pointer affordance for "open".
+ * ======================================================================== */
+
+.wiki-link {
+  color: var(--text-link);
+  text-decoration: none;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: color 0.1s ease, background-color 0.1s ease;
+}
+
+.wiki-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.wiki-link-unresolved {
+  color: var(--color-text-quaternary);
+  text-decoration: underline dashed;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  cursor: default;
+}
+
+.wiki-link-unresolved:hover {
+  color: var(--color-text-tertiary);
+}
+
+/* ===========================================================================
+ * 5. READING-VIEW TYPOGRAPHY NICETIES
+ *
+ *   Scoped strictly under `.wiki-reading` / `.wiki-markdown`. These COMPLEMENT
+ *   www's existing Markdown component styling (the chat `Markdown.tsx` override
+ *   map) rather than replacing it — they only add heading rhythm and list
+ *   spacing that the reading surface wants. Nothing here leaks to other
+ *   surfaces because of the wrapper scope.
+ * ======================================================================== */
+
+.wiki-reading,
+.wiki-markdown {
+  color: var(--foreground);
+}
+
+/* Heading rhythm — generous top margin, tight bottom, scroll anchor offset so
+   outline clicks (#slug) don't tuck headings under a sticky header. */
+.wiki-reading :where(h1, h2, h3, h4, h5, h6),
+.wiki-markdown :where(h1, h2, h3, h4, h5, h6) {
+  color: var(--foreground);
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  scroll-margin-top: 1rem;
+}
+
+.wiki-reading :where(h1):first-child,
+.wiki-markdown :where(h1):first-child {
+  margin-top: 0;
+}
+
+.wiki-reading :where(h1),
+.wiki-markdown :where(h1) {
+  font-size: 1.618em;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+.wiki-reading :where(h2),
+.wiki-markdown :where(h2) {
+  font-size: 1.382em;
+}
+.wiki-reading :where(h3),
+.wiki-markdown :where(h3) {
+  font-size: 1.176em;
+}
+.wiki-reading :where(h4),
+.wiki-markdown :where(h4) {
+  font-size: 1.059em;
+}
+.wiki-reading :where(h5, h6),
+.wiki-markdown :where(h5, h6) {
+  font-size: 1em;
+  color: var(--color-text-secondary);
+}
+
+/* Paragraph & list spacing — comfortable reading rhythm. */
+.wiki-reading :where(p),
+.wiki-markdown :where(p) {
+  margin: 0.75em 0;
+  line-height: 1.65;
+}
+
+.wiki-reading :where(ul, ol),
+.wiki-markdown :where(ul, ol) {
+  margin: 0.6em 0;
+  padding-inline-start: 1.5em;
+}
+
+.wiki-reading :where(li),
+.wiki-markdown :where(li) {
+  margin: 0.2em 0;
+}
+
+/* Nested lists tighten up. */
+.wiki-reading :where(li > ul, li > ol),
+.wiki-markdown :where(li > ul, li > ol) {
+  margin: 0.2em 0;
+}
+
+/* Task-list items (read-only) — drop the marker, align the checkbox. */
+.wiki-reading :where(li:has(> input[type="checkbox"])),
+.wiki-markdown :where(li:has(> input[type="checkbox"])) {
+  list-style: none;
+  margin-inline-start: -1.2em;
+}
+
+.wiki-reading :where(li > input[type="checkbox"]),
+.wiki-markdown :where(li > input[type="checkbox"]) {
+  margin-right: 0.45em;
+  vertical-align: middle;
+  accent-color: var(--primary);
+}
+
+/* Blockquotes that AREN'T callouts — muted left rule. (Callouts opt out by
+   carrying `.wiki-callout`, which is a <div>, not a <blockquote>.) */
+.wiki-reading :where(blockquote),
+.wiki-markdown :where(blockquote) {
+  margin: 1em 0;
+  padding-left: 1em;
+  border-left: 3px solid var(--border);
+  color: var(--color-text-secondary);
+}
+
+/* Horizontal rules use the divider token. */
+.wiki-reading :where(hr),
+.wiki-markdown :where(hr) {
+  margin: 1.5em 0;
+  border: none;
+  border-top: 1px solid var(--color-divider);
+}
+
+/* Footnotes (GFM) — render the section + backrefs in muted tone, scoped here
+   so chat footnotes keep their own styling. */
+.wiki-reading :where(.wiki-footnotes),
+.wiki-markdown :where(.wiki-footnotes) {
+  margin-top: 2em;
+  padding-top: 1em;
+  border-top: 1px solid var(--color-divider);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.wiki-reading :where(.wiki-footnotes a[data-footnote-backref]),
+.wiki-markdown :where(.wiki-footnotes a[data-footnote-backref]),
+.wiki-reading :where(sup a[data-footnote-ref]),
+.wiki-markdown :where(sup a[data-footnote-ref]) {
+  color: var(--text-link);
+  text-decoration: none;
+}

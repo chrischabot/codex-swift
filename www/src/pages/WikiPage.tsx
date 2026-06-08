@@ -1,18 +1,30 @@
 import { useParams, useNavigate } from "react-router-dom";
 import { useWikiPage, useWikiRecents } from "@/state/wiki";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Badge } from "@/components/ui/badge";
-import { Markdown } from "@/components/chat/Markdown";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { WikiReadingView } from "@/components/wiki/WikiReadingView";
+import { WikiConnectionsPanel } from "@/components/wiki/WikiConnectionsPanel";
+import { WikiPropertiesPanel } from "@/components/wiki/WikiPropertiesPanel";
+import { WikiOutlinePanel } from "@/components/wiki/WikiOutlinePanel";
+import { WikiTagsPanel } from "@/components/wiki/WikiTagsPanel";
 
 /**
- * Full-screen Memory Wiki view (lives inside AppShell's <Outlet/>). M0 ships the
- * read slice: an index when no page is selected, and a page's rendered markdown
- * body + a right rail of tags and entity connections. Editor (M4), graph (M2),
- * and richer panels mount into the marked slots in later milestones.
+ * Full-screen Memory Wiki view (inside AppShell's <Outlet/>). M1: granite read
+ * surface — reading view (markdown + Obsidian extensions) in the main pane, and
+ * a right rail of tabbed panels (Connections / Tags / Outline / Properties).
+ * Graph (M2) and editor (M4) mount into the marked slots later.
  */
 export function WikiPage() {
   const { pageId } = useParams();
+  const navigate = useNavigate();
   const { page, loading } = useWikiPage(pageId);
+
+  // M1: wikilinks + tags route to a search query (full search lands in M3). The
+  // outline jumps to in-page heading anchors (ids added by rehypeHeadingIds).
+  const onWikiLink = (target: string) => navigate(`/wiki?q=${encodeURIComponent(target)}`);
+  const onTag = (tag: string) => navigate(`/wiki?q=${encodeURIComponent(`#${tag}`)}`);
+  const onJump = (slug: string) =>
+    document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" });
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -27,65 +39,49 @@ export function WikiPage() {
             ) : !page ? (
               <div className="text-[13px] text-[color:var(--color-text-secondary)]">Page not found.</div>
             ) : (
-              <article>
-                <h1 className="text-[22px] font-semibold text-foreground">{page.title}</h1>
-                {page.tags && page.tags.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {page.tags.map((t) => (
-                      <Badge key={t} variant="outline" className="text-[11px]">#{t}</Badge>
-                    ))}
-                  </div>
-                )}
-                <div className="mt-4">
-                  {page.content.trim() ? (
-                    <Markdown content={page.content} />
-                  ) : (
-                    <div className="text-[13px] text-[color:var(--color-text-quaternary)]">(empty page)</div>
-                  )}
-                </div>
-              </article>
+              <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} />
             )}
           </div>
         </ScrollArea>
       </div>
 
-      {/* RIGHT RAIL — connections (M2: graph panel mounts here) */}
+      {/* RIGHT RAIL — tabbed panels (M2: a Graph tab mounts here) */}
       {pageId && page && (
-        <aside className="hidden w-[300px] shrink-0 flex-col border-l border-[color:var(--border)] lg:flex">
-          <ScrollArea className="flex-1">
-            <div className="flex flex-col gap-6 px-4 py-6">
-              <section>
-                <h2 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-[color:var(--color-text-tertiary)]">
-                  Connections
-                </h2>
-                {!page.connections || page.connections.length === 0 ? (
-                  <div className="text-[12px] text-[color:var(--color-text-quaternary)]">No connections</div>
-                ) : (
-                  <ul className="flex flex-col gap-1">
-                    {page.connections.map((c, i) => (
-                      <li
-                        key={`${c.entityId}-${i}`}
-                        className="flex items-center justify-between rounded-md px-2 py-1 text-[13px]"
-                      >
-                        <span className="truncate text-foreground">{c.canonical}</span>
-                        <span className="ml-2 shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">
-                          {c.relation}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </section>
-              {/* M2 MOUNT: <WikiGraphPanel pageId={pageId} /> */}
-            </div>
-          </ScrollArea>
+        <aside className="hidden w-[320px] shrink-0 flex-col border-l border-[color:var(--border)] lg:flex">
+          <Tabs defaultValue="connections" className="flex min-h-0 flex-1 flex-col gap-0">
+            <TabsList className="shrink-0 justify-start rounded-none border-b border-[color:var(--border)] bg-transparent px-2">
+              <TabsTrigger value="connections">Links</TabsTrigger>
+              <TabsTrigger value="tags">Tags</TabsTrigger>
+              <TabsTrigger value="outline">Outline</TabsTrigger>
+              <TabsTrigger value="properties">Info</TabsTrigger>
+            </TabsList>
+            <ScrollArea className="min-h-0 flex-1">
+              <div className="px-3 py-4">
+                <TabsContent value="connections" className="mt-0">
+                  <WikiConnectionsPanel
+                    page={page}
+                    onSelectEntity={(_id, canonical) => onWikiLink(canonical)}
+                  />
+                </TabsContent>
+                <TabsContent value="tags" className="mt-0">
+                  <WikiTagsPanel onSelectTag={onTag} />
+                </TabsContent>
+                <TabsContent value="outline" className="mt-0">
+                  <WikiOutlinePanel content={page.content} onJump={onJump} />
+                </TabsContent>
+                <TabsContent value="properties" className="mt-0">
+                  <WikiPropertiesPanel page={page} />
+                </TabsContent>
+              </div>
+            </ScrollArea>
+          </Tabs>
         </aside>
       )}
     </div>
   );
 }
 
-/** M0 index: recent pages. M1 adds search + a tag cloud here. */
+/** M1 index: recent pages + a tag cloud. M3 adds full search here. */
 function WikiIndex() {
   const navigate = useNavigate();
   const { pages, loading } = useWikiRecents(50);
@@ -95,34 +91,42 @@ function WikiIndex() {
       <p className="mt-1 text-[13px] text-[color:var(--color-text-secondary)]">
         Your Memory Wiki — browse, explore, and enrich curated knowledge.
       </p>
-      <div className="mt-6">
-        <h2 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-[color:var(--color-text-tertiary)]">
-          Recent pages
-        </h2>
-        {loading ? (
-          <div className="text-[13px] text-[color:var(--color-text-secondary)]">Loading…</div>
-        ) : pages.length === 0 ? (
-          <div className="text-[13px] text-[color:var(--color-text-quaternary)]">
-            No wiki pages yet. Pages appear here as your Memory Wiki is populated.
-          </div>
-        ) : (
-          <ul className="flex flex-col gap-0.5">
-            {pages.map((p) => (
-              <li key={p.id}>
-                <button
-                  type="button"
-                  onClick={() => navigate(`/wiki/${p.id}`)}
-                  className="w-full rounded-md px-2 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
-                >
-                  <div className="truncate text-[14px] text-foreground">{p.title}</div>
-                  {p.excerpt && (
-                    <div className="truncate text-[12px] text-[color:var(--color-text-tertiary)]">{p.excerpt}</div>
-                  )}
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
+      <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[1fr_240px]">
+        <div>
+          <h2 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-[color:var(--color-text-tertiary)]">
+            Recent pages
+          </h2>
+          {loading ? (
+            <div className="text-[13px] text-[color:var(--color-text-secondary)]">Loading…</div>
+          ) : pages.length === 0 ? (
+            <div className="text-[13px] text-[color:var(--color-text-quaternary)]">
+              No wiki pages yet. Pages appear here as your Memory Wiki is populated.
+            </div>
+          ) : (
+            <ul className="flex flex-col gap-0.5">
+              {pages.map((p) => (
+                <li key={p.id}>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/wiki/${p.id}`)}
+                    className="w-full rounded-md px-2 py-1.5 text-left hover:bg-[color:var(--color-surface-hover)]"
+                  >
+                    <div className="truncate text-[14px] text-foreground">{p.title}</div>
+                    {p.excerpt && (
+                      <div className="truncate text-[12px] text-[color:var(--color-text-tertiary)]">{p.excerpt}</div>
+                    )}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div>
+          <h2 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-[color:var(--color-text-tertiary)]">
+            Tags
+          </h2>
+          <WikiTagsPanel onSelectTag={(t) => navigate(`/wiki?q=${encodeURIComponent(`#${t}`)}`)} />
+        </div>
       </div>
     </div>
   );
