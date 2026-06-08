@@ -1031,7 +1031,8 @@ final class PersistenceTests: XCTestCase {
         let store = try ThreadStore(codexHome: home, limits: smallLimits())
         let id = ThreadId("p1_1_session_meta")
         let cfg = SessionConfig(threadId: id, cwd: "/tmp/some/work",
-                                baseInstructions: "## be helpful")
+                                baseInstructions: "## be helpful",
+                                originator: SessionConfig.portDefaultOriginator)
         _ = try await store.create(cfg)
 
         // Append a non-meta record so the writer has something to flush, then

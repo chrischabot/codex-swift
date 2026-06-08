@@ -17,7 +17,7 @@ public struct MemoryInferConfig: Sendable {
     public var rerankInFlight: Int
 
     public init(backend: Backend = .mock,
-                embeddingDimension: Int = 768,
+                embeddingDimension: Int = 1536,
                 extractInFlight: Int = 4,
                 embedInFlight: Int = 8,
                 rerankInFlight: Int = 4) {

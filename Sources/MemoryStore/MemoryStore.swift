@@ -20,10 +20,12 @@ public enum MemoryStoreError: Error, Sendable, CustomStringConvertible {
     }
 }
 
-/// Embedding dimension used end-to-end. Nomic-Embed-Text-v1.5 is 768 floats;
-/// the value is also stamped into a `meta` row at first init so an accidental
-/// model swap to a different dim is caught immediately on bring-up.
-public let memoryEmbeddingDimension: Int = 768
+/// Embedding storage width used end-to-end for the Memory Wiki. Local Nomic
+/// embeddings are natively 768 floats and are zero-padded to this width by the
+/// MLX provider; OpenAI `text-embedding-3-small` can emit this width directly.
+/// The dimension and provider id are stamped into `meta` rows at first init so
+/// accidental incompatible vector-space swaps are caught immediately.
+public let memoryEmbeddingDimension: Int = 1536
 
 /// Auto-extension registration is idempotent in sqlite-vec's static-link
 /// pattern: register once before any handle is opened so every handle picks
@@ -53,15 +55,18 @@ public struct MemoryStoreConfig: Sendable, Equatable {
     public var mmapSize: Int64
     public var cachePages: Int
     public var embeddingDimension: Int
+    public var embeddingProviderID: String?
 
     public init(path: String,
                 mmapSize: Int64 = 8 << 30,
                 cachePages: Int = -262_144,
-                embeddingDimension: Int = memoryEmbeddingDimension) {
+                embeddingDimension: Int = memoryEmbeddingDimension,
+                embeddingProviderID: String? = nil) {
         self.path = path
         self.mmapSize = mmapSize
         self.cachePages = cachePages
         self.embeddingDimension = embeddingDimension
+        self.embeddingProviderID = embeddingProviderID
     }
 
     public static func defaultPath() -> String {
@@ -248,6 +253,28 @@ public actor MemoryStore {
             throw MemoryStoreError.invalid(
                 "embedding dim mismatch: store=\(stored) config=\(dim)")
         }
+        if let providerID = config.embeddingProviderID, !providerID.isEmpty {
+            let escaped = providerID.replacingOccurrences(of: "'", with: "''")
+            try execRaw(db, """
+            INSERT INTO meta(key,value) VALUES('embedding_provider_id','\(escaped)')
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            WHERE meta.value=excluded.value;
+            """)
+            var providerStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key='embedding_provider_id';",
+                                      -1, &providerStmt, nil) == SQLITE_OK, let ps = providerStmt else {
+                throw MemoryStoreError.prepare(errMsg(db))
+            }
+            defer { sqlite3_finalize(ps) }
+            if sqlite3_step(ps) == SQLITE_ROW,
+               let raw = sqlite3_column_text(ps, 0) {
+                let stored = String(cString: raw)
+                if stored != providerID {
+                    throw MemoryStoreError.invalid(
+                        "embedding provider mismatch: store=\(stored) config=\(providerID)")
+                }
+            }
+        }
     }
 
     // MARK: - low-level query helpers (actor-isolated)
@@ -380,6 +407,30 @@ public actor MemoryStore {
         return rows.first.map(Self.rowToDocument)
     }
 
+    public func documents(limit: Int = 10_000) throws -> [DocumentRow] {
+        try run("""
+        SELECT * FROM document
+         ORDER BY source_uri, id
+         LIMIT ?;
+        """, [.int(Int64(limit))]).map(Self.rowToDocument)
+    }
+
+    public func documentChunkSummaries(limit: Int = 10_000) throws -> [DocumentChunkSummary] {
+        let rows = try run("""
+        SELECT d.*, COUNT(c.id) AS chunk_count
+          FROM document d
+          LEFT JOIN chunk c ON c.document_id=d.id
+         GROUP BY d.id
+         ORDER BY d.source_uri, d.id
+         LIMIT ?;
+        """, [.int(Int64(limit))])
+        return rows.map { row in
+            DocumentChunkSummary(
+                document: Self.rowToDocument(row),
+                chunkCount: Int((row["chunk_count"] as? Int64) ?? 0))
+        }
+    }
+
     /// Delete a document by id. New databases cascade mentions and clear edge
     /// evidence via FK actions, but older databases may have been created
     /// before those actions existed. Perform the dependent-row cleanup
@@ -389,74 +440,107 @@ public actor MemoryStore {
     public func deleteDocument(id: Int64) throws {
         try execRaw("BEGIN IMMEDIATE;")
         do {
-            // Purge the FTS5 (external-content) and vec0 virtual-table rows for
-            // this document's chunks. Neither is reachable by a FK cascade and
-            // there are no sync triggers, so without this they accumulate orphan
-            // rows: stale BM25 hits in search, dangling ANN vectors, and —
-            // because both index by chunk.id — desync when a re-imported
-            // document reuses a recycled rowid. Must run while the chunk rows
-            // still exist, because the FTS5 external-content 'delete' command
-            // needs the originally-indexed text.
-            let staleChunks = try run(
-                "SELECT id, text FROM chunk WHERE document_id=?;", [.int(id)])
-            for row in staleChunks {
-                guard let cid = row["id"] as? Int64 else { continue }
-                let text = (row["text"] as? String) ?? ""
-                try run(
-                    "INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES('delete', ?, ?);",
-                    [.int(cid), .text(text)])
-                if vecAvailable {
-                    try run("DELETE FROM chunk_vec WHERE rowid=?;", [.int(cid)])
-                }
-            }
-            try run("""
-            UPDATE edge SET evidence_chunk_id=NULL
-            WHERE evidence_chunk_id IN (
-              SELECT id FROM chunk WHERE document_id=?
-            );
-            """, [.int(id)])
-            // insight.trigger_chunk_id is ON DELETE SET NULL by design — an
-            // insight outlives its triggering chunk as a historical record that
-            // recentInteresting() LEFT JOINs through. Null it explicitly for the
-            // same legacy-cascade reason as edge above: on a DB predating the FK
-            // action the cascade is silently ignored, so the later DELETE FROM
-            // chunk would orphan the reference (or fail the FK check).
-            try run("""
-            UPDATE insight SET trigger_chunk_id=NULL
-            WHERE trigger_chunk_id IN (
-              SELECT id FROM chunk WHERE document_id=?
-            );
-            """, [.int(id)])
-            try run("""
-            DELETE FROM mention
-            WHERE chunk_id IN (
-              SELECT id FROM chunk WHERE document_id=?
-            );
-            """, [.int(id)])
-            // Delete chunk_embedding + chunk rows explicitly rather than relying
-            // on document→chunk→chunk_embedding ON DELETE CASCADE: the cascade is
-            // declared under CREATE TABLE IF NOT EXISTS, so on a database created
-            // before these FK actions existed SQLite silently ignores them and
-            // the rows would orphan (or the document delete would fail FK checks).
-            // Doing it by hand makes deleteDocument correct on legacy and fresh
-            // DBs alike; on fresh DBs the later cascade just no-ops on gone rows.
-            // chunk_embedding only exists on the non-vec build (vec0 stores
-            // vectors in chunk_vec, purged above), so guard on vecAvailable.
-            if !vecAvailable {
-                try run("""
-                DELETE FROM chunk_embedding
-                WHERE chunk_id IN (
-                  SELECT id FROM chunk WHERE document_id=?
-                );
-                """, [.int(id)])
-            }
-            try run("DELETE FROM chunk WHERE document_id=?;", [.int(id)])
-            try run("DELETE FROM document WHERE id=?;", [.int(id)])
+            try purgeDocumentRows(id: id)
             try execRaw("COMMIT;")
         } catch {
             try? execRaw("ROLLBACK;")
             throw error
         }
+    }
+
+    /// Promote a fully processed staging document into a stable source URI.
+    /// The old document, if present, and all of its search/vector side tables
+    /// are purged in the same transaction that updates the staged document's
+    /// `source_uri`. This lets importers preserve the last good index until a
+    /// replacement has been completely processed.
+    public func promoteStagedDocument(stagedId: Int64,
+                                      sourceURI: String,
+                                      bodyPath: String,
+                                      title: String?) throws {
+        try execRaw("BEGIN IMMEDIATE;")
+        do {
+            let existingRows = try run(
+                "SELECT id FROM document WHERE source_uri=? AND id<>?;",
+                [.text(sourceURI), .int(stagedId)])
+            for row in existingRows {
+                if let oldId = row["id"] as? Int64 {
+                    try purgeDocumentRows(id: oldId)
+                }
+            }
+            try run("""
+            UPDATE document
+            SET source_uri=?, body_path=?, title=COALESCE(?, title)
+            WHERE id=?;
+            """, [
+                .text(sourceURI),
+                .text(bodyPath),
+                title.map(Bind.text) ?? .null,
+                .int(stagedId),
+            ])
+            try execRaw("COMMIT;")
+        } catch {
+            try? execRaw("ROLLBACK;")
+            throw error
+        }
+    }
+
+    private func purgeDocumentRows(id: Int64) throws {
+        // Purge the FTS5 (external-content) and vec0 virtual-table rows for
+        // this document's chunks. Neither is reachable by a FK cascade and
+        // there are no sync triggers, so without this they accumulate orphan
+        // rows: stale BM25 hits in search, dangling ANN vectors, and —
+        // because both index by chunk.id — desync when a re-imported document
+        // reuses a recycled rowid. Must run while the chunk rows still exist,
+        // because the FTS5 external-content 'delete' command needs the
+        // originally-indexed text.
+        let staleChunks = try run(
+            "SELECT id, text FROM chunk WHERE document_id=?;", [.int(id)])
+        for row in staleChunks {
+            guard let cid = row["id"] as? Int64 else { continue }
+            let text = (row["text"] as? String) ?? ""
+            try run(
+                "INSERT INTO chunk_fts(chunk_fts, rowid, text) VALUES('delete', ?, ?);",
+                [.int(cid), .text(text)])
+            if vecAvailable {
+                try run("DELETE FROM chunk_vec WHERE rowid=?;", [.int(cid)])
+            }
+        }
+        try run("""
+        UPDATE edge SET evidence_chunk_id=NULL
+        WHERE evidence_chunk_id IN (
+          SELECT id FROM chunk WHERE document_id=?
+        );
+        """, [.int(id)])
+        // insight.trigger_chunk_id is ON DELETE SET NULL by design — an
+        // insight outlives its triggering chunk as a historical record that
+        // recentInteresting() LEFT JOINs through. Null it explicitly for the
+        // same legacy-cascade reason as edge above.
+        try run("""
+        UPDATE insight SET trigger_chunk_id=NULL
+        WHERE trigger_chunk_id IN (
+          SELECT id FROM chunk WHERE document_id=?
+        );
+        """, [.int(id)])
+        try run("""
+        DELETE FROM mention
+        WHERE chunk_id IN (
+          SELECT id FROM chunk WHERE document_id=?
+        );
+        """, [.int(id)])
+        // Delete chunk_embedding + chunk rows explicitly rather than relying
+        // on document→chunk→chunk_embedding ON DELETE CASCADE: the cascade is
+        // declared under CREATE TABLE IF NOT EXISTS, so on a database created
+        // before these FK actions existed SQLite silently ignores them.
+        if !vecAvailable {
+            try run("""
+            DELETE FROM chunk_embedding
+            WHERE chunk_id IN (
+              SELECT id FROM chunk WHERE document_id=?
+            );
+            """, [.int(id)])
+        }
+        try run("DELETE FROM chunk WHERE document_id=?;", [.int(id)])
+        try run("DELETE FROM document WHERE id=?;", [.int(id)])
     }
 
     public func documentCount() throws -> Int {
@@ -522,6 +606,12 @@ public actor MemoryStore {
 
     public func chunkCount() throws -> Int {
         let rows = try run("SELECT COUNT(*) AS n FROM chunk;")
+        return Int((rows.first?["n"] as? Int64) ?? 0)
+    }
+
+    public func chunkCount(documentId: Int64) throws -> Int {
+        let rows = try run("SELECT COUNT(*) AS n FROM chunk WHERE document_id=?;",
+                           [.int(documentId)])
         return Int((rows.first?["n"] as? Int64) ?? 0)
     }
 
@@ -670,6 +760,14 @@ public actor MemoryStore {
         return Int((rows.first?["n"] as? Int64) ?? 0)
     }
 
+    public func entities(limit: Int = 10_000) throws -> [EntityRow] {
+        try run("""
+        SELECT * FROM entity
+         ORDER BY kind, canonical, id
+         LIMIT ?;
+        """, [.int(Int64(limit))]).map(Self.rowToEntity)
+    }
+
     public func setEgoBetweenness(entityId: Int64, value: Double) throws {
         try run("UPDATE entity SET ego_betweenness_cached=? WHERE id=?;",
                 [.real(value), .int(entityId)])
@@ -718,6 +816,19 @@ public actor MemoryStore {
     public func edgesIntroducedAfter(_ ts: Int64) throws -> [EdgeRow] {
         try run("SELECT * FROM edge WHERE first_seen>=? ORDER BY id;",
                 [.int(ts)]).map(Self.rowToEdge)
+    }
+
+    public func edgeCount() throws -> Int {
+        let rows = try run("SELECT COUNT(*) AS n FROM edge;")
+        return Int((rows.first?["n"] as? Int64) ?? 0)
+    }
+
+    public func edges(limit: Int = 10_000) throws -> [EdgeRow] {
+        try run("""
+        SELECT * FROM edge
+         ORDER BY src, dst, relation, id
+         LIMIT ?;
+        """, [.int(Int64(limit))]).map(Self.rowToEdge)
     }
 
     /// 2-hop expansion from `seed`. The recursive CTE bounds the depth and
@@ -770,6 +881,51 @@ public actor MemoryStore {
         try run("SELECT chunk_id FROM mention WHERE entity_id=? LIMIT ?;",
                 [.int(entityId), .int(Int64(limit))])
             .compactMap { $0["chunk_id"] as? Int64 }
+    }
+
+    public func chunkEvidence(id: Int64) throws -> ChunkEvidenceRow? {
+        let rows = try run("""
+        SELECT c.id AS c_id, c.document_id AS c_document_id, c.idx AS c_idx,
+               c.text AS c_text, c.raw_text AS c_raw_text,
+               c.token_count AS c_token_count, c.logprob_avg AS c_logprob_avg,
+               c.created_at AS c_created_at,
+               d.id AS d_id, d.source AS d_source, d.source_uri AS d_source_uri,
+               d.title AS d_title, d.body_path AS d_body_path,
+               d.fetched_at AS d_fetched_at, d.published_at AS d_published_at,
+               d.content_sha AS d_content_sha, d.language AS d_language,
+               d.raw_bytes AS d_raw_bytes
+          FROM chunk c
+          LEFT JOIN document d ON d.id=c.document_id
+         WHERE c.id=?;
+        """, [.int(id)])
+        guard let row = rows.first else { return nil }
+        let chunk = ChunkRow(
+            id: (row["c_id"] as? Int64) ?? 0,
+            documentId: (row["c_document_id"] as? Int64) ?? 0,
+            idx: Int((row["c_idx"] as? Int64) ?? 0),
+            text: (row["c_text"] as? String) ?? "",
+            rawText: (row["c_raw_text"] as? String) ?? "",
+            tokenCount: Int((row["c_token_count"] as? Int64) ?? 0),
+            logprobAvg: row["c_logprob_avg"] as? Double,
+            createdAt: (row["c_created_at"] as? Int64) ?? 0)
+        let document: DocumentRow?
+        if row["d_id"] as? Int64 != nil {
+            let source = MemorySource(rawValue: (row["d_source"] as? String) ?? "") ?? .manual
+            document = DocumentRow(
+                id: (row["d_id"] as? Int64) ?? 0,
+                source: source,
+                sourceURI: (row["d_source_uri"] as? String) ?? "",
+                title: row["d_title"] as? String,
+                bodyPath: (row["d_body_path"] as? String) ?? "",
+                fetchedAt: (row["d_fetched_at"] as? Int64) ?? 0,
+                publishedAt: row["d_published_at"] as? Int64,
+                contentSHA: (row["d_content_sha"] as? Data) ?? Data(),
+                language: row["d_language"] as? String,
+                rawBytes: (row["d_raw_bytes"] as? Int64) ?? 0)
+        } else {
+            document = nil
+        }
+        return ChunkEvidenceRow(chunk: chunk, document: document)
     }
 
     // MARK: - insight cards + spend
@@ -905,6 +1061,94 @@ public actor MemoryStore {
 
     public func checkpoint() throws {
         try execRaw("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
+    public func indexHealth(sampleLimit: Int = 100) throws -> MemoryStoreIndexHealth {
+        let documentCount = try documentCount()
+        let chunkCount = try chunkCount()
+        let entityCount = try entityCount()
+        let edgeCount = try edgeCount()
+        let limit = Int64(sampleLimit)
+
+        let zeroDocs = try run("""
+        SELECT d.id
+          FROM document d
+          LEFT JOIN chunk c ON c.document_id=d.id
+         GROUP BY d.id
+        HAVING COUNT(c.id)=0
+         ORDER BY d.id
+         LIMIT ?;
+        """, [.int(limit)]).compactMap { $0["id"] as? Int64 }
+
+        let orphanChunks = try run("""
+        SELECT c.id
+          FROM chunk c
+          LEFT JOIN document d ON d.id=c.document_id
+         WHERE d.id IS NULL
+         ORDER BY c.id
+         LIMIT ?;
+        """, [.int(limit)]).compactMap { $0["id"] as? Int64 }
+
+        let missingVector: [Int64]
+        let staleVector: [Int64]
+        if vecAvailable {
+            missingVector = try run("""
+            SELECT c.id
+              FROM chunk c
+             WHERE NOT EXISTS (SELECT 1 FROM chunk_vec v WHERE v.rowid=c.id)
+             ORDER BY c.id
+             LIMIT ?;
+            """, [.int(limit)]).compactMap { $0["id"] as? Int64 }
+            staleVector = try run("""
+            SELECT v.rowid AS id
+              FROM chunk_vec v
+              LEFT JOIN chunk c ON c.id=v.rowid
+             WHERE c.id IS NULL
+             ORDER BY v.rowid
+             LIMIT ?;
+            """, [.int(limit)]).compactMap { $0["id"] as? Int64 }
+        } else {
+            missingVector = try run("""
+            SELECT c.id
+              FROM chunk c
+             WHERE NOT EXISTS (
+               SELECT 1 FROM chunk_embedding e WHERE e.chunk_id=c.id
+             )
+             ORDER BY c.id
+             LIMIT ?;
+            """, [.int(limit)]).compactMap { $0["id"] as? Int64 }
+            staleVector = try run("""
+            SELECT e.chunk_id AS id
+              FROM chunk_embedding e
+              LEFT JOIN chunk c ON c.id=e.chunk_id
+             WHERE c.id IS NULL
+             ORDER BY e.chunk_id
+             LIMIT ?;
+            """, [.int(limit)]).compactMap { $0["id"] as? Int64 }
+        }
+
+        let ftsOK: Bool
+        let ftsError: String?
+        do {
+            try run("INSERT INTO chunk_fts(chunk_fts) VALUES('integrity-check');")
+            ftsOK = true
+            ftsError = nil
+        } catch {
+            ftsOK = false
+            ftsError = String(describing: error)
+        }
+
+        return MemoryStoreIndexHealth(
+            documentCount: documentCount,
+            chunkCount: chunkCount,
+            entityCount: entityCount,
+            edgeCount: edgeCount,
+            zeroChunkDocumentIds: zeroDocs,
+            orphanChunkIds: orphanChunks,
+            chunksMissingVector: missingVector,
+            staleVectorRowIds: staleVector,
+            ftsIntegrityOK: ftsOK,
+            ftsIntegrityError: ftsError)
     }
 
     // MARK: - row decoders

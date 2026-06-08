@@ -52,4 +52,17 @@ final class MockInferenceProviderTests: XCTestCase {
         let e = try await wrapped.embed(["x"], deadline: .fromNow(.seconds(1)))
         XCTAssertEqual(e.first?.dimension, 8)
     }
+
+    func testMLXLocalProviderDefaultsToBGERerankerWithFallback() {
+        let config = MLXLocalProvider.Config()
+        XCTAssertEqual(config.rerankerModelID, "BAAI/bge-reranker-v2-m3")
+        XCTAssertEqual(config.rerankerMaxTokens, 8192)
+        XCTAssertTrue(config.allowCosineRerankFallback)
+    }
+
+    func testMLXAvailabilityHonorsRuntimeDisableEnv() {
+        XCTAssertFalse(MLXLocalProvider.isAvailable(env: ["CODEXKIT_MOCK": "1"]))
+        XCTAssertFalse(MLXLocalProvider.isAvailable(env: ["CODEXKIT_MLX": "0"]))
+        XCTAssertFalse(MLXLocalProvider.isAvailable(env: ["CODEXKIT_MLX_RUNTIME": "0"]))
+    }
 }

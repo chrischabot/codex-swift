@@ -31,9 +31,9 @@ status see `../STATUS.md`.
 - **OpenAI API key (optional).** Live tests and live smokes auto-run
   when `OPENAI_API_KEY` is set in the environment, and skip cleanly
   with a clear message otherwise.
-- **Apple Silicon Mac (optional).** Setting `CODEXKIT_MLX=1` opts the
-  MemoryInfer module into MLX-backed embedding inference. Unset, the
-  module uses a portable fallback. Linux ignores the flag.
+- **Apple Silicon Mac (optional).** MLX-backed memory inference is enabled by
+  default on macOS. Set `CODEXKIT_MLX=0` for a dependency-light build. Linux
+  always uses the portable fallback.
 
 ## 2. Build
 

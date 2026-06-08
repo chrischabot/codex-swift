@@ -19,6 +19,7 @@ import Observability
 import Auth
 import Config
 import MemoryExtension
+import Mem0Extension
 import Push
 import GoogleWorkspace
 import Media
@@ -173,7 +174,11 @@ struct SessionWorkerMain {
         let useMock = env["CODEXKIT_MOCK"] == "1"
         let apiKey = env["OPENAI_API_KEY"]
         let model: any ModelClient
+        let mem0AuthProvider: Mem0SessionAuthProvider?
+        let wikiAuthProvider: WikiMemoryAuthProvider?
         if useMock {
+            mem0AuthProvider = nil
+            wikiAuthProvider = nil
             let mockText = env["CODEXKIT_MOCK_TEXT"] ?? "Hello from codex-session (mock)."
             if env["CODEXKIT_MOCK_SCENARIO"] == "tool-loop-compact" {
                 model = MockModelClient(MockScenario.toolLoopCompactionSequence(repetitions: 256))
@@ -190,12 +195,20 @@ struct SessionWorkerMain {
                 model = MockModelClient(repeating: .hello(mockText), times: 1024)
             }
         } else if let apiKey, !apiKey.isEmpty {
+            mem0AuthProvider = .staticToken(apiKey)
+            wikiAuthProvider = .staticToken(apiKey)
             model = openAIClient(apiKey: apiKey,
                                  limits: limits,
                                  attestationProvider: attestationProvider)
             log.info("codex-session using OpenAI Responses client from OPENAI_API_KEY")
         } else if let brokerAuth = brokerAuthClient(codexHome: codexHome),
                   let token = await brokerAuth.validAccessToken() {
+            mem0AuthProvider = Mem0SessionAuthProvider(
+                accessToken: { await brokerAuth.validAccessToken() },
+                refreshToken: { await brokerAuth.refreshAccessToken() })
+            wikiAuthProvider = WikiMemoryAuthProvider(
+                accessToken: { await brokerAuth.validAccessToken() },
+                refreshToken: { await brokerAuth.refreshAccessToken() })
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token,
                                       limits: limits,
@@ -206,6 +219,12 @@ struct SessionWorkerMain {
                                            attestationProvider: attestationProvider) })
             log.info("codex-session using OpenAI Responses client from broker auth with 401 refresh")
         } else if let token = await authManager.validAccessToken() {
+            mem0AuthProvider = Mem0SessionAuthProvider(
+                accessToken: { await authManager.validAccessToken() },
+                refreshToken: { await authManager.refreshAccessToken() })
+            wikiAuthProvider = WikiMemoryAuthProvider(
+                accessToken: { await authManager.validAccessToken() },
+                refreshToken: { await authManager.refreshAccessToken() })
             model = AuthRefreshingModelClient(
                 initial: openAIClient(apiKey: token,
                                       limits: limits,
@@ -216,6 +235,8 @@ struct SessionWorkerMain {
                                            attestationProvider: attestationProvider) })
             log.info("codex-session using OpenAI Responses client from stored auth with 401 refresh")
         } else {
+            mem0AuthProvider = nil
+            wikiAuthProvider = nil
             model = SessionNotConfiguredModel()
         }
 
@@ -266,6 +287,8 @@ struct SessionWorkerMain {
                     websocketURL: remote.execServerUrl,
                     limits: limits)
             }
+            let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
+            let configuredMemoryProvider = addonConfig.value("memory")?.objectValue?["provider"]?.stringValue
             let memory = MemoryStore(codexHome: codexHome)
             // Upstream parity (H-32 / P4.8): wire the model client into the
             // memory store so end-of-turn consolidation runs the Stage-1
@@ -273,13 +296,12 @@ struct SessionWorkerMain {
             // rollout_slug) instead of local truncation. On any error we fall
             // back to the deterministic local summary.
             await memory.setModelClient(model)
-            await router.register(MemoryTool(store: memory))
-            // Upstream parity (H-32 / P4.8): three namespaced memory tools.
-            // The legacy single `memory` tool is kept registered for back-
-            // compat; new sessions and the model should prefer these.
-            await router.register(MemoriesListTool(store: memory))
-            await router.register(MemoriesReadTool(store: memory))
-            await router.register(MemoriesSearchTool(store: memory))
+            if shouldRegisterCoreMemoryTools(config: addonConfig) {
+                await router.register(MemoryTool(store: memory))
+                await router.register(MemoriesListTool(store: memory))
+                await router.register(MemoriesReadTool(store: memory))
+                await router.register(MemoriesSearchTool(store: memory))
+            }
             let mcp = McpManager()
             // Upstream parity (codex-mcp/src/elicitation.rs::make_sender):
             // apply the elicitation policy BEFORE surfacing a prompt. Under
@@ -364,40 +386,44 @@ struct SessionWorkerMain {
                 for: c.model, configOverride: autoCompactOverride)
             let approved = ApprovedRuleStore(codexHome: codexHome)
             // Extension spine (ARCHITECTURE.md §5.4 / Phase 0): build this
-            // session's registry from the enabled `[extensions]` manifests.
-            // Returns nil (→ byte-identical core) when the `extensions` feature
-            // is off or nothing is enabled. Mirrors `HookEngine.load`.
-            let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
-            // Phase 1 (ARCHITECTURE.md §7.1): the core `.md` memories are the
-            // default MemoryProvider slot candidate. `selectMemoryProvider`
-            // honors `[memory].provider` ("none" disables recall; "wiki"
-            // selects the vector store). Recall (fenced) + capture wire into
-            // the registry; the memory *tools* stay registered above.
+            // session's registry from enabled `[extensions]` manifests plus the
+            // selected memory provider. General manifests are feature-gated;
+            // memory can install independently because mem0 is the default
+            // personal-memory path.
+            // Phase 1 (ARCHITECTURE.md §7.1): the memory slot candidates.
+            // mem0 is the default personal-memory provider when
+            // `[memory].provider` is unset; "core", "wiki", and "none" remain
+            // explicit choices. Recall (fenced) + capture wire into the
+            // registry; the legacy core memory *tools* are exposed only for
+            // explicit core/legacy-tools configurations.
             //
             // The vector "Memory Wiki" candidate is built ONLY when
             // `[memory].provider == "wiki"` — constructing it opens a SQLite
             // handle on the wiki DB, which we must not do for sessions that
             // never select it. `makeWikiMemoryProvider` reuses THIS session's
             // `ModelClient` for the wiki's own text inference (D1) and returns
-            // nil if the DB can't be opened (degrade to the core candidate).
+            // nil if the DB can't be opened, so a configured-but-unavailable
+            // wiki disables recall rather than crashing the session.
             var memoryCandidates: [any MemoryProvider] = [CoreMemoriesProvider(store: memory)]
-            if addonConfig.value("memory")?.objectValue?["provider"]?.stringValue == "wiki",
-               let wiki = makeWikiMemoryProvider(config: addonConfig, modelClient: model) {
+            if (configuredMemoryProvider == nil || configuredMemoryProvider == "mem0"),
+               let mem0 = makeMem0MemoryProvider(config: addonConfig,
+                                                 authProvider: mem0AuthProvider) {
+                memoryCandidates.append(mem0)
+            }
+            if configuredMemoryProvider == "wiki",
+               let wiki = makeWikiMemoryProvider(config: addonConfig,
+                                                 modelClient: model,
+                                                 authProvider: wikiAuthProvider) {
                 memoryCandidates.append(wiki)
             }
             let memoryProvider = selectMemoryProvider(
                 config: addonConfig, candidates: memoryCandidates)
             // Register the selected provider's tools (core's are [] — the core
-            // memory tools are registered above; a "wiki" provider's MemoryToolset
-            // would wire here). Closes the tools() contract limb. Gated on the
-            // SAME `extensions` feature that gates the provider's recall/capture
-            // (installAddons, below): registering the provider's tools while
-            // recall stayed off was an asymmetry that leaked e.g. wiki tools into
-            // an extensions-off session, diverging the tool list from the core
-            // (violating "extensions off → byte-identical core").
-            if addonConfig.isFeatureEnabled("extensions") {
-                for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
-            }
+            // memory tools are registered above; mem0 contributes mem0_search /
+            // mem0_add; wiki contributes its MemoryToolset in compatibility
+            // mode). Memory is no longer gated by the general `extensions`
+            // feature because mem0 is the default personal-memory product path.
+            for t in (memoryProvider?.tools() ?? []) { await router.register(t) }
             // ADDONS Phase 0 #2: addon tool-pack seam (mirrors codexd). #4
             // (Google Workspace), #7 (Push), #8 (Media) append their packs here;
             // each is gated by `[features].<pack.id>` and self-prunes when

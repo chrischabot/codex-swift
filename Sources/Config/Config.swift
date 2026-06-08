@@ -649,6 +649,15 @@ public struct ConfigLoader: Sendable {
         "otel",
     ]
 
+    /// Additional CodexKit-only project-local restrictions for extension
+    /// config that can redirect authenticated memory traffic. User, system,
+    /// managed, env, and runtime layers still own these settings.
+    static let projectLocalNestedConfigDenylist: [String] = [
+        "memory.mem0",
+        "memory.embeddings_url",
+        "memory.embeddings_api_key",
+    ]
+
     /// Canonical key aliasing (codex `config/key_aliases.rs` analog): the
     /// env-derived key is lowercased, so map common lowercase/camel forms
     /// onto the canonical snake_case config keys (matching upstream's TOML
@@ -897,7 +906,31 @@ public struct ConfigLoader: Sendable {
             root[key] = nil
             removed.append(key)
         }
+        for nestedKey in projectLocalNestedConfigDenylist {
+            let parts = nestedKey.split(separator: ".").map(String.init)
+            guard removeNestedKey(parts, from: &root) else { continue }
+            removed.append(nestedKey)
+        }
         return removed
+    }
+
+    private static func removeNestedKey(_ path: [String], from object: inout [String: ConfigValue]) -> Bool {
+        guard !path.isEmpty else { return false }
+        if path.count == 1 {
+            guard object[path[0]] != nil else { return false }
+            object[path[0]] = nil
+            return true
+        }
+        let key = path[0]
+        guard case .object(var child)? = object[key] else { return false }
+        let removed = removeNestedKey(Array(path.dropFirst()), from: &child)
+        guard removed else { return false }
+        if child.isEmpty {
+            object[key] = nil
+        } else {
+            object[key] = .object(child)
+        }
+        return true
     }
 
     // NOTE: there is intentionally NO top-level camelCase→snake_case aliasing

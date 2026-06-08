@@ -25,6 +25,7 @@ docs.
 - **Understand the agent** — [Turn loop](features/agent-loop.md),
   [Models & providers](features/models-and-providers.md),
   [Tools](features/tools.md), [Memory](features/memory.md),
+  [Memory systems](features/memory-systems.md),
   [Prompts & context](features/prompts-and-context.md),
   [Persistence & resume](features/persistence-and-resume.md),
   [Auth](features/auth.md).

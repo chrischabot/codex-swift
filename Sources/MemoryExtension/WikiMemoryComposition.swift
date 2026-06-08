@@ -34,12 +34,49 @@ import Tools
 // SmallModel-backed client here instead of the provider client to honour D1;
 // the seam is the injected `ModelClient`, so this file stays endpoint-agnostic.
 
+/// Session-level auth source for the wiki's OpenAI-compatible embeddings path.
+/// Text inference already routes through the injected `ModelClient`; this keeps
+/// the embeddings bridge on the same API-key/ChatGPT-login credential source.
+public struct WikiMemoryAuthProvider: Sendable {
+    let bridge: ModelClientBridge.BearerTokenProvider
+
+    public init(accessToken: @escaping @Sendable () async -> String?,
+                refreshToken: @escaping @Sendable () async -> String?) {
+        self.bridge = ModelClientBridge.BearerTokenProvider(
+            accessToken: accessToken,
+            refreshToken: refreshToken)
+    }
+
+    public static func staticToken(_ token: String) -> WikiMemoryAuthProvider {
+        WikiMemoryAuthProvider(accessToken: { token }, refreshToken: { token })
+    }
+}
+
+public enum WikiInferenceBackend: String, Sendable, Equatable {
+    case auto
+    case local
+    case remote
+    case mock
+
+    static func parse(_ raw: String?) -> WikiInferenceBackend? {
+        guard let raw else { return nil }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "auto": return .auto
+        case "local", "mlx", "mlx_local": return .local
+        case "remote", "openai": return .remote
+        case "mock", "offline": return .mock
+        default: return nil
+        }
+    }
+}
+
 /// Configuration knobs for the wiki provider, read from `[memory]` (TOML/JSON
 /// `Config`). Everything is optional with sane defaults; the only thing that
 /// changes recall *quality* is whether a real embeddings endpoint is reachable
-/// (see `embeddingsURL` / `embeddingsAPIKey`). Absent an endpoint the provider
-/// still builds and answers — it falls back to `MockInferenceProvider`, whose
-/// embeddings are deterministic but semantically weak (documented blocker).
+/// (see `embeddingsURL` / `embeddingsAPIKey`) or the composition root passes a
+/// shared OpenAI auth provider. Absent either, the provider still builds and
+/// answers — it falls back to `MockInferenceProvider`, whose embeddings are
+/// deterministic but semantically weak (documented blocker).
 public struct WikiMemoryConfig: Sendable, Equatable {
     /// SQLite DB path. Defaults to `MemoryStoreConfig.defaultPath()` (the same
     /// host-global DB the `codex-memory` daemon writes), so an agent session
@@ -59,30 +96,38 @@ public struct WikiMemoryConfig: Sendable, Equatable {
     /// endpoint is assumed key-less (e.g. a local server); the bridge sends an
     /// empty bearer.
     public var embeddingsAPIKey: String?
+    /// Inference backend policy. `auto` prefers local MLX (Qwen + Nomic), then
+    /// remote OpenAI-compatible, then mock. Explicit `local` never falls through
+    /// to remote; if MLX is unavailable it uses mock so private memory stays
+    /// local/offline.
+    public var inferenceBackend: WikiInferenceBackend
 
     public init(dbPath: String? = nil,
                 embeddingDimension: Int = memoryEmbeddingDimension,
                 extractorModel: String = "gpt-5.4-mini",
                 embeddingModel: String = "text-embedding-3-small",
                 embeddingsURL: String? = nil,
-                embeddingsAPIKey: String? = nil) {
+                embeddingsAPIKey: String? = nil,
+                inferenceBackend: WikiInferenceBackend = .auto) {
         self.dbPath = dbPath
         self.embeddingDimension = embeddingDimension
         self.extractorModel = extractorModel
         self.embeddingModel = embeddingModel
         self.embeddingsURL = embeddingsURL
         self.embeddingsAPIKey = embeddingsAPIKey
+        self.inferenceBackend = inferenceBackend
     }
 
     /// Parse the `[memory]` table for the wiki knobs. Recognises:
     ///   [memory]
     ///   provider = "wiki"
     ///   db_path = "/path/to/memory.db"          # optional
-    ///   embedding_dimension = 768               # optional
+    ///   embedding_dimension = 1536              # optional
     ///   extractor_model = "gpt-5.4-mini"        # optional
     ///   embedding_model = "text-embedding-3-small"
     ///   embeddings_url = "https://.../v1/embeddings"   # enables real recall
     ///   embeddings_api_key = "sk-..."           # optional (env may override)
+    ///   inference_backend = "auto"              # auto/local/remote/mock
     /// Falls back to env (`CODEX_MEMORY_*`, `OPENAI_API_KEY`) for the
     /// embeddings endpoint/key so an operator can keep secrets out of the TOML,
     /// mirroring `codex-memory`'s `assemble()`.
@@ -102,6 +147,11 @@ public struct WikiMemoryConfig: Sendable, Equatable {
         else if let u = env["CODEX_MEMORY_EMBEDDINGS_URL"], !u.isEmpty { out.embeddingsURL = u }
         if let k = mem["embeddings_api_key"]?.stringValue, !k.isEmpty { out.embeddingsAPIKey = k }
         else if let k = env["OPENAI_API_KEY"], !k.isEmpty { out.embeddingsAPIKey = k }
+        if let b = WikiInferenceBackend.parse(mem["inference_backend"]?.stringValue) {
+            out.inferenceBackend = b
+        } else if let b = WikiInferenceBackend.parse(env["CODEX_MEMORY_INFERENCE_BACKEND"]) {
+            out.inferenceBackend = b
+        }
         return out
     }
 }
@@ -118,46 +168,55 @@ public struct WikiMemoryConfig: Sendable, Equatable {
 ///   - env: process environment (injectable for tests).
 public func makeWikiMemoryProvider(config: Config,
                                    modelClient: any ModelClient,
-                                   env: [String: String] = ProcessInfo.processInfo.environment)
+                                   env: [String: String] = ProcessInfo.processInfo.environment,
+                                   authProvider: WikiMemoryAuthProvider? = nil)
 -> WikiMemoryProvider? {
     let wiki = WikiMemoryConfig.fromConfig(config, env: env)
-    return makeWikiMemoryProvider(wiki: wiki, modelClient: modelClient)
+    return makeWikiMemoryProvider(wiki: wiki,
+                                  modelClient: modelClient,
+                                  env: env,
+                                  authProvider: authProvider)
 }
 
 /// Construction core, factored out so tests can drive it with an explicit
 /// `WikiMemoryConfig` (e.g. a temp DB path) without going through TOML parsing.
 public func makeWikiMemoryProvider(wiki: WikiMemoryConfig,
-                                   modelClient: any ModelClient) -> WikiMemoryProvider? {
+                                   modelClient: any ModelClient,
+                                   env: [String: String] = ProcessInfo.processInfo.environment,
+                                   authProvider: WikiMemoryAuthProvider? = nil) -> WikiMemoryProvider? {
+    let plan = resolveInferencePlan(wiki: wiki, authProvider: authProvider, env: env)
     // Open the SQLite store. A missing/locked/corrupt DB must NOT crash the
     // session — return nil so `selectMemoryProvider` (or the caller's
     // compactMap) falls through to the next candidate.
     let storeConfig = MemoryStoreConfig(
         path: wiki.dbPath ?? MemoryStoreConfig.defaultPath(),
-        embeddingDimension: wiki.embeddingDimension)
+        embeddingDimension: wiki.embeddingDimension,
+        embeddingProviderID: plan.providerID)
     guard let store = try? MemoryStore(storeConfig) else { return nil }
 
-    let inference = makeInference(wiki: wiki, modelClient: modelClient,
-                                  storeConfig: storeConfig)
+    let inference = makeInference(wiki: wiki, plan: plan, modelClient: modelClient,
+                                  storeConfig: storeConfig,
+                                  authProvider: authProvider)
     let retriever = MemoryRetriever(store: store, inference: inference)
     // Personas live in `[memory.personas.*]`; fall back to the five defaults.
     let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
         ?? (NSHomeDirectory() + "/.codex")
     let personas = PersonaState.load(codexHome: codexHome)
 
-    // BrainGate escalation routes through the same inference backend (so a
-    // local model can serve insight per D1). When the backend is the mock, the
-    // call still succeeds with a synthetic card rather than failing the tool —
-    // matching `codex-memory`'s `assemble()` shape.
-    let gate = BrainGate(store: store, caller: { prompt, _, deadline in
-        let result = try await inference.extract(
-            ChunkBatch(documentTitle: nil, documentURI: "brain://escalate",
-                       chunks: [Chunk(localId: "escalate", rawText: prompt, idx: 0)]),
-            schema: .default, deadline: deadline)
-        let text = "{\"headline\":\"escalation\",\"summary\":\"\(prompt.prefix(200))\","
-            + "\"entities\":[],\"rationale\":\"auto\",\"summaryOnly\":false}"
+    // BrainGate is the explicit spend-gated escalation path. It must not pretend
+    // local/mock extraction is a GPT escalation, so it asks the shared session
+    // ModelClient for the exact model BrainGate admitted and lets BrainGate fail
+    // closed on unparseable output.
+    let gate = BrainGate(store: store, caller: { prompt, model, deadline in
+        let bridge = ModelClientBridge(
+            modelClient: modelClient,
+            modelName: model,
+            embeddings: nil,
+            instructions: "Return only a JSON object matching the requested InsightCard schema.")
+        let text = try await bridge.textCall()(prompt, deadline)
         return (text: text,
-                tokensIn: result.tokensInput,
-                tokensOut: result.tokensOutput)
+                tokensIn: estimatedTokenCount(prompt),
+                tokensOut: estimatedTokenCount(text))
     })
 
     let toolset = MemoryToolset(store: store, retriever: retriever,
@@ -166,32 +225,93 @@ public func makeWikiMemoryProvider(wiki: WikiMemoryConfig,
     return WikiMemoryProvider(retriever: retriever, tools: toolset.tools())
 }
 
-/// Pick the inference backend. When an embeddings endpoint is configured we
-/// wrap the injected `ModelClient` (text) + a curl `/v1/embeddings` bridge
-/// (vectors) in a `RemoteOpenAICompatibleProvider`; otherwise we fall back to
-/// `MockInferenceProvider` (deterministic but semantically weak — see the
-/// `externallyBlocked` note). Both are wrapped in `BoundedInferenceProvider`
+private enum ResolvedWikiInferenceBackend {
+    case local
+    case remote(url: String)
+    case mock
+}
+
+private struct WikiInferencePlan {
+    var backend: ResolvedWikiInferenceBackend
+    var providerID: String
+}
+
+private func resolveInferencePlan(wiki: WikiMemoryConfig,
+                                  authProvider: WikiMemoryAuthProvider?,
+                                  env: [String: String]) -> WikiInferencePlan {
+    let defaultEmbeddingsURL = "https://api.openai.com/v1/embeddings"
+    let configuredAPIKey = !(wiki.embeddingsAPIKey?.isEmpty ?? true)
+    let remoteURL = wiki.embeddingsURL
+        ?? ((authProvider != nil || configuredAPIKey) ? defaultEmbeddingsURL : nil)
+    let canUseRemote = remoteURL != nil
+
+    func localPlan() -> WikiInferencePlan {
+        WikiInferencePlan(
+            backend: .local,
+            providerID: "local-mlx:qwen3-30b-a3b+nomic-embed-text-v1.5:padded-\(wiki.embeddingDimension)")
+    }
+    func remotePlan(_ url: String) -> WikiInferencePlan {
+        WikiInferencePlan(
+            backend: .remote(url: url),
+            providerID: "remote-openai-compatible:\(wiki.embeddingModel):\(wiki.embeddingDimension):\(url)")
+    }
+    func mockPlan() -> WikiInferencePlan {
+        WikiInferencePlan(backend: .mock, providerID: "mock:\(wiki.embeddingDimension)")
+    }
+
+    switch wiki.inferenceBackend {
+    case .mock:
+        return mockPlan()
+    case .remote:
+        if let remoteURL { return remotePlan(remoteURL) }
+        return MLXLocalProvider.isAvailable(env: env) ? localPlan() : mockPlan()
+    case .local:
+        if MLXLocalProvider.isAvailable(env: env) { return localPlan() }
+        return mockPlan()
+    case .auto:
+        if MLXLocalProvider.isAvailable(env: env) { return localPlan() }
+        if let remoteURL, canUseRemote { return remotePlan(remoteURL) }
+        return mockPlan()
+    }
+}
+
+private func estimatedTokenCount(_ text: String) -> Int {
+    max(1, (text.utf8.count + 3) / 4)
+}
+
+/// Pick the inference backend. `auto` resolves to local MLX first (Qwen text
+/// tasks + dedicated Nomic embeddings), then remote OpenAI-compatible, then
+/// mock. Both real and mock providers are wrapped in `BoundedInferenceProvider`
 /// so deadlines/cancellation are honoured on the turn hot path.
 private func makeInference(wiki: WikiMemoryConfig,
+                           plan: WikiInferencePlan,
                            modelClient: any ModelClient,
-                           storeConfig: MemoryStoreConfig)
+                           storeConfig: MemoryStoreConfig,
+                           authProvider: WikiMemoryAuthProvider?)
 -> any LocalInferenceProvider {
     let inferenceConfig = MemoryInferConfig(
         embeddingDimension: storeConfig.embeddingDimension)
-    if let url = wiki.embeddingsURL, !url.isEmpty {
+    switch plan.backend {
+    case .local:
+        return BoundedInferenceProvider(
+            MLXLocalProvider(embeddingDimension: storeConfig.embeddingDimension),
+            config: inferenceConfig)
+    case .remote(let url):
         let bridge = ModelClientBridge(
             modelClient: modelClient,
             modelName: wiki.extractorModel,
             embeddings: ModelClientBridge.EmbeddingsEndpoint(
                 url: url,
                 apiKey: wiki.embeddingsAPIKey ?? "",
+                authProvider: authProvider?.bridge,
                 model: wiki.embeddingModel,
                 dimensions: storeConfig.embeddingDimension))
         return BoundedInferenceProvider(
             bridge.makeProvider(embeddingDimension: storeConfig.embeddingDimension),
             config: inferenceConfig)
+    case .mock:
+        return BoundedInferenceProvider(
+            MockInferenceProvider(embeddingDimension: storeConfig.embeddingDimension),
+            config: inferenceConfig)
     }
-    return BoundedInferenceProvider(
-        MockInferenceProvider(embeddingDimension: storeConfig.embeddingDimension),
-        config: inferenceConfig)
 }

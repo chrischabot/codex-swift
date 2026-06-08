@@ -197,6 +197,61 @@ public struct SpendRow: Sendable, Equatable {
     }
 }
 
+public struct DocumentChunkSummary: Sendable, Equatable {
+    public var document: DocumentRow
+    public var chunkCount: Int
+
+    public init(document: DocumentRow, chunkCount: Int) {
+        self.document = document
+        self.chunkCount = chunkCount
+    }
+}
+
+public struct ChunkEvidenceRow: Sendable, Equatable {
+    public var chunk: ChunkRow
+    public var document: DocumentRow?
+
+    public init(chunk: ChunkRow, document: DocumentRow?) {
+        self.chunk = chunk
+        self.document = document
+    }
+}
+
+public struct MemoryStoreIndexHealth: Sendable, Equatable {
+    public var documentCount: Int
+    public var chunkCount: Int
+    public var entityCount: Int
+    public var edgeCount: Int
+    public var zeroChunkDocumentIds: [Int64]
+    public var orphanChunkIds: [Int64]
+    public var chunksMissingVector: [Int64]
+    public var staleVectorRowIds: [Int64]
+    public var ftsIntegrityOK: Bool
+    public var ftsIntegrityError: String?
+
+    public init(documentCount: Int,
+                chunkCount: Int,
+                entityCount: Int,
+                edgeCount: Int,
+                zeroChunkDocumentIds: [Int64] = [],
+                orphanChunkIds: [Int64] = [],
+                chunksMissingVector: [Int64] = [],
+                staleVectorRowIds: [Int64] = [],
+                ftsIntegrityOK: Bool = true,
+                ftsIntegrityError: String? = nil) {
+        self.documentCount = documentCount
+        self.chunkCount = chunkCount
+        self.entityCount = entityCount
+        self.edgeCount = edgeCount
+        self.zeroChunkDocumentIds = zeroChunkDocumentIds
+        self.orphanChunkIds = orphanChunkIds
+        self.chunksMissingVector = chunksMissingVector
+        self.staleVectorRowIds = staleVectorRowIds
+        self.ftsIntegrityOK = ftsIntegrityOK
+        self.ftsIntegrityError = ftsIntegrityError
+    }
+}
+
 /// Result of a vector search: chunk id + cosine distance (0 = identical).
 public struct VectorHit: Sendable, Equatable {
     public var chunkId: Int64

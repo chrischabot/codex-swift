@@ -29,6 +29,15 @@ enum MCPJSON {
         guard let data = s.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(T.self, from: data)
     }
+
+    static func boundedInt(_ value: Int?,
+                           defaultValue: Int,
+                           min: Int,
+                           max: Int) -> Int? {
+        let raw = value ?? defaultValue
+        guard raw >= min, raw <= max else { return nil }
+        return raw
+    }
 }
 
 /// memory_hybrid_search
@@ -57,8 +66,12 @@ public struct HybridSearchTool: Tool {
             return ToolResult(callId: call.callId, output: "bad arguments",
                               success: false, truncated: false)
         }
+        guard let k = MCPJSON.boundedInt(args.k, defaultValue: 10, min: 1, max: 100) else {
+            return ToolResult(callId: call.callId, output: "invalid memory_hybrid_search arguments",
+                              success: false, truncated: false)
+        }
         if let p = args.persona { _ = await personas.setActive(p) }
-        let hits = try await retriever.search(args.query, k: args.k ?? 10, rerank: true)
+        let hits = try await retriever.search(args.query, k: k, rerank: true)
         struct HitOut: Encodable {
             var chunk_id: Int64; var doc_uri: String; var score: Double; var snippet: String
             var why: WhyOut
@@ -176,7 +189,8 @@ public struct RecentInterestingTool: Tool {
     {"type":"object","required":["since_iso"],"properties":{
       "since_iso":{"type":"string"},
       "min_score":{"type":"number","default":0.7},
-      "persona":{"type":"string"}}}
+      "persona":{"type":"string"},
+      "limit":{"type":"integer","minimum":1,"maximum":100,"default":20}}}
     """
     private let store: MemoryStore
     private let retriever: MemoryRetriever
@@ -206,10 +220,14 @@ public struct RecentInterestingTool: Tool {
             ?? ISO8601DateFormatter().date(from: args.since_iso)
         let sinceTs = Int64((date ?? Date(timeIntervalSince1970: 0))
                                 .timeIntervalSince1970)
+        guard let limit = MCPJSON.boundedInt(args.limit, defaultValue: 20, min: 1, max: 100) else {
+            return ToolResult(callId: call.callId, output: "invalid memory_recent_interesting arguments",
+                              success: false, truncated: false)
+        }
         let rows = try await store.recentInteresting(
             since: sinceTs,
             minScore: args.min_score ?? 0.7,
-            limit: args.limit ?? 20)
+            limit: limit)
         struct Item: Encodable {
             var insight_id: Int64
             var chunk_id: Int64
@@ -285,7 +303,7 @@ public struct AskLocalBrainTool: Tool {
     public let jsonSchema = """
     {"type":"object","required":["question"],"properties":{
       "question":{"type":"string"},
-      "persona":{"type":"string"},"k":{"type":"integer","default":20}}}
+      "persona":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":100,"default":20}}}
     """
     private let retriever: MemoryRetriever
     private let inference: any LocalInferenceProvider
@@ -301,7 +319,11 @@ public struct AskLocalBrainTool: Tool {
             return ToolResult(callId: call.callId, output: "bad arguments",
                               success: false, truncated: false)
         }
-        let hits = try await retriever.search(args.question, k: args.k ?? 20, rerank: false)
+        guard let k = MCPJSON.boundedInt(args.k, defaultValue: 20, min: 1, max: 100) else {
+            return ToolResult(callId: call.callId, output: "invalid memory_ask_local_brain arguments",
+                              success: false, truncated: false)
+        }
+        let hits = try await retriever.search(args.question, k: k, rerank: false)
         let snippets = hits.map(\.snippet).joined(separator: "\n\n")
         // The "local brain" answer is a synthesised paragraph stitched from
         // the top hits. A real impl prompts the local extractor; here we hand
@@ -318,7 +340,7 @@ public struct AskLocalBrainTool: Tool {
 public struct EscalateToBrainTool: Tool {
     public let name = "memory_escalate_to_brain"
     public let parallelSafe = false
-    public let toolDescription = "Spend-gated GPT-5.5 escalation. Returns an insight card or a rate-limit reason."
+    public let toolDescription = "Spend-gated model escalation through shared OpenAI/ChatGPT auth. Returns an insight card or a denial reason."
     public let jsonSchema = """
     {"type":"object","required":["question","reason"],"properties":{
       "question":{"type":"string"},

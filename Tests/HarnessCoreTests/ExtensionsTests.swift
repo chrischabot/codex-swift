@@ -580,6 +580,17 @@ final class ExtensionsTests: XCTestCase {
                         "feature on + an enabled manifest yields a registry")
     }
 
+    func testInstallAddonsInstallsMemoryProviderWithoutExtensionsFeature() {
+        // Personal memory is a product-default seam. It must not require the
+        // general `[features].extensions` gate, which only controls unrelated
+        // extension manifests.
+        let config = Config(layers: [ConfigLayer(name: "test", values: [:])])
+        let cfg = SessionConfig(threadId: ThreadId.generate(), cwd: "/w")
+        let memory = MockMemoryProvider(id: "mem0", snippets: [])
+        XCTAssertNotNil(installAddons(config: config, sessionConfig: cfg, memoryProvider: memory),
+                        "selected memory provider installs even when general extensions are off")
+    }
+
     func testInstallAddonsNilWhenEnabledButNoManifests() {
         // Feature on but the [extensions] table is empty/absent → still nil
         // (nothing to wire), keeping the engine byte-identical.
@@ -964,6 +975,7 @@ final class ExtensionsTests: XCTestCase {
     }
 
     func testSelectMemoryProviderByConfigDefaultAndDedup() {
+        let mem0 = MockMemoryProvider(id: "mem0", snippets: [])
         let wiki = MockMemoryProvider(id: "wiki", snippets: [])
         let core = MockMemoryProvider(id: "core", snippets: [])
 
@@ -972,18 +984,17 @@ final class ExtensionsTests: XCTestCase {
             "memory": .object(["provider": .string("wiki")])])])
         XCTAssertEqual(selectMemoryProvider(config: cfgWiki, candidates: [wiki, core])?.id, "wiki")
 
-        // No key → nil (recall is EXPLICIT opt-in, never auto-on).
+        // No key → mem0 when available (the product default).
         let empty = Config(layers: [ConfigLayer(name: "t", values: [:])])
-        XCTAssertNil(selectMemoryProvider(config: empty, candidates: [core]),
-                     "no [memory].provider → nil even with a single candidate")
+        XCTAssertEqual(selectMemoryProvider(config: empty, candidates: [wiki, mem0, core])?.id, "mem0")
+
+        // No key + no mem0 candidate → core fallback.
+        XCTAssertEqual(selectMemoryProvider(config: empty, candidates: [wiki, core])?.id, "core")
 
         // provider = "none" → nil (explicit disable).
         let none = Config(layers: [ConfigLayer(name: "t", values: [
             "memory": .object(["provider": .string("none")])])])
         XCTAssertNil(selectMemoryProvider(config: none, candidates: [core]))
-
-        // No key + multiple candidates → nil.
-        XCTAssertNil(selectMemoryProvider(config: empty, candidates: [wiki, core]))
 
         // Configured id not among candidates → nil.
         let cfgGhost = Config(layers: [ConfigLayer(name: "t", values: [
@@ -997,6 +1008,29 @@ final class ExtensionsTests: XCTestCase {
             "memory": .object(["provider": .string("core")])])])
         let picked = selectMemoryProvider(config: cfgCore, candidates: [coreA, coreB]) as? MockMemoryProvider
         XCTAssertEqual(picked?.id, "core")
+    }
+
+    func testCoreMemoryToolsAreHiddenUnlessCoreOrLegacyOptIn() {
+        let empty = Config(layers: [ConfigLayer(name: "t", values: [:])])
+        XCTAssertFalse(shouldRegisterCoreMemoryTools(config: empty))
+
+        let mem0 = Config(layers: [ConfigLayer(name: "t", values: [
+            "memory": .object(["provider": .string("mem0")]),
+        ])])
+        XCTAssertFalse(shouldRegisterCoreMemoryTools(config: mem0))
+
+        let core = Config(layers: [ConfigLayer(name: "t", values: [
+            "memory": .object(["provider": .string("core")]),
+        ])])
+        XCTAssertTrue(shouldRegisterCoreMemoryTools(config: core))
+
+        let legacy = Config(layers: [ConfigLayer(name: "t", values: [
+            "memory": .object([
+                "provider": .string("mem0"),
+                "legacy_tools": .bool(true),
+            ]),
+        ])])
+        XCTAssertTrue(shouldRegisterCoreMemoryTools(config: legacy))
     }
 
     // MARK: Phase 2 — Workflows as a ToolPack extension

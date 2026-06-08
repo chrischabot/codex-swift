@@ -45,7 +45,7 @@ extension mechanisms.
 |---|---|---|
 | D1 | Local LLM (gemma/qwen) scope | **Addon-only utility.** A separate `SmallModel` client used only by extensions (primarily Memory Wiki labeling/scoring). Never enters the agent's model path. "Escalation" = an extension spawns a real codex turn/subagent. |
 | D2 | Content curation / n8n-style "Flows" | **Out of scope for codex-swift.** It becomes a **separate project** (its own UI *and* backend). codex-swift's job is only to keep its daemon surfaces clean enough that the Flows project can integrate later as a client; the integration contract is deliberately **not** designed yet. |
-| D3 | Memory | **One swappable slot.** Define `MemoryProvider`; the vector Memory Wiki is impl #1; codex's own `HarnessCore/Memories` becomes another impl behind the same slot. One recall path, one capture path. |
+| D3 | Memory | **One swappable personal-memory slot.** Define `MemoryProvider`; mem0 is the default implementation, codex's own `HarnessCore/Memories` is the markdown fallback, and the vector Memory Wiki remains a compatibility provider while it moves toward a separate knowledge-corpus surface. One recall path, one capture path. |
 | D4 | Trust & packaging | **We build all first-party extensions → native, in-process, trusted.** We never ship our own features as MCP. **MCP = external, third-party services we did not build → untrusted by design**, isolated out-of-process. |
 | D5 | `ExtensionRegistry` `Config` generic | ~~Daemon `Config`~~ → **`SessionConfig`** (revised during Phase 0). `HarnessCore` cannot depend on the daemon executable's `Config` without a layering cycle; `SessionConfig` is the per-session value already threaded everywhere, and the `[extensions]` table is parsed at the composition root (which *does* have `Config`) and injected. Confirmed correct by adversarial review. |
 | D6 | Hot-path discipline | Recall/context contributors borrow the **Workflows stall/timeout** discipline (strict per-call timeout; degrade to empty). |
@@ -163,9 +163,9 @@ types: `Tool`, `ModelClient`/`Prompt`/`ModelSettings`/`ResponseStream`,
 `ServerNotification`, `EngineOp`, `ExtensionRegistry`, `PromptFragment`.
 
 ### 7.1 MemoryProvider (the swappable slot — D3)
-One slot, one active provider. Split into read engine + lifecycle seams (so a
-pure-RAG impl, the Wiki, mem0, or a novel approach each implement only what they
-need).
+One personal-memory slot, one active provider. Split into read engine +
+lifecycle seams (so mem0, the core markdown fallback, the Wiki compatibility
+provider, pure RAG, or a novel approach each implement only what they need).
 
 ```swift
 public protocol MemoryProvider: Sendable {
@@ -202,9 +202,10 @@ Integration (all via the spine, no core edit beyond §5):
 - **Import is out-of-band:** a separate `detect → plan → apply` pipeline produces
   a previewable, conflict-aware plan; it is *not* part of `MemoryProvider`.
 
-Impl #1 = the existing Memory Wiki (`MemoryStore.searchVectors/searchLexical/
-upsertDocument` already exist). Impl #2 = a thin adapter over core
-`HarnessCore/Memories`. mem0/RAG = future adapters.
+Default impl = mem0 (`Mem0MemoryProvider`, additive fact extraction + hybrid
+recall). Fallback impl = a thin adapter over core `HarnessCore/Memories`.
+Compatibility impl = the existing Memory Wiki search stack while the wiki moves
+toward a separate professional `KnowledgeCorpus`.
 
 ### 7.2 ToolPack (bus-backed tools)
 ```swift
@@ -299,7 +300,8 @@ distinction then.
 
 | Use case | Contracts used | Flow |
 |---|---|---|
-| **Memory Wiki** | `MemoryProvider` (slot impl #1) + `Embedder` + ToolPack | recall→`contextContributor`; write→capture hook + `memory_*` tools |
+| **Personal memory** | `MemoryProvider` slot (`Mem0MemoryProvider` default, core fallback) | recall→`contextContributor`; write→capture hook + provider tools |
+| **Memory Wiki** | `KnowledgeCorpus` direction + compatibility `WikiMemoryProvider` + ToolPack | source-backed wiki search/get/apply/lint + optional recall compatibility |
 | **Agent Workflows** (existing) | ToolPack + bus | already wired; relabel as extension |
 | **Local classification** | `SmallModelService` | memory labeling/scoring; escalate via spawning a codex turn |
 | **Channels** (telegram/discord/slack/google) | `Channel` + `ChannelHost` | inbound→`submitTurn`; outbound←`events`; identity server-injected |
@@ -361,8 +363,8 @@ primary rule is simply ours = native, theirs = MCP.)
 
 ## 11. Phased plan
 
-- **Phase 0 — Spine.** Activate `ExtensionAPI` (generic over the daemon `Config`, D5); add the optional `registry` field + 5 guarded call-sites to `SessionEngine`; write `installAddons()`; add the `[extensions]` config table + `ExtensionManifest`. Ship with zero features enabled → core behavior byte-identical. (Verify with the existing wire-faithful tests.)
-- **Phase 1 — Memory slot.** Define `MemoryProvider`/`Embedder`; make the Memory Wiki impl #1; wire recall (contextContributor, fenced, Workflows-style timeout per D6) + capture (turn onStop) + `memory_*` via `MemoryBus`. Adapter for core `HarnessCore/Memories` as impl #2. Migration as a side pipeline.
+- **Phase 0 — Spine.** Activate `ExtensionAPI` (generic over the daemon `Config`, D5); add the optional `registry` field + 5 guarded call-sites to `SessionEngine`; write `installAddons()`; add the `[extensions]` config table + `ExtensionManifest`. At Phase 0, zero features enabled meant core behavior byte-identical; today personal memory is the deliberate default exception. (Verify no-registry behavior with the existing wire-faithful tests.)
+- **Phase 1 — Memory slot.** Define `MemoryProvider`; make mem0 the default personal-memory implementation, wire recall (contextContributor, fenced, Workflows-style timeout per D6) + capture (turn onStop/onAbort) + provider tools. Keep core `HarnessCore/Memories` as fallback and `WikiMemoryProvider` as a compatibility path while the wiki moves into a separate knowledge-corpus design.
 - **Phase 2 — Reclassify Workflows** as a ToolPack extension (mostly relabeling; it already uses the bus). Confirms the model on a live feature.
 - **Phase 3 — SmallModel utility.** Second `ModelClient` at a local endpoint + `SmallModelService` + schema-JSON (reuse Workflows' validator). First consumer = Memory Wiki labeling/scoring.
 - **Phase 4 — Channels.** `Channel`/`ChannelHost` over the supervisor; first concrete channel (Telegram is simplest). Then the "fashion agent" conversational side as pure composition.
@@ -392,7 +394,7 @@ Each phase is independently shippable and leaves core pristine.
 
 **Phase 2 status: COMPLETE.** `ToolPack` contract (`id`/`tools()`/optional `install()`) in HarnessCore; `WorkflowsToolPack` classifies Workflows (surfaces the 4 workflow tools + a manifest). Deliberately did NOT rewire the orchestrator: a bus-backed feature = a ToolPack (tool surface) + a host-installed bus provider (backing) — forcing the coherent orchestrator into a stateless pack would be churn-for-churn's-sake. Existing Workflows wiring/tests untouched (83 green).
 
-**Phase 1 status: COMPLETE & verified.** `MemoryProvider` slot (HarnessCore) with `CoreMemoriesProvider` (impl #2, keyword recall over `.md` memories) and `WikiMemoryProvider` (impl #1, adapter over `MemoryRetriever`, in `MemoryExtension`); recall→fenced `contextContributor` (escapes `<>&` + folds newlines + brackets the body with untrusted-guards, kept at low `.contextualUser` authority by design), capture→best-effort `onStop`, `selectMemoryProvider` (explicit opt-in via `[memory].provider`; `"none"`/unknown → off; dedup-by-id), engine stashes the per-turn query (overwritten every turn), wired in both composition roots. 172 HarnessCore + 3 MemoryExtension deterministic tests + a live recall E2E. Adversarial review caught real defects (cross-turn query leak on text-less turns; newline/citation injection past the fence; an unwired `tools()` limb; a surprising auto-on default) — all fixed with regressions. **Deferred:** the Wiki provider's composition-root construction (the embeddings/inference stack) — `WikiMemoryProvider` exists + maps correctly, but the root currently registers only the core candidate; capture of assistant text and `onTurnAbort` capture.
+**Phase 1 status: COMPLETE & verified.** `MemoryProvider` slot (HarnessCore) with `Mem0MemoryProvider` as the default personal-memory provider, `CoreMemoriesProvider` as the `.md` fallback, and `WikiMemoryProvider` as the compatibility wiki provider; recall→fenced `contextContributor` (escapes `<>&` + folds newlines + brackets the body with untrusted-guards, kept at low `.contextualUser` authority by design), capture→best-effort `onStop`/`onAbort`, `selectMemoryProvider` (unset → mem0 if available, then core; `"none"`/unknown → off; dedup-by-id), engine stashes the per-turn query (overwritten every turn), wired in both composition roots. HarnessCore, MemoryExtension, and Mem0Extension deterministic tests cover the slot, provider mapping, tools, and capture/recall paths. Adversarial review caught real defects (cross-turn query leak on text-less turns; newline/citation injection past the fence; an unwired `tools()` limb; assistant-text capture gaps) — all fixed with regressions. The product direction now separates mem0 personal memory from the Memory Wiki knowledge system; see `docs/features/memory-systems.md`.
 
 **Phase 0 status: COMPLETE & verified** (build green; 163 HarnessCore deterministic tests incl. byte-neutrality + uncooperative-contributor regressions; live-LLM E2E green). Adversarial review caught and fixed two real defects: the D6 timeout used `withTaskGroup` (which structurally joins the loser, so it did NOT bound an uncooperative contributor — rewritten to a detached claim-once race) and a turn-1 double-injection (the turn-1 and per-turn sites both fired `promptFragments` — collapsed to one per-turn site). Duplicate-id dedupe added.
 

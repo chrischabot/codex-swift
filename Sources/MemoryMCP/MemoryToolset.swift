@@ -36,6 +36,10 @@ public struct MemoryToolset: Sendable {
             SetPersonaTool(personas: personas),
             AskLocalBrainTool(retriever: retriever, inference: inference),
             EscalateToBrainTool(gate: gate, store: store),
+            WikiBriefTool(store: store),
+            WikiCompareTool(store: store),
+            WikiAngleTool(store: store),
+            WikiPMFitTool(store: store),
         ]
     }
 }

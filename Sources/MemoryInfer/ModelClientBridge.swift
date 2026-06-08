@@ -1,19 +1,38 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import InfraPrimitives
 import ModelClient
 
 /// Bridges CodexKit's existing `ModelClient` into the three closures that
 /// `RemoteOpenAICompatibleProvider` expects. The text closure runs a single
 /// turn through `client.stream(...)`, accumulating output until `.completed`,
-/// then returns it along with the usage breakdown. The embedding closure
-/// shells out to `/v1/embeddings` via curl (the Responses API does not host
-/// embeddings). The logprob closure returns a deterministic fallback derived
-/// from the model's perplexity estimate when the provider does not expose
-/// logprobs directly — Responses API does not emit them today.
+/// then returns it. The embedding closure POSTs to `/v1/embeddings` using
+/// URLSession so bearer tokens never enter process argv. The logprob closure
+/// returns a deterministic fallback derived from the model's perplexity
+/// estimate when the provider does not expose logprobs directly — Responses
+/// API does not emit them today.
 public struct ModelClientBridge: Sendable {
+    public struct BearerTokenProvider: Sendable {
+        let accessToken: @Sendable () async -> String?
+        let refreshToken: @Sendable () async -> String?
+
+        public init(accessToken: @escaping @Sendable () async -> String?,
+                    refreshToken: @escaping @Sendable () async -> String?) {
+            self.accessToken = accessToken
+            self.refreshToken = refreshToken
+        }
+
+        public static func staticToken(_ token: String) -> BearerTokenProvider {
+            BearerTokenProvider(accessToken: { token }, refreshToken: { token })
+        }
+    }
+
     public struct EmbeddingsEndpoint: Sendable {
         public var url: String
         public var apiKey: String
+        public var authProvider: BearerTokenProvider?
         public var model: String
         /// Number of vector dimensions to request (some providers honour an
         /// explicit `dimensions` param; for Nomic / text-embedding-3 we leave
@@ -21,10 +40,12 @@ public struct ModelClientBridge: Sendable {
         public var dimensions: Int?
         public init(url: String,
                     apiKey: String,
+                    authProvider: BearerTokenProvider? = nil,
                     model: String = "text-embedding-3-small",
                     dimensions: Int? = nil) {
             self.url = url
             self.apiKey = apiKey
+            self.authProvider = authProvider
             self.model = model
             self.dimensions = dimensions
         }
@@ -77,19 +98,19 @@ public struct ModelClientBridge: Sendable {
         }
     }
 
-    /// Build the embeddings closure. Shells out to curl against the
-    /// configured `/v1/embeddings` endpoint and parses the standard OpenAI
-    /// response shape. When no endpoint is configured the closure throws so
-    /// the caller falls back to a local provider.
+    /// Build the embeddings closure. Calls the configured `/v1/embeddings`
+    /// endpoint and parses the standard OpenAI response shape. When no endpoint
+    /// is configured the closure throws so the caller falls back to a local
+    /// provider.
     public func embeddingCall() -> RemoteOpenAICompatibleProvider.EmbeddingCall {
         let endpoint = embeddings
         return { texts, deadline in
             guard let endpoint else {
                 throw InferenceError.providerUnavailable("no /v1/embeddings endpoint configured")
             }
-            return try await curlEmbeddings(endpoint: endpoint,
-                                            texts: texts,
-                                            deadline: deadline)
+            return try await urlSessionEmbeddings(endpoint: endpoint,
+                                                  texts: texts,
+                                                  deadline: deadline)
         }
     }
 
@@ -122,36 +143,66 @@ public struct ModelClientBridge: Sendable {
     }
 }
 
-// MARK: - curl-backed /v1/embeddings
+// MARK: - URLSession-backed /v1/embeddings
 
-func curlEmbeddings(endpoint: ModelClientBridge.EmbeddingsEndpoint,
-                    texts: [String],
-                    deadline: Deadline) async throws -> [[Float]] {
+func urlSessionEmbeddings(endpoint: ModelClientBridge.EmbeddingsEndpoint,
+                          texts: [String],
+                          deadline: Deadline,
+                          session: URLSession = .shared) async throws -> [[Float]] {
+    let usesAuthProvider = endpoint.apiKey.isEmpty && endpoint.authProvider != nil
+    let bearer = usesAuthProvider ? await endpoint.authProvider?.accessToken() : endpoint.apiKey
+    let first = try await runURLSessionEmbeddings(endpoint: endpoint, texts: texts,
+                                                  deadline: deadline, bearer: bearer,
+                                                  session: session)
+    if first.status == 401, usesAuthProvider,
+       let refreshed = await endpoint.authProvider?.refreshToken(), !refreshed.isEmpty {
+        let retry = try await runURLSessionEmbeddings(endpoint: endpoint, texts: texts,
+                                                      deadline: deadline, bearer: refreshed,
+                                                      session: session)
+        return try parseEmbeddingResponse(retry.body, status: retry.status)
+    }
+    return try parseEmbeddingResponse(first.body, status: first.status)
+}
+
+private func runURLSessionEmbeddings(endpoint: ModelClientBridge.EmbeddingsEndpoint,
+                                     texts: [String],
+                                     deadline: Deadline,
+                                     bearer: String?,
+                                     session: URLSession) async throws -> (body: Data, status: Int?) {
     let maxTime = max(2, Int(deadline.remaining.seconds))
     var body: [String: Any] = ["model": endpoint.model, "input": texts]
     if let d = endpoint.dimensions { body["dimensions"] = d }
     let bodyData = try JSONSerialization.data(withJSONObject: body)
-    let tmp = NSTemporaryDirectory() + "codex-memory-embed-\(UUID().uuidString).json"
-    defer { try? FileManager.default.removeItem(atPath: tmp) }
-    try bodyData.write(to: URL(fileURLWithPath: tmp))
-    let argv = [
-        "-sS", "--max-time", "\(maxTime)",
-        "-H", "Content-Type: application/json",
-        "-H", "Authorization: Bearer \(endpoint.apiKey)",
-        "-X", "POST",
-        "--data-binary", "@\(tmp)",
-        endpoint.url,
-    ]
-    let result = await runSubprocess(executable: "/usr/bin/curl", argv: argv)
-    guard result.exit == 0 else {
-        throw InferenceError.providerUnavailable("curl /v1/embeddings exit=\(result.exit) \(result.stderr.prefix(200))")
+    guard let url = URL(string: endpoint.url) else {
+        throw InferenceError.providerUnavailable("invalid /v1/embeddings URL")
     }
-    guard let object = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Any] else {
+    var request = URLRequest(url: url, timeoutInterval: TimeInterval(maxTime))
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    if let bearer, !bearer.isEmpty {
+        request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+    }
+    request.httpBody = bodyData
+    do {
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode
+        return (data, status)
+    } catch {
+        throw InferenceError.providerUnavailable("/v1/embeddings request failed: \(error)")
+    }
+}
+
+private func parseEmbeddingResponse(_ body: Data, status: Int?) throws -> [[Float]] {
+    guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
         throw InferenceError.malformedResponse("non-JSON embeddings response")
     }
     if let err = object["error"] as? [String: Any] {
         let msg = (err["message"] as? String) ?? "unknown"
-        throw InferenceError.providerUnavailable("/v1/embeddings: \(msg)")
+        let prefix = status.map { "HTTP \($0) " } ?? ""
+        throw InferenceError.providerUnavailable("/v1/embeddings: \(prefix)\(msg)")
+    }
+    if let status, !(200..<300).contains(status) {
+        throw InferenceError.providerUnavailable("/v1/embeddings: HTTP \(status)")
     }
     guard let data = object["data"] as? [[String: Any]] else {
         throw InferenceError.malformedResponse("missing data[]")
@@ -165,32 +216,4 @@ func curlEmbeddings(endpoint: ModelClientBridge.EmbeddingsEndpoint,
         out.append(arr.map { ($0 as? Double).map(Float.init) ?? 0 })
     }
     return out
-}
-
-struct SubprocessResult: Sendable {
-    var exit: Int32
-    var stdout: Data
-    var stderr: String
-}
-
-func runSubprocess(executable: String, argv: [String]) async -> SubprocessResult {
-    await withCheckedContinuation { cont in
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: executable)
-        p.arguments = argv
-        let out = Pipe(); let err = Pipe()
-        p.standardOutput = out; p.standardError = err
-        do { try p.run() } catch {
-            cont.resume(returning: SubprocessResult(
-                exit: 127, stdout: Data(),
-                stderr: "spawn failed: \(error)"))
-            return
-        }
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        cont.resume(returning: SubprocessResult(
-            exit: p.terminationStatus, stdout: outData,
-            stderr: String(data: errData, encoding: .utf8) ?? ""))
-    }
 }

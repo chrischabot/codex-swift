@@ -64,10 +64,38 @@ surface gated (`// MACOS-COMPLETION:`) · ⛔ not started.
   `.contextMessage` mapped to `Message{role: developer|user, content:
   [input_text...]}`; legacy `[ThreadItem]` reader fallback for pre-P9.3
   rollouts; durable resume after daemon restart / true OS reboot.
-- **Memory subsystem** — `codex-memory` daemon, MemoryStore archive with
-  per-source body files, MemoryInfer (local embedding provider, MLX-Swift
-  optional), MemoryScore single-flight insight scoring, MemoryMCP adapter,
-  consolidation at turn end, durable `memory/reset` semantics.
+- **Memory subsystem** — default native mem0 personal-memory provider
+  (`Mem0Core`/`Mem0Store`/`Mem0Extension` + `codex-mem0`), legacy core `.md`
+  memories, `codex-memory` daemon, MemoryStore archive with per-source body
+  files, MemoryInfer (local embedding provider, MLX-Swift optional),
+  MemoryScore single-flight insight scoring, MemoryMCP adapter, consolidation
+  at turn end, local-first MLX Qwen/Nomic inference with OpenAI-compatible
+  fallback, shared API-key/ChatGPT auth for remote memory calls, durable
+  `memory/reset` semantics, and initial mem0 admin
+  list/update/delete/history/privacy tools with scoped safety checks,
+  deleted-memory history authorization, secret rejection, project-local
+  `[memory.mem0]` hardening, release-mode admin latency benchmarks, and initial
+  `codex-memory import-markdown` support with offline seed-corpus dry-run,
+  path/symlink guards, idempotent replacement, partial same-SHA repair, and
+  state files. Initial `codex-memory wiki-compile` / `wiki-lint` support now
+  compiles source/entity/edge-claim pages plus deterministic
+  `_digests/agent-digest.json`, preserves human edit blocks, optionally indexes
+  compiled pages through staged replacement, and lints markdown roots, compiled
+  vault coverage, and SQLite index health; warm release lint over the 4,967-file
+  seed corpus completes in ~2.75s with 0 errors / 49 warnings against an empty
+  temp store. Initial cited production tools (`wiki_brief`, `wiki_compare`,
+  `wiki_angle`, `wiki_pmfit`) are wired into `MemoryToolset`; they are
+  lexical-only over `MemoryStore`, make zero embedding/model calls, expose
+  `retrieval.cloud_spend_usd = 0`, cite every generated point, and return
+  explicit insufficient-evidence payloads instead of uncited synthesis. Initial
+  MLX BGE reranking is wired in `MemoryInfer`: a Roberta/BERT
+  sequence-classification wrapper loads `BAAI/bge-reranker-v2-m3` lazily via a
+  custom `EmbedderModelFactory` registry, scores query/candidate pairs, and
+  falls back to cosine rerank when the local cross-encoder is unavailable.
+  Planned next:
+  bulk import crash/restart proof, durable wiki claim schema plus
+  synthesis/dashboard pages, and deeper mem0 admin hardening for transactional
+  history, cursor pagination, and durable category policy.
 - **Auth + broker** — `codex-broker` shared service, auth state machine,
   refresh coalescing (200-request storm), durable broker state restart,
   refresh-failure breaker, proactive refresh due-storm coalescing, real

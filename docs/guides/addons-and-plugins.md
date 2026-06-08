@@ -68,7 +68,11 @@ Several addons assumed guarantees the seams didn't yet enforce. The "reverse the
 
 ## Using it
 
-**Enable the subsystem.** The whole spine is opt-in. Turn it on with `CODEX_FEATURE_EXTENSIONS=1` or `[features].extensions = true` in `config.toml`. With it off, `installAddons` returns `nil` and the engine is byte-identical to stock.
+**Enable general addons.** Addon manifests are opt-in. Turn them on with
+`CODEX_FEATURE_EXTENSIONS=1` or `[features].extensions = true` in `config.toml`.
+Personal memory is the exception: the selected memory provider can install
+recall/capture without enabling unrelated addon manifests, because mem0 is the
+default memory path.
 
 **Add a capability as one file.** The full worked example from `BUILDING_EXTENSIONS.md` — a context module that injects project facts every turn:
 

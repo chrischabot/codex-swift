@@ -306,7 +306,7 @@ final class McpP73Tests: XCTestCase {
     // MARK: - F8: OAuth store wiring
 
     /// Verifies both daemon entrypoints (`codex-session/main.swift` and
-    /// `codexd/main.swift`) pass a real `McpOAuthStore` into
+    /// `codexd/CodexDaemon.swift`) pass a real `McpOAuthStore` into
     /// `McpManager.startAll`, not `nil`. We do this via a source-text grep
     /// — the failure mode is a single-line regression that's hard to
     /// notice in code review, and grep is the cheapest detector.
@@ -332,7 +332,7 @@ final class McpP73Tests: XCTestCase {
         }
         let paths = [
             root.appendingPathComponent("Sources/codex-session/main.swift").path,
-            root.appendingPathComponent("Sources/codexd/main.swift").path,
+            root.appendingPathComponent("Sources/codexd/CodexDaemon.swift").path,
         ]
         for p in paths {
             guard let data = fm.contents(atPath: p),

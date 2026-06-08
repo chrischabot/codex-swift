@@ -61,6 +61,36 @@ case "import-claude":
         exit(2)
     }
 
+case "import-markdown":
+    do {
+        let result = try await CodexMemoryMarkdownImport.runDetailed(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.report.failed == 0 ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("import-markdown failed: \(error)\n".utf8))
+        exit(2)
+    }
+
+case "wiki-compile":
+    do {
+        let result = try await CodexMemoryWikiCompile.runDetailed(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.report.failed == 0 ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-compile failed: \(error)\n".utf8))
+        exit(2)
+    }
+
+case "wiki-lint":
+    do {
+        let result = try await CodexMemoryWikiLint.runDetailed(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.report.errorCount == 0 ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-lint failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "run":
     await CodexMemoryRun.runForever()
 
@@ -71,6 +101,9 @@ case "help", "--help", "-h":
       verify          Phase-0 self-check: probe deps, schema, pricing pins.
       tick            Run one ingest/process cycle then exit (useful in tests).
       import-claude   Import Claude transcript memory documents from JSONL.
+      import-markdown Import local markdown roots into the Memory Wiki index.
+      wiki-compile    Compile source/entity/claim pages and agent digests.
+      wiki-lint       Lint markdown roots, compiled vault, and wiki index health.
       run             Long-running daemon: ingest → process → score, with MCP.
 
     See docs/codex-swift-memory-wiki.md for the full design.

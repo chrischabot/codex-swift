@@ -35,21 +35,21 @@ final class WikiMemoryCompositionTests: XCTestCase {
         MockModelClient(repeating: .hello("ok"), times: 8)
     }
 
-    // MARK: - factory: builds a provider with the 7-tool MemoryToolset
+    // MARK: - factory: builds a provider with the MemoryToolset
 
     func testFactoryBuildsProviderWithToolsetAndWikiId() async throws {
         let db = tempDBPath()
         defer { cleanup(db) }
         // No embeddingsURL → mock inference backend (deterministic, no network).
-        let cfg = WikiMemoryConfig(dbPath: db)
+        let cfg = WikiMemoryConfig(dbPath: db, inferenceBackend: .mock)
         guard let provider = makeWikiMemoryProvider(wiki: cfg, modelClient: mockModel()) else {
             return XCTFail("makeWikiMemoryProvider returned nil for a fresh temp DB")
         }
         // Slot id must match the selection key.
         XCTAssertEqual(provider.id, "wiki")
-        // The seven `memory.*` MCP tools must be surfaced through tools().
-        XCTAssertEqual(provider.tools().count, 7,
-                       "wiki provider must expose the full MemoryToolset (7 tools)")
+        // The wiki MCP tools must be surfaced through tools().
+        XCTAssertEqual(provider.tools().count, 11,
+                       "wiki provider must expose the full MemoryToolset")
         // Every tool has a non-empty name (sanity — they are registered on the
         // router by name at the composition root).
         for t in provider.tools() {
@@ -63,7 +63,7 @@ final class WikiMemoryCompositionTests: XCTestCase {
     func testRecallOnEmptyDBDegradesToEmpty() async throws {
         let db = tempDBPath()
         defer { cleanup(db) }
-        guard let provider = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db),
+        guard let provider = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db, inferenceBackend: .mock),
                                                     modelClient: mockModel()) else {
             return XCTFail("factory returned nil")
         }
@@ -76,12 +76,52 @@ final class WikiMemoryCompositionTests: XCTestCase {
     func testRecallEmptyQueryReturnsEmpty() async throws {
         let db = tempDBPath()
         defer { cleanup(db) }
-        guard let provider = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db),
+        guard let provider = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db, inferenceBackend: .mock),
                                                     modelClient: mockModel()) else {
             return XCTFail("factory returned nil")
         }
         let snippets = await provider.recall("   ", limit: 5)
         XCTAssertTrue(snippets.isEmpty)
+    }
+
+    func testExplicitLocalBackendDoesNotFallThroughToRemoteWhenUnavailable() async throws {
+        let db = tempDBPath()
+        defer { cleanup(db) }
+        let cfg = WikiMemoryConfig(
+            dbPath: db,
+            embeddingsURL: "http://127.0.0.1:9/v1/embeddings",
+            embeddingsAPIKey: "sk-should-not-be-used",
+            inferenceBackend: .local)
+        guard let provider = makeWikiMemoryProvider(
+            wiki: cfg,
+            modelClient: mockModel(),
+            env: ["CODEXKIT_MLX": "0"]) else {
+            return XCTFail("factory returned nil")
+        }
+        let tool = try XCTUnwrap(provider.tools().first { $0.name == "memory_hybrid_search" })
+        let result = try await tool.run(
+            ToolCall(callId: "hybrid", name: tool.name,
+                     argumentsJSON: #"{"query":"agent memory","k":3}"#),
+            cwd: "/")
+        XCTAssertTrue(result.success, result.output)
+    }
+
+    func testEscalationDoesNotFabricateSyntheticInsightFromMockInference() async throws {
+        let db = tempDBPath()
+        defer { cleanup(db) }
+        guard let provider = makeWikiMemoryProvider(
+            wiki: WikiMemoryConfig(dbPath: db, inferenceBackend: .mock),
+            modelClient: mockModel()) else {
+            return XCTFail("factory returned nil")
+        }
+        let tool = try XCTUnwrap(provider.tools().first { $0.name == "memory_escalate_to_brain" })
+        let result = try await tool.run(
+            ToolCall(callId: "brain", name: tool.name,
+                     argumentsJSON: #"{"question":"what changed?","reason":"test"}"#),
+            cwd: "/")
+        XCTAssertFalse(result.success)
+        XCTAssertTrue(result.output.contains("unparseable") || result.output.contains("admitted\":false"),
+                      result.output)
     }
 
     // MARK: - candidate selection (the exact composition-root logic)
@@ -97,7 +137,7 @@ final class WikiMemoryCompositionTests: XCTestCase {
     func testSelectionPicksWikiWhenConfigured() async throws {
         let db = tempDBPath()
         defer { cleanup(db) }
-        guard let wiki = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db),
+        guard let wiki = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db, inferenceBackend: .mock),
                                                 modelClient: mockModel()) else {
             return XCTFail("factory returned nil")
         }
@@ -112,7 +152,7 @@ final class WikiMemoryCompositionTests: XCTestCase {
     func testSelectionPicksCoreWhenConfigured() async throws {
         let db = tempDBPath()
         defer { cleanup(db) }
-        guard let wiki = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db),
+        guard let wiki = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db, inferenceBackend: .mock),
                                                 modelClient: mockModel()) else {
             return XCTFail("factory returned nil")
         }
@@ -122,20 +162,20 @@ final class WikiMemoryCompositionTests: XCTestCase {
         XCTAssertEqual(chosen?.id, "core")
     }
 
-    /// "none" and an absent provider both disable recall (nil), even with both
-    /// candidates registered.
-    func testSelectionNoneAndAbsentDisable() async throws {
+    /// "none" disables recall; an absent provider now means "mem0 default",
+    /// with core fallback if the mem0 candidate is not available.
+    func testSelectionNoneDisablesAndAbsentFallsBackToCore() async throws {
         let db = tempDBPath()
         defer { cleanup(db) }
-        guard let wiki = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db),
+        guard let wiki = makeWikiMemoryProvider(wiki: WikiMemoryConfig(dbPath: db, inferenceBackend: .mock),
                                                 modelClient: mockModel()) else {
             return XCTFail("factory returned nil")
         }
         let core = CoreMemoriesProvider(store: MemoryStore(codexHome: NSTemporaryDirectory()))
         XCTAssertNil(selectMemoryProvider(config: configWith(provider: "none"),
                                           candidates: [core, wiki]))
-        XCTAssertNil(selectMemoryProvider(config: configWith(provider: nil),
-                                          candidates: [core, wiki]))
+        XCTAssertEqual(selectMemoryProvider(config: configWith(provider: nil),
+                                            candidates: [core, wiki])?.id, "core")
     }
 
     /// An unknown provider id selects nothing (no surprise activation).
@@ -156,6 +196,7 @@ final class WikiMemoryCompositionTests: XCTestCase {
             "embedding_model": .string("local-embed"),
             "embeddings_url": .string("http://localhost:11434/v1/embeddings"),
             "embeddings_api_key": .string("local-key"),
+            "inference_backend": .string("local"),
         ])])
         // Pass an empty env so env fallbacks don't shadow the TOML values
         // (e.g. a real OPENAI_API_KEY in the test runner's environment).
@@ -166,6 +207,7 @@ final class WikiMemoryCompositionTests: XCTestCase {
         XCTAssertEqual(wiki.embeddingModel, "local-embed")
         XCTAssertEqual(wiki.embeddingsURL, "http://localhost:11434/v1/embeddings")
         XCTAssertEqual(wiki.embeddingsAPIKey, "local-key")
+        XCTAssertEqual(wiki.inferenceBackend, .local)
     }
 
     /// Defaults hold when `[memory]` carries only `provider`, and env supplies
@@ -185,6 +227,7 @@ final class WikiMemoryCompositionTests: XCTestCase {
         XCTAssertEqual(wiki.embeddingDimension, WikiMemoryConfig().embeddingDimension)
         XCTAssertEqual(wiki.embeddingsURL, "https://api.example/v1/embeddings")
         XCTAssertEqual(wiki.embeddingsAPIKey, "sk-from-env")
+        XCTAssertEqual(wiki.inferenceBackend, .auto)
     }
 
     /// TOML values take precedence over env for the embeddings endpoint/key.

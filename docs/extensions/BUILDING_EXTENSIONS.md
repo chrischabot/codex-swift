@@ -59,12 +59,15 @@ authority). `.contextualUser` = **untrusted/low-authority** (recalled memory).
 **Never put untrusted content at `.developer`.**
 
 ### 2.2 `MemoryProvider` — the swappable memory slot
-One provider active per session, chosen by `[memory].provider` (explicit
-opt-in). Implement `recall`/`capture`/`tools`/`status`; wire with
+One personal-memory provider active per session, chosen by `[memory].provider`.
+When unset, mem0 is the product default; `"core"` selects the legacy `.md`
+provider, `"wiki"` selects the compatibility wiki provider, and `"none"`
+disables recall. Implement `recall`/`capture`/`tools`; wire with
 `registerMemory(provider, into: builder)` (recall→fenced contextContributor,
-capture→onStop). Existing impls: `CoreMemoriesProvider` (`.md` files, keyword
-recall), `WikiMemoryProvider` (vector retriever). A new backend (RAG, mem0, …) =
-a new `MemoryProvider`, registered as a candidate, selected by config.
+capture→onStop). Existing impls: `Mem0MemoryProvider`, `CoreMemoriesProvider`
+(`.md` files, keyword recall), and `WikiMemoryProvider` (vector retriever,
+moving toward a separate KnowledgeCorpus/wiki surface). A new personal-memory
+backend = a new `MemoryProvider`, registered as a candidate, selected by config.
 
 ### 2.3 `ToolPack` / `*Bus` — agent tools
 - Pure tools → a `ToolPack` (`id` + `tools()`); register at the composition root.

@@ -1,6 +1,6 @@
 # Authentication
 
-*How Codex signs you in — ChatGPT browser/device-code login or an API key — keeps your credentials safe in the macOS Keychain, refreshes tokens behind your back, and hands a fresh bearer to every model turn.*
+*How Codex signs you in — ChatGPT browser/device-code login or an API key — keeps your credentials safe in the macOS Keychain, refreshes tokens behind your back, and hands a fresh bearer to every OpenAI-backed model or memory call.*
 
 ## Why it matters
 
@@ -10,7 +10,7 @@ Codex's auth layer is built so you sign in once and stop thinking about it. You 
 
 ## What it is
 
-The authentication subsystem gives you three ways to authenticate and one consistent way for those credentials to reach a model turn:
+The authentication subsystem gives you three ways to authenticate and one consistent way for those credentials to reach OpenAI-backed work:
 
 - **ChatGPT browser login** — opens an OAuth page in your browser; you approve, and tokens come back to a local callback. Best on the machine you're sitting at.
 - **ChatGPT device-code login** — shows you a short code and a URL. You open the URL on *any* device, sign in, and type the code. Best for headless or remote machines where no browser is available.
@@ -18,7 +18,7 @@ The authentication subsystem gives you three ways to authenticate and one consis
 
 After a ChatGPT login, Codex also tries (best-effort) to mint a long-lived OpenAI API key from your identity token, so the same login can serve both the ChatGPT-managed path and the API-key path.
 
-Whichever you choose, the result is a stored credential plus an account identity (account id, plan type like `plus`/`pro`/`enterprise`). From there, the system always answers one question on demand: *"give me a valid access token right now."*
+Whichever you choose, the result is a stored credential plus an account identity (account id, plan type like `plus`/`pro`/`enterprise`). From there, the system always answers one question on demand: *"give me a valid access token right now."* That bearer is shared by the core `ModelClient`, mem0's embeddings/extraction providers, and the Memory Wiki's text/embedding inference paths.
 
 ## How it works
 
@@ -32,7 +32,7 @@ Four pieces cooperate. Keep this mental model and the rest follows.
                 AuthRefreshBroker / BrokerService  ──┘   (single-flight refresh)
                       │
                       ▼ fresh bearer
-                 Model turn  ──►  OpenAI
+                 OpenAI-backed calls ──► OpenAI
 ```
 
 **AuthManager** (`Sources/Auth/AuthManager.swift`) is the actor that owns the whole login lifecycle: `loginStart`/`loginFinish` (browser PKCE), `deviceCodeStart`/`deviceCodeComplete`, `loginWithAPIKey`, `logout`, and the on-demand accessors `validAccessToken()` and `refreshAccessToken()`. It never talks to the network directly — it delegates to injectable seams (the token exchanger, device-code client) so the whole flow is testable offline.
@@ -49,7 +49,7 @@ On disk the schema is `AuthDotJson` (`Sources/Auth/AuthSupport.swift`): either a
 
 **The broker** (`Sources/Broker/Broker.swift`) is the anti-stampede layer. When N concurrent sessions all need a refresh at the same instant, `AuthRefreshBroker` (and `BrokerService`) collapse them through a *single-flight* keyed by account: one real refresh runs, everyone else awaits its result. `BrokerService` adds a durable cache, **proactive refresh** (refresh a bit *before* expiry, with jitter, so turns never block on it), and a **circuit breaker** — after a threshold of consecutive refresh failures it opens for a cooldown so a dead credential doesn't get hammered.
 
-**How credentials reach a turn.** When `codexd` starts, it builds the model client by resolving auth in precedence order (`Sources/codexd/main.swift`): an explicit `OPENAI_API_KEY` env var wins; otherwise a running broker's token; otherwise the stored credential via `AuthManager.validAccessToken()`. The client is wrapped in an `AuthRefreshingModelClient`: on a mid-turn `401` it calls back into `refreshAccessToken()`, gets a fresh bearer, and retries — so an expiring token mid-run heals itself instead of failing the turn.
+**How credentials reach OpenAI calls.** When `codexd` and `codex-session` start, they resolve auth in precedence order: an explicit `OPENAI_API_KEY` env var wins; otherwise a running broker's token; otherwise the stored credential via `AuthManager.validAccessToken()`. The core client is wrapped in an `AuthRefreshingModelClient`: on a mid-turn `401` it calls back into `refreshAccessToken()`, gets a fresh bearer, and retries. The same refreshable bearer is also passed to mem0 (`Mem0SessionAuthProvider`) and the Memory Wiki (`WikiMemoryAuthProvider`) so their OpenAI-compatible embeddings/extraction calls do not quietly fall back to API-key-only behavior. The host-wide `codex-memory` daemon follows the same precedence order when `CODEXKIT_MEMORY=1`.
 
 **When refresh can't recover.** A `401` from the token endpoint is classified (`Sources/Auth/RefreshFailure.swift`) into `expired` / `exhausted` (reused) / `revoked` / `other`. The first three are *permanent*: `validAccessToken()` short-circuits instead of burning another doomed refresh, and the user-facing message tells you to log out and sign in again. `other` is transient and a retry may recover.
 

@@ -1,4 +1,6 @@
 import Foundation
+import Auth
+import Config
 import InfraPrimitives
 import MemoryIngest
 import MemoryInfer
@@ -9,6 +11,39 @@ import MemoryScore
 import MemoryStore
 import ModelClient
 import Observability
+
+private struct MemoryOpenAIAuth {
+    let modelClient: any ModelClient
+    let embeddingAuthProvider: ModelClientBridge.BearerTokenProvider
+}
+
+private enum MemoryInferenceBackend: String {
+    case auto
+    case local
+    case remote
+    case mock
+
+    static func parse(_ raw: String?) -> MemoryInferenceBackend {
+        guard let raw else { return .auto }
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "local", "mlx", "mlx_local": return .local
+        case "remote", "openai": return .remote
+        case "mock", "offline": return .mock
+        default: return .auto
+        }
+    }
+}
+
+private enum ResolvedMemoryInferenceBackend {
+    case local
+    case remote
+    case mock
+}
+
+private struct MemoryInferencePlan {
+    var backend: ResolvedMemoryInferenceBackend
+    var providerID: String
+}
 
 /// Daemon glue. Wires the seven Memory* modules together so a single
 /// `codex-memory run` (or `codex-memory tick`) drives a coherent end-to-end
@@ -140,20 +175,31 @@ public enum CodexMemoryRun {
     }
 
     static func assemble() async throws -> AssembledMemory {
-        let storeConfig = MemoryStoreConfig.default
-        let store = try MemoryStore(storeConfig)
-        let ring = ChunkRing()
         let env = ProcessInfo.processInfo.environment
         let codexHome = env["CODEX_HOME"] ?? (NSHomeDirectory() + "/.codex")
 
-        // Pick the inference backend. Order: explicit env override → real
-        // OpenAI bridge when OPENAI_API_KEY is set → mock fallback.
+        // Pick the inference backend. Order: local MLX when available →
+        // explicit env API key / broker / stored ChatGPT auth → mock fallback.
+        let openAIAuth = await resolveOpenAIAuth(env: env, codexHome: codexHome)
+        let embeddingModel = env["CODEX_MEMORY_EMBEDDING_MODEL"] ?? "text-embedding-3-small"
+        let embeddingEndpoint = env["CODEX_MEMORY_EMBEDDINGS_URL"]
+            ?? "https://api.openai.com/v1/embeddings"
+        let plan = resolveInferencePlan(env: env,
+                                        openAIAuth: openAIAuth,
+                                        embeddingModel: embeddingModel,
+                                        embeddingEndpoint: embeddingEndpoint)
+        let storeConfig = MemoryStoreConfig(
+            path: MemoryStoreConfig.defaultPath(),
+            embeddingDimension: memoryEmbeddingDimension,
+            embeddingProviderID: plan.providerID)
+        let store = try MemoryStore(storeConfig)
+        let ring = ChunkRing()
         let inference = makeInference(
-            apiKey: env["OPENAI_API_KEY"],
+            openAIAuth: openAIAuth,
+            plan: plan,
             extractorModel: env["CODEX_MEMORY_EXTRACTOR_MODEL"] ?? "gpt-5.4-mini",
-            embeddingModel: env["CODEX_MEMORY_EMBEDDING_MODEL"] ?? "text-embedding-3-small",
-            embeddingEndpoint: env["CODEX_MEMORY_EMBEDDINGS_URL"]
-                ?? "https://api.openai.com/v1/embeddings",
+            embeddingModel: embeddingModel,
+            embeddingEndpoint: embeddingEndpoint,
             storeConfig: storeConfig)
 
         // Personas read from TOML, falling back to the five defaults.
@@ -176,19 +222,22 @@ public enum CodexMemoryRun {
         let retriever = MemoryRetriever(store: store, inference: inference)
         let scorer = Scorer(store: store)
 
-        // BrainGate: when bound to a real inference backend, route escalations
-        // through the same provider for synthesis. When the backend is the
-        // mock provider, escalations fail closed.
+        // BrainGate is the explicit spend-gated escalation path. It uses the
+        // shared OpenAI/ChatGPT auth-backed ModelClient, not local/mock extraction,
+        // so the tool cannot label synthetic output as a cloud escalation.
         let gate = BrainGate(store: store, caller: { prompt, model, deadline in
-            let result = try await inference.extract(
-                ChunkBatch(documentTitle: nil, documentURI: "brain://escalate",
-                           chunks: [Chunk(localId: "escalate", rawText: prompt, idx: 0)]),
-                schema: .default, deadline: deadline)
-            let text = "{\"headline\":\"escalation\",\"summary\":\"\(prompt.prefix(200))\","
-                + "\"entities\":[],\"rationale\":\"auto\",\"summaryOnly\":false}"
+            guard let openAIAuth else {
+                throw InferenceError.providerUnavailable("memory escalation requires shared OpenAI auth")
+            }
+            let bridge = ModelClientBridge(
+                modelClient: openAIAuth.modelClient,
+                modelName: model,
+                embeddings: nil,
+                instructions: "Return only a JSON object matching the requested InsightCard schema.")
+            let text = try await bridge.textCall()(prompt, deadline)
             return (text: text,
-                    tokensIn: result.tokensInput,
-                    tokensOut: result.tokensOutput)
+                    tokensIn: Self.estimatedTokenCount(prompt),
+                    tokensOut: Self.estimatedTokenCount(text))
         })
 
         let toolset = MemoryToolset(store: store, retriever: retriever,
@@ -204,7 +253,8 @@ public enum CodexMemoryRun {
             archive: archive, snapshotScheduler: snapshotScheduler)
     }
 
-    private static func makeInference(apiKey: String?,
+    private static func makeInference(openAIAuth: MemoryOpenAIAuth?,
+                                      plan: MemoryInferencePlan,
                                       extractorModel: String,
                                       embeddingModel: String,
                                       embeddingEndpoint: String,
@@ -212,23 +262,116 @@ public enum CodexMemoryRun {
     -> any LocalInferenceProvider {
         let inferenceConfig = MemoryInferConfig(
             embeddingDimension: storeConfig.embeddingDimension)
-        if let key = apiKey, !key.isEmpty {
-            let limits = Limits()
-            let modelClient: any ModelClient = OpenAIResponsesClient(
-                apiKey: key, limits: limits)
+        switch plan.backend {
+        case .local:
+            return BoundedInferenceProvider(
+                MLXLocalProvider(embeddingDimension: storeConfig.embeddingDimension),
+                config: inferenceConfig)
+        case .remote:
+            guard let openAIAuth else {
+                return BoundedInferenceProvider(
+                    MockInferenceProvider(embeddingDimension: storeConfig.embeddingDimension),
+                    config: inferenceConfig)
+            }
             let bridge = ModelClientBridge(
-                modelClient: modelClient,
+                modelClient: openAIAuth.modelClient,
                 modelName: extractorModel,
                 embeddings: ModelClientBridge.EmbeddingsEndpoint(
-                    url: embeddingEndpoint, apiKey: key,
+                    url: embeddingEndpoint,
+                    apiKey: "",
+                    authProvider: openAIAuth.embeddingAuthProvider,
                     model: embeddingModel,
                     dimensions: storeConfig.embeddingDimension))
             return BoundedInferenceProvider(
                 bridge.makeProvider(embeddingDimension: storeConfig.embeddingDimension),
                 config: inferenceConfig)
+        case .mock:
+            return BoundedInferenceProvider(
+                MockInferenceProvider(embeddingDimension: storeConfig.embeddingDimension),
+                config: inferenceConfig)
         }
-        return BoundedInferenceProvider(
-            MockInferenceProvider(embeddingDimension: storeConfig.embeddingDimension),
-            config: inferenceConfig)
+    }
+
+    private static func resolveInferencePlan(env: [String: String],
+                                             openAIAuth: MemoryOpenAIAuth?,
+                                             embeddingModel: String,
+                                             embeddingEndpoint: String) -> MemoryInferencePlan {
+        let requested = MemoryInferenceBackend.parse(env["CODEX_MEMORY_INFERENCE_BACKEND"])
+        func local() -> MemoryInferencePlan {
+            MemoryInferencePlan(
+                backend: .local,
+                providerID: "local-mlx:qwen3-30b-a3b+nomic-embed-text-v1.5:padded-\(memoryEmbeddingDimension)")
+        }
+        func remote() -> MemoryInferencePlan {
+            MemoryInferencePlan(
+                backend: .remote,
+                providerID: "remote-openai-compatible:\(embeddingModel):\(memoryEmbeddingDimension):\(embeddingEndpoint)")
+        }
+        func mock() -> MemoryInferencePlan {
+            MemoryInferencePlan(backend: .mock, providerID: "mock:\(memoryEmbeddingDimension)")
+        }
+
+        switch requested {
+        case .mock:
+            return mock()
+        case .remote:
+            return openAIAuth != nil ? remote() : (MLXLocalProvider.isAvailable(env: env) ? local() : mock())
+        case .local:
+            return MLXLocalProvider.isAvailable(env: env) ? local() : mock()
+        case .auto:
+            return MLXLocalProvider.isAvailable(env: env) ? local() : (openAIAuth != nil ? remote() : mock())
+        }
+    }
+
+    private static func estimatedTokenCount(_ text: String) -> Int {
+        max(1, (text.utf8.count + 3) / 4)
+    }
+
+    private static func resolveOpenAIAuth(env: [String: String],
+                                          codexHome: String) async -> MemoryOpenAIAuth? {
+        let limits = Limits()
+        if let apiKey = env["OPENAI_API_KEY"], !apiKey.isEmpty {
+            return MemoryOpenAIAuth(
+                modelClient: OpenAIResponsesClient(apiKey: apiKey, limits: limits),
+                embeddingAuthProvider: .staticToken(apiKey))
+        }
+        if let brokerAuth = brokerAuthClient(codexHome: codexHome),
+           let token = await brokerAuth.validAccessToken() {
+            return MemoryOpenAIAuth(
+                modelClient: AuthRefreshingModelClient(
+                    initial: OpenAIResponsesClient(apiKey: token, limits: limits),
+                    refreshToken: { await brokerAuth.refreshAccessToken() },
+                    makeClient: { OpenAIResponsesClient(apiKey: $0, limits: limits) }),
+                embeddingAuthProvider: ModelClientBridge.BearerTokenProvider(
+                    accessToken: { await brokerAuth.validAccessToken() },
+                    refreshToken: { await brokerAuth.refreshAccessToken() }))
+        }
+        let authStoreMode = AuthCredentialsStoreMode.parse(
+            ConfigLoader(codexHome: codexHome).load()
+                .value("cli_auth_credentials_store")?.stringValue)
+        let authManager = AuthManager(
+            store: TokenStoreFactory.production(codexHome: codexHome, mode: authStoreMode),
+            apiKeyExchanger: CurlAPIKeyExchanger(),
+            revoker: CurlTokenRevoker())
+        guard let token = await authManager.validAccessToken() else { return nil }
+        return MemoryOpenAIAuth(
+            modelClient: AuthRefreshingModelClient(
+                initial: OpenAIResponsesClient(apiKey: token, limits: limits),
+                refreshToken: { await authManager.refreshAccessToken() },
+                makeClient: { OpenAIResponsesClient(apiKey: $0, limits: limits) }),
+            embeddingAuthProvider: ModelClientBridge.BearerTokenProvider(
+                accessToken: { await authManager.validAccessToken() },
+                refreshToken: { await authManager.refreshAccessToken() }))
+    }
+
+    private static func brokerAuthClient(codexHome: String) -> BrokerAuthClient? {
+        let env = ProcessInfo.processInfo.environment
+        let raw = env["CODEXKIT_AUTH_BROKER"]
+            ?? env["CODEX_BROKER_LISTEN"]
+            ?? "unix://\(BrokerAuthClient.defaultSocketPath(codexHome: codexHome))"
+        guard raw.hasPrefix("unix://") else { return nil }
+        let path = String(raw.dropFirst("unix://".count))
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        return BrokerAuthClient(socketPath: path)
     }
 }

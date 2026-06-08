@@ -482,6 +482,8 @@ struct CodexDaemon {
                             websocketURL: remote.execServerUrl,
                             limits: limits)
                     }
+                    let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
+                    let configuredMemoryProvider = addonConfig.value("memory")?.objectValue?["provider"]?.stringValue
                     let memory = MemoryStore(codexHome: codexHome)
                     // Upstream parity (H-32 / P4.8): wire the model client
                     // into the memory store so end-of-turn consolidation runs
@@ -489,13 +491,12 @@ struct CodexDaemon {
                     // rollout_summary / rollout_slug). Falls back to the
                     // deterministic local summary on any error.
                     await memory.setModelClient(model)
-                    await router.register(MemoryTool(store: memory))
-                    // Upstream parity (H-32 / P4.8): three namespaced memory
-                    // tools alongside the legacy `memory` tool. The legacy
-                    // tool stays registered for back-compat.
-                    await router.register(MemoriesListTool(store: memory))
-                    await router.register(MemoriesReadTool(store: memory))
-                    await router.register(MemoriesSearchTool(store: memory))
+                    if shouldRegisterCoreMemoryTools(config: addonConfig) {
+                        await router.register(MemoryTool(store: memory))
+                        await router.register(MemoriesListTool(store: memory))
+                        await router.register(MemoriesReadTool(store: memory))
+                        await router.register(MemoriesSearchTool(store: memory))
+                    }
                     let mcp = McpManager()
                     // F8 (MEDIUM): supply the OAuth store so HTTP MCP
                     // servers reuse previously-saved tokens from
@@ -526,7 +527,6 @@ struct CodexDaemon {
                     // path). General manifests are feature-gated; memory can
                     // install independently because mem0 is the default
                     // personal-memory path.
-                    let addonConfig = ConfigLoader(codexHome: codexHome, cwdOverride: c.cwd).load()
                     // Phase 1 (ARCHITECTURE.md §7.1): memory slot candidates.
                     // mem0 is the default personal-memory provider when
                     // `[memory].provider` is unset; "core", "wiki", and "none"
@@ -539,7 +539,6 @@ struct CodexDaemon {
                     // nil if the DB can't be opened, so a configured-but-
                     // unavailable wiki disables recall rather than crashing.
                     var memoryCandidates: [any MemoryProvider] = [CoreMemoriesProvider(store: memory)]
-                    let configuredMemoryProvider = addonConfig.value("memory")?.objectValue?["provider"]?.stringValue
                     if (configuredMemoryProvider == nil || configuredMemoryProvider == "mem0"),
                        let mem0 = makeMem0MemoryProvider(config: addonConfig,
                                                          authProvider: mem0AuthProvider) {

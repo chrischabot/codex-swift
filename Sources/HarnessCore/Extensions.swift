@@ -15,10 +15,11 @@ import ExtensionAPI
 // dependency (seam-map "Option (b)": parse at the composition root, inject the
 // built registry into the engine).
 //
-// Phase 0 ships with ZERO first-party features registered, so `installAddons`
-// returns `nil` whenever the `extensions` feature is off or no manifest is
-// enabled — and a `nil` registry makes every `SessionEngine` call-site a no-op,
-// keeping core behavior byte-identical (verified by the wire-faithful tests).
+// Phase 0 shipped with zero first-party features registered. General extension
+// manifests still require the `extensions` feature flag, but the memory provider
+// slot is now allowed to install independently because personal memory is a
+// product-default capability. When neither memory nor enabled manifests are
+// present, a nil registry keeps every SessionEngine call-site a no-op.
 
 /// One feature's cheap, declarable identity + capability metadata. Readable
 /// without running the feature (ARCHITECTURE.md principle 4 / lesson L6): it
@@ -129,10 +130,10 @@ public func parseExtensionManifests(from config: Config) -> [ExtensionManifest] 
 /// `codexd`. Builds an `ExtensionRegistry<SessionConfig>` from the enabled
 /// manifests and returns it for installation on that session's `SessionEngine`.
 ///
-/// Phase 0 registers NO first-party features, so the body is intentionally a
-/// no-op aside from gating + manifest parsing: it returns `nil` whenever the
-/// `extensions` feature is disabled or no manifest is enabled. A `nil` registry
-/// keeps the engine byte-identical to the no-extension baseline.
+/// Phase 0 registered no first-party features. Today the memory slot is allowed
+/// to install independently of the general `extensions` feature gate because
+/// personal memory is a product default; unrelated extension manifests still
+/// require `[features].extensions`.
 ///
 /// Later phases append their `register(into:)` calls here (Memory slot, etc.)
 /// — adding a feature touches this function + its own folder, nothing else
@@ -140,13 +141,17 @@ public func parseExtensionManifests(from config: Config) -> [ExtensionManifest] 
 public func installAddons(config: Config,
                           sessionConfig: SessionConfig,
                           memoryProvider: (any MemoryProvider)? = nil) -> ExtensionRegistry<SessionConfig>? {
-    // Subsystem gate: the whole spine is opt-in behind the `extensions`
-    // feature (`CODEX_FEATURE_EXTENSIONS` env or `[features].extensions` in
-    // config.toml), defaulting to off — so the `[extensions]` table is
-    // silently ignored unless explicitly enabled. Mirrors `WorkflowGating`.
-    guard config.isFeatureEnabled("extensions") else { return nil }
+    // General extension manifests are opt-in behind the `extensions` feature
+    // (`CODEX_FEATURE_EXTENSIONS` env or `[features].extensions` in config.toml),
+    // defaulting to off. The selected memory provider is the exception: personal
+    // memory is a product-default seam, so it may install recall/capture without
+    // enabling unrelated extension manifests.
+    let extensionsEnabled = config.isFeatureEnabled("extensions")
+    if !extensionsEnabled && memoryProvider == nil { return nil }
 
-    let manifests = parseExtensionManifests(from: config).filter { $0.enabled }
+    let manifests = extensionsEnabled
+        ? parseExtensionManifests(from: config).filter { $0.enabled }
+        : []
     let builder = ExtensionRegistryBuilder<SessionConfig>()
 
     // Phase 1: wire the selected Memory slot provider (recall → fenced
@@ -160,7 +165,7 @@ public func installAddons(config: Config,
 
     // Return a registry only when something is actually wired (a memory provider
     // or, for later phases, an enabled manifest). A nil registry keeps the
-    // engine byte-identical to the no-extension baseline.
+    // engine byte-identical only when memory is also absent.
     if memoryProvider == nil && manifests.isEmpty { return nil }
     return builder.build()
 }

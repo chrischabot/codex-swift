@@ -1,6 +1,6 @@
 # Memory
 
-*How the agent carries knowledge across sessions — auto-consolidating each turn into durable notes, recalling them into the next prompt, and optionally drawing on a host-wide vector "Memory Wiki."*
+*How the agent carries knowledge across sessions — default personal memory with mem0, legacy markdown notes as a fallback, and a separate professional Memory Wiki for durable knowledge work.*
 
 ## Why it matters
 
@@ -10,22 +10,45 @@ Memory closes that loop. After a turn completes, the agent quietly folds what ju
 
 ## What it is
 
-Memory is a per-thread, on-disk knowledge layer plus an optional shared knowledge base. Concretely, three things happen for you:
+Memory is split into two product concerns that should not be confused:
+personal memory and professional knowledge. Concretely, three things happen for
+you:
 
-- **It writes itself.** At the end of each completed turn the session consolidates the transcript into `$CODEX_HOME/memories/<thread-id>.md`. You never call a "save" tool — consolidation is automatic.
-- **It recalls itself.** At the start of a turn, the active *memory provider* searches your notes for fragments relevant to your message and injects them into the prompt as clearly-labeled, untrusted reference context.
+- **It learns personal facts.** The default `mem0` provider extracts short,
+  durable facts from completed turns: preferences, projects, people, wardrobe,
+  health notes, household details, and the sort of "this agent really knows me"
+  context that should survive across sessions.
+- **It recalls itself.** At the start of a turn, the active *memory provider*
+  searches personal memories for fragments relevant to your message and injects
+  them into the prompt as clearly-labeled, untrusted reference context.
 - **The agent can browse it.** Three read-only tools — `memories_list`, `memories_read`, `memories_search` — let the model deliberately page through and search memory mid-turn when recall alone isn't enough.
+- **It can consult a wiki.** The Memory Wiki is a separate professional
+  knowledge system: a curated, source-backed corpus for AI, coding agents,
+  developer relations, releases, market analysis, and content production.
 
-There are **two flavors of memory**, selected by one config key:
+There are **three memory-related surfaces**:
 
-1. **Core `.md` memories** (`provider = "core"`) — the always-available default. Plain markdown files, keyword search, zero external dependencies. This is what powers the auto-consolidation loop and the live end-to-end test.
-2. **The vector Memory Wiki** (`provider = "wiki"`) — a host-wide SQLite knowledge base with embeddings, hybrid search, and reranking, fed by a separate `codex-memory` daemon. This is curated knowledge that *all* your threads can recall against, not just per-conversation notes.
+1. **mem0 personal memory** (unset provider or `provider = "mem0"`) — the
+   default. SQLite-backed additive fact extraction, hybrid semantic+BM25
+   recall, and `mem0_search` / `mem0_add` tools.
+2. **Core `.md` memories** (`provider = "core"`) — the always-available legacy
+   fallback. Plain markdown files, keyword search, zero external dependencies.
+3. **The Memory Wiki** (`provider = "wiki"` today, moving toward its own
+   first-class wiki surface) — a host-wide knowledge base with embeddings,
+   hybrid search, provenance, ingest, and wiki-native tools. This is for
+   professional knowledge, not the user's personal profile.
 
 ## How it works
 
 ### The provider slot
 
-A session has exactly one **memory provider** in a swappable slot, chosen by `[memory].provider` in config. The contract (`MemoryProvider` in `Sources/HarnessCore/MemoryProvider.swift`) is small: `recall(query, limit)`, optional `capture(turn)`, and `tools()`. Selection is explicit opt-in — absent a `provider`, or `"none"`, or an unknown id, there is **no recall** (the agent won't surprise you by reaching into memory just because some other extension is on). The memory *tools* are registered separately and stay available regardless.
+A session has exactly one **personal memory provider** in a swappable slot,
+chosen by `[memory].provider` in config. The contract (`MemoryProvider` in
+`Sources/HarnessCore/MemoryProvider.swift`) is small: `recall(query, limit)`,
+optional `capture(turn)`, and `tools()`. Selection defaults to mem0 when no
+provider is configured; `"core"` selects markdown memories; `"wiki"` selects
+the legacy wiki provider; `"none"` disables recall. Unknown ids are not silently
+rewritten.
 
 ```
   your message
@@ -53,20 +76,68 @@ When a turn finishes successfully, the session engine calls `MemoryStore.consoli
 
 Both paths run through `MemorySanitizer.redactSecrets` first, which strips OpenAI `sk-…` keys, AWS access-key ids, `Bearer` tokens, and `api_key/token/secret/password = …` assignments before anything touches disk.
 
-### Core memories: the default provider
+### mem0 personal memory: the default provider
+
+`Mem0MemoryProvider` (`Sources/Mem0Extension/`) wraps the native Swift mem0
+engine. Recall runs hybrid semantic+BM25 search against `$CODEX_HOME/mem0/mem0.db`
+by default, and capture performs mem0's additive extraction off the teardown
+path. With real OpenAI-compatible providers configured, capture extracts concise
+facts such as "User prefers black denim jackets" or "User's cat is named X"; in
+offline mock mode, it stays dependency-free but inferred extraction is a no-op
+unless `infer = false`.
+
+In `codex-session` and `codexd`, mem0 uses the same OpenAI credential
+resolution as the core model client: explicit `OPENAI_API_KEY`, broker ChatGPT
+auth, then stored ChatGPT/API-key auth, with one refresh retry after a `401`.
+Its default backend policy is local-first on Apple Silicon: dedicated Nomic
+embeddings via MLX and local Qwen extraction, then remote OpenAI-compatible,
+then mock.
+
+The provider contributes recall, explicit capture, and admin tools when
+selected:
+
+- `mem0_search` — search the user's long-term personal memory.
+- `mem0_add` — store a durable fact explicitly.
+- `mem0_list` — inspect scoped memories by category, sensitivity, query, and
+  limit.
+- `mem0_update` — correct a scoped memory while preserving public metadata.
+- `mem0_delete` — delete one scoped memory, or a confirmed scoped filtered set.
+- `mem0_history` — inspect the mutation history for a current scoped memory.
+- `mem0_privacy` — summarize privacy behavior or export the current scope.
+
+The admin surface enforces scope on id-based reads and writes, requires the
+exact confirmation `DELETE MEM0 SCOPE` for broad deletes, and rejects obvious
+credentials before explicit or automatic memory capture.
+
+### Core memories: the markdown fallback
 
 `CoreMemoriesProvider` recalls by tokenizing your message into significant terms (lowercased, ≥3 chars, minus a stop-word set), running a substring search per term across the `.md` files, and ranking each note by how many terms it satisfied. No embeddings, no daemon — it just works. Its `capture` is a no-op because the engine's end-of-turn consolidation already handles write-back.
 
-### The Memory Wiki: the vector provider
+### The Memory Wiki: professional knowledge
 
-`WikiMemoryProvider` (`Sources/MemoryExtension/`) wraps `MemoryRetriever` (`Sources/MemoryRetrieve/`), which runs the real hybrid-search pipeline against a SQLite store:
+`WikiMemoryProvider` (`Sources/MemoryExtension/`) currently wraps
+`MemoryRetriever` (`Sources/MemoryRetrieve/`), which runs the real
+hybrid-search pipeline against a SQLite store:
 
 1. FTS5 BM25 lexical top-200 **and** sqlite-vec cosine top-200 (on the query embedding), in parallel.
 2. **Reciprocal Rank Fusion** to a fused top-50.
 3. Optional **cross-encoder rerank** (BGE-reranker when MLX is wired; otherwise a cosine fallback).
 4. Final blend: `0.7·rerank + 0.2·(1−vec_dist) + 0.1·bm25`, sorted, top-k.
 
-The wiki points at the **same host-global DB** the `codex-memory` daemon writes, so an agent session recalls against curated knowledge rather than a private empty store. Recall is hardened to degrade-to-empty: any retriever error returns `[]` rather than throwing into the engine, because recall sits on the turn hot path. The wiki also contributes the seven `memory.*` agent tools (`hybrid_search`, `graph_walk`, `recent_interesting`, `ask_local_brain`, `escalate_to_brain`, persona controls) via `MemoryToolset`.
+The wiki points at the **same host-global DB** the `codex-memory` daemon writes,
+so an agent session can consult curated knowledge rather than a private empty
+store. Product-wise, though, this should evolve beside personal memory, not
+replace it: the wiki owns source ingest, compiled pages, claim provenance,
+contradiction tracking, dashboards, and content/research workflows. See
+[Memory Systems Architecture](memory-systems.md).
+
+The first wiki fixtures are local: AI Agent data at
+`/Users/chabotc/Projects/agentwiki/data/agentwiki/markdown` (4,865 markdown
+files) and Developer Relations at
+`/Users/chabotc/Projects/devrel-almanac/devrel` (102 markdown files). They
+should drive bulk import, compiler/linter tuning, retrieval quality, MLX
+reranker evaluation, and production tools such as `wiki_compare`, `wiki_angle`,
+and `wiki_pmfit`.
 
 ### The `codex-memory` daemon
 
@@ -83,26 +154,48 @@ The wiki is fed by a **separate executable**, `codex-memory`, one process per ho
 - `CODEXKIT_MEMORY` is checked at two layers. In the session engine, in-process consolidation runs unless `CODEXKIT_MEMORY=0` — so it is *on by default*, and you set `=0` to turn it off (it saves ~3–7 s per turn). In `codexd`, the host-wide `codex-memory` **daemon** is spawned only when `CODEXKIT_MEMORY=1`.
 - Consolidation additionally requires the thread's memory mode to be `.enabled` and the turn to be non-ephemeral.
 
-**Pick the recall provider** in your config's `[memory]` table:
+**Pick the personal recall provider** in your config's `[memory]` table:
 
 ```toml
 [memory]
-provider = "core"     # "core" (default .md store) | "wiki" | "none"
+provider = "mem0"     # unset/"mem0" (default) | "core" | "wiki" | "none"
 ```
 
-To use the vector wiki, set `provider = "wiki"` and (for *real* semantic recall) point it at an embeddings endpoint — without one it falls back to a deterministic-but-weak mock:
+To make the default explicit and configure real extraction/embeddings:
+
+```toml
+[memory]
+provider = "mem0"
+
+[memory.mem0]
+user_id = "chris"
+api_key = "sk-..."                         # or CODEX_MEM0_API_KEY / OPENAI_API_KEY
+embedding_model = "text-embedding-3-small"
+embedding_backend = "auto"                 # auto/local/remote/mock
+llm_backend = "auto"                       # auto/local/remote/mock
+llm_model = "gpt-4o-mini"
+```
+
+The `api_key` field is optional in normal Codex sessions; it is mainly an
+explicit override or standalone `codex-mem0` setting. ChatGPT-login sessions
+can still use real mem0 embeddings/extraction through the shared auth provider.
+
+To use the legacy vector wiki provider, set `provider = "wiki"`. Its `auto`
+backend prefers local MLX Qwen + Nomic, then a remote OpenAI-compatible
+endpoint, then a deterministic-but-weak mock:
 
 ```toml
 [memory]
 provider = "wiki"
 db_path = "/path/to/memory.db"                 # optional; defaults to the daemon's host-global DB
-embedding_dimension = 768                       # must match stored vectors
+embedding_dimension = 1536                      # store width; local Nomic is padded
 embedding_model = "text-embedding-3-small"
 embeddings_url = "https://api.openai.com/v1/embeddings"
 extractor_model = "gpt-5.4-mini"
+inference_backend = "auto"                      # auto/local/remote/mock
 ```
 
-Secrets can stay out of TOML — `embeddings_url`/`embeddings_api_key` fall back to `CODEX_MEMORY_EMBEDDINGS_URL` / `OPENAI_API_KEY` (and `CODEX_MEMORY_DB`, `CODEX_MEMORY_*_MODEL`) from the environment.
+Secrets can stay out of TOML — `embeddings_url`/`embeddings_api_key` fall back to `CODEX_MEMORY_EMBEDDINGS_URL` / `OPENAI_API_KEY` (and `CODEX_MEMORY_DB`, `CODEX_MEMORY_*_MODEL`) from the environment. When the wiki provider or host-wide daemon falls back to remote inference, embeddings default to `https://api.openai.com/v1/embeddings` and use the refreshable shared bearer unless an explicit `embeddings_api_key` is configured. The store stamps both embedding dimension and provider id, so switching between local Nomic and remote OpenAI-compatible vectors requires a reindex instead of silently mixing vector spaces.
 
 **The three read tools** the agent can call (also re-exported to external MCP clients via `Sources/MemoryMCP/`):
 
@@ -132,8 +225,35 @@ It composes with the [extension layer](../extensions/ARCHITECTURE.md) (the provi
 
 ## Status
 
-The **core `.md` path is production-ready** and on by default. The **vector wiki is functional but degraded without local inference**: cross-encoder rerank and on-device extraction/embedding need MLX wired in (`CODEXKIT_MLX`); absent a real embeddings endpoint, wiki recall falls back to a deterministic mock that is semantically weak. The full ingest/score/gate daemon pipeline is the design in the wiki plan and runs behind `CODEXKIT_MEMORY=1`.
+The **mem0 path is the default personal-memory provider** and is covered by
+targeted engine/store/extension tests. The **core `.md` path is production-ready**
+as a fallback and explicit `provider = "core"` mode. The **vector wiki is
+functional but still evolving into a separate professional knowledge system**:
+on-device extraction/embedding and the local BGE cross-encoder path use MLX
+(`CODEXKIT_MLX`); absent MLX or a real embeddings endpoint, wiki recall falls
+back to a deterministic mock that is semantically weak. The full
+ingest/score/gate daemon pipeline is the design in the wiki plan and runs
+behind `CODEXKIT_MEMORY=1`.
+
+Initial `codex-memory import-markdown` support now covers offline dry-runs and
+idempotent local markdown import for the two seed corpora. Initial
+`codex-memory wiki-compile` / `wiki-lint` support compiles deterministic
+source/entity/edge-claim pages, preserves human edit blocks, emits
+`agent-digest.json`, optionally indexes compiled pages through staged
+replacement, and lints markdown roots plus SQLite index health. The planned
+memory/wiki work is: crash/restart proof for bulk import; durable claim schema,
+synthesis pages, dashboards, and contradiction/staleness linting; richer
+production-tool synthesis over cited topic packs; live BGE reranker model-load
+benchmarking and labelled retrieval evals; and deeper mem0 admin hardening for
+transactional history, cursor pagination, and durable category policy. The
+current production tools are already available as lexical-only, zero-cloud,
+citation-first `wiki_brief`, `wiki_compare`, `wiki_angle`, and `wiki_pmfit`
+surfaces.
 
 ## Go deeper
 
-Internals and reference: `docs/MEMORY.md` (pipeline, tool schemas, worked search example) and `docs/codex-swift-memory-wiki.md` (the full SQLite/MLX wiki implementation plan).
+Internals and reference: [Memory Systems Architecture](memory-systems.md) (the
+personal memory vs. professional wiki split), `docs/MEMORY.md` (pipeline, tool
+schemas, worked search example), `docs/MEM0.md` (native mem0), and
+`docs/codex-swift-memory-wiki.md` (the full SQLite/MLX wiki implementation
+plan).

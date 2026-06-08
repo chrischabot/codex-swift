@@ -90,14 +90,15 @@ public actor MemoryRetriever {
         // to FTS5 (which would crash with a parse error).
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return [] }
-        let topK = k ?? config.finalTopK
+        let topK = Self.clampedPositive(k ?? config.finalTopK, defaultValue: 10, max: 100)
+        let fuseTopK = Self.clampedPositive(config.fuseTopK, defaultValue: 50, max: 1_000)
         async let bm25Task = bm25TopHits(query)
         async let vecTask  = vecTopHits(query)
         let (bm25, vec) = try await (bm25Task, vecTask)
         let fused = ReciprocalRankFusion.fuse(
             [bm25.map(\.chunkId), vec.map(\.chunkId)],
             kConstant: config.rrfK)
-            .prefix(config.fuseTopK)
+            .prefix(fuseTopK)
             .map { $0 }
         let bm25Scores = Dictionary(uniqueKeysWithValues: bm25.map { ($0.chunkId, $0.score) })
         let vecScores  = Dictionary(uniqueKeysWithValues: vec.map { ($0.chunkId, 1 - $0.distance) })
@@ -139,6 +140,13 @@ public actor MemoryRetriever {
         }
         ranked.sort { $0.score > $1.score }
         return Array(ranked.prefix(topK))
+    }
+
+    private static func clampedPositive(_ value: Int,
+                                        defaultValue: Int,
+                                        max: Int) -> Int {
+        guard value > 0 else { return defaultValue }
+        return Swift.min(value, max)
     }
 
     func bm25TopHits(_ query: String) async throws -> [LexicalHit] {

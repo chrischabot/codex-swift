@@ -99,8 +99,8 @@ module structure matches).
 ### Validate on Apple Silicon
 
 ```bash
-# (downloads ~15 GB once)
-CODEXKIT_MLX=1 swift test --filter MemoryInferTests   # or a tiny script:
+# (downloads ~15 GB once; MLX is default-on for macOS builds)
+swift test --filter MemoryInferTests   # or a tiny script:
 #   set extractorModelID = "mlx-community/gemma-4-26b-a4b-it-4bit", run one extract() call,
 #   confirm it loads + returns coherent text. Compare a few logits vs. python mlx_vlm.
 ```

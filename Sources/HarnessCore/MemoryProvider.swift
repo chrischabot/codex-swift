@@ -121,19 +121,31 @@ public enum MemoryFence {
 
 // MARK: - Slot selection (D3/D4)
 
-/// Pick the active memory provider for the `memory` slot. Memory recall is an
-/// EXPLICIT opt-in: `[memory].provider` must name a candidate id (e.g. "core",
-/// "wiki"). Absent, or `"none"`, or an unknown id → nil (no recall). This avoids
-/// surprising activation just because the `extensions` feature is on for some
-/// other reason. Candidates are deduped by id (first wins) so duplicate
-/// registrations never both win the slot.
+/// Pick the active memory provider for the `memory` slot. `[memory].provider`
+/// may explicitly name a candidate id (e.g. "mem0", "core", "wiki"), and
+/// `"none"` disables recall. When unset, mem0 is the product default; if the
+/// mem0 candidate could not be constructed, fall back to core `.md` memories.
+/// Candidates are deduped by id (first wins) so duplicate registrations never
+/// both win the slot.
 public func selectMemoryProvider(config: Config,
                                  candidates: [any MemoryProvider]) -> (any MemoryProvider)? {
-    guard case .object(let m)? = config.value("memory"),
-          let chosen = m["provider"]?.stringValue, chosen != "none" else { return nil }
     var byId: [String: any MemoryProvider] = [:]
     for c in candidates where byId[c.id] == nil { byId[c.id] = c }
-    return byId[chosen]
+    if case .object(let m)? = config.value("memory"),
+       let chosen = m["provider"]?.stringValue {
+        return chosen == "none" ? nil : byId[chosen]
+    }
+    return byId["mem0"] ?? byId["core"]
+}
+
+/// Whether to expose the legacy markdown-memory MCP tools (`memory`,
+/// `memories_*`). mem0 is the default personal-memory product path, so the core
+/// tools are shown only when core is explicitly selected or when an operator
+/// opts in for migration/debugging.
+public func shouldRegisterCoreMemoryTools(config: Config) -> Bool {
+    guard case .object(let memory)? = config.value("memory") else { return false }
+    if memory["legacy_tools"]?.boolValue == true { return true }
+    return memory["provider"]?.stringValue == "core"
 }
 
 /// Wire a selected memory provider into the extension registry builder: recall

@@ -343,12 +343,12 @@ backends:
 - **`LocalInferenceProvider`** — the default. Pure-Swift; no MLX dependency
   required. Used by tests and by sessions where the operator doesn't want
   to take a runtime dependency on MLX.
-- **`MLXLocalProvider`** — gated on `CODEXKIT_MLX` at compile time. When the
-  build is configured with `CODEXKIT_MLX=1` and MLX-Swift is linked, the
-  provider can run on-device LLM and embedding inference. Files import
+- **`MLXLocalProvider`** — gated on `CODEXKIT_MLX` at compile time. macOS
+  builds enable it by default unless `CODEXKIT_MLX=0` is set, and the provider
+  can run on-device LLM and embedding inference. Files import
   `MLX`, `MLXLMCommon`, `MLXLLM`, `MLXEmbedders` under `#if CODEXKIT_MLX &&
   canImport(...)`. When MLX is not available, every method returns an
-  error like `"MLX Swift LM not linked — rebuild with CODEXKIT_MLX=1"`.
+  error like `"MLX Swift LM not linked — rebuild with MLX enabled"`.
 - **`RemoteOpenAICompatibleProvider`** — proxies to a remote OpenAI-compatible
   endpoint (`InferenceAssembly` supports a `remoteText` + `remoteEmbedding` +
   `remoteLogprob` triple).

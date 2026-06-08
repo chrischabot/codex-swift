@@ -50,6 +50,21 @@ final class RegressionFixesTests: XCTestCase {
         XCTAssertEqual(row?.contentSHA, sha2)
     }
 
+    func testEmbeddingProviderMismatchThrowsEvenWhenDimensionMatches() async throws {
+        let path = tmpDB(); defer { try? FileManager.default.removeItem(atPath: path) }
+        _ = try MemoryStore(MemoryStoreConfig(
+            path: path, embeddingDimension: 1536,
+            embeddingProviderID: "local-mlx:nomic:padded-1536"))
+        do {
+            _ = try MemoryStore(MemoryStoreConfig(
+                path: path, embeddingDimension: 1536,
+                embeddingProviderID: "remote-openai:text-embedding-3-small:1536"))
+            XCTFail("provider mismatch should throw")
+        } catch let MemoryStoreError.invalid(message) {
+            XCTAssertTrue(message.contains("embedding provider mismatch"), message)
+        }
+    }
+
     // Fix #14: recentInteresting must use LEFT JOIN so an insight whose
     // trigger chunk was deleted still appears. Simulate by inserting a
     // doc + chunk + insight, then cascading-delete the document — the
