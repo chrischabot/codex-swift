@@ -17,6 +17,24 @@ locked down via `SessionConfig`) · local-first (on-device MLX lane) · durabili
 at-least-once; crash/reboot resume) · testing bar (severe + live-token e2e where a real service
 is touched, skipping cleanly without a key) · parity with upstream codex-rs.
 
+## Status (updated 2026-06-08)
+
+**Shipped:** #1 Gmail channel (`3ba6b55`), #2 typed Google helpers (`da2f0e6`),
+#11 channel chunking (`697208f`), #3 live media provider + #4 signed media URLs
++ #7 computer_use session OAuth bearer (`de7a484`). Each landed implemented →
+fresh-agent adversarial review → review fixes folded in → severe + live-token
+e2e (clean XCTSkip without a key) → committed.
+
+**Owned by the parallel memory workstream (skipped here):** #5 mem0 bulk-import
+durability (covered by `Sources/codex-memory/ImportMarkdown.swift`), #6 mem0
+admin cursor/category, #10 wiki claim schema.
+
+**Deliberately deferred with documented rationale (see notes below):** #8 IP-pin
+socket egress (defense-in-depth over an already-mitigated host-pin path), #9
+generic OAuth runtime (premature generalization — no second consumer yet), #12
+realtime audio, #13 media-inbound, #14 native proxy (skip), #15 native Starlark,
+#16 Prometheus, #17 Gemma 4 MoE (Qwen3 covers it).
+
 ## Triage summary
 
 | # | Item | Align | Value | Effort | Verdict | Decision |

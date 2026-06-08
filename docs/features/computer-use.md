@@ -101,7 +101,7 @@ It pairs naturally with the [Web Gateway](./web-gateway.md) and the session runt
 
 ## Status
 
-Shipped and live-validated, but with honest edges. It is **off by default** and macOS-only; the integrated tool requires a **direct** `OPENAI_API_KEY` (it does not yet reuse the session's OAuth bearer). Deferred TODOs: a kill-switch hotkey, ScreenCaptureKit (instead of shelling out to `screencapture`), and multi-display support (today it targets the single main display).
+Shipped and live-validated, but with honest edges. It is **off by default** and macOS-only. As of #7 the integrated tool now drives the loop with the **session's OAuth bearer** when the session authenticates via ChatGPT (broker / stored auth): `ComputerUseTool.tokenProvider` prefers a non-blank session token over `OPENAI_API_KEY`, and the loop **re-resolves the bearer before each request** so a long desktop run survives an OAuth-token refresh — falling back to a direct `OPENAI_API_KEY` only when no OAuth token is available. It is gated OFF under a mock model (so a mock session never reaches the live API via the env fallback). Deferred TODOs: a kill-switch hotkey, ScreenCaptureKit (instead of shelling out to `screencapture`), and multi-display support (today it targets the single main display).
 
 ## Go deeper
 
