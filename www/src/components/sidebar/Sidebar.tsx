@@ -12,8 +12,10 @@ import {
   Search,
   Blocks,
   Clock4,
+  Notebook,
   PanelLeft,
 } from "lucide-react";
+import { useWikiRecents } from "@/state/wiki";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
@@ -43,6 +45,12 @@ export function Sidebar({ onToggle }: SidebarProps) {
     .sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned));
 
   const isActive = (path: string) => location.pathname === path;
+
+  // When the Wiki section is active, the projects/chats area is repurposed to
+  // show recent wiki pages (the granite "recent entries" pane, merged into the
+  // main nav). Recents are only fetched while in the section.
+  const inWikiSection = location.pathname === "/wiki" || location.pathname.startsWith("/wiki/");
+  const { pages: wikiPages } = useWikiRecents(20);
   const activeThreadId = params.threadId;
   const activeProjectId = params.projectId;
 
@@ -82,10 +90,35 @@ export function Sidebar({ onToggle }: SidebarProps) {
           active={isActive("/automations")}
           onClick={() => navigate("/automations")}
         />
+        <SidebarNavItem
+          icon={<Notebook />}
+          label="Wiki"
+          active={inWikiSection}
+          onClick={() => navigate("/wiki")}
+        />
       </div>
 
       <ScrollArea className="flex-1">
         <div className="px-2 pb-3">
+          {inWikiSection ? (
+            <div>
+              <SidebarSectionHeader label="Recent wiki pages" />
+              {wikiPages.length === 0 ? (
+                <div className="px-2 py-1 text-[12px] text-[color:var(--color-text-quaternary)]">No wiki pages yet</div>
+              ) : (
+                wikiPages.map((p) => (
+                  <SidebarNavItem
+                    key={p.id}
+                    icon={<Notebook />}
+                    label={p.title}
+                    active={params.pageId === p.id}
+                    onClick={() => navigate(`/wiki/${p.id}`)}
+                  />
+                ))
+              )}
+            </div>
+          ) : (
+          <>
           <div>
             <SidebarSectionHeader label="Projects" />
             {orderedProjects.map((p) => (
@@ -118,6 +151,8 @@ export function Sidebar({ onToggle }: SidebarProps) {
               ))
             )}
           </div>
+          </>
+          )}
         </div>
       </ScrollArea>
 

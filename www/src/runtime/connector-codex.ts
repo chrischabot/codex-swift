@@ -37,6 +37,10 @@ import type {
   SendOptions,
   ThreadStreamEvent,
   UploadedAttachment,
+  WikiGraph,
+  WikiPage,
+  WikiPageSummary,
+  WikiTag,
 } from "./connector";
 import { toast } from "@/components/ui/sonner";
 import { parseUnifiedDiff, countDiff } from "@/lib/diff";
@@ -932,6 +936,94 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       return { env, files };
     },
     getTimeline: async (threadId): Promise<TimelineEvent[]> => (timeline.get(threadId) ?? []).slice().reverse(),
+
+    // ── Wiki (read-only; on-demand, never folded into the snapshot) ──
+    listWikiPages: async (opts) => {
+      try {
+        const r = (await rpc("wiki/list", { limit: opts?.limit ?? 50 })) as { data?: Record<string, unknown>[] };
+        return (r.data ?? []).map(mapWikiSummary);
+      } catch { return []; }
+    },
+    getWikiPage: async (pageId) => {
+      try {
+        const r = (await rpc("wiki/page/get", { id: Number(pageId) })) as Record<string, unknown> | null;
+        return r ? mapWikiPage(r) : null;
+      } catch { return null; }   // backend maps not-found to an error → null
+    },
+    searchWiki: async (query, opts) => {
+      try {
+        const r = (await rpc("wiki/search", { query, k: opts?.limit ?? 25 })) as { data?: Record<string, unknown>[] };
+        return (r.data ?? []).map(mapWikiSummary);
+      } catch { return []; }
+    },
+    getWikiGraph: async (opts) => {
+      try {
+        const params: Record<string, unknown> = {};
+        if (opts?.pageId) params.seed = Number(opts.pageId);
+        if (opts?.depth != null) params.depth = opts.depth;
+        const r = (await rpc("wiki/graph", params)) as { nodes?: Record<string, unknown>[]; edges?: Record<string, unknown>[] };
+        return {
+          nodes: (r.nodes ?? []).map((n) => ({
+            id: idStr(n.id),
+            title: pick(n, "title", "canonical") || idStr(n.id),
+            kind: pick(n, "kind") || undefined,
+            weight: numOrU(n.weight),
+          })),
+          edges: (r.edges ?? []).map((e) => ({
+            source: idStr(e.source ?? (e as { src?: unknown }).src),
+            target: idStr(e.target ?? (e as { dst?: unknown }).dst),
+            relation: pick(e, "relation") || undefined,
+          })).filter((e) => e.source && e.target),
+        };
+      } catch { return { nodes: [], edges: [] }; }
+    },
+    getWikiTags: async () => {
+      try {
+        const r = (await rpc("wiki/tags", {})) as { data?: Record<string, unknown>[] };
+        return (r.data ?? []).map((t) => ({ tag: pick(t, "tag", "name"), count: numOrU(t.count) ?? 0 })).filter((t) => t.tag);
+      } catch { return []; }
+    },
+  };
+}
+
+// ── Wiki mappers (ids arrive as integers on the wire; stringify for routing). ──
+function idStr(v: unknown): string {
+  if (typeof v === "number") return String(v);
+  if (typeof v === "string") return v;
+  return "";
+}
+function numOrU(v: unknown): number | undefined {
+  return typeof v === "number" ? v : undefined;
+}
+function normalizeEpochMs(v: unknown): number | undefined {
+  if (typeof v !== "number" || v <= 0) return undefined;
+  return v < 1e12 ? v * 1000 : v;
+}
+function mapWikiSummary(o: Record<string, unknown>): WikiPageSummary {
+  return {
+    id: idStr(o.id),
+    title: pick(o, "title", "name") || "Untitled",
+    excerpt: pick(o, "excerpt", "snippet", "preview") || undefined,
+    source: pick(o, "source") || undefined,
+    updatedAt: normalizeEpochMs(o.updatedAt),
+  };
+}
+function mapWikiPage(o: Record<string, unknown>): WikiPage {
+  const tags = Array.isArray(o.tags) ? (o.tags as unknown[]).filter((t): t is string => typeof t === "string") : undefined;
+  const connections = Array.isArray(o.connections)
+    ? (o.connections as Record<string, unknown>[]).map((c) => ({
+        entityId: idStr(c.entityId),
+        canonical: pick(c, "canonical"),
+        kind: pick(c, "kind"),
+        relation: pick(c, "relation"),
+        weight: numOrU(c.weight),
+      })).filter((c) => c.canonical)
+    : undefined;
+  return {
+    ...mapWikiSummary(o),
+    content: pick(o, "content", "body", "markdown"),
+    tags: tags?.length ? tags : undefined,
+    connections: connections?.length ? connections : undefined,
   };
 }
 

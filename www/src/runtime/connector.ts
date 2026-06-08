@@ -144,6 +144,49 @@ export interface DiffViewModel {
   files: DiffFile[];
 }
 
+// ── Wiki (Memory Wiki browse surface; a "page" is a backend DocumentRow) ─────
+/** Lightweight row for lists (sidebar recents, search results, index). */
+export interface WikiPageSummary {
+  id: string;
+  title: string;
+  excerpt?: string;
+  source?: string;
+  updatedAt?: number; // epoch ms (connector normalizes)
+}
+/** An entity connection of a page (from the entity/edge graph). */
+export interface WikiConnection {
+  entityId: string;
+  canonical: string;
+  kind: string;
+  relation: string;
+  weight?: number;
+}
+/** Full page payload for the reading view. */
+export interface WikiPage extends WikiPageSummary {
+  content: string;
+  tags?: string[];
+  connections?: WikiConnection[];
+}
+export interface WikiTag {
+  tag: string;
+  count: number;
+}
+export interface WikiGraphNode {
+  id: string;
+  title: string;
+  kind?: string;
+  weight?: number;
+}
+export interface WikiGraphEdge {
+  source: string;
+  target: string;
+  relation?: string;
+}
+export interface WikiGraph {
+  nodes: WikiGraphNode[];
+  edges: WikiGraphEdge[];
+}
+
 export interface Connector {
   /** Lifecycle. Mock implementations may be no-ops. */
   connect(): Promise<void>;
@@ -232,4 +275,11 @@ export interface Connector {
 
   /** Timeline of events for the side-panel TIMELINE tab. */
   getTimeline(threadId: string): Promise<TimelineEvent[]>;
+
+  // ── Wiki (optional: mock skips; live codex connector wires to wiki/*). ──
+  listWikiPages?(opts?: { limit?: number }): Promise<WikiPageSummary[]>;
+  getWikiPage?(pageId: string): Promise<WikiPage | null>;
+  searchWiki?(query: string, opts?: { limit?: number }): Promise<WikiPageSummary[]>;
+  getWikiGraph?(opts?: { pageId?: string; depth?: number }): Promise<WikiGraph>;
+  getWikiTags?(): Promise<WikiTag[]>;
 }
