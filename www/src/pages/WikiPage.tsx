@@ -7,6 +7,7 @@ import { WikiConnectionsPanel } from "@/components/wiki/WikiConnectionsPanel";
 import { WikiPropertiesPanel } from "@/components/wiki/WikiPropertiesPanel";
 import { WikiOutlinePanel } from "@/components/wiki/WikiOutlinePanel";
 import { WikiTagsPanel } from "@/components/wiki/WikiTagsPanel";
+import { WikiGraphView } from "@/components/wiki/graph/WikiGraphView";
 
 /**
  * Full-screen Memory Wiki view (inside AppShell's <Outlet/>). M1: granite read
@@ -51,10 +52,20 @@ export function WikiPage() {
           <Tabs defaultValue="connections" className="flex min-h-0 flex-1 flex-col gap-0">
             <TabsList className="shrink-0 justify-start rounded-none border-b border-[color:var(--border)] bg-transparent px-2">
               <TabsTrigger value="connections">Links</TabsTrigger>
+              <TabsTrigger value="graph">Graph</TabsTrigger>
               <TabsTrigger value="tags">Tags</TabsTrigger>
               <TabsTrigger value="outline">Outline</TabsTrigger>
               <TabsTrigger value="properties">Info</TabsTrigger>
             </TabsList>
+            {/* Graph tab fills the rail height (a canvas), so it sits OUTSIDE the
+                scroll area; the other panels scroll. */}
+            <TabsContent value="graph" className="mt-0 min-h-0 flex-1 p-3 data-[state=inactive]:hidden">
+              {page.connections && page.connections.length > 0 ? (
+                <WikiGraphView seedEntityId={page.connections[0].entityId} depth={2} className="h-full w-full" />
+              ) : (
+                <div className="text-[12px] text-[color:var(--color-text-quaternary)]">No graph for this page</div>
+              )}
+            </TabsContent>
             <ScrollArea className="min-h-0 flex-1">
               <div className="px-3 py-4">
                 <TabsContent value="connections" className="mt-0">
@@ -87,10 +98,21 @@ function WikiIndex() {
   const { pages, loading } = useWikiRecents(50);
   return (
     <div className="pt-6">
-      <h1 className="text-[22px] font-semibold text-foreground">Wiki</h1>
-      <p className="mt-1 text-[13px] text-[color:var(--color-text-secondary)]">
-        Your Memory Wiki — browse, explore, and enrich curated knowledge.
-      </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-[22px] font-semibold text-foreground">Wiki</h1>
+          <p className="mt-1 text-[13px] text-[color:var(--color-text-secondary)]">
+            Your Memory Wiki — browse, explore, and enrich curated knowledge.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => navigate("/wiki/graph")}
+          className="shrink-0 rounded-md border border-[color:var(--border)] px-3 py-1.5 text-[13px] text-foreground hover:bg-[color:var(--color-surface-hover)]"
+        >
+          Open graph
+        </button>
+      </div>
       <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[1fr_240px]">
         <div>
           <h2 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-[color:var(--color-text-tertiary)]">

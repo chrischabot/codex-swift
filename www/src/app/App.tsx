@@ -20,6 +20,7 @@ import { SettingsPage } from "@/pages/SettingsPage";
 import { ArchivePage } from "@/pages/ArchivePage";
 import { AutomationEditPage } from "@/pages/AutomationEditPage";
 import { WikiPage } from "@/pages/WikiPage";
+import { WikiGraphPage } from "@/pages/WikiGraphPage";
 
 export function App() {
   return (
@@ -38,6 +39,7 @@ export function App() {
             <Route path="automations" element={<AutomationsPage />} />
             <Route path="automations/:automationId" element={<AutomationEditPage />} />
             <Route path="wiki" element={<WikiPage />} />
+            <Route path="wiki/graph" element={<WikiGraphPage />} />
             <Route path="wiki/:pageId" element={<WikiPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="archive" element={<ArchivePage />} />
