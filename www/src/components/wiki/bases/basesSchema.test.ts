@@ -82,6 +82,16 @@ describe("base config round-trip", () => {
     expect(parsed.sort).toEqual(cfg.sort);
     expect(parsed.group).toBe("status");
   });
+
+  it("round-trips column summaries", () => {
+    const cfg = { ...DEFAULT_BASE, summaries: { prio: "sum", status: "unique" } };
+    expect(parseBaseConfig(serializeBaseConfig(cfg)).summaries).toEqual({ prio: "sum", status: "unique" });
+  });
+
+  it("omits an empty summaries map", () => {
+    const cfg = { ...DEFAULT_BASE, summaries: {} };
+    expect(parseBaseConfig(serializeBaseConfig(cfg)).summaries).toBeUndefined();
+  });
 });
 
 describe("isBaseBody hardening (anti-misrouting)", () => {

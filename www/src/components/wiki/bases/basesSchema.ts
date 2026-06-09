@@ -87,6 +87,9 @@ export interface BaseConfig {
   readonly filters: ReadonlyArray<BaseFilter>;
   readonly sort: ReadonlyArray<BaseSort>;
   readonly group?: ColumnKey;
+  /** Per-column footer summary op (e.g. {prio: "sum"}). Op strings are validated
+   *  by the view (baseSummaries.SummaryOp); kept loose here to avoid a cycle. */
+  readonly summaries?: Readonly<Record<string, string>>;
 }
 
 export const DEFAULT_BASE: BaseConfig = {
@@ -254,8 +257,19 @@ export function parseBaseConfig(content: string | undefined | null): BaseConfig 
     columns: asColumns(obj.columns),
     filters: asFilters(obj.filters),
     sort: asSort(obj.sort),
+    summaries: asSummaries(obj.summaries),
   };
   return group ? { ...config, group } : config;
+}
+
+/** A `{ columnKey: opString }` map of string→string, or undefined. */
+function asSummaries(v: unknown): Readonly<Record<string, string>> | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === "string" && val) out[k] = val;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Serialize a BaseConfig back into a wiki page body (frontmatter + JSON). */
@@ -268,6 +282,7 @@ export function serializeBaseConfig(config: BaseConfig): string {
     sort: config.sort.map((s) => ({ key: s.key, dir: s.dir })),
   };
   if (config.group) json.group = config.group;
+  if (config.summaries && Object.keys(config.summaries).length > 0) json.summaries = config.summaries;
   return `---\nwiki_type: ${WIKI_TYPE}\n---\n${JSON.stringify(json, null, 2)}\n`;
 }
 

@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { computeSummary, SUMMARY_OPS, SUMMARY_LABEL, type SummaryOp } from "./baseSummaries";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -697,6 +698,37 @@ function TableView({
             ])
           : renderRows(rows)}
       </tbody>
+      <tfoot>
+        <tr className="border-t-2 border-[color:var(--border)]">
+          {cols.map((c) => {
+            const op = (config.summaries?.[c.key] ?? "none") as SummaryOp;
+            const value = computeSummary(rows, c.key, op);
+            const setOp = (next: SummaryOp) => {
+              const rest = { ...(config.summaries ?? {}) };
+              if (next === "none") delete rest[c.key];
+              else rest[c.key] = next;
+              onChange({ ...config, summaries: rest });
+            };
+            return (
+              <td key={c.key} className="px-3 py-1.5 align-middle text-[12px] text-[color:var(--color-text-tertiary)]">
+                <span className="inline-flex items-center gap-1">
+                  <select
+                    aria-label={`${c.label} summary`}
+                    value={op}
+                    onChange={(e) => setOp(e.currentTarget.value as SummaryOp)}
+                    className="cursor-pointer rounded border-0 bg-transparent text-[11px] text-[color:var(--color-text-quaternary)] hover:text-foreground focus:outline-none"
+                  >
+                    {SUMMARY_OPS.map((o) => (
+                      <option key={o} value={o}>{SUMMARY_LABEL[o]}</option>
+                    ))}
+                  </select>
+                  {value && <span className="font-medium tabular-nums text-[color:var(--color-text-secondary)]">{value}</span>}
+                </span>
+              </td>
+            );
+          })}
+        </tr>
+      </tfoot>
     </table>
   );
 }
