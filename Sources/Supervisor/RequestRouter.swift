@@ -2175,6 +2175,8 @@ public actor RequestRouter {
             await replyWiki(conn, id) { try await $0.tags() }
         case .wikiPageUpsert(let id, let p):
             await replyWiki(conn, id) { try await $0.upsert(p.id, p.title, p.body) }
+        case .wikiPageDelete(let id, let p):
+            await replyWiki(conn, id) { try await $0.delete(p.id) }
         case .wikiBrief(let id, let p):
             await replyWiki(conn, id) { try await $0.brief(p.topic, min(max(p.k ?? 8, 1), 20)) }
 

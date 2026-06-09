@@ -56,3 +56,9 @@ public struct WikiPageUpsertParams: Decodable, Sendable, Equatable {
         self.id = id; self.title = title; self.body = body
     }
 }
+
+public struct WikiPageDeleteParams: Decodable, Sendable, Equatable {
+    /// DocumentRow.id of the page to delete (with its derived chunks/index rows).
+    public var id: Int64
+    public init(id: Int64) { self.id = id }
+}

@@ -25,6 +25,10 @@ public struct WikiQueryHandle: Sendable {
     /// Insert/overwrite a page (id nil → create). Returns `{id}`. The wiki UI is
     /// the edit environment, so this WRITE lives on the same deny-default handle.
     public var upsert: @Sendable (_ id: Int64?, _ title: String?, _ body: String) async throws -> JSONValue
+    /// Delete a page (manual document) + its derived chunks/index rows. Returns
+    /// `{deleted, id}`; idempotent on a missing id. Lives on the same
+    /// deny-default handle as upsert — the wiki UI is the edit environment.
+    public var delete: @Sendable (_ id: Int64) async throws -> JSONValue
     /// Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface).
     public var brief: @Sendable (_ topic: String, _ k: Int) async throws -> JSONValue
 
@@ -36,6 +40,7 @@ public struct WikiQueryHandle: Sendable {
         backlinks: @escaping @Sendable (Int64) async throws -> JSONValue,
         tags: @escaping @Sendable () async throws -> JSONValue,
         upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue,
+        delete: @escaping @Sendable (Int64) async throws -> JSONValue,
         brief: @escaping @Sendable (String, Int) async throws -> JSONValue
     ) {
         self.list = list
@@ -45,6 +50,7 @@ public struct WikiQueryHandle: Sendable {
         self.backlinks = backlinks
         self.tags = tags
         self.upsert = upsert
+        self.delete = delete
         self.brief = brief
     }
 }

@@ -310,6 +310,9 @@ export interface Connector {
   getWikiTags?(): Promise<WikiTag[]>;
   /** Create (id omitted) or overwrite a wiki page. Returns the page id. */
   saveWikiPage?(input: { id?: string; title?: string; body: string }): Promise<{ id: string } | null>;
+  /** Delete a wiki page (and its derived chunks / index rows). Returns whether a
+   *  page actually existed (false = already gone), or null on transport failure. */
+  deleteWikiPage?(pageId: string): Promise<{ deleted: boolean } | null>;
   /** Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface). */
   getWikiBrief?(topic: string, opts?: { k?: number }): Promise<WikiBrief | null>;
 }

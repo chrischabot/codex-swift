@@ -55,6 +55,7 @@ public enum WikiQueryWiring {
             backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
             tags:      { try await WikiJSON.tags(store) },
             upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
+            delete:    { try await WikiJSON.delete(store, id: $0) },
             brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) })
     }
 }
@@ -258,6 +259,20 @@ public enum WikiJSON {
             bodyPath: bodyPath, contentSHA: contentSHA, rawBytes: Int64(data.count),
             now: now, chunkTexts: chunks)
         return .object(["id": .int(newId)])
+    }
+
+    /// Delete a wiki page (a manual document) and everything derived from it.
+    /// Routes through `MemoryStore.deleteDocument`, which purges the document
+    /// row, its chunks, and the FTS5 / vec0 / mention / embedding rows keyed off
+    /// them — so the search indexes stay consistent (a raw SQL delete would
+    /// orphan them). Idempotent: deleting a missing/already-gone id returns
+    /// `{deleted:false}` rather than erroring. Returns `{deleted, id}`.
+    public static func delete(_ store: MemoryStore, id: Int64) async throws -> JSONValue {
+        let existed = (try await store.document(id: id)) != nil
+        if existed {
+            try await store.deleteDocument(id: id)
+        }
+        return .object(["deleted": .bool(existed), "id": .int(id)])
     }
 
     /// "Enrich": a lexical, zero-spend, citation-first synthesis brief on a topic.

@@ -1000,6 +1000,14 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       const id = idStr(r?.id);
       return id ? { id } : null;
     },
+    deleteWikiPage: async (pageId) => {
+      const n = Number(pageId);
+      if (!Number.isInteger(n)) return null;   // non-numeric route → no round-trip
+      try {
+        const r = (await rpc("wiki/page/delete", { id: n })) as { deleted?: unknown };
+        return { deleted: r?.deleted === true };
+      } catch { return null; }
+    },
     getWikiBrief: async (topic, opts) => {
       try {
         // The backend returns the WikiBriefPayload object directly (parsed).

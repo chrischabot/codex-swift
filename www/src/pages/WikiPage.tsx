@@ -23,6 +23,7 @@ import { useWikiSwitcherHotkey } from "@/components/wiki/useWikiSwitcherHotkey";
 import { WikiBacklinksPanel } from "@/components/wiki/panels/WikiBacklinksPanel";
 import { WikiBookmarksPanel } from "@/components/wiki/panels/WikiBookmarksPanel";
 import { BookmarkButton } from "@/components/wiki/panels/BookmarkButton";
+import { DeletePageButton } from "@/components/wiki/panels/DeletePageButton";
 import { WikiCanvasView } from "@/components/wiki/canvas/WikiCanvasView";
 import { isCanvasDoc } from "@/components/wiki/canvas/canvasSchema";
 import { WikiBaseView } from "@/components/wiki/bases/WikiBaseView";
@@ -118,17 +119,25 @@ export function WikiPage() {
 
   if (docKind === "canvas" && pageId) {
     return (
-      <div className="flex min-h-0 flex-1">
+      <div className="relative flex min-h-0 flex-1">
         {overlays}
         <WikiCanvasView pageId={pageId} onOpenPage={(id) => navigate(`/wiki/${id}`)} className="flex-1" />
+        {/* Full-bleed views have no action row; a floating delete (top-left, clear
+            of the view's own top-right toolbar) keeps canvas/base deletable. */}
+        <div className="absolute left-3 top-3 z-20">
+          <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+        </div>
       </div>
     );
   }
   if (docKind === "base" && pageId) {
     return (
-      <div className="flex min-h-0 flex-1">
+      <div className="relative flex min-h-0 flex-1">
         {overlays}
         <WikiBaseView pageId={pageId} />
+        <div className="absolute right-3 top-3 z-20">
+          <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+        </div>
       </div>
     );
   }
@@ -170,6 +179,7 @@ export function WikiPage() {
                     <Button variant="outline" size="xs" onClick={() => setSettingsOpen(true)} aria-label="Wiki settings">
                       <SettingsIcon className="size-3" />
                     </Button>
+                    <DeletePageButton pageId={page.id} title={page.title} onDeleted={() => navigate("/wiki")} />
                   </div>
                   <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} resolveWikiLink={resolveWikiLink} />
                 </div>

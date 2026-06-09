@@ -31,11 +31,11 @@ enum MethodGate {
         "thread/rollback", "thread/inject_items", "thread/shellCommand",
         "thread/goal/get", "thread/goal/set", "thread/goal/clear",
         "thread/memoryMode/set", "memory/reset",
-        // memory wiki — browse/search/graph + page edit. wiki/page/upsert is the
-        // edit surface (the wiki UI is the management/edit environment); it is
-        // still deny-default behind the CODEXKIT_MEMORY-gated WikiQueryHandle.
+        // memory wiki — browse/search/graph + page edit/delete. upsert+delete are
+        // the edit surface (the wiki UI is the management/edit environment); both
+        // stay deny-default behind the CODEXKIT_MEMORY-gated WikiQueryHandle.
         "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/tags",
-        "wiki/page/upsert", "wiki/brief",
+        "wiki/page/upsert", "wiki/page/delete", "wiki/brief",
         // turn lifecycle
         "turn/start", "turn/steer", "turn/interrupt", "review/start",
         // git diff-rail + automations
