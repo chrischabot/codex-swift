@@ -64,7 +64,23 @@ export interface WorkspaceState {
    * its history (same leaf id); a split copy starts fresh (new leaf id).
    */
   readonly histories: ReadonlyMap<LeafId, NavHistory>;
+  /**
+   * Resize weights, keyed by GROUP id (stable). `w` = the width weight of the
+   * COLUMN this group leads (a column's width = its first group's `w`); `h` =
+   * the height weight of this group within its column. Both default to 1 when
+   * absent. Keyed by group id (not column index) to dodge index-aliasing when
+   * columns are added/removed; stale entries for deleted groups are harmless.
+   * Persisted positionally (re-keyed to fresh ids on deserialize).
+   */
+  readonly groupSizes: ReadonlyMap<TabGroupId, GroupSize>;
 }
+
+export interface GroupSize {
+  readonly w: number;
+  readonly h: number;
+}
+
+const DEFAULT_SIZE: GroupSize = { w: 1, h: 1 };
 
 // ── id generation ───────────────────────────────────────────────────────────
 
@@ -88,11 +104,17 @@ function flatten(columns: ReadonlyArray<ReadonlyArray<TabGroupId>>): TabGroupId[
  *  `histories` defaults to empty when a caller builds state from scratch
  *  (buildInitial / deserialize); ops that spread `...state` carry it through. */
 function withDerived(
-  next: Omit<WorkspaceState, "rootGroupIds" | "histories"> & {
+  next: Omit<WorkspaceState, "rootGroupIds" | "histories" | "groupSizes"> & {
     histories?: ReadonlyMap<LeafId, NavHistory>;
+    groupSizes?: ReadonlyMap<TabGroupId, GroupSize>;
   },
 ): WorkspaceState {
-  return { ...next, histories: next.histories ?? new Map(), rootGroupIds: flatten(next.columns) };
+  return {
+    ...next,
+    histories: next.histories ?? new Map(),
+    groupSizes: next.groupSizes ?? new Map(),
+    rootGroupIds: flatten(next.columns),
+  };
 }
 
 /** Append `pageId` to a leaf's history, truncating any forward entries and
@@ -500,6 +522,69 @@ export function canGoForward(state: WorkspaceState, leafId: LeafId): boolean {
   return !!slot && slot.cursor < slot.entries.length - 1;
 }
 
+// ── resize weights ──────────────────────────────────────────────────────────
+
+/** Flex-grow weight for the column at `colIdx` (its first group's `w`). */
+export function columnWidthWeight(state: WorkspaceState, colIdx: number): number {
+  const first = state.columns[colIdx]?.[0];
+  if (!first) return DEFAULT_SIZE.w;
+  return state.groupSizes.get(first)?.w ?? DEFAULT_SIZE.w;
+}
+
+/** Flex-grow weight for a group within its column (its `h`). */
+export function groupHeightWeight(state: WorkspaceState, groupId: TabGroupId): number {
+  return state.groupSizes.get(groupId)?.h ?? DEFAULT_SIZE.h;
+}
+
+function setSize(
+  sizes: ReadonlyMap<TabGroupId, GroupSize>,
+  groupId: TabGroupId,
+  patch: Partial<GroupSize>,
+): Map<TabGroupId, GroupSize> {
+  const cur = sizes.get(groupId) ?? DEFAULT_SIZE;
+  return new Map(sizes).set(groupId, { ...cur, ...patch });
+}
+
+const MIN_WEIGHT = 0.15; // keep a pane from collapsing to nothing
+
+/**
+ * Set the width weights of two ADJACENT columns (the boundary the user is
+ * dragging). Weights are clamped so neither pane vanishes; only these two
+ * columns change so the rest of the layout stays put.
+ */
+export function resizeColumns(
+  state: WorkspaceState,
+  leftColIdx: number,
+  leftW: number,
+  rightW: number,
+): WorkspaceState {
+  const left = state.columns[leftColIdx]?.[0];
+  const right = state.columns[leftColIdx + 1]?.[0];
+  if (!left || !right) return state;
+  const lw = Math.max(MIN_WEIGHT, leftW);
+  const rw = Math.max(MIN_WEIGHT, rightW);
+  let sizes = setSize(state.groupSizes, left, { w: lw });
+  sizes = setSize(sizes, right, { w: rw });
+  return withDerived({ ...state, groupSizes: sizes });
+}
+
+/**
+ * Set the height weights of two ADJACENT groups stacked in the same column
+ * (the horizontal boundary being dragged).
+ */
+export function resizeGroups(
+  state: WorkspaceState,
+  aboveGroupId: TabGroupId,
+  belowGroupId: TabGroupId,
+  aboveH: number,
+  belowH: number,
+): WorkspaceState {
+  if (!state.groups.has(aboveGroupId) || !state.groups.has(belowGroupId)) return state;
+  let sizes = setSize(state.groupSizes, aboveGroupId, { h: Math.max(MIN_WEIGHT, aboveH) });
+  sizes = setSize(sizes, belowGroupId, { h: Math.max(MIN_WEIGHT, belowH) });
+  return withDerived({ ...state, groupSizes: sizes });
+}
+
 /** Toggle a group's stacked (vertical tab column) rendering. */
 export function toggleStacked(state: WorkspaceState, groupId: TabGroupId): WorkspaceState {
   const group = state.groups.get(groupId);
@@ -594,6 +679,10 @@ interface SerializedGroup {
   readonly leaves: ReadonlyArray<WikiLeafState>;
   readonly activeIndex: number;
   readonly stacked?: boolean;
+  /** Column-width / group-height weights, persisted positionally and re-keyed
+   *  to fresh group ids on load. Omitted when at the default (1). */
+  readonly w?: number;
+  readonly h?: number;
 }
 export interface SerializedWorkspace {
   readonly columns: ReadonlyArray<ReadonlyArray<SerializedGroup>>;
@@ -627,7 +716,14 @@ export function serialize(state: WorkspaceState): SerializedWorkspace | null {
       if (leafStates.length === 0) continue;
       if (gid === state.activeGroupId) activeGroupIndex = flatIdx;
       flatIdx += 1;
-      colGroups.push(group.stacked ? { leaves: leafStates, activeIndex, stacked: true } : { leaves: leafStates, activeIndex });
+      const size = state.groupSizes.get(gid);
+      colGroups.push({
+        leaves: leafStates,
+        activeIndex,
+        ...(group.stacked ? { stacked: true } : {}),
+        ...(size && size.w !== DEFAULT_SIZE.w ? { w: size.w } : {}),
+        ...(size && size.h !== DEFAULT_SIZE.h ? { h: size.h } : {}),
+      });
     }
     if (colGroups.length > 0) columns.push(colGroups);
   }
@@ -643,6 +739,7 @@ export function deserialize(snap: SerializedWorkspace | null | undefined): Works
   if (!snap || !Array.isArray(snap.columns) || snap.columns.length === 0) return null;
   const leaves = new Map<LeafId, Leaf>();
   const groups = new Map<TabGroupId, TabGroup>();
+  const groupSizes = new Map<TabGroupId, GroupSize>();
   const columns: TabGroupId[][] = [];
   for (const col of snap.columns) {
     if (!Array.isArray(col)) continue;
@@ -660,6 +757,9 @@ export function deserialize(snap: SerializedWorkspace | null | undefined): Works
       if (leafIds.length === 0) continue;
       const activeLeafId = leafIds[clamp(g.activeIndex, 0, leafIds.length - 1)] ?? null;
       groups.set(groupId, { id: groupId, leafIds, activeLeafId, ...(g.stacked ? { stacked: true } : {}) });
+      const w = typeof g.w === "number" && Number.isFinite(g.w) ? g.w : DEFAULT_SIZE.w;
+      const h = typeof g.h === "number" && Number.isFinite(g.h) ? g.h : DEFAULT_SIZE.h;
+      if (w !== DEFAULT_SIZE.w || h !== DEFAULT_SIZE.h) groupSizes.set(groupId, { w, h });
       colGroups.push(groupId);
     }
     if (colGroups.length > 0) columns.push(colGroups);
@@ -667,7 +767,7 @@ export function deserialize(snap: SerializedWorkspace | null | undefined): Works
   if (columns.length === 0) return null;
   const flat = flatten(columns);
   const activeGroupId = flat[clamp(snap.activeGroupIndex, 0, flat.length - 1)] ?? null;
-  return withDerived({ leaves, groups, columns, activeGroupId });
+  return withDerived({ leaves, groups, columns, activeGroupId, groupSizes });
 }
 
 function clamp(n: unknown, lo: number, hi: number): number {

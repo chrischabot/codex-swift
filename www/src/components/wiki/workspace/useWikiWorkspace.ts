@@ -3,6 +3,8 @@ import {
   buildInitial,
   goBack as goBackOp,
   goForward as goForwardOp,
+  resizeColumns as resizeColumnsOp,
+  resizeGroups as resizeGroupsOp,
   closeGroup as closeGroupOp,
   closeLeavesToRight as closeRightOp,
   closeLeaf as closeLeafOp,
@@ -63,6 +65,8 @@ export interface UseWikiWorkspace {
   togglePinned: (id: LeafId) => void;
   goBack: (id: LeafId) => void;
   goForward: (id: LeafId) => void;
+  resizeColumns: (leftColIdx: number, leftW: number, rightW: number) => void;
+  resizeGroups: (aboveId: TabGroupId, belowId: TabGroupId, aboveH: number, belowH: number) => void;
 }
 
 /**
@@ -108,6 +112,16 @@ export function useWikiWorkspace(): UseWikiWorkspace {
   const togglePinned = React.useCallback((id: LeafId) => setState((s) => togglePinnedOp(s, id)), []);
   const goBack = React.useCallback((id: LeafId) => setState((s) => goBackOp(s, id)), []);
   const goForward = React.useCallback((id: LeafId) => setState((s) => goForwardOp(s, id)), []);
+  const resizeColumns = React.useCallback(
+    (leftColIdx: number, leftW: number, rightW: number) =>
+      setState((s) => resizeColumnsOp(s, leftColIdx, leftW, rightW)),
+    [],
+  );
+  const resizeGroups = React.useCallback(
+    (aboveId: TabGroupId, belowId: TabGroupId, aboveH: number, belowH: number) =>
+      setState((s) => resizeGroupsOp(s, aboveId, belowId, aboveH, belowH)),
+    [],
+  );
 
   return {
     state,
@@ -125,5 +139,7 @@ export function useWikiWorkspace(): UseWikiWorkspace {
     togglePinned,
     goBack,
     goForward,
+    resizeColumns,
+    resizeGroups,
   };
 }

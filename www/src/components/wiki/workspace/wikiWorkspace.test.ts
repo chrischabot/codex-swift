@@ -18,6 +18,10 @@ import {
   leavesOfGroup,
   moveTab,
   newTab,
+  columnWidthWeight,
+  groupHeightWeight,
+  resizeColumns,
+  resizeGroups,
   openOrFocusPage,
   serialize,
   splitLeaf,
@@ -459,6 +463,48 @@ describe("moveTab", () => {
     s = moveTab(s, only, s.activeGroupId!, null);
     expect(totalGroups(s)).toBe(1);
     expect(groupLeafIds(s)).toEqual([only]);
+  });
+});
+
+describe("resize weights", () => {
+  it("default weights are 1", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = splitLeaf(s, groupLeafIds(s, s.rootGroupIds[0])[0], "right");
+    expect(columnWidthWeight(s, 0)).toBe(1);
+    expect(columnWidthWeight(s, 1)).toBe(1);
+  });
+
+  it("resizeColumns sets the two adjacent column weights", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = splitLeaf(s, groupLeafIds(s, s.rootGroupIds[0])[0], "right");
+    s = resizeColumns(s, 0, 1.6, 0.4);
+    expect(columnWidthWeight(s, 0)).toBeCloseTo(1.6);
+    expect(columnWidthWeight(s, 1)).toBeCloseTo(0.4);
+  });
+
+  it("resizeColumns clamps so a pane never vanishes", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = splitLeaf(s, groupLeafIds(s, s.rootGroupIds[0])[0], "right");
+    s = resizeColumns(s, 0, 5, 0); // right would collapse
+    expect(columnWidthWeight(s, 1)).toBeGreaterThan(0);
+  });
+
+  it("resizeGroups sets stacked group heights", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = splitLeaf(s, groupLeafIds(s, s.rootGroupIds[0])[0], "down");
+    const [above, below] = s.columns[0];
+    s = resizeGroups(s, above, below, 1.5, 0.5);
+    expect(groupHeightWeight(s, above)).toBeCloseTo(1.5);
+    expect(groupHeightWeight(s, below)).toBeCloseTo(0.5);
+  });
+
+  it("weights survive serialize round-trip (re-keyed to fresh ids)", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = splitLeaf(s, groupLeafIds(s, s.rootGroupIds[0])[0], "right");
+    s = resizeColumns(s, 0, 1.7, 0.3);
+    const restored = deserialize(serialize(s))!;
+    expect(columnWidthWeight(restored, 0)).toBeCloseTo(1.7);
+    expect(columnWidthWeight(restored, 1)).toBeCloseTo(0.3);
   });
 });
 
