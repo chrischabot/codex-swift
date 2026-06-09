@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { CodeBlock } from "@/components/chat/CodeBlock";
 import { Callout } from "./markdown/Callout";
 import { WikiEmbed } from "./markdown/WikiEmbed";
+import { WikiLinkWithHover } from "./hover/WikiLinkWithHover";
 import {
   type CalloutType,
   rehypeHeadingIds,
@@ -27,6 +28,11 @@ interface Props {
    *  argument is the full target (including any `#heading` / `#^block`
    *  suffix). */
   onWikiLink?: (target: string) => void;
+  /** Maps a (suffix-stripped) wikilink title to a page id. When provided, a
+   *  resolvable `[[Target]]` anchor gets a hover preview card. Built by the host
+   *  (typically a lowercased title→id Map from listWikiPages); returns undefined
+   *  for dangling links, which then render as a plain anchor (no card). */
+  resolveWikiLink?: (title: string) => string | undefined;
 }
 
 /**
@@ -40,7 +46,7 @@ interface Props {
  *   - `==highlight==`                           → <mark>
  *   - footnotes `[^1]` (+ defs)                 → via remark-gfm; styled here
  */
-export function WikiMarkdown({ content, onWikiLink }: Props) {
+export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
   const src = stripComments(content);
 
   // The "wiki-embed" key is a custom element name not in JSX.IntrinsicElements,
@@ -56,19 +62,13 @@ export function WikiMarkdown({ content, onWikiLink }: Props) {
       if (typeof href === "string" && href.startsWith("wiki:")) {
         const target = href.slice("wiki:".length);
         return (
-          <a
-            {...rest}
-            href={`/wiki?q=${encodeURIComponent(target)}`}
-            className="wiki-link cursor-pointer rounded-sm text-[color:var(--text-link)] underline decoration-dotted underline-offset-2 hover:decoration-solid"
-            onClick={(e) => {
-              if (onWikiLink) {
-                e.preventDefault();
-                onWikiLink(target);
-              }
-            }}
+          <WikiLinkWithHover
+            target={target}
+            resolveId={resolveWikiLink}
+            onOpen={onWikiLink}
           >
             {children}
-          </a>
+          </WikiLinkWithHover>
         );
       }
       // In-document fragment links (#heading, GFM footnote refs/backrefs) must

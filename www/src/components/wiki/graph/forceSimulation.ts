@@ -123,6 +123,12 @@ export class ForceSimulation {
   readonly vy: Float64Array;
   /** Node masses. */
   readonly mass: Float64Array;
+  /**
+   * Per-node pin flag (1 = pinned). Pinned nodes ignore all forces and keep
+   * their current position — used for drag-to-pin in the view. Mutated via
+   * {@link pin} / {@link unpin} / {@link setNodePosition}.
+   */
+  readonly pinned: Uint8Array;
   /** Ordered node ids — index `i` here corresponds to x[i]/y[i]. */
   readonly ids: ReadonlyArray<string>;
 
@@ -153,6 +159,7 @@ export class ForceSimulation {
     this.vx = new Float64Array(this.count);
     this.vy = new Float64Array(this.count);
     this.mass = new Float64Array(this.count);
+    this.pinned = new Uint8Array(this.count);
     this.indexById = new Map();
     const ids: string[] = new Array(this.count);
 
@@ -327,6 +334,13 @@ export class ForceSimulation {
     // 4) Center pull + integrate (Verlet-style with damping).
     let energy = 0;
     for (let i = 0; i < this.count; i++) {
+      // Pinned nodes are held fixed: zero velocity, ignore all accumulated
+      // forces, keep position. (Used for drag-to-pin in the view.)
+      if (this.pinned[i]) {
+        this.vx[i] = 0;
+        this.vy[i] = 0;
+        continue;
+      }
       const px = this.x[i] ?? 0;
       const py = this.y[i] ?? 0;
       const m = this.mass[i] ?? 1;
@@ -386,6 +400,38 @@ export class ForceSimulation {
     const i = this.indexById.get(id);
     if (i === undefined) return null;
     return { x: this.x[i] ?? 0, y: this.y[i] ?? 0 };
+  }
+
+  /**
+   * Imperatively move node `i` to a world-space point and zero its velocity.
+   * Used while dragging a node so it tracks the cursor without the integrator
+   * fighting the move. No-op for out-of-range indices.
+   */
+  setNodePosition(i: number, x: number, y: number): void {
+    if (i < 0 || i >= this.count) return;
+    this.x[i] = x;
+    this.y[i] = y;
+    this.vx[i] = 0;
+    this.vy[i] = 0;
+  }
+
+  /** Pin node `i` so the simulation holds it fixed. No-op if out of range. */
+  pin(i: number): void {
+    if (i < 0 || i >= this.count) return;
+    this.pinned[i] = 1;
+    this.vx[i] = 0;
+    this.vy[i] = 0;
+  }
+
+  /** Release a previously pinned node so forces act on it again. */
+  unpin(i: number): void {
+    if (i < 0 || i >= this.count) return;
+    this.pinned[i] = 0;
+  }
+
+  /** Whether node `i` is currently pinned. */
+  isPinned(i: number): boolean {
+    return i >= 0 && i < this.count && this.pinned[i] === 1;
   }
 
   /**

@@ -10,6 +10,9 @@ interface Props {
   onWikiLink?: (target: string) => void;
   /** Invoked when a tag chip is clicked. Receives the bare tag (no leading #). */
   onTag?: (tag: string) => void;
+  /** Maps a wikilink title to a page id; threaded to WikiMarkdown to enable
+   *  hover previews on resolvable `[[wikilinks]]`. */
+  resolveWikiLink?: (title: string) => string | undefined;
 }
 
 /**
@@ -18,7 +21,7 @@ interface Props {
  * markdown extensions). This is the read-only surface; editing/rename and the
  * right-rail panels (backlinks/outline/properties) live elsewhere.
  */
-export function WikiReadingView({ page, onWikiLink, onTag }: Props) {
+export function WikiReadingView({ page, onWikiLink, onTag, resolveWikiLink }: Props) {
   const tags = page.tags ?? [];
   return (
     <article className="wiki-reading-view mx-auto w-full max-w-3xl px-1">
@@ -62,7 +65,7 @@ export function WikiReadingView({ page, onWikiLink, onTag }: Props) {
         </div>
       )}
 
-      <WikiMarkdown content={page.content} onWikiLink={onWikiLink} />
+      <WikiMarkdown content={page.content} onWikiLink={onWikiLink} resolveWikiLink={resolveWikiLink} />
     </article>
   );
 }

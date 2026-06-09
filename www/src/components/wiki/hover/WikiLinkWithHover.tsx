@@ -9,8 +9,10 @@ interface Props {
   /** Maps a (suffix-stripped) title to a page id. Typically built from
    *  listWikiPages; returns undefined for unresolved/dangling links. */
   resolveId?: (title: string) => string | undefined;
-  /** Open the link's target (click) — forwarded to WikiMarkdown's onWikiLink. */
-  onOpen: (target: string) => void;
+  /** Open the link's target (click) — forwarded to WikiMarkdown's onWikiLink.
+   *  Optional: when absent the anchor falls back to navigating its href (so
+   *  surfaces that render WikiMarkdown without a handler keep working links). */
+  onOpen?: (target: string) => void;
   /** The rendered anchor/label (the wikilink text or alias). */
   children: React.ReactNode;
 }
@@ -37,8 +39,12 @@ export function WikiLinkWithHover({ target, resolveId, onOpen, children }: Props
       href={`/wiki?q=${encodeURIComponent(target)}`}
       className="wiki-link cursor-pointer rounded-sm text-[color:var(--text-link)] underline decoration-dotted underline-offset-2 hover:decoration-solid"
       onClick={(e) => {
-        e.preventDefault();
-        onOpen(target);
+        // Only intercept when a handler is wired; otherwise let the href
+        // navigate (the original WikiMarkdown behaviour for handler-less hosts).
+        if (onOpen) {
+          e.preventDefault();
+          onOpen(target);
+        }
       }}
     >
       {children}
@@ -52,7 +58,7 @@ export function WikiLinkWithHover({ target, resolveId, onOpen, children }: Props
     <HoverCard openDelay={OPEN_DELAY_MS} closeDelay={CLOSE_DELAY_MS}>
       <HoverCardTrigger asChild>{anchor}</HoverCardTrigger>
       <HoverCardContent align="start" className="w-80">
-        <WikiHoverCard pageId={pageId} title={baseTitle} onOpen={() => onOpen(target)} />
+        <WikiHoverCard pageId={pageId} title={baseTitle} onOpen={() => onOpen?.(target)} />
       </HoverCardContent>
     </HoverCard>
   );
