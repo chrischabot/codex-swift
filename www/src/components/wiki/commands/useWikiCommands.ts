@@ -1,7 +1,9 @@
 import * as React from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "@/components/ui/sonner";
+import { useRuntime } from "@/runtime/RuntimeProvider";
 import { useBookmarks } from "@/components/wiki/panels/useBookmarks";
+import { dailyNoteTitle, dailyNoteBody, findDailyNoteId } from "./dailyNote";
 import {
   wikiCommandRegistry,
   type WikiCommand,
@@ -53,7 +55,57 @@ export function useWikiCommands({
   const [open, setOpen] = React.useState(false);
   const navigate = useNavigate();
   const params = useParams();
+  const { connector, status } = useRuntime();
   const { toggle: toggleBookmark } = useBookmarks();
+
+  // Open today's daily note, creating it (date-titled, from a template) when it
+  // doesn't exist yet. Fire-and-forget from the sync command context.
+  // An in-flight ref prevents a same-tab double-fire from creating duplicates.
+  const dailyBusyRef = React.useRef(false);
+  const openDailyNote = React.useCallback(() => {
+    if (status.kind !== "connected" || !connector.listWikiPages) {
+      toast.error("Not connected");
+      return;
+    }
+    if (dailyBusyRef.current) return;
+    dailyBusyRef.current = true;
+    void (async () => {
+      try {
+        const date = new Date();
+        const title = dailyNoteTitle(date);
+        // Find an existing daily note. Prefer searchWiki: the note's body carries
+        // a `# <date>` heading that IS in the FTS index, so it ranks regardless
+        // of corpus size — avoiding the silent daily-duplicate a fixed-limit
+        // listWikiPages would cause past its cap. Fall back to listing.
+        let existing: string | null = null;
+        if (connector.searchWiki) {
+          existing = findDailyNoteId(await connector.searchWiki(title, { limit: 25 }), date);
+        }
+        if (!existing && connector.listWikiPages) {
+          existing = findDailyNoteId(await connector.listWikiPages({ limit: 1000 }), date);
+        }
+        if (existing) {
+          navigate(`/wiki/${existing}`);
+          return;
+        }
+        if (!connector.saveWikiPage) {
+          toast.error("Can't create a daily note with this connection");
+          return;
+        }
+        const res = await connector.saveWikiPage({ title, body: dailyNoteBody(date) });
+        if (res) {
+          toast.success("Created today's note");
+          navigate(`/wiki/${res.id}`);
+        } else {
+          toast.error("Failed to create today's note");
+        }
+      } catch {
+        toast.error("Failed to open today's note");
+      } finally {
+        dailyBusyRef.current = false;
+      }
+    })();
+  }, [connector, status.kind, navigate]);
 
   // Normalize the route param: only a *real* page id should surface as
   // ctx.pageId. The wiki routes reuse `/wiki/:pageId` for the `new` create
@@ -86,9 +138,10 @@ export function useWikiCommands({
         const nowBookmarked = toggleBookmark(pageId);
         toast(nowBookmarked ? "Bookmarked page" : "Removed bookmark");
       },
+      openDailyNote,
       notify: (message: string) => toast(message),
     };
-  }, [navigate, pageId, onOpenSwitcher, onOpenSearch, toggleBookmark]);
+  }, [navigate, pageId, onOpenSwitcher, onOpenSearch, toggleBookmark, openDailyNote]);
 
   // Availability filter needs a context; recompute when the registry list or
   // the context-shaping inputs change.

@@ -47,6 +47,9 @@ export interface WikiCommandContext {
   readonly openSearch: () => void;
   /** Bookmark / un-bookmark the current page. No-op when no page is open. */
   readonly toggleBookmarkCurrent: () => void;
+  /** Open today's daily note, creating it (from a date-titled template) if it
+   *  doesn't exist yet. */
+  readonly openDailyNote: () => void;
   /** Toast helper for "nothing to act on" / confirmation feedback. */
   readonly notify: (message: string) => void;
 }
@@ -138,17 +141,6 @@ export const WIKI_EVENTS = {
   newCanvas: "wiki:new-canvas",
   newBase: "wiki:new-base",
 } as const;
-
-/** "Today's note" id convention: a daily-note slug `daily/YYYY-MM-DD`. The wiki
- *  page route accepts any id; if the page doesn't exist yet, WikiPage renders a
- *  not-found state from which the user can create it. Kept here so the daily
- *  format lives in one place. */
-export function todaysNoteId(date = new Date()): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `daily/${y}-${m}-${d}`;
-}
 
 /**
  * Dispatch a window CustomEvent and report whether a listener consumed it.
@@ -262,7 +254,7 @@ const BUILTIN_WIKI_COMMANDS: ReadonlyArray<WikiCommand> = [
     category: "Navigate",
     name: "Go to today's note",
     icon: CalendarDays,
-    run: (ctx) => ctx.navigate(`/wiki/${todaysNoteId()}`),
+    run: (ctx) => ctx.openDailyNote(),
   },
 ];
 
