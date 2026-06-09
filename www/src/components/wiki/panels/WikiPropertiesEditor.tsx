@@ -127,32 +127,54 @@ function rid(): string {
 }
 
 // ── Split: leading `---\n … \n---\n` block off the front of the body ──────────
-const FENCE_RE = /^---\r?\n/;
 
 interface Split {
   yamlText: string | null;
   body: string;
   newline: "\n" | "\r\n";
+  /** The closing fence the source used — `---` or the YAML document-end `...`.
+   *  Preserved on re-serialize so a `...`-terminated doc round-trips exactly. */
+  endFence: "---" | "...";
 }
 
 function splitFrontmatter(text: string): Split {
-  const newline: "\n" | "\r\n" = text.includes("\r\n") ? "\r\n" : "\n";
-  if (!FENCE_RE.test(text)) return { yamlText: null, body: text, newline };
-  const startLen = 3 + newline.length;
-  const endMarker = `${newline}---${newline}`;
-  const end = text.indexOf(endMarker, startLen);
-  // Also accept a closing fence that ends the document (no trailing newline).
-  if (end === -1) {
-    const tailMarker = `${newline}---`;
-    if (text.endsWith(tailMarker)) {
-      const yamlText = text.slice(startLen, text.length - tailMarker.length);
-      return { yamlText, body: "", newline };
+  // Newline style is taken from the OPENING fence ONLY. Detecting it from the
+  // whole document is wrong: a single `\r\n` anywhere (a Windows-pasted body
+  // line, a CRLF code block) would force a `\r\n` end-marker that never matches
+  // an LF fence, demoting the entire frontmatter into the body on save.
+  const open = /^---(\r?\n)/.exec(text);
+  const newline: "\n" | "\r\n" = open
+    ? open[1] === "\r\n" ? "\r\n" : "\n"
+    : text.includes("\r\n") ? "\r\n" : "\n";
+  if (!open) return { yamlText: null, body: text, newline, endFence: "---" };
+  const startLen = open[0].length; // 3 + newline length
+  // Closing fence: the first `---` OR `...` (YAML document-end) on its own line.
+  // Search from just before the first content line so an empty frontmatter
+  // (`---\n---\n`) is still recognized.
+  const from = Math.max(0, startLen - newline.length);
+  let bestNl = -1; // index of the newline that precedes the closing marker
+  let bodyStart = -1;
+  let endFence: "---" | "..." = "---";
+  for (const mark of ["---", "..."] as const) {
+    const endMarker = `${newline}${mark}${newline}`;
+    const i = text.indexOf(endMarker, from);
+    if (i !== -1 && (bestNl === -1 || i < bestNl)) {
+      bestNl = i;
+      bodyStart = i + endMarker.length;
+      endFence = mark;
     }
-    return { yamlText: null, body: text, newline };
   }
-  const yamlText = text.slice(startLen, end);
-  const body = text.slice(end + endMarker.length);
-  return { yamlText, body, newline };
+  if (bestNl !== -1) {
+    return { yamlText: text.slice(startLen, bestNl), body: text.slice(bodyStart), newline, endFence };
+  }
+  // Closing fence at EOF (no trailing newline).
+  for (const mark of ["---", "..."] as const) {
+    const tail = `${newline}${mark}`;
+    if (text.endsWith(tail)) {
+      return { yamlText: text.slice(startLen, text.length - tail.length), body: "", newline, endFence: mark };
+    }
+  }
+  return { yamlText: null, body: text, newline, endFence: "---" };
 }
 
 // ── Scalar helpers ────────────────────────────────────────────────────────────
@@ -539,7 +561,12 @@ function rowEdited(row: PropertyRowState): boolean {
   return orig.raw !== row.raw;
 }
 
-function serialize(segments: Segment[], body: string, newline: "\n" | "\r\n"): string {
+function serialize(
+  segments: Segment[],
+  body: string,
+  newline: "\n" | "\r\n",
+  endFence: "---" | "..." = "---",
+): string {
   const out: string[] = [];
   for (const seg of segments) {
     if (seg.kind === "raw") {
@@ -549,14 +576,15 @@ function serialize(segments: Segment[], body: string, newline: "\n" | "\r\n"): s
       if (emitted) for (const l of emitted) out.push(l);
     }
   }
-  const trimmedBody = body.replace(/^\s+/, "");
-
-  // Drop trailing blank lines that would otherwise sit just before the close
-  // fence ONLY when they came from raw segments at the very end? No — preserve
-  // verbatim. We keep everything to honour the round-trip guarantee.
-  if (out.length === 0) return trimmedBody;
+  // The markdown body is emitted VERBATIM — `splitFrontmatter` already returns
+  // exactly the text after the closing fence's trailing newline, so re-prefixing
+  // `---\n…\n---\n` reproduces the original byte-for-byte. (An earlier
+  // `body.replace(/^\s+/, "")` here silently deleted leading blank lines and the
+  // indentation of an indented first line — e.g. a leading indented code block —
+  // on every save.)
+  if (out.length === 0) return body;
   const block = out.join(newline);
-  return `---${newline}${block}${newline}---${newline}${trimmedBody}`;
+  return `---${newline}${block}${newline}${endFence}${newline}${body}`;
 }
 
 // ── System metadata (read-only) ───────────────────────────────────────────────
@@ -659,7 +687,7 @@ export function WikiPropertiesEditor({ page, onSave }: Props) {
       setSaving(true);
       setError(null);
       try {
-        const nextBody = serialize(nextSegments, split.body, split.newline);
+        const nextBody = serialize(nextSegments, split.body, split.newline, split.endFence);
         await onSave(nextBody);
         // Only the latest commit may be considered authoritative.
         if (ticket >= lastApplied.current) lastApplied.current = ticket;
@@ -673,7 +701,7 @@ export function WikiPropertiesEditor({ page, onSave }: Props) {
         if (ticket >= commitSeq.current) setSaving(false);
       }
     },
-    [onSave, split.body, split.newline],
+    [onSave, split.body, split.newline, split.endFence],
   );
 
   const patchRow = useCallback((id: string, patch: Partial<PropertyRowState>) => {

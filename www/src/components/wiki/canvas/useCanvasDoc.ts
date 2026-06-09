@@ -81,6 +81,16 @@ export function useCanvasDoc(pageId: string | undefined): UseCanvasDoc {
           setStatus("missing");
           return;
         }
+        // A reload can re-fire on reconnect / rtStatus changes. If the user has
+        // an unsaved local edit (dirtyRef), the server copy is STALE — adopting
+        // it would silently discard the edit, and the pending debounce save
+        // would then no-op (dirty already cleared). Keep the local doc; only
+        // leave the loading state. The queued save still flushes the edit.
+        if (dirtyRef.current) {
+          setTitle(page.title ?? "");
+          setStatus("ready");
+          return;
+        }
         const { frontmatter, canvas: parsed } = parseCanvasDoc(page.content);
         frontmatterRef.current = frontmatter;
         canvasRef.current = parsed;

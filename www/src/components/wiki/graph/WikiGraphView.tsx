@@ -348,20 +348,26 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
         centerGravity: settings.centerGravity,
       };
       const prev = prevForcesRef.current;
-      const forcesChanged =
-        !prev ||
-        prev.repulsion !== next.repulsion ||
-        prev.attraction !== next.attraction ||
-        prev.linkDistance !== next.linkDistance ||
-        prev.centerGravity !== next.centerGravity;
-      // Only push forces + reheat when a FORCE slider actually moved. Display
-      // sliders (nodeSize/linkThickness/labelThreshold) and colorBy are read
-      // per-frame / re-tinted below, so they just need a repaint — reheating on
-      // them would visibly disturb an already-settled layout.
-      if (forcesChanged) {
-        sim.setForces({ ...next, theta: sim.getParams().theta });
-        sim.reheat(0.6);
+      if (!prev) {
+        // First run after the sim is built: the sim was already constructed WITH
+        // these forces (and alpha=1), so don't reheat — just record the baseline.
+        // Reheating here would needlessly drop the opening anneal from 1.0→0.6.
         prevForcesRef.current = next;
+      } else {
+        const forcesChanged =
+          prev.repulsion !== next.repulsion ||
+          prev.attraction !== next.attraction ||
+          prev.linkDistance !== next.linkDistance ||
+          prev.centerGravity !== next.centerGravity;
+        // Only push forces + reheat when a FORCE slider actually moved. Display
+        // sliders (nodeSize/linkThickness/labelThreshold) and colorBy are read
+        // per-frame / re-tinted below, so they just need a repaint — reheating on
+        // them would visibly disturb an already-settled layout.
+        if (forcesChanged) {
+          sim.setForces({ ...next, theta: sim.getParams().theta });
+          sim.reheat(0.6);
+          prevForcesRef.current = next;
+        }
       }
     }
     // Re-tint for the current colorBy (cheap; safe even when colorBy didn't change).

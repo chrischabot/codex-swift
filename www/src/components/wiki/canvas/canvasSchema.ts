@@ -220,11 +220,24 @@ export function serializeCanvasDoc(
   return `---\n${fmLines}\n---\n${json}\n`;
 }
 
-/** True when a wiki page body declares itself a canvas via frontmatter. */
+/** True when a wiki page body declares itself a canvas via frontmatter AND its
+ *  body is an actual canvas JSON object. The body check guards against a normal
+ *  prose page that merely happens to carry a `wiki_type: canvas` frontmatter
+ *  key: such a page must open in the reading view (with an Edit escape hatch),
+ *  not the full-bleed board — which would otherwise overwrite the prose with
+ *  canvas JSON on the first edit. */
 export function isCanvasDoc(content: string | undefined | null): boolean {
   if (!content) return false;
-  const { frontmatter } = splitFrontmatter(content);
-  return frontmatter.wiki_type === CANVAS_WIKI_TYPE;
+  const { frontmatter, rest } = splitFrontmatter(content);
+  if (frontmatter.wiki_type !== CANVAS_WIKI_TYPE) return false;
+  const jsonText = rest.trim();
+  if (!jsonText) return false; // marker but no board payload → treat as prose
+  try {
+    const p = JSON.parse(jsonText);
+    return !!p && typeof p === "object" && !Array.isArray(p) && ("nodes" in p || "edges" in p);
+  } catch {
+    return false;
+  }
 }
 
 /** Short random node/edge id, stable across browsers (Web Crypto). */

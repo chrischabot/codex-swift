@@ -101,6 +101,15 @@ export function useBaseDoc(pageId: string): UseBaseDoc {
           });
           return;
         }
+        // A reload can re-fire on reconnect / reloadTick. If there's an unsaved
+        // local edit (dirtyRef), the server copy is STALE — adopting it would
+        // silently discard the edit and the pending debounce save would no-op
+        // (dirty already cleared). Keep the local config; just clear loading.
+        if (dirtyRef.current) {
+          titleRef.current = page.title ?? "";
+          setState((s) => ({ ...s, title: page.title ?? "", loading: false, error: null }));
+          return;
+        }
         const parsed = parseBaseConfig(page.content);
         configRef.current = parsed;
         titleRef.current = page.title ?? "";

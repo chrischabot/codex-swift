@@ -158,10 +158,21 @@ function unquote(s: string): string {
 /** Is this page body a `wiki_type: base` document? */
 export function isBaseBody(content: string | undefined | null): boolean {
   if (!content) return false;
-  const { frontmatter } = splitFrontmatter(content);
+  const { frontmatter, body } = splitFrontmatter(content);
   if (frontmatter === null) return false;
   const v = readFrontmatterKey(frontmatter, "wiki_type");
-  return v !== null && unquote(v) === WIKI_TYPE;
+  if (v === null || unquote(v) !== WIKI_TYPE) return false;
+  // Require the body to actually be a base JSON object, so a normal prose page
+  // that merely carries a `wiki_type: base` frontmatter key is NOT hijacked into
+  // the full-bleed base view (which has no Edit escape hatch).
+  const jsonText = body.trim();
+  if (!jsonText) return false;
+  try {
+    const p = JSON.parse(jsonText);
+    return !!p && typeof p === "object" && !Array.isArray(p);
+  } catch {
+    return false;
+  }
 }
 
 function asView(v: unknown): BaseViewType {
