@@ -94,24 +94,30 @@ export function WikiPage() {
     [idByTitle],
   );
 
-  // ── route ⇄ workspace sync ────────────────────────────────────────────────
-  // Route → workspace: a real pageId opens/focuses in the active pane.
+  // ── route ⇄ workspace sync (single reconciler) ────────────────────────────
+  // The URL (`urlId`) and the active pane's page (`wsId`) must stay equal, but
+  // EITHER side can change first: a route change (deep-link, explorer/wikilink
+  // click, back/forward) must drive the workspace; a workspace change (focus /
+  // close / split / drag) must drive the URL. Two separate effects deadlock —
+  // when the two disagree, each insists ITS value is authoritative and they
+  // ping-pong the URL forever (100% CPU). So a SINGLE effect arbitrates using a
+  // `lastSync` ref: whichever value diverged from the last reconciled point is
+  // the one that changed, and therefore the authority. The other side follows;
+  // next run both equal `lastSync` and it no-ops. `replace` since the URL
+  // mirrors internal state, not a fresh navigation.
+  const urlId = pageId && pageId !== "new" ? pageId : null;
+  const wsId = apid;
+  const lastSync = React.useRef<string | null | undefined>(undefined);
   React.useEffect(() => {
-    if (pageId && pageId !== "new") ws.openPage(pageId);
-  }, [pageId, ws.openPage]);
-  // Workspace → route: keep the URL pointing at the active pane's page (or the
-  // index when the active leaf is empty). This REFLECTS internal focus / close /
-  // split / drag changes, so it `replace`s rather than pushing — only explicit
-  // navigations (explorer / wikilink clicks, which call navigate() directly)
-  // add history entries. Equality guards prevent a loop.
-  React.useEffect(() => {
-    if (creating) return;
-    if (apid) {
-      if (apid !== pageId) navigate(`/wiki/${apid}`, { replace: true });
-    } else if (pageId) {
-      navigate("/wiki", { replace: true });
+    if (creating) return; // /wiki/new owns the URL until it saves
+    if (urlId !== lastSync.current) {
+      lastSync.current = urlId;
+      if (urlId) ws.openPage(urlId); // URL → workspace
+    } else if (wsId !== lastSync.current) {
+      lastSync.current = wsId;
+      navigate(wsId ? `/wiki/${wsId}` : "/wiki", { replace: true }); // workspace → URL
     }
-  }, [apid, pageId, creating, navigate]);
+  }, [urlId, wsId, creating, navigate, ws.openPage]);
 
   // Wiki-scoped command palette (Cmd-P).
   const cmds = useWikiCommands({
