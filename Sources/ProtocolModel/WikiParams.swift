@@ -62,3 +62,11 @@ public struct WikiPageDeleteParams: Decodable, Sendable, Equatable {
     public var id: Int64
     public init(id: Int64) { self.id = id }
 }
+
+public struct WikiPageRenameParams: Decodable, Sendable, Equatable {
+    /// DocumentRow.id of the page to rename.
+    public var id: Int64
+    /// The new title.
+    public var title: String
+    public init(id: Int64, title: String) { self.id = id; self.title = title }
+}

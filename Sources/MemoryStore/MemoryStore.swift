@@ -453,6 +453,13 @@ public actor MemoryStore {
         }
     }
 
+    /// Rename a document — updates ONLY its title, preserving the source, body,
+    /// chunks, and search index (unlike `rewriteManualPage`, which re-chunks and
+    /// forces `source = .manual`). No-op when the id doesn't exist.
+    public func renameDocument(id: Int64, title: String) throws {
+        try run("UPDATE document SET title=? WHERE id=?;", [.text(title), .int(id)])
+    }
+
     /// Promote a fully processed staging document into a stable source URI.
     /// The old document, if present, and all of its search/vector side tables
     /// are purged in the same transaction that updates the staged document's

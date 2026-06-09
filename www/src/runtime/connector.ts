@@ -313,6 +313,9 @@ export interface Connector {
   /** Delete a wiki page (and its derived chunks / index rows). Returns whether a
    *  page actually existed (false = already gone), or null on transport failure. */
   deleteWikiPage?(pageId: string): Promise<{ deleted: boolean } | null>;
+  /** Rename a wiki page (title only — preserves source/body/index). Returns
+   *  whether a page was renamed (false = not found), or null on transport failure. */
+  renameWikiPage?(pageId: string, title: string): Promise<{ renamed: boolean } | null>;
   /** Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface). */
   getWikiBrief?(topic: string, opts?: { k?: number }): Promise<WikiBrief | null>;
 }

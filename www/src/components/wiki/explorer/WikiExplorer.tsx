@@ -15,9 +15,41 @@ import {
 import type { WikiPageSummary } from "@/runtime/connector";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogFooter,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
+import { toast } from "@/components/ui/sonner";
 import { cn } from "@/lib/utils";
+
+// Context for the row-level actions (rename/delete/open) so the deeply-nested
+// FileRow can reach them without prop-drilling through TreeRow/FolderRow.
+interface ExplorerActions {
+  canEdit: boolean;
+  onOpen: (id: string) => void;
+  onRename: (node: FileNode) => void;
+  onDelete: (node: FileNode) => void;
+}
+const ExplorerActionsContext = React.createContext<ExplorerActions | null>(null);
+function useExplorerActions(): ExplorerActions {
+  const ctx = React.useContext(ExplorerActionsContext);
+  if (!ctx) throw new Error("ExplorerActionsContext missing");
+  return ctx;
+}
 
 interface Props {
   /** Currently-open page; its row gets the active highlight + auto-reveal. */
@@ -165,10 +197,11 @@ function sourceIcon(group: string): React.ReactNode {
 
 /** Recents loader (local; mirrors state/wiki.ts so the integrator mounts this
  *  without touching shared state). Gates on the WS handshake + optional method. */
-function useExplorerPages(limit = 200): { pages: WikiPageSummary[]; loading: boolean } {
+function useExplorerPages(limit = 200): { pages: WikiPageSummary[]; loading: boolean; reload: () => void } {
   const { connector, status } = useRuntime();
   const [pages, setPages] = React.useState<WikiPageSummary[]>([]);
   const [loading, setLoading] = React.useState(false);
+  const [tick, setTick] = React.useState(0);
   React.useEffect(() => {
     if (!connector.listWikiPages || status.kind !== "connected") return;
     let alive = true;
@@ -181,12 +214,29 @@ function useExplorerPages(limit = 200): { pages: WikiPageSummary[]; loading: boo
     return () => {
       alive = false;
     };
-  }, [connector, status.kind, limit]);
-  return { pages, loading };
+  }, [connector, status.kind, limit, tick]);
+  const reload = React.useCallback(() => setTick((t) => t + 1), []);
+  return { pages, loading, reload };
 }
 
 export function WikiExplorer({ activePageId, onOpenPage }: Props) {
-  const { pages, loading } = useExplorerPages();
+  const { connector, status } = useRuntime();
+  const { pages, loading, reload } = useExplorerPages();
+  const canEdit =
+    status.kind === "connected" &&
+    typeof connector.renameWikiPage === "function" &&
+    typeof connector.deleteWikiPage === "function";
+  const [renameTarget, setRenameTarget] = React.useState<FileNode | null>(null);
+  const [deleteTarget, setDeleteTarget] = React.useState<FileNode | null>(null);
+  const actions = React.useMemo<ExplorerActions>(
+    () => ({
+      canEdit,
+      onOpen: onOpenPage,
+      onRename: (node) => setRenameTarget(node),
+      onDelete: (node) => setDeleteTarget(node),
+    }),
+    [canEdit, onOpenPage],
+  );
   const [query, setQuery] = React.useState("");
   // Folders are EXPANDED by default; this set holds the explicitly-collapsed
   // paths (matches granite's `collapsed` semantics — empty = everything open).
@@ -214,7 +264,22 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
   );
 
   return (
+    <ExplorerActionsContext.Provider value={actions}>
     <div className="flex min-h-0 flex-col">
+      {renameTarget && (
+        <RenamePageDialog
+          node={renameTarget}
+          onClose={() => setRenameTarget(null)}
+          onDone={reload}
+        />
+      )}
+      {deleteTarget && (
+        <DeletePageDialog
+          node={deleteTarget}
+          onClose={() => setDeleteTarget(null)}
+          onDone={reload}
+        />
+      )}
       {/* SEARCH / FILTER BOX */}
       <div className="relative px-1 pb-2">
         <Search
@@ -264,6 +329,100 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
         </nav>
       </ScrollArea>
     </div>
+    </ExplorerActionsContext.Provider>
+  );
+}
+
+// ── Rename / Delete dialogs ──────────────────────────────────────────────────
+
+function RenamePageDialog({ node, onClose, onDone }: { node: FileNode; onClose: () => void; onDone: () => void }) {
+  const { connector } = useRuntime();
+  const [title, setTitle] = React.useState(node.page.title ?? node.label);
+  const [busy, setBusy] = React.useState(false);
+  const aliveRef = React.useRef(true);
+  React.useEffect(() => () => { aliveRef.current = false; }, []);
+  const submit = async () => {
+    const next = title.trim();
+    // Only block on empty / in-flight. We intentionally do NOT short-circuit on
+    // `next === node.page.title`: that's the DISPLAYED title (a NULL-titled page
+    // shows "Untitled"/its sourceURI), so comparing against it would silently
+    // skip a legit rename. The backend no-ops a true identical title cheaply.
+    if (!connector.renameWikiPage || busy || !next) return;
+    setBusy(true);
+    try {
+      const res = await connector.renameWikiPage(node.id, next);
+      if (res === null) { toast.error("Rename failed"); return; }
+      if (!res.renamed) { toast.error("Page not found or empty title"); return; }
+      toast.success("Page renamed");
+      onDone();
+      onClose();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Rename failed");
+    } finally {
+      if (aliveRef.current) setBusy(false);
+    }
+  };
+  return (
+    <Dialog open onOpenChange={(o) => !busy && !o && onClose()}>
+      <DialogContent className="sm:max-w-[420px]">
+        <DialogHeader>
+          <DialogTitle>Rename page</DialogTitle>
+          <DialogDescription>Change the title of this wiki page.</DialogDescription>
+        </DialogHeader>
+        <Input
+          autoFocus
+          value={title}
+          onChange={(e) => setTitle(e.currentTarget.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void submit(); }}
+          aria-label="New page title"
+        />
+        <DialogFooter>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>Cancel</Button>
+          <Button variant="default" size="sm" loading={busy} disabled={!title.trim()} onClick={() => void submit()}>
+            Rename
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DeletePageDialog({ node, onClose, onDone }: { node: FileNode; onClose: () => void; onDone: () => void }) {
+  const { connector } = useRuntime();
+  const [busy, setBusy] = React.useState(false);
+  const aliveRef = React.useRef(true);
+  React.useEffect(() => () => { aliveRef.current = false; }, []);
+  const submit = async () => {
+    if (!connector.deleteWikiPage || busy) return;
+    setBusy(true);
+    try {
+      const res = await connector.deleteWikiPage(node.id);
+      if (res === null) { toast.error("Delete failed"); return; }
+      toast.success(res.deleted ? "Page deleted" : "Page was already gone");
+      onDone();
+      onClose();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Delete failed");
+    } finally {
+      if (aliveRef.current) setBusy(false);
+    }
+  };
+  return (
+    <Dialog open onOpenChange={(o) => !busy && !o && onClose()}>
+      <DialogContent className="sm:max-w-[420px]">
+        <DialogHeader>
+          <DialogTitle>Delete page?</DialogTitle>
+          <DialogDescription>
+            “{node.page.title ?? node.label}” and its search-index entries will be permanently
+            removed. This can’t be undone.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={onClose}>Cancel</Button>
+          <Button variant="destructive" size="sm" loading={busy} onClick={() => void submit()}>Delete</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -310,12 +469,13 @@ interface FileRowProps {
 
 function FileRow({ node, depth, activePageId, onOpenPage }: FileRowProps) {
   const active = node.id === activePageId;
+  const actions = useExplorerActions();
   const ref = React.useRef<HTMLButtonElement>(null);
   // Reveal the active page when it changes (e.g. opened from search/links).
   React.useEffect(() => {
     if (active) ref.current?.scrollIntoView({ block: "nearest" });
   }, [active]);
-  return (
+  const rowButton = (
     <button
       ref={ref}
       type="button"
@@ -340,6 +500,26 @@ function FileRow({ node, depth, activePageId, onOpenPage }: FileRowProps) {
       />
       <span className="truncate">{node.label}</span>
     </button>
+  );
+
+  // No edit capability (mock connector / disconnected) → plain row, no menu.
+  if (!actions.canEdit) return rowButton;
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
+      <ContextMenuContent className="w-44">
+        <ContextMenuItem onSelect={() => actions.onOpen(node.id)}>Open</ContextMenuItem>
+        <ContextMenuItem onSelect={() => actions.onRename(node)}>Rename…</ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem
+          onSelect={() => actions.onDelete(node)}
+          className="text-[color:var(--color-red-500,#ef4444)] focus:text-[color:var(--color-red-500,#ef4444)]"
+        >
+          Delete…
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 

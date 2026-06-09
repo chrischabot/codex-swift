@@ -29,6 +29,8 @@ public struct WikiQueryHandle: Sendable {
     /// `{deleted, id}`; idempotent on a missing id. Lives on the same
     /// deny-default handle as upsert — the wiki UI is the edit environment.
     public var delete: @Sendable (_ id: Int64) async throws -> JSONValue
+    /// Rename a page (title only — preserves source/body/index). `{renamed, id}`.
+    public var rename: @Sendable (_ id: Int64, _ title: String) async throws -> JSONValue
     /// Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface).
     public var brief: @Sendable (_ topic: String, _ k: Int) async throws -> JSONValue
 
@@ -41,6 +43,7 @@ public struct WikiQueryHandle: Sendable {
         tags: @escaping @Sendable () async throws -> JSONValue,
         upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue,
         delete: @escaping @Sendable (Int64) async throws -> JSONValue,
+        rename: @escaping @Sendable (Int64, String) async throws -> JSONValue,
         brief: @escaping @Sendable (String, Int) async throws -> JSONValue
     ) {
         self.list = list
@@ -51,6 +54,7 @@ public struct WikiQueryHandle: Sendable {
         self.tags = tags
         self.upsert = upsert
         self.delete = delete
+        self.rename = rename
         self.brief = brief
     }
 }

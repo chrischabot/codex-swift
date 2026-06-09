@@ -262,6 +262,36 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(again.obj?["deleted"]?.bool, false, "re-deleting a missing id is a no-op")
     }
 
+    /// CLAIM: wiki/page/rename updates ONLY the title (page stays fetchable with
+    /// the new title; the body/content is unchanged), and is idempotent on a
+    /// missing id ({renamed:false}, no throw). SEVERITY: strong.
+    func testRenameUpdatesTitleOnly() async throws {
+        let root = dir + "/bodies"
+        let created = try await WikiJSON.upsert(store, bodyRoot: root, id: nil, title: "Old Name",
+                                                body: "Body about axolotls stays put.")
+        let id = created.obj?["id"]?.int
+        XCTAssertNotNil(id)
+
+        let renamed = try await WikiJSON.rename(store, id: id!, title: "New Name")
+        XCTAssertEqual(renamed.obj?["renamed"]?.bool, true)
+        XCTAssertEqual(renamed.obj?["id"]?.int, id!)
+
+        // Title changed; body preserved.
+        let page = try await WikiJSON.pageGet(store, id: id!)
+        XCTAssertEqual(page?.obj?["title"]?.str, "New Name")
+        XCTAssertTrue((page?.obj?["content"]?.str ?? "").contains("axolotls"))
+
+        // Idempotent on a missing id.
+        let missing = try await WikiJSON.rename(store, id: 999_999, title: "Nope")
+        XCTAssertEqual(missing.obj?["renamed"]?.bool, false)
+
+        // A blank title is rejected (renamed:false) and the title is unchanged.
+        let blank = try await WikiJSON.rename(store, id: id!, title: "   ")
+        XCTAssertEqual(blank.obj?["renamed"]?.bool, false)
+        let still = try await WikiJSON.pageGet(store, id: id!)
+        XCTAssertEqual(still?.obj?["title"]?.str, "New Name", "blank rename left the title intact")
+    }
+
     // MARK: - brief (enrich)
 
     /// CLAIM: wiki/brief produces a structured payload (object) from lexical

@@ -1008,6 +1008,14 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         return { deleted: r?.deleted === true };
       } catch { return null; }
     },
+    renameWikiPage: async (pageId, title) => {
+      const n = Number(pageId);
+      if (!Number.isInteger(n)) return null;
+      try {
+        const r = (await rpc("wiki/page/rename", { id: n, title })) as { renamed?: unknown };
+        return { renamed: r?.renamed === true };
+      } catch { return null; }
+    },
     getWikiBrief: async (topic, opts) => {
       try {
         // The backend returns the WikiBriefPayload object directly (parsed).

@@ -56,6 +56,7 @@ public enum WikiQueryWiring {
             tags:      { try await WikiJSON.tags(store) },
             upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
             delete:    { try await WikiJSON.delete(store, id: $0) },
+            rename:    { try await WikiJSON.rename(store, id: $0, title: $1) },
             brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) })
     }
 }
@@ -259,6 +260,21 @@ public enum WikiJSON {
             bodyPath: bodyPath, contentSHA: contentSHA, rawBytes: Int64(data.count),
             now: now, chunkTexts: chunks)
         return .object(["id": .int(newId)])
+    }
+
+    /// Rename a wiki page (title only — preserves source, body, chunks, index).
+    /// Idempotent on a missing id. A blank title is rejected (a page must keep a
+    /// title); the title is length-clamped, mirroring the create path's care.
+    /// Returns `{renamed, id}`.
+    public static func rename(_ store: MemoryStore, id: Int64, title: String) async throws -> JSONValue {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .object(["renamed": .bool(false), "id": .int(id)]) }
+        let clamped = String(trimmed.prefix(500))
+        let existed = (try await store.document(id: id)) != nil
+        if existed {
+            try await store.renameDocument(id: id, title: clamped)
+        }
+        return .object(["renamed": .bool(existed), "id": .int(id)])
     }
 
     /// Delete a wiki page (a manual document) and everything derived from it.
