@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
 import { resolveWikilinkNav } from "@/components/wiki/markdown/wikiRemarkPlugins";
-import { Pencil, FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown } from "lucide-react";
+import { FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -18,7 +18,6 @@ import { Button } from "@/components/ui/button";
 import { WikiEditor } from "@/components/wiki/editor/WikiEditor";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { WikiReadingView } from "@/components/wiki/WikiReadingView";
 import { WikiConnectionsPanel } from "@/components/wiki/WikiConnectionsPanel";
 import { WikiPropertiesPanel } from "@/components/wiki/WikiPropertiesPanel";
 import { WikiPropertiesEditor } from "@/components/wiki/panels/WikiPropertiesEditor";
@@ -30,144 +29,141 @@ import { WikiQuickSwitcher } from "@/components/wiki/WikiQuickSwitcher";
 import { useWikiSwitcherHotkey } from "@/components/wiki/useWikiSwitcherHotkey";
 import { WikiBacklinksPanel } from "@/components/wiki/panels/WikiBacklinksPanel";
 import { WikiBookmarksPanel } from "@/components/wiki/panels/WikiBookmarksPanel";
-import { BookmarkButton } from "@/components/wiki/panels/BookmarkButton";
-import { DeletePageButton } from "@/components/wiki/panels/DeletePageButton";
-import { WikiCanvasView } from "@/components/wiki/canvas/WikiCanvasView";
 import { isCanvasDoc } from "@/components/wiki/canvas/canvasSchema";
-import { WikiBaseView } from "@/components/wiki/bases/WikiBaseView";
 import { isBaseBody } from "@/components/wiki/bases/basesSchema";
-import { useWikiTabs } from "@/components/wiki/tabs/useWikiTabs";
-import { WikiTabStrip } from "@/components/wiki/tabs/WikiTabStrip";
-import { activeAfterClose } from "@/components/wiki/tabs/wikiTabs";
+import { useWikiWorkspace } from "@/components/wiki/workspace/useWikiWorkspace";
+import { WikiWorkspace } from "@/components/wiki/workspace/WikiWorkspaceView";
+import { activePageId, isPristine, type Leaf, type TabGroupId } from "@/components/wiki/workspace/wikiWorkspace";
+import type { LeafBodyCallbacks } from "@/components/wiki/workspace/WikiLeafBody";
 import { useWikiCommands } from "@/components/wiki/commands/useWikiCommands";
 import { WikiCommandPalette } from "@/components/wiki/commands/WikiCommandPalette";
 import { WikiSettingsModal } from "@/components/wiki/settings/WikiSettingsModal";
 import { Settings as SettingsIcon } from "lucide-react";
 
 /**
- * Full-screen Memory Wiki view (inside AppShell's <Outlet/>). M1: granite read
- * surface — reading view (markdown + Obsidian extensions) in the main pane, and
- * a right rail of tabbed panels (Connections / Tags / Outline / Properties).
- * Graph (M2) and editor (M4) mount into the marked slots later.
+ * Full-screen Memory Wiki view (inside AppShell's <Outlet/>). The page-viewing
+ * surface is a multi-pane WORKSPACE (granite parity, M22): columns → groups →
+ * panes, each pane its own tab strip + leaf body. The route `/wiki/:pageId`
+ * mirrors the active pane's page (deep-links, back/forward, bookmarks all keep
+ * working); the index / search / create surfaces render only when the workspace
+ * is pristine. The right rail + section overlays are global, following the
+ * active leaf.
  */
 export function WikiPage() {
   const { pageId } = useParams();
   const navigate = useNavigate();
   const { connector, status } = useRuntime();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [reloadKey, setReloadKey] = React.useState(0);
-  const [editing, setEditing] = React.useState(false);
-  const { page, loading } = useWikiPage(pageId, reloadKey);
+  const location = useLocation();
   const switcher = useWikiSwitcherHotkey(); // Cmd/Ctrl-O quick switcher (wiki-scoped)
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  // Bumped on any page save/delete so the live page list + the right rail's
+  // active-page fetch both refresh.
+  const [dataVersion, setDataVersion] = React.useState(0);
 
-  // Title→id resolver for wikilink hover previews + resolved-link styling.
-  // Built once from the page list; dangling links resolve to undefined (no card).
+  const ws = useWikiWorkspace();
+  const apid = activePageId(ws.state);
+  const pristine = isPristine(ws.state);
+  const creating = pageId === "new";
+  const q = searchParams.get("q") ?? "";
+
+  // ── id ⇄ title maps (live page list) ──────────────────────────────────────
+  // titleById feeds the tab strips; idByTitle resolves wikilink targets.
   const [idByTitle, setIdByTitle] = React.useState<Map<string, string>>(new Map());
+  const [titleById, setTitleById] = React.useState<Map<string, string>>(new Map());
   React.useEffect(() => {
     if (status.kind !== "connected" || !connector.listWikiPages) return;
     let alive = true;
     connector.listWikiPages({ limit: 1000 })
       .then((ps) => {
         if (!alive) return;
-        const m = new Map<string, string>();
-        for (const p of ps) m.set(p.title.toLowerCase(), p.id);
-        setIdByTitle(m);
+        const byTitle = new Map<string, string>();
+        const byId = new Map<string, string>();
+        for (const p of ps) {
+          byTitle.set(p.title.toLowerCase(), p.id);
+          byId.set(p.id, p.title);
+        }
+        setIdByTitle(byTitle);
+        setTitleById(byId);
       })
       .catch(() => {});
     return () => { alive = false; };
-  }, [connector, status.kind]);
+  }, [connector, status.kind, dataVersion]);
   const resolveWikiLink = React.useCallback(
     (title: string) => idByTitle.get(title.trim().toLowerCase()),
     [idByTitle],
   );
 
-  // Open-page tabs (the additive core of Obsidian's tab workspace). The route
-  // owns the active page; opening a real page adds/refreshes its tab.
-  const tabsApi = useWikiTabs();
-  const { open: openTab, close: doCloseTab, tabs: openTabs } = tabsApi;
+  // ── route ⇄ workspace sync ────────────────────────────────────────────────
+  // Route → workspace: a real pageId opens/focuses in the active pane.
   React.useEffect(() => {
-    if (pageId && pageId !== "new" && page) openTab({ id: pageId, title: page.title });
-  }, [pageId, page, openTab]);
-  const closeTab = React.useCallback(
-    (id: string) => {
-      const next = activeAfterClose(openTabs, id, pageId);
-      doCloseTab(id);
-      if (next === undefined) return; // closed a background tab — no nav change
-      navigate(next === null ? "/wiki" : `/wiki/${next}`);
-    },
-    [openTabs, doCloseTab, pageId, navigate],
-  );
-  const tabStrip = (
-    <WikiTabStrip
-      tabs={tabsApi.tabs}
-      activeId={pageId}
-      onSelect={(id) => navigate(`/wiki/${id}`)}
-      onClose={closeTab}
-    />
-  );
+    if (pageId && pageId !== "new") ws.openPage(pageId);
+  }, [pageId, ws.openPage]);
+  // Workspace → route: keep the URL pointing at the active pane's page (or the
+  // index when the active leaf is empty). This REFLECTS internal focus / close /
+  // split / drag changes, so it `replace`s rather than pushing — only explicit
+  // navigations (explorer / wikilink clicks, which call navigate() directly)
+  // add history entries. Equality guards prevent a loop.
+  React.useEffect(() => {
+    if (creating) return;
+    if (apid) {
+      if (apid !== pageId) navigate(`/wiki/${apid}`, { replace: true });
+    } else if (pageId) {
+      navigate("/wiki", { replace: true });
+    }
+  }, [apid, pageId, creating, navigate]);
 
-  // Wiki-scoped command palette (Cmd-P). The wiki settings modal is opened via
-  // the gear button (Cmd-, is owned by the app shell's global settings).
-  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  // Wiki-scoped command palette (Cmd-P).
   const cmds = useWikiCommands({
     enabled: true,
     onOpenSwitcher: () => switcher.setOpen(true),
     onOpenSearch: () => navigate("/wiki?q="),
   });
 
-  const location = useLocation();
-  const q = searchParams.get("q") ?? "";
   const setQ = (next: string) => setSearchParams(next ? { q: next } : {}, { replace: true });
-  // Leave edit mode whenever the route changes (new page / back to index).
-  React.useEffect(() => { setEditing(false); }, [pageId]);
-  // `/wiki/new` is the create surface (no pageId, not a real page).
-  const creating = pageId === "new";
+  const onTag = React.useCallback(
+    (tag: string) => navigate(`/wiki?q=${encodeURIComponent(`#${tag}`)}`),
+    [navigate],
+  );
 
-  // A clicked wikilink opens its target page DIRECTLY (resolved title → id),
-  // jumping to a `#heading` / `#^block` fragment when present; a dangling target
-  // falls back to a search query. Tags route to a tag search.
-  const onWikiLink = (target: string) => {
-    const nav = resolveWikilinkNav(target, (t) => resolveWikiLink(t));
-    // A hash-only result is a same-page jump — keep the current path + search so
-    // the scroll effect fires without leaving the page.
-    if (nav.startsWith("#")) navigate({ pathname: location.pathname, hash: nav });
-    else navigate(nav);
-  };
-  const onTag = (tag: string) => navigate(`/wiki?q=${encodeURIComponent(`#${tag}`)}`);
-  const onJump = (slug: string) =>
-    document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" });
-
-  // Scroll to the URL hash fragment (heading slug or `block-<id>`) once the
-  // target page has rendered. Re-runs when the page or hash changes so a
-  // same-page `[[#heading]]` jump and a cross-page open both land correctly.
+  // Scroll to the URL hash fragment (heading slug or `block-<id>`) after render.
   React.useEffect(() => {
-    if (loading || !page) return;
+    if (!apid) return;
     const raw = location.hash.replace(/^#/, "");
     if (!raw) return;
     const id = decodeURIComponent(raw);
-    // Defer to the next frame so the markdown (and its heading/block ids) exist.
     const t = window.setTimeout(() => {
       document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 60);
     return () => window.clearTimeout(t);
-  }, [loading, page, location.hash, pageId]);
+  }, [apid, location.hash]);
 
-  // A canvas / base is a wiki document whose body carries a `wiki_type`
-  // frontmatter key. When such a page opens (from explorer, recents, or a
-  // deep-link) it gets its dedicated full-bleed view instead of the reading
-  // surface + right rail. Editing those raw bodies is intentionally not exposed
-  // (the visual editors own them); the Edit button is hidden below.
-  const docKind: "canvas" | "base" | "page" =
-    page && pageId && !creating
-      ? isCanvasDoc(page.content)
-        ? "canvas"
-        : isBaseBody(page.content)
-          ? "base"
-          : "page"
-      : "page";
+  // Per-pane body callbacks. Navigation focuses the pane first so the URL (and
+  // the route→workspace effect) lands the new page in the right pane; delete
+  // closes the pane's leaf rather than leaving the workspace.
+  const buildCallbacks = React.useCallback(
+    (leaf: Leaf, groupId: TabGroupId): LeafBodyCallbacks => ({
+      onWikiLink: (target: string) => {
+        const nav = resolveWikilinkNav(target, resolveWikiLink);
+        if (!nav.startsWith("#")) ws.focusGroup(groupId);
+        if (nav.startsWith("#")) navigate({ pathname: location.pathname, hash: nav });
+        else navigate(nav);
+      },
+      onTag,
+      onJump: (slug: string) =>
+        document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" }),
+      resolveWikiLink,
+      onOpenSettings: () => setSettingsOpen(true),
+      onDeleted: () => {
+        ws.closeLeaf(leaf.id);
+        setDataVersion((v) => v + 1);
+      },
+      onPageSaved: () => setDataVersion((v) => v + 1),
+    }),
+    [resolveWikiLink, ws, navigate, location.pathname, onTag],
+  );
 
-  // Section-global overlays (switcher + command palette + settings) — mounted in
-  // every branch so the hotkeys work on canvas / base / page routes alike.
+  // Section-global overlays (hotkeys work on every surface).
   const overlays = (
     <>
       <WikiQuickSwitcher open={switcher.open} onOpenChange={switcher.setOpen} />
@@ -176,33 +172,34 @@ export function WikiPage() {
     </>
   );
 
-  if (docKind === "canvas" && pageId) {
+  // ── render-surface selection ──────────────────────────────────────────────
+  //  creating → editor; bare /wiki?q= → search; pristine /wiki → index;
+  //  otherwise → the multi-pane workspace.
+  if (creating) {
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {overlays}
-        {tabStrip}
-        <div className="relative flex min-h-0 flex-1">
-          <WikiCanvasView pageId={pageId} onOpenPage={(id) => navigate(`/wiki/${id}`)} className="flex-1" />
-          {/* Full-bleed views have no action row; a floating delete (top-left, clear
-              of the view's own top-right toolbar) keeps canvas/base deletable. */}
-          <div className="absolute left-3 top-3 z-20">
-            <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
-          </div>
-        </div>
+        <WikiEditor onSaved={(id) => navigate(`/wiki/${id}`)} onCancel={() => navigate("/wiki")} />
       </div>
     );
   }
-  if (docKind === "base" && pageId) {
+  if (!pageId && q && pristine) {
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {overlays}
-        {tabStrip}
-        <div className="relative flex min-h-0 flex-1">
-          <WikiBaseView pageId={pageId} />
-          <div className="absolute right-3 top-3 z-20">
-            <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+        <WikiSearchView query={q} onQueryChange={setQ} />
+      </div>
+    );
+  }
+  if (!pageId && pristine) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        {overlays}
+        <ScrollArea className="flex-1">
+          <div className="mx-auto w-full max-w-[820px] px-6 pb-16 pt-6">
+            <WikiIndex onOpenSettings={() => setSettingsOpen(true)} />
           </div>
-        </div>
+        </ScrollArea>
       </div>
     );
   }
@@ -210,112 +207,111 @@ export function WikiPage() {
   return (
     <div className="flex min-h-0 flex-1">
       {overlays}
-      {/* MAIN PANE — editor / search / index / reading view */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {tabStrip}
-        {creating || (pageId && editing) ? (
-          // Editor owns full height (its own internal scroll).
-          <WikiEditor
-            pageId={creating ? undefined : pageId}
-            onSaved={(id) => {
-              setEditing(false);
-              if (creating || id !== pageId) navigate(`/wiki/${id}`);
-              else setReloadKey((k) => k + 1); // same page → force a refetch
-            }}
-            onCancel={() => (creating ? navigate("/wiki") : setEditing(false))}
-          />
-        ) : !pageId && q ? (
-          <WikiSearchView query={q} onQueryChange={setQ} />
-        ) : (
-          <ScrollArea className="flex-1">
-            <div className="mx-auto w-full max-w-[820px] px-6 pb-16 pt-6">
-              {!pageId ? (
-                <WikiIndex onOpenSettings={() => setSettingsOpen(true)} />
-              ) : loading ? (
-                <div className="text-[13px] text-[color:var(--color-text-secondary)]">Loading…</div>
-              ) : !page ? (
-                <div className="text-[13px] text-[color:var(--color-text-secondary)]">Page not found.</div>
-              ) : (
-                <div>
-                  <div className="mb-2 flex justify-end gap-1.5">
-                    <BookmarkButton pageId={page.id} title={page.title} />
-                    <Button variant="outline" size="xs" onClick={() => setEditing(true)}>
-                      <Pencil className="mr-1 size-3" /> Edit
-                    </Button>
-                    <Button variant="outline" size="xs" onClick={() => setSettingsOpen(true)} aria-label="Wiki settings">
-                      <SettingsIcon className="size-3" />
-                    </Button>
-                    <DeletePageButton pageId={page.id} title={page.title} onDeleted={() => navigate("/wiki")} />
-                  </div>
-                  <WikiReadingView page={page} onWikiLink={onWikiLink} onTag={onTag} resolveWikiLink={resolveWikiLink} />
-                </div>
-              )}
-            </div>
-          </ScrollArea>
-        )}
+        <WikiWorkspace ws={ws} titleById={titleById} buildCallbacks={buildCallbacks} />
       </div>
+      <WikiRightRail
+        pageId={apid}
+        dataVersion={dataVersion}
+        onOpenPage={(id) => navigate(`/wiki/${id}`)}
+        onWikiLink={(canonical) => {
+          const nav = resolveWikilinkNav(canonical, resolveWikiLink);
+          if (nav.startsWith("#")) navigate({ pathname: location.pathname, hash: nav });
+          else navigate(nav);
+        }}
+        onTag={onTag}
+        onSaved={() => setDataVersion((v) => v + 1)}
+      />
+    </div>
+  );
+}
 
-      {/* RIGHT RAIL — tabbed panels (M2: a Graph tab mounts here) */}
-      {pageId && page && !editing && (
-        <aside className="hidden w-[320px] shrink-0 flex-col border-l border-[color:var(--border)] lg:flex">
-          <Tabs defaultValue="connections" className="flex min-h-0 flex-1 flex-col gap-0">
-            <TabsList className="shrink-0 justify-start rounded-none border-b border-[color:var(--border)] bg-transparent px-2">
-              <TabsTrigger value="connections">Links</TabsTrigger>
-              <TabsTrigger value="graph">Graph</TabsTrigger>
-              <TabsTrigger value="tags">Tags</TabsTrigger>
-              <TabsTrigger value="outline">Outline</TabsTrigger>
-              <TabsTrigger value="bookmarks">Saved</TabsTrigger>
-              <TabsTrigger value="properties">Info</TabsTrigger>
-            </TabsList>
-            {/* Graph tab fills the rail height (a canvas), so it sits OUTSIDE the
-                scroll area; the other panels scroll. */}
-            <TabsContent value="graph" className="mt-0 min-h-0 flex-1 p-3 data-[state=inactive]:hidden">
-              {page.connections && page.connections.length > 0 ? (
-                <WikiGraphView seedEntityId={page.connections[0].entityId} depth={2} className="h-full w-full" />
+/**
+ * Global right rail — tabbed panels (Links / Graph / Tags / Outline / Saved /
+ * Info) for the ACTIVE leaf's page. Hidden for the index, canvas, and base
+ * surfaces (which carry no markdown rail).
+ */
+function WikiRightRail({
+  pageId,
+  dataVersion,
+  onOpenPage,
+  onWikiLink,
+  onTag,
+  onSaved,
+}: {
+  pageId: string | null;
+  dataVersion: number;
+  onOpenPage: (id: string) => void;
+  onWikiLink: (canonical: string) => void;
+  onTag: (tag: string) => void;
+  onSaved: () => void;
+}) {
+  const { connector, status } = useRuntime();
+  const { page } = useWikiPage(pageId ?? undefined, dataVersion);
+  if (!pageId || !page) return null;
+  // Canvas / base pages own their full surface — no markdown rail.
+  if (isCanvasDoc(page.content) || isBaseBody(page.content)) return null;
+
+  return (
+    <aside className="hidden w-[320px] shrink-0 flex-col border-l border-[color:var(--border)] lg:flex">
+      <Tabs defaultValue="connections" className="flex min-h-0 flex-1 flex-col gap-0">
+        <TabsList className="shrink-0 justify-start rounded-none border-b border-[color:var(--border)] bg-transparent px-2">
+          <TabsTrigger value="connections">Links</TabsTrigger>
+          <TabsTrigger value="graph">Graph</TabsTrigger>
+          <TabsTrigger value="tags">Tags</TabsTrigger>
+          <TabsTrigger value="outline">Outline</TabsTrigger>
+          <TabsTrigger value="bookmarks">Saved</TabsTrigger>
+          <TabsTrigger value="properties">Info</TabsTrigger>
+        </TabsList>
+        {/* Graph tab fills the rail height (a canvas), so it sits OUTSIDE the
+            scroll area; the other panels scroll. */}
+        <TabsContent value="graph" className="mt-0 min-h-0 flex-1 p-3 data-[state=inactive]:hidden">
+          {page.connections && page.connections.length > 0 ? (
+            <WikiGraphView seedEntityId={page.connections[0].entityId} depth={2} className="h-full w-full" />
+          ) : (
+            <div className="text-[12px] text-[color:var(--color-text-quaternary)]">No graph for this page</div>
+          )}
+        </TabsContent>
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="px-3 py-4">
+            <TabsContent value="connections" className="mt-0">
+              <WikiBacklinksPanel page={page} onOpenPage={onOpenPage} />
+              <div className="mt-4 border-t border-[color:var(--border)] pt-3">
+                <WikiConnectionsPanel page={page} onSelectEntity={(_id, canonical) => onWikiLink(canonical)} />
+              </div>
+            </TabsContent>
+            <TabsContent value="bookmarks" className="mt-0">
+              <WikiBookmarksPanel onSelect={onOpenPage} />
+            </TabsContent>
+            <TabsContent value="tags" className="mt-0">
+              <WikiTagsPanel onSelectTag={onTag} />
+            </TabsContent>
+            <TabsContent value="outline" className="mt-0">
+              <WikiOutlinePanel
+                content={page.content}
+                onJump={(slug) =>
+                  document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" })
+                }
+              />
+            </TabsContent>
+            <TabsContent value="properties" className="mt-0">
+              {status.kind === "connected" && typeof connector.saveWikiPage === "function" ? (
+                <WikiPropertiesEditor
+                  page={page}
+                  onSave={async (newBody) => {
+                    const res = await connector.saveWikiPage?.({ id: page.id, body: newBody });
+                    if (!res) throw new Error("Save failed");
+                    onSaved();
+                  }}
+                />
               ) : (
-                <div className="text-[12px] text-[color:var(--color-text-quaternary)]">No graph for this page</div>
+                <WikiPropertiesPanel page={page} />
               )}
             </TabsContent>
-            <ScrollArea className="min-h-0 flex-1">
-              <div className="px-3 py-4">
-                <TabsContent value="connections" className="mt-0">
-                  <WikiBacklinksPanel page={page} onOpenPage={(id) => navigate(`/wiki/${id}`)} />
-                  <div className="mt-4 border-t border-[color:var(--border)] pt-3">
-                    <WikiConnectionsPanel
-                      page={page}
-                      onSelectEntity={(_id, canonical) => onWikiLink(canonical)}
-                    />
-                  </div>
-                </TabsContent>
-                <TabsContent value="bookmarks" className="mt-0">
-                  <WikiBookmarksPanel onSelect={(id) => navigate(`/wiki/${id}`)} />
-                </TabsContent>
-                <TabsContent value="tags" className="mt-0">
-                  <WikiTagsPanel onSelectTag={onTag} />
-                </TabsContent>
-                <TabsContent value="outline" className="mt-0">
-                  <WikiOutlinePanel content={page.content} onJump={onJump} />
-                </TabsContent>
-                <TabsContent value="properties" className="mt-0">
-                  {status.kind === "connected" && typeof connector.saveWikiPage === "function" ? (
-                    <WikiPropertiesEditor
-                      page={page}
-                      onSave={async (newBody) => {
-                        const res = await connector.saveWikiPage?.({ id: page.id, body: newBody });
-                        if (!res) throw new Error("Save failed");
-                        setReloadKey((k) => k + 1);
-                      }}
-                    />
-                  ) : (
-                    <WikiPropertiesPanel page={page} />
-                  )}
-                </TabsContent>
-              </div>
-            </ScrollArea>
-          </Tabs>
-        </aside>
-      )}
-    </div>
+          </div>
+        </ScrollArea>
+      </Tabs>
+    </aside>
   );
 }
 
