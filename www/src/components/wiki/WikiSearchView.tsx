@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { highlightMatch } from "./highlightMatch";
+import { parseSearchQuery, matchSummary, type SearchQuery } from "./search/searchQuery";
 
 interface Props {
   /** The active query — typically driven from the `?q=` search param. */
@@ -19,63 +20,25 @@ interface Props {
 const DEBOUNCE_MS = 200;
 const SEARCH_LIMIT = 50;
 
-// ── Client-side operator parsing ─────────────────────────────────────────────
-// The backend search is lexical BM25 with no operator grammar, so `tag:`/`title:`
-// operators are parsed here and applied as a best-effort filter over the
-// returned summaries. Bare terms become the full-text query sent to searchWiki.
-interface ParsedQuery {
-  /** What we send to searchWiki — the bare (non-operator) terms joined. */
-  fullText: string;
-  /** Individual bare terms, used to highlight matches in excerpts. */
-  terms: string[];
-  /** `tag:foo` — result must mention `#foo` or the word `foo` in title/excerpt. */
-  tags: string[];
-  /** `title:foo` — result title must contain `foo` (case-insensitive). */
-  titles: string[];
-}
+// Operator grammar (AND/OR/NOT, tag/title/path, /regex/, "phrases") lives in
+// ./search/searchQuery — parsed here and applied client-side over the BM25
+// summaries. `query.fullText` is what we send to searchWiki; an operator-only
+// query (no free terms) falls back to listing pages and filtering.
 
-function parseQuery(raw: string): ParsedQuery {
-  const tags: string[] = [];
-  const titles: string[] = [];
-  const bare: string[] = [];
-  // Split on whitespace; quoted segments are rare in this surface so we keep it
-  // simple and treat each token independently.
-  for (const tok of raw.trim().split(/\s+/).filter(Boolean)) {
-    const lower = tok.toLowerCase();
-    if (lower.startsWith("tag:") && tok.length > 4) {
-      tags.push(tok.slice(4).replace(/^#/, ""));
-    } else if (lower.startsWith("title:") && tok.length > 6) {
-      titles.push(tok.slice(6));
-    } else if (tok.startsWith("#") && tok.length > 1) {
-      // A bare `#foo` token is PURE tag sugar (matches M1 tag links which
-      // navigate to ?q=#foo) — it filters the corpus; it is NOT sent to BM25 and
-      // does not become a highlight term (the operator-only path lists pages).
-      tags.push(tok.slice(1));
-    } else {
-      bare.push(tok);
+/** Operator chips shown above the results (tag:/title:/path:/regex/-exclusions). */
+function operatorChips(parsed: SearchQuery): string[] {
+  const chips: string[] = [];
+  for (const group of parsed.groups) {
+    for (const p of group) {
+      if (p.kind === "term") continue;
+      const prefix = p.negate ? "-" : "";
+      if (p.kind === "tag") chips.push(`${prefix}#${p.value}`);
+      else if (p.kind === "phrase") chips.push(`${prefix}"${p.value}"`);
+      else if (p.kind === "regex") chips.push(`${prefix}/${p.value}/`);
+      else chips.push(`${prefix}${p.kind}:${p.value}`);
     }
   }
-  return { fullText: bare.join(" ").trim(), terms: bare, tags, titles };
-}
-
-/** Word-boundary test for a term within a haystack (avoids `cat` matching
- *  `category`). The term is regex-escaped first. */
-function mentionsWord(hay: string, term: string): boolean {
-  const esc = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\w#])${esc}([^\\w]|$)`, "i").test(hay);
-}
-
-/** Does a summary satisfy the parsed `tag:`/`title:` filters? */
-function matchesFilters(p: WikiPageSummary, parsed: ParsedQuery): boolean {
-  const hay = `${p.title} ${p.excerpt ?? ""}`;
-  for (const t of parsed.titles) {
-    if (!p.title.toLowerCase().includes(t.toLowerCase())) return false;
-  }
-  for (const tag of parsed.tags) {
-    // A literal `#tag`, or the bare WORD (not a substring) in title/excerpt.
-    if (!hay.toLowerCase().includes(`#${tag.toLowerCase()}`) && !mentionsWord(hay, tag)) return false;
-  }
-  return true;
+  return chips;
 }
 
 interface SearchState {
@@ -83,7 +46,15 @@ interface SearchState {
   loading: boolean;
   /** The full-text query that produced `results` (drives the empty-state copy). */
   ran: string;
+  /** True when the candidate fetch hit its cap — operator filters ran over a
+   *  bounded window, so matches beyond it may be missing. Surfaced to the user. */
+  truncated: boolean;
 }
+
+// Candidate fetch caps. Operator-bearing free-text queries pull a WIDER BM25
+// window so the client filters don't just see the top-50 lexical hits.
+const OPERATOR_CANDIDATES = 200;
+const LIST_CANDIDATES = 500;
 
 /**
  * Self-contained debounced search hook. Mirrors the `state/wiki.ts` pattern
@@ -94,40 +65,56 @@ interface SearchState {
  */
 function useWikiSearch(query: string): SearchState {
   const { connector, status } = useRuntime();
-  const [state, setState] = React.useState<SearchState>({ results: [], loading: false, ran: "" });
+  const [state, setState] = React.useState<SearchState>({ results: [], loading: false, ran: "", truncated: false });
   const connected = status.kind === "connected";
-  const parsed = React.useMemo(() => parseQuery(query), [query]);
+  const parsed = React.useMemo(() => parseSearchQuery(query), [query]);
 
   React.useEffect(() => {
-    const { fullText, tags, titles } = parsed;
-    const hasQuery = fullText.length > 0 || tags.length > 0 || titles.length > 0;
+    const { fullText, hasQuery, groups } = parsed;
     if (!hasQuery) {
-      setState({ results: [], loading: false, ran: "" });
+      setState({ results: [], loading: false, ran: "", truncated: false });
       return;
     }
     if (!connector.searchWiki || !connected) {
-      setState({ results: [], loading: false, ran: query });
+      setState({ results: [], loading: false, ran: query, truncated: false });
       return;
     }
+    // Any non-`term` predicate is an operator that filters client-side, so we
+    // need a wider candidate window than the top-50 BM25 hits.
+    const hasOperators = groups.some((g) => g.some((p) => p.kind !== "term"));
     let alive = true;
     setState((s) => ({ ...s, loading: true }));
     const handle = setTimeout(() => {
-      // If there are only operators (no bare terms) we still need a corpus to
-      // filter, so fall back to listing recent pages.
+      // Free terms seed the BM25 fetch (wider when operators will filter it);
+      // an operator-only query lists pages to filter against.
+      const cap =
+        fullText.length > 0
+          ? hasOperators
+            ? OPERATOR_CANDIDATES
+            : SEARCH_LIMIT
+          : LIST_CANDIDATES;
       const fetcher =
         fullText.length > 0
-          ? connector.searchWiki!(fullText, { limit: SEARCH_LIMIT })
+          ? connector.searchWiki!(fullText, { limit: cap })
           : connector.listWikiPages
-            ? connector.listWikiPages({ limit: SEARCH_LIMIT })
+            ? connector.listWikiPages({ limit: cap })
             : Promise.resolve<WikiPageSummary[]>([]);
       fetcher
         .then((rows) => {
           if (!alive) return;
-          const filtered = rows.filter((r) => matchesFilters(r, parsed));
-          setState({ results: filtered, loading: false, ran: query });
+          // The candidate set hit its cap → there may be matches beyond it.
+          const hitCap = rows.length >= cap;
+          const matched = rows.filter((r) => matchSummary(r, parsed));
+          const filtered = matched.slice(0, SEARCH_LIMIT);
+          setState({
+            results: filtered,
+            loading: false,
+            ran: query,
+            truncated: hitCap || matched.length > filtered.length,
+          });
         })
         .catch(() => {
-          if (alive) setState({ results: [], loading: false, ran: query });
+          if (alive) setState({ results: [], loading: false, ran: query, truncated: false });
         });
     }, DEBOUNCE_MS);
     return () => {
@@ -141,8 +128,9 @@ function useWikiSearch(query: string): SearchState {
 
 export function WikiSearchView({ query, onQueryChange }: Props) {
   const navigate = useNavigate();
-  const parsed = React.useMemo(() => parseQuery(query), [query]);
-  const { results, loading, ran } = useWikiSearch(query);
+  const parsed = React.useMemo(() => parseSearchQuery(query), [query]);
+  const chips = React.useMemo(() => operatorChips(parsed), [parsed]);
+  const { results, loading, ran, truncated } = useWikiSearch(query);
   const [selected, setSelected] = React.useState(0);
   const listRef = React.useRef<HTMLDivElement>(null);
 
@@ -176,7 +164,7 @@ export function WikiSearchView({ query, onQueryChange }: Props) {
     ? "Searching…"
     : !hasQuery
       ? null
-      : `${results.length} result${results.length === 1 ? "" : "s"}`;
+      : `${results.length} result${results.length === 1 ? "" : "s"}${truncated ? " (showing first matches — refine to narrow)" : ""}`;
 
   return (
     <div className="flex min-h-0 flex-col" onKeyDown={onKeyDown}>
@@ -204,16 +192,11 @@ export function WikiSearchView({ query, onQueryChange }: Props) {
       {status && (
         <div className="mt-2 px-1 text-[12px] text-[color:var(--color-text-tertiary)]">
           {status}
-          {(parsed.tags.length > 0 || parsed.titles.length > 0) && !loading && (
+          {chips.length > 0 && !loading && (
             <span className="ml-2 inline-flex flex-wrap gap-1 align-middle">
-              {parsed.titles.map((t) => (
-                <Badge key={`t-${t}`} variant="outline" className="text-[11px]">
-                  title:{t}
-                </Badge>
-              ))}
-              {parsed.tags.map((t) => (
-                <Badge key={`g-${t}`} variant="outline" className="text-[11px]">
-                  #{t}
+              {chips.map((c) => (
+                <Badge key={`c-${c}`} variant="outline" className="text-[11px]">
+                  {c}
                 </Badge>
               ))}
             </span>
@@ -242,7 +225,7 @@ export function WikiSearchView({ query, onQueryChange }: Props) {
               <SearchResultCard
                 key={p.id}
                 page={p}
-                terms={parsed.terms}
+                terms={parsed.highlightTerms}
                 selected={i === selected}
                 onMouseEnter={() => setSelected(i)}
                 onClick={() => open(p)}
