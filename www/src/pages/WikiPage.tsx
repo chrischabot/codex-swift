@@ -1,5 +1,6 @@
 import * as React from "react";
-import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
+import { resolveWikilinkNav } from "@/components/wiki/markdown/wikiRemarkPlugins";
 import { Pencil, FilePlus2, Sparkles, LayoutGrid, Table2 } from "lucide-react";
 import { useWikiPage, useWikiRecents } from "@/state/wiki";
 import { useRuntime } from "@/runtime/RuntimeProvider";
@@ -79,6 +80,7 @@ export function WikiPage() {
     onOpenSearch: () => navigate("/wiki?q="),
   });
 
+  const location = useLocation();
   const q = searchParams.get("q") ?? "";
   const setQ = (next: string) => setSearchParams(next ? { q: next } : {}, { replace: true });
   // Leave edit mode whenever the route changes (new page / back to index).
@@ -86,12 +88,34 @@ export function WikiPage() {
   // `/wiki/new` is the create surface (no pageId, not a real page).
   const creating = pageId === "new";
 
-  // Wikilinks + tags route to a search query; the outline jumps to in-page
-  // heading anchors (ids added by rehypeHeadingIds).
-  const onWikiLink = (target: string) => navigate(`/wiki?q=${encodeURIComponent(target)}`);
+  // A clicked wikilink opens its target page DIRECTLY (resolved title → id),
+  // jumping to a `#heading` / `#^block` fragment when present; a dangling target
+  // falls back to a search query. Tags route to a tag search.
+  const onWikiLink = (target: string) => {
+    const nav = resolveWikilinkNav(target, (t) => resolveWikiLink(t));
+    // A hash-only result is a same-page jump — keep the current path + search so
+    // the scroll effect fires without leaving the page.
+    if (nav.startsWith("#")) navigate({ pathname: location.pathname, hash: nav });
+    else navigate(nav);
+  };
   const onTag = (tag: string) => navigate(`/wiki?q=${encodeURIComponent(`#${tag}`)}`);
   const onJump = (slug: string) =>
     document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  // Scroll to the URL hash fragment (heading slug or `block-<id>`) once the
+  // target page has rendered. Re-runs when the page or hash changes so a
+  // same-page `[[#heading]]` jump and a cross-page open both land correctly.
+  React.useEffect(() => {
+    if (loading || !page) return;
+    const raw = location.hash.replace(/^#/, "");
+    if (!raw) return;
+    const id = decodeURIComponent(raw);
+    // Defer to the next frame so the markdown (and its heading/block ids) exist.
+    const t = window.setTimeout(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 60);
+    return () => window.clearTimeout(t);
+  }, [loading, page, location.hash, pageId]);
 
   // A canvas / base is a wiki document whose body carries a `wiki_type`
   // frontmatter key. When such a page opens (from explorer, recents, or a

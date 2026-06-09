@@ -105,6 +105,106 @@ export function slugify(text: string): string {
     .replace(/\s+/g, "-");
 }
 
+// Trailing Obsidian block id: ` ^abc-123` at the end of a paragraph/heading.
+// Requires leading whitespace so a standalone `^id` line (which Obsidian binds
+// to the PREVIOUS block) is not mistakenly consumed here.
+const BLOCK_ID_RE = /[ \t]+\^([A-Za-z0-9_-]+)[ \t]*$/;
+
+/**
+ * remark transform: strip a trailing `^blockid` from a paragraph/heading and tag
+ * that block with `id="block-<id>"` so `[[Page#^blockid]]` links can scroll to
+ * it (the id matches {@link fragmentAnchorId}). Operates on the raw text before
+ * wikilink splitting; a block id already present is not overwritten.
+ */
+export function remarkBlockIds() {
+  return (tree: MdastNode): void => walk(tree);
+
+  function walk(node: MdastNode): void {
+    if (!isParent(node)) return;
+    for (const child of node.children) walk(child);
+
+    // List items: hoist a block id from the inner paragraph onto the <li>. A
+    // TIGHT list renders the item WITHOUT a <p> wrapper (mdast-util-to-hast
+    // drops it), which would otherwise discard the id — so the listItem must
+    // own it. Children were already walked, so the paragraph's id is set.
+    if (node.type === "listItem") {
+      for (const child of node.children) {
+        const cp = child as MdastParent;
+        const pid = child.type === "paragraph" ? cp.data?.hProperties?.id : undefined;
+        if (typeof pid === "string" && pid.startsWith("block-")) {
+          const data = (node.data ??= {} as MdastNodeData);
+          const props = (data.hProperties ??= {} as Record<string, unknown>);
+          if (props.id == null) props.id = pid;
+          delete cp.data!.hProperties!.id;
+          break;
+        }
+      }
+      return;
+    }
+
+    if (node.type !== "paragraph" && node.type !== "heading") return;
+    const kids = node.children;
+    const last = kids[kids.length - 1];
+    if (!last || last.type !== "text") return;
+    const text = last as MdastText;
+    const m = BLOCK_ID_RE.exec(text.value);
+    if (!m) return;
+    text.value = text.value.slice(0, m.index);
+    const data = (node.data ??= {} as MdastNodeData);
+    const props = (data.hProperties ??= {} as Record<string, unknown>);
+    if (props.id == null) props.id = `block-${m[1]}`;
+    // Drop a now-empty trailing text node (block id was the only content).
+    if (text.value === "") kids.pop();
+  }
+}
+
+/** Decode a percent-encoded wiki link target back to its human title. rehype
+ *  percent-encodes the `wiki:` URL (spaces → %20), so the title must be decoded
+ *  before resolving against a title→id map. Tolerant of malformed escapes. */
+export function decodeWikiTarget(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** The DOM anchor id for a wikilink fragment (heading or block), or "" when the
+ *  link has no fragment. Headings slug to match {@link rehypeHeadingIds};
+ *  blocks become `block-<id>` to match {@link remarkBlockIds}. */
+export function fragmentAnchorId(parts: WikilinkParts): string {
+  if (parts.block) return `block-${parts.block}`;
+  if (parts.heading) return slugify(parts.heading);
+  return "";
+}
+
+/**
+ * Resolve a clicked wikilink target to an in-app navigation path. A resolvable
+ * page opens DIRECTLY (`/wiki/:id`, with a `#fragment` when the link points at a
+ * heading/block) — matching Obsidian, where a wikilink jumps to the note, not a
+ * search. An unresolved/dangling target falls back to a search query so the user
+ * can find or create it. Pure + exported for unit tests.
+ */
+export function resolveWikilinkNav(
+  rawTarget: string,
+  resolveId: (title: string) => string | undefined,
+): string {
+  const parts = parseWikilink(rawTarget);
+  // A bare `[[#heading]]` / `[[#^block]]` (no target) is a same-page jump —
+  // return a hash-only nav so the host scrolls in place instead of routing to
+  // an empty search.
+  if (!parts.target) {
+    const anchor = fragmentAnchorId(parts);
+    return anchor ? `#${anchor}` : "/wiki";
+  }
+  const id = resolveId(parts.target);
+  if (id) {
+    const anchor = fragmentAnchorId(parts);
+    return `/wiki/${id}${anchor ? `#${anchor}` : ""}`;
+  }
+  return `/wiki?q=${encodeURIComponent(parts.target)}`;
+}
+
 // ── Callout type aliases (ported from granite renderer.ts:54-82) ────────────
 
 const CALLOUT_ALIASES: Record<string, string> = {
@@ -270,6 +370,16 @@ export function remarkWikilinks() {
           child.children.length > 0 &&
           child.children.every((c) => c.type === "wikiEmbed")
         ) {
+          // The paragraph is discarded, so carry any block-id anchor that
+          // remarkBlockIds put on it onto the first lifted embed — otherwise a
+          // `[[Page#^id]]` link to an embed line would scroll to nothing.
+          const liftedId = (child as MdastParent).data?.hProperties?.id;
+          if (liftedId != null && child.children.length > 0) {
+            const first = child.children[0] as MdastParent;
+            const fd = (first.data ??= {} as MdastNodeData);
+            const fp = (fd.hProperties ??= {} as Record<string, unknown>);
+            if (fp.id == null) fp.id = liftedId;
+          }
           out.push(...child.children);
         } else {
           out.push(child);
@@ -419,6 +529,16 @@ export function remarkHighlight() {
           child.children.length > 0 &&
           child.children.every((c) => c.type === "wikiEmbed")
         ) {
+          // The paragraph is discarded, so carry any block-id anchor that
+          // remarkBlockIds put on it onto the first lifted embed — otherwise a
+          // `[[Page#^id]]` link to an embed line would scroll to nothing.
+          const liftedId = (child as MdastParent).data?.hProperties?.id;
+          if (liftedId != null && child.children.length > 0) {
+            const first = child.children[0] as MdastParent;
+            const fd = (first.data ??= {} as MdastNodeData);
+            const fp = (fd.hProperties ??= {} as Record<string, unknown>);
+            if (fp.id == null) fp.id = liftedId;
+          }
           out.push(...child.children);
         } else {
           out.push(child);

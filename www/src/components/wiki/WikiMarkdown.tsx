@@ -12,6 +12,8 @@ import { WikiLinkWithHover } from "./hover/WikiLinkWithHover";
 import {
   type CalloutType,
   rehypeHeadingIds,
+  decodeWikiTarget,
+  remarkBlockIds,
   remarkCallouts,
   remarkHighlight,
   remarkWikilinks,
@@ -60,7 +62,11 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
         node?: unknown;
       };
       if (typeof href === "string" && href.startsWith("wiki:")) {
-        const target = href.slice("wiki:".length);
+        // rehype percent-encodes the URL (spaces → %20, etc.), so decode back to
+        // the human title before resolution — otherwise `[[Two Words]]` becomes
+        // "Two%20Words" and never matches a title→id map (breaking direct-open
+        // AND hover for any multi-word page).
+        const target = decodeWikiTarget(href.slice("wiki:".length));
         return (
           <WikiLinkWithHover
             target={target}
@@ -97,6 +103,7 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
           target={String(props.target ?? "")}
           fullTarget={full != null ? String(full) : undefined}
           display={props.display != null ? String(props.display) : undefined}
+          anchorId={props.id != null ? String(props.id) : undefined}
           onOpen={onWikiLink}
         />
       );
@@ -139,7 +146,13 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
     },
 
     // ── Reused element styling (mirrors chat/Markdown.tsx) ────────────────
-    p: ({ children }) => <p className="mb-3 last:mb-0">{children}</p>,
+    // Pass through props (notably the `id` that remarkBlockIds sets for
+    // `^blockid` anchors); drop react-markdown's internal `node` prop.
+    p: ({ children, node: _node, ...rest }) => (
+      <p {...rest} className="mb-3 last:mb-0">
+        {children}
+      </p>
+    ),
     ul: ({ children, className: cls }) => (
       <ul
         className={cn(
@@ -151,8 +164,9 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
       </ul>
     ),
     ol: ({ children }) => <ol className="mb-3 list-decimal pl-5 last:mb-0">{children}</ol>,
-    li: ({ children, className: cls }) => (
+    li: ({ children, className: cls, node: _n, ...rest }) => (
       <li
+        {...rest}
         className={cn(
           "mb-1 marker:text-[color:var(--color-text-quaternary)]",
           (cls ?? "").includes("task-list-item") && "task-list-item flex list-none items-start gap-2",
@@ -267,7 +281,7 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
         // remarkCallouts runs BEFORE wikilinks/highlight so it sees the callout
         // header's first text node intact (a `[!tip] [[Home]]` title isn't split
         // out from under it).
-        remarkPlugins={[remarkGfm, remarkMath, remarkCallouts, remarkWikilinks, remarkHighlight]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkBlockIds, remarkCallouts, remarkWikilinks, remarkHighlight]}
         rehypePlugins={[rehypeKatex, rehypeHeadingIds]}
         // Preserve the `wiki:` sentinel scheme that remarkWikilinks emits —
         // react-markdown's defaultUrlTransform would otherwise strip it to "",

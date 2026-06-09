@@ -1,1 +1,0 @@
-import{x as e}from"./mermaid-parser.core-CMDxP_C7.js";export{e as createArchitectureServices};

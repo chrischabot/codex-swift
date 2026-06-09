@@ -1,0 +1,1 @@
+import{h as e}from"./src-mbaT1L-5.js";var t=class{constructor(e){this.init=e,this.records=this.init()}static{e(this,`ImperativeState`)}reset(){this.records=this.init()}};export{t};
