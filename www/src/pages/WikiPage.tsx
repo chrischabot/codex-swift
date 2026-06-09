@@ -36,6 +36,9 @@ import { WikiCanvasView } from "@/components/wiki/canvas/WikiCanvasView";
 import { isCanvasDoc } from "@/components/wiki/canvas/canvasSchema";
 import { WikiBaseView } from "@/components/wiki/bases/WikiBaseView";
 import { isBaseBody } from "@/components/wiki/bases/basesSchema";
+import { useWikiTabs } from "@/components/wiki/tabs/useWikiTabs";
+import { WikiTabStrip } from "@/components/wiki/tabs/WikiTabStrip";
+import { activeAfterClose } from "@/components/wiki/tabs/wikiTabs";
 import { useWikiCommands } from "@/components/wiki/commands/useWikiCommands";
 import { WikiCommandPalette } from "@/components/wiki/commands/WikiCommandPalette";
 import { WikiSettingsModal } from "@/components/wiki/settings/WikiSettingsModal";
@@ -76,6 +79,31 @@ export function WikiPage() {
   const resolveWikiLink = React.useCallback(
     (title: string) => idByTitle.get(title.trim().toLowerCase()),
     [idByTitle],
+  );
+
+  // Open-page tabs (the additive core of Obsidian's tab workspace). The route
+  // owns the active page; opening a real page adds/refreshes its tab.
+  const tabsApi = useWikiTabs();
+  const { open: openTab, close: doCloseTab, tabs: openTabs } = tabsApi;
+  React.useEffect(() => {
+    if (pageId && pageId !== "new" && page) openTab({ id: pageId, title: page.title });
+  }, [pageId, page, openTab]);
+  const closeTab = React.useCallback(
+    (id: string) => {
+      const next = activeAfterClose(openTabs, id, pageId);
+      doCloseTab(id);
+      if (next === undefined) return; // closed a background tab — no nav change
+      navigate(next === null ? "/wiki" : `/wiki/${next}`);
+    },
+    [openTabs, doCloseTab, pageId, navigate],
+  );
+  const tabStrip = (
+    <WikiTabStrip
+      tabs={tabsApi.tabs}
+      activeId={pageId}
+      onSelect={(id) => navigate(`/wiki/${id}`)}
+      onClose={closeTab}
+    />
   );
 
   // Wiki-scoped command palette (Cmd-P). The wiki settings modal is opened via
@@ -150,24 +178,30 @@ export function WikiPage() {
 
   if (docKind === "canvas" && pageId) {
     return (
-      <div className="relative flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 flex-col">
         {overlays}
-        <WikiCanvasView pageId={pageId} onOpenPage={(id) => navigate(`/wiki/${id}`)} className="flex-1" />
-        {/* Full-bleed views have no action row; a floating delete (top-left, clear
-            of the view's own top-right toolbar) keeps canvas/base deletable. */}
-        <div className="absolute left-3 top-3 z-20">
-          <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+        {tabStrip}
+        <div className="relative flex min-h-0 flex-1">
+          <WikiCanvasView pageId={pageId} onOpenPage={(id) => navigate(`/wiki/${id}`)} className="flex-1" />
+          {/* Full-bleed views have no action row; a floating delete (top-left, clear
+              of the view's own top-right toolbar) keeps canvas/base deletable. */}
+          <div className="absolute left-3 top-3 z-20">
+            <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+          </div>
         </div>
       </div>
     );
   }
   if (docKind === "base" && pageId) {
     return (
-      <div className="relative flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 flex-col">
         {overlays}
-        <WikiBaseView pageId={pageId} />
-        <div className="absolute right-3 top-3 z-20">
-          <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+        {tabStrip}
+        <div className="relative flex min-h-0 flex-1">
+          <WikiBaseView pageId={pageId} />
+          <div className="absolute right-3 top-3 z-20">
+            <DeletePageButton pageId={pageId} title={page?.title} onDeleted={() => navigate("/wiki")} />
+          </div>
         </div>
       </div>
     );
@@ -178,6 +212,7 @@ export function WikiPage() {
       {overlays}
       {/* MAIN PANE — editor / search / index / reading view */}
       <div className="flex min-w-0 flex-1 flex-col">
+        {tabStrip}
         {creating || (pageId && editing) ? (
           // Editor owns full height (its own internal scroll).
           <WikiEditor

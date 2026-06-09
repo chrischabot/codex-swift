@@ -34,6 +34,7 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/sonner";
+import { renameTabInStorage } from "@/components/wiki/tabs/useWikiTabs";
 import { cn } from "@/lib/utils";
 
 // Context for the row-level actions (rename/delete/open) so the deeply-nested
@@ -353,6 +354,7 @@ function RenamePageDialog({ node, onClose, onDone }: { node: FileNode; onClose: 
       const res = await connector.renameWikiPage(node.id, next);
       if (res === null) { toast.error("Rename failed"); return; }
       if (!res.renamed) { toast.error("Page not found or empty title"); return; }
+      renameTabInStorage(node.id, next); // keep any open tab's title fresh
       toast.success("Page renamed");
       onDone();
       onClose();
