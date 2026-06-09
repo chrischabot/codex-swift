@@ -137,7 +137,8 @@ interface Split {
   endFence: "---" | "...";
 }
 
-function splitFrontmatter(text: string): Split {
+// Exported for unit tests (pure; no behaviour change).
+export function splitFrontmatter(text: string): Split {
   // Newline style is taken from the OPENING fence ONLY. Detecting it from the
   // whole document is wrong: a single `\r\n` anywhere (a Windows-pasted body
   // line, a CRLF code block) would force a `\r\n` end-marker that never matches
@@ -290,7 +291,7 @@ function isSafeNumber(t: string): boolean {
 
 // ── Parse the frontmatter into ordered segments ───────────────────────────────
 
-function parseSegments(yamlText: string | null): ParsedFrontmatter {
+export function parseSegments(yamlText: string | null): ParsedFrontmatter {
   if (yamlText === null) return { segments: [], originalYaml: null };
   const lines = yamlText.split(/\r?\n/);
   const segments: Segment[] = [];
@@ -561,7 +562,7 @@ function rowEdited(row: PropertyRowState): boolean {
   return orig.raw !== row.raw;
 }
 
-function serialize(
+export function serialize(
   segments: Segment[],
   body: string,
   newline: "\n" | "\r\n",
