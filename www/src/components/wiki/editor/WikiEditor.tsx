@@ -1,15 +1,29 @@
 import * as React from "react";
-import { Save, X, Eye, Pencil } from "lucide-react";
+import { EditorView } from "@codemirror/view";
+import { Save, X, Eye, Pencil, Bold, Italic, Code, Link2, Heading2, Quote, List, Highlighter } from "lucide-react";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { toast } from "@/components/ui/sonner";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { WikiMarkdown } from "@/components/wiki/WikiMarkdown";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { livePreview } from "./livePreview";
 import { wikiAutocomplete } from "./autocomplete";
 import { editorExtensions } from "./extensions";
+import {
+  formattingKeymap,
+  boldCommand,
+  italicCommand,
+  codeCommand,
+  highlightCommand,
+  wikilinkCommand,
+  headingCommand,
+  quoteCommand,
+  bulletCommand,
+} from "./formatting";
+import { useWikiSettings } from "@/components/wiki/settings/useWikiSettings";
 import "./livePreview.css";
 
 interface Props {
@@ -55,11 +69,23 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
     return () => { alive = false; };
   }, [connector, connected]);
 
-  // CM6 extension bundle for the editor: Live Preview (render-as-you-type) +
-  // autocomplete ([[ / # / /) + folding + multi-cursor. Memoized so the editor
-  // only reconfigures when the providers/resolver change.
+  const { settings } = useWikiSettings();
+  // Handle to the live EditorView so the formatting toolbar can dispatch the
+  // same commands the keymap binds.
+  const viewRef = React.useRef<EditorView | null>(null);
+  const runCmd = React.useCallback((cmd: (v: EditorView) => boolean) => {
+    if (viewRef.current) cmd(viewRef.current);
+  }, []);
+
+  // CM6 extension bundle for the editor: Live Preview (render-as-you-type, when
+  // enabled in settings) + formatting keymap (Cmd-B/I/`/K) + autocomplete
+  // ([[ / # / /) + folding + multi-cursor. Memoized so the editor only
+  // reconfigures when the providers/resolver/settings change.
   const cmExtensions = React.useMemo(() => [
-    livePreview({ isLinkResolved: (t) => knownTitles.has(t.split(/[#|]/)[0].trim().toLowerCase()) }),
+    formattingKeymap,
+    ...(settings.editorLivePreview
+      ? [livePreview({ isLinkResolved: (t) => knownTitles.has(t.split(/[#|]/)[0].trim().toLowerCase()) })]
+      : []),
     wikiAutocomplete({
       pages: async () => {
         if (!connector.listWikiPages) return [];
@@ -73,7 +99,7 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
       },
     }),
     editorExtensions({ fold: true }),
-  ], [connector, knownTitles]);
+  ], [connector, knownTitles, settings.editorLivePreview]);
 
   // Load the existing page (edit mode). New-page mode resets to a blank draft.
   React.useEffect(() => {
@@ -198,6 +224,22 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
         </div>
       </div>
 
+      {/* Formatting toolbar (edit mode only). Buttons dispatch the SAME commands
+          the keymap binds (Cmd-B/I/`/K), so keyboard + click stay in sync. */}
+      {mode === "edit" && (
+        <div className="flex shrink-0 flex-wrap items-center gap-0.5 border-b border-[color:var(--border)] px-3 py-1">
+          <FormatButton label="Bold (⌘B)" onClick={() => runCmd(boldCommand)}><Bold className="size-3.5" /></FormatButton>
+          <FormatButton label="Italic (⌘I)" onClick={() => runCmd(italicCommand)}><Italic className="size-3.5" /></FormatButton>
+          <FormatButton label="Code (⌘`)" onClick={() => runCmd(codeCommand)}><Code className="size-3.5" /></FormatButton>
+          <FormatButton label="Highlight (⌘⇧H)" onClick={() => runCmd(highlightCommand)}><Highlighter className="size-3.5" /></FormatButton>
+          <div className="mx-1 h-4 w-px bg-[color:var(--border)]" />
+          <FormatButton label="Wikilink (⌘K)" onClick={() => runCmd(wikilinkCommand)}><Link2 className="size-3.5" /></FormatButton>
+          <FormatButton label="Heading" onClick={() => runCmd(headingCommand(2))}><Heading2 className="size-3.5" /></FormatButton>
+          <FormatButton label="Quote" onClick={() => runCmd(quoteCommand)}><Quote className="size-3.5" /></FormatButton>
+          <FormatButton label="Bullet list" onClick={() => runCmd(bulletCommand)}><List className="size-3.5" /></FormatButton>
+        </div>
+      )}
+
       {/* Title */}
       <div className="shrink-0 px-4 pt-4">
         <Input
@@ -221,10 +263,40 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
             value={body}
             onChange={onBodyChange}
             extensions={cmExtensions}
+            viewRef={viewRef}
             className={cn("h-full rounded-md")}
           />
         )}
       </div>
     </div>
+  );
+}
+
+/** A square icon button in the formatting toolbar. mousedown is prevented so the
+ *  editor keeps its selection when a button is clicked. */
+function FormatButton({
+  label,
+  onClick,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onClick}
+          className="inline-flex size-7 items-center justify-center rounded text-[color:var(--color-text-tertiary)] transition-colors hover:bg-[color:var(--color-surface-hover)] hover:text-foreground"
+        >
+          {children}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }

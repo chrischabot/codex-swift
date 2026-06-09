@@ -19,6 +19,9 @@ interface Props {
    * array — a new array every render triggers a reconfigure each time.
    */
   extensions?: Extension[];
+  /** Optional handle to the live EditorView, so the host (e.g. a formatting
+   *  toolbar) can dispatch commands. Set on mount, cleared on unmount. */
+  viewRef?: React.MutableRefObject<EditorView | null>;
 }
 
 // Bridges www's design tokens into CodeMirror's chrome so the editor reads as
@@ -74,7 +77,7 @@ function themeExtensions(dark: boolean) {
  *   documentElement's class — so toggling the app's .dark class re-themes the
  *   editor in place without rebuilding it.
  */
-export function CodeMirrorEditor({ value, onChange, className, extensions }: Props) {
+export function CodeMirrorEditor({ value, onChange, className, extensions, viewRef: externalViewRef }: Props) {
   const hostRef = React.useRef<HTMLDivElement>(null);
   const viewRef = React.useRef<EditorView | null>(null);
   const themeCompartment = React.useRef(new Compartment());
@@ -116,6 +119,7 @@ export function CodeMirrorEditor({ value, onChange, className, extensions }: Pro
       }),
     });
     viewRef.current = view;
+    if (externalViewRef) externalViewRef.current = view;
 
     // Re-theme in place when the app flips its .dark class.
     const observer = new MutationObserver(() => {
@@ -132,6 +136,7 @@ export function CodeMirrorEditor({ value, onChange, className, extensions }: Pro
       observer.disconnect();
       view.destroy();
       viewRef.current = null;
+      if (externalViewRef) externalViewRef.current = null;
     };
     // Created once; value/onChange are reconciled imperatively below.
     // eslint-disable-next-line react-hooks/exhaustive-deps

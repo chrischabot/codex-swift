@@ -121,6 +121,19 @@ function write(next: WikiSettings): void {
   if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 
+/**
+ * Flip `editorLivePreview` in the persisted settings and broadcast so every
+ * `useWikiSettings` consumer (the editor, the modal) updates. Callable from
+ * outside React — used by the command-palette "Toggle live preview" command.
+ * Returns the new value.
+ */
+export function toggleLivePreviewSetting(): boolean {
+  const cur = read();
+  const next = { ...cur, editorLivePreview: !cur.editorLivePreview };
+  write(next);
+  return next.editorLivePreview;
+}
+
 export interface UseWikiSettings {
   /** The current, fully-populated preferences. */
   settings: WikiSettings;

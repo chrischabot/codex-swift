@@ -11,6 +11,7 @@ import {
   Table2,
   Type,
 } from "lucide-react";
+import { toggleLivePreviewSetting } from "@/components/wiki/settings/useWikiSettings";
 
 // ---------------------------------------------------------------------------
 // Wiki command registry — a www-idiomatic port of granite's
@@ -136,10 +137,7 @@ export const wikiCommandRegistry = new WikiCommandRegistry();
 export const WIKI_EVENTS = {
   newCanvas: "wiki:new-canvas",
   newBase: "wiki:new-base",
-  toggleLivePreview: "wiki:toggle-live-preview",
 } as const;
-
-const LIVE_PREVIEW_KEY = "wiki:live-preview";
 
 /** "Today's note" id convention: a daily-note slug `daily/YYYY-MM-DD`. The wiki
  *  page route accepts any id; if the page doesn't exist yet, WikiPage renders a
@@ -221,18 +219,10 @@ const BUILTIN_WIKI_COMMANDS: ReadonlyArray<WikiCommand> = [
     name: "Toggle live preview",
     icon: Eye,
     run: (ctx) => {
-      // Flip a persisted flag and broadcast so the editor (a sibling
-      // milestone's file) can react. We own the storage key so the toggle is
-      // meaningful even before a listener exists.
-      let next = true;
-      try {
-        const cur = localStorage.getItem(LIVE_PREVIEW_KEY) === "true";
-        next = !cur;
-        localStorage.setItem(LIVE_PREVIEW_KEY, String(next));
-      } catch {
-        /* private mode — best-effort */
-      }
-      fireEvent(WIKI_EVENTS.toggleLivePreview, { enabled: next });
+      // Flip the shared wiki settings flag the editor subscribes to (via
+      // useWikiSettings). Broadcasts through the settings change event so the
+      // open editor reconfigures its CM extensions live.
+      const next = toggleLivePreviewSetting();
       ctx.notify(next ? "Live preview on" : "Live preview off");
     },
   },
