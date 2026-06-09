@@ -73,8 +73,9 @@ flightdeck.tar.gz
 *.provisionprofile
 AuthKey_*.p8
 
-# Node / web UI (www/) — regenerable deps + audit/trace artifacts (never commit)
+# Node / web UI (www/) — regenerable deps + build/audit/trace artifacts (never commit)
 node_modules/
+www/dist/
 .audits/
 .turbo/
 *.tsbuildinfo
