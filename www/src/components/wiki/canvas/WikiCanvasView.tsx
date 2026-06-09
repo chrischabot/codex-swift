@@ -38,6 +38,7 @@ import {
   type EdgeSide,
   type NodeType,
   newCanvasId,
+  cloneSelection,
 } from "./canvasSchema";
 import { useCanvasDoc } from "./useCanvasDoc";
 
@@ -608,12 +609,62 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
     if (p) setEdgeDraftEnd(p);
   };
 
-  // ── keyboard: delete + arrow nudge ──
+  // Clipboard for canvas copy/paste (in-app, not the OS clipboard). The paste
+  // offset grows per consecutive paste so repeated ⌘V cascades instead of
+  // stacking exactly.
+  const clipboardRef = React.useRef<{ nodes: CanvasNode[]; edges: CanvasEdge[] } | null>(null);
+  const pasteOffsetRef = React.useRef(0);
+
+  const duplicateSelection = React.useCallback(
+    (ids: ReadonlySet<string>) => {
+      if (ids.size === 0) return;
+      const c = canvasRef.current;
+      const cloned = cloneSelection(c.nodes, c.edges, ids, GRID, newCanvasId);
+      if (cloned.nodes.length === 0) return;
+      mutate({ nodes: [...c.nodes, ...cloned.nodes], edges: [...c.edges, ...cloned.edges] });
+      setSelected(cloned.newIds);
+    },
+    [mutate],
+  );
+
+  // ── keyboard: copy/paste/duplicate + delete + arrow nudge ──
   React.useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       const t = ev.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      const mod = ev.metaKey || ev.ctrlKey;
+      // Cmd-V pastes even with nothing selected (it places the clipboard).
+      // Repeated pastes CASCADE (offset grows each time) so they don't stack
+      // exactly on top of one another (Obsidian parity).
+      if (mod && ev.key.toLowerCase() === "v" && clipboardRef.current) {
+        ev.preventDefault();
+        const c = canvasRef.current;
+        const ids = new Set(clipboardRef.current.nodes.map((n) => n.id));
+        pasteOffsetRef.current += GRID;
+        const pasted = cloneSelection(clipboardRef.current.nodes, clipboardRef.current.edges, ids, pasteOffsetRef.current, newCanvasId);
+        if (pasted.nodes.length > 0) {
+          mutate({ nodes: [...c.nodes, ...pasted.nodes], edges: [...c.edges, ...pasted.edges] });
+          setSelected(pasted.newIds);
+        }
+        return;
+      }
       if (selectedRef.current.length === 0) return;
+      const sel = new Set(selectedRef.current);
+      if (mod && ev.key.toLowerCase() === "c") {
+        ev.preventDefault();
+        const c = canvasRef.current;
+        clipboardRef.current = {
+          nodes: c.nodes.filter((n) => sel.has(n.id)),
+          edges: c.edges.filter((e) => sel.has(e.fromNode) && sel.has(e.toNode)),
+        };
+        pasteOffsetRef.current = 0; // fresh copy → next paste starts one grid out
+        return;
+      }
+      if (mod && ev.key.toLowerCase() === "d") {
+        ev.preventDefault();
+        duplicateSelection(sel);
+        return;
+      }
       if (ev.key === "Backspace" || ev.key === "Delete") {
         ev.preventDefault();
         deleteSelected();
@@ -639,7 +690,7 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [deleteSelected, mutate]);
+  }, [deleteSelected, mutate, duplicateSelection]);
 
   const selectedNode =
     selected.length === 1 ? (canvas.nodes.find((n) => n.id === selected[0]) ?? null) : null;

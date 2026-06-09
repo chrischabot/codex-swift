@@ -47,6 +47,37 @@ export interface Canvas {
   edges: CanvasEdge[];
 }
 
+/**
+ * Clone a selection of nodes (by id) with fresh ids, offset by `offset` px.
+ * Edges are carried over ONLY when BOTH endpoints are in the selection (an edge
+ * to an unselected node can't be meaningfully duplicated). `genId` is injected
+ * so the result is deterministic in tests. Returns the clones + the new node
+ * ids (for re-selecting the duplicates). Pure.
+ */
+export function cloneSelection(
+  nodes: ReadonlyArray<CanvasNode>,
+  edges: ReadonlyArray<CanvasEdge>,
+  selectedIds: ReadonlySet<string>,
+  offset: number,
+  genId: () => string,
+): { nodes: CanvasNode[]; edges: CanvasEdge[]; newIds: string[] } {
+  const idMap = new Map<string, string>();
+  const outNodes: CanvasNode[] = [];
+  for (const n of nodes) {
+    if (!selectedIds.has(n.id)) continue;
+    const nid = genId();
+    idMap.set(n.id, nid);
+    outNodes.push({ ...n, id: nid, x: n.x + offset, y: n.y + offset });
+  }
+  const outEdges: CanvasEdge[] = [];
+  for (const e of edges) {
+    const from = idMap.get(e.fromNode);
+    const to = idMap.get(e.toNode);
+    if (from && to) outEdges.push({ ...e, id: genId(), fromNode: from, toNode: to });
+  }
+  return { nodes: outNodes, edges: outEdges, newIds: [...idMap.values()] };
+}
+
 export interface ParsedCanvasDoc {
   /** Raw frontmatter key/values parsed off the leading `---` block. */
   frontmatter: Record<string, string>;
