@@ -15,7 +15,7 @@ import {
   Notebook,
   PanelLeft,
 } from "lucide-react";
-import { useWikiRecents } from "@/state/wiki";
+import { WikiExplorer } from "@/components/wiki/explorer/WikiExplorer";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
@@ -51,7 +51,6 @@ export function Sidebar({ onToggle }: SidebarProps) {
   // main nav). Recents are fetched ONLY while in the section (the `enabled` gate),
   // so unrelated sessions never query the wiki store.
   const inWikiSection = location.pathname === "/wiki" || location.pathname.startsWith("/wiki/");
-  const { pages: wikiPages } = useWikiRecents(20, inWikiSection);
   const activeThreadId = params.threadId;
   const activeProjectId = params.projectId;
 
@@ -102,22 +101,10 @@ export function Sidebar({ onToggle }: SidebarProps) {
       <ScrollArea className="flex-1">
         <div className="px-2 pb-3">
           {inWikiSection ? (
-            <div>
-              <SidebarSectionHeader label="Recent wiki pages" />
-              {wikiPages.length === 0 ? (
-                <div className="px-2 py-1 text-[12px] text-[color:var(--color-text-quaternary)]">No wiki pages yet</div>
-              ) : (
-                wikiPages.map((p) => (
-                  <SidebarNavItem
-                    key={p.id}
-                    icon={<Notebook />}
-                    label={p.title}
-                    active={params.pageId === p.id}
-                    onClick={() => navigate(`/wiki/${p.id}`)}
-                  />
-                ))
-              )}
-            </div>
+            <WikiExplorer
+              activePageId={params.pageId}
+              onOpenPage={(id) => navigate(`/wiki/${id}`)}
+            />
           ) : (
           <>
           <div>

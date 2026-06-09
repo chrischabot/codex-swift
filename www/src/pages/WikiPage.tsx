@@ -15,6 +15,9 @@ import { WikiGraphView } from "@/components/wiki/graph/WikiGraphView";
 import { WikiSearchView } from "@/components/wiki/WikiSearchView";
 import { WikiQuickSwitcher } from "@/components/wiki/WikiQuickSwitcher";
 import { useWikiSwitcherHotkey } from "@/components/wiki/useWikiSwitcherHotkey";
+import { WikiBacklinksPanel } from "@/components/wiki/panels/WikiBacklinksPanel";
+import { WikiBookmarksPanel } from "@/components/wiki/panels/WikiBookmarksPanel";
+import { BookmarkButton } from "@/components/wiki/panels/BookmarkButton";
 
 /**
  * Full-screen Memory Wiki view (inside AppShell's <Outlet/>). M1: granite read
@@ -74,7 +77,8 @@ export function WikiPage() {
                 <div className="text-[13px] text-[color:var(--color-text-secondary)]">Page not found.</div>
               ) : (
                 <div>
-                  <div className="mb-2 flex justify-end">
+                  <div className="mb-2 flex justify-end gap-1.5">
+                    <BookmarkButton pageId={page.id} title={page.title} />
                     <Button variant="outline" size="xs" onClick={() => setEditing(true)}>
                       <Pencil className="mr-1 size-3" /> Edit
                     </Button>
@@ -96,6 +100,7 @@ export function WikiPage() {
               <TabsTrigger value="graph">Graph</TabsTrigger>
               <TabsTrigger value="tags">Tags</TabsTrigger>
               <TabsTrigger value="outline">Outline</TabsTrigger>
+              <TabsTrigger value="bookmarks">Saved</TabsTrigger>
               <TabsTrigger value="properties">Info</TabsTrigger>
             </TabsList>
             {/* Graph tab fills the rail height (a canvas), so it sits OUTSIDE the
@@ -110,10 +115,16 @@ export function WikiPage() {
             <ScrollArea className="min-h-0 flex-1">
               <div className="px-3 py-4">
                 <TabsContent value="connections" className="mt-0">
-                  <WikiConnectionsPanel
-                    page={page}
-                    onSelectEntity={(_id, canonical) => onWikiLink(canonical)}
-                  />
+                  <WikiBacklinksPanel page={page} onOpenPage={(id) => navigate(`/wiki/${id}`)} />
+                  <div className="mt-4 border-t border-[color:var(--border)] pt-3">
+                    <WikiConnectionsPanel
+                      page={page}
+                      onSelectEntity={(_id, canonical) => onWikiLink(canonical)}
+                    />
+                  </div>
+                </TabsContent>
+                <TabsContent value="bookmarks" className="mt-0">
+                  <WikiBookmarksPanel onSelect={(id) => navigate(`/wiki/${id}`)} />
                 </TabsContent>
                 <TabsContent value="tags" className="mt-0">
                   <WikiTagsPanel onSelectTag={onTag} />
