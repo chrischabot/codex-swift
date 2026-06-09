@@ -114,6 +114,7 @@ The deep design docs and the addon thesis:
 | [`docs/HOOKS.md`](docs/HOOKS.md) | Hook lifecycle, trust gating, payloads |
 | [`docs/SANDBOX.md`](docs/SANDBOX.md) | Seatbelt profiles, workspace policy, approval engine |
 | [`docs/MEMORY.md`](docs/MEMORY.md) | `codex-memory` daemon, stages, MLX inference |
+| [`docs/notes/on-device-mlx-bringup.md`](docs/notes/on-device-mlx-bringup.md) | Running the on-device MLX lane: metallib, nomic patch, tokenizer, split provider |
 | [`docs/PERSISTENCE.md`](docs/PERSISTENCE.md) | Rollout JSONL, SQLite WAL, resume |
 | [`docs/CONFIG.md`](docs/CONFIG.md) | `config.toml` schema, layering, config RPCs |
 | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Building, testing, release gates, CI |
