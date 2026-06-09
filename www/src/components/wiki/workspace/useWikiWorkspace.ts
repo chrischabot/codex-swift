@@ -1,6 +1,8 @@
 import * as React from "react";
 import {
   buildInitial,
+  goBack as goBackOp,
+  goForward as goForwardOp,
   closeGroup as closeGroupOp,
   closeLeavesToRight as closeRightOp,
   closeLeaf as closeLeafOp,
@@ -59,6 +61,8 @@ export interface UseWikiWorkspace {
   moveTab: (id: LeafId, targetGroupId: TabGroupId, beforeLeafId: LeafId | null) => void;
   toggleStacked: (id: TabGroupId) => void;
   togglePinned: (id: LeafId) => void;
+  goBack: (id: LeafId) => void;
+  goForward: (id: LeafId) => void;
 }
 
 /**
@@ -102,6 +106,8 @@ export function useWikiWorkspace(): UseWikiWorkspace {
     [],
   );
   const togglePinned = React.useCallback((id: LeafId) => setState((s) => togglePinnedOp(s, id)), []);
+  const goBack = React.useCallback((id: LeafId) => setState((s) => goBackOp(s, id)), []);
+  const goForward = React.useCallback((id: LeafId) => setState((s) => goForwardOp(s, id)), []);
 
   return {
     state,
@@ -117,5 +123,7 @@ export function useWikiWorkspace(): UseWikiWorkspace {
     moveTab,
     toggleStacked,
     togglePinned,
+    goBack,
+    goForward,
   };
 }

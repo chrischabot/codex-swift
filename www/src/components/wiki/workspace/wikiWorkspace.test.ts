@@ -4,6 +4,10 @@ import {
   activeLeaf,
   activePageId,
   buildInitial,
+  canGoBack,
+  canGoForward,
+  goBack,
+  goForward,
   closeGroup,
   closeLeaf,
   closeLeavesToRight,
@@ -311,6 +315,87 @@ describe("togglePinned", () => {
     const restored = deserialize(serialize(s))!;
     const first = leavesOfGroup(restored, restored.rootGroupIds[0])[0];
     expect(first.state).toMatchObject({ pageId: "p1", pinned: true });
+  });
+});
+
+describe("nav history (per-leaf back/forward)", () => {
+  // Navigate a single pane through p1 → p2 → p3 (all in-place replacements).
+  function trail(): WorkspaceState {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2");
+    s = openOrFocusPage(s, "p3");
+    return s;
+  }
+
+  it("records in-place navigation and goes back", () => {
+    let s = trail();
+    const id = s.activeGroupId ? s.groups.get(s.activeGroupId)!.activeLeafId! : "";
+    expect(canGoBack(s, id)).toBe(true);
+    expect(canGoForward(s, id)).toBe(false);
+    s = goBack(s, id);
+    expect(activePageId(s)).toBe("p2");
+    s = goBack(s, id);
+    expect(activePageId(s)).toBe("p1");
+    expect(canGoBack(s, id)).toBe(false);
+    expect(canGoForward(s, id)).toBe(true);
+  });
+
+  it("goes forward after going back", () => {
+    let s = trail();
+    const id = s.groups.get(s.activeGroupId!)!.activeLeafId!;
+    s = goBack(s, id);
+    s = goForward(s, id);
+    expect(activePageId(s)).toBe("p3");
+    expect(canGoForward(s, id)).toBe(false);
+  });
+
+  it("navigating after going back truncates the forward stack", () => {
+    let s = trail(); // [p1,p2,p3] cursor 2
+    const id = s.groups.get(s.activeGroupId!)!.activeLeafId!;
+    s = goBack(s, id); // p2
+    s = openOrFocusPage(s, "p9"); // replace p2 → new branch [p1,p2,p9]
+    expect(activePageId(s)).toBe("p9");
+    expect(canGoForward(s, id)).toBe(false); // p3 dropped
+    s = goBack(s, id);
+    expect(activePageId(s)).toBe("p2");
+  });
+
+  it("goBack/goForward are no-ops at the ends", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    const id = s.groups.get(s.activeGroupId!)!.activeLeafId!;
+    expect(goBack(s, id)).toBe(s); // only one entry
+    expect(goForward(s, id)).toBe(s);
+  });
+
+  it("re-opening the same page does not grow history", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2");
+    const id = s.groups.get(s.activeGroupId!)!.activeLeafId!;
+    s = openOrFocusPage(s, "p2"); // already active → no-op
+    s = goBack(s, id);
+    expect(activePageId(s)).toBe("p1"); // p2 wasn't double-recorded
+  });
+
+  it("a moved tab keeps its history; a split copy starts fresh", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2"); // group A leaf has history [p1,p2]
+    const gA = s.activeGroupId!;
+    const leafA = s.groups.get(gA)!.activeLeafId!;
+    // split → copy gets a NEW leaf id with no history
+    s = splitLeaf(s, leafA, "right");
+    const copyId = s.groups.get(s.activeGroupId!)!.activeLeafId!;
+    expect(canGoBack(s, copyId)).toBe(false);
+    // original still has its history
+    expect(canGoBack(s, leafA)).toBe(true);
+  });
+
+  it("history is transient — deserialize starts with no back/forward", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2");
+    const restored = deserialize(serialize(s))!;
+    const id = restored.groups.get(restored.activeGroupId!)!.activeLeafId!;
+    expect(canGoBack(restored, id)).toBe(false);
+    expect(activePageId(restored)).toBe("p2");
   });
 });
 

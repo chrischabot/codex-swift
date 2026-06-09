@@ -2,7 +2,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 import { WikiPaneTabStrip, type PaneTabActions } from "./WikiPaneTabStrip";
 import { WikiLeafBody, type LeafBodyCallbacks } from "./WikiLeafBody";
-import { leavesOfGroup, type Leaf, type TabGroupId } from "./wikiWorkspace";
+import { canGoBack, canGoForward, leavesOfGroup, type Leaf, type TabGroupId } from "./wikiWorkspace";
 import type { UseWikiWorkspace } from "./useWikiWorkspace";
 
 interface Props {
@@ -40,6 +40,8 @@ export function WikiWorkspace({ ws, titleById, buildCallbacks }: Props) {
       },
       onToggleStacked: ws.toggleStacked,
       onCloseGroup: ws.closeGroup,
+      onBack: ws.goBack,
+      onForward: ws.goForward,
     }),
     [ws],
   );
@@ -75,6 +77,8 @@ export function WikiWorkspace({ ws, titleById, buildCallbacks }: Props) {
                   stacked={!!group.stacked}
                   canCloseGroup={totalGroups > 1}
                   titleById={titleById}
+                  canBack={!!group.activeLeafId && canGoBack(state, group.activeLeafId)}
+                  canForward={!!group.activeLeafId && canGoForward(state, group.activeLeafId)}
                   actions={tabActions}
                 />
                 <div className="flex min-h-0 flex-1 flex-col">

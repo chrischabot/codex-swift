@@ -44,6 +44,12 @@ export interface TabGroup {
   readonly stacked?: boolean;
 }
 
+/** Per-leaf back/forward stack of pageIds (cursor = current position). */
+export interface NavHistory {
+  readonly entries: ReadonlyArray<string>;
+  readonly cursor: number;
+}
+
 export interface WorkspaceState {
   readonly leaves: ReadonlyMap<LeafId, Leaf>;
   readonly groups: ReadonlyMap<TabGroupId, TabGroup>;
@@ -52,6 +58,12 @@ export interface WorkspaceState {
   /** Derived: `columns.flat()` in reading order. Never set directly. */
   readonly rootGroupIds: ReadonlyArray<TabGroupId>;
   readonly activeGroupId: TabGroupId | null;
+  /**
+   * Per-leaf navigation history, keyed by leaf id. TRANSIENT — never
+   * serialized (granite parity: history clears on reload). A moved tab keeps
+   * its history (same leaf id); a split copy starts fresh (new leaf id).
+   */
+  readonly histories: ReadonlyMap<LeafId, NavHistory>;
 }
 
 // ── id generation ───────────────────────────────────────────────────────────
@@ -72,11 +84,31 @@ function flatten(columns: ReadonlyArray<ReadonlyArray<TabGroupId>>): TabGroupId[
   return out;
 }
 
-/** Re-derive `rootGroupIds` from `columns`; the single place that sets it. */
+/** Re-derive `rootGroupIds` from `columns`; the single place that sets it.
+ *  `histories` defaults to empty when a caller builds state from scratch
+ *  (buildInitial / deserialize); ops that spread `...state` carry it through. */
 function withDerived(
-  next: Omit<WorkspaceState, "rootGroupIds">,
+  next: Omit<WorkspaceState, "rootGroupIds" | "histories"> & {
+    histories?: ReadonlyMap<LeafId, NavHistory>;
+  },
 ): WorkspaceState {
-  return { ...next, rootGroupIds: flatten(next.columns) };
+  return { ...next, histories: next.histories ?? new Map(), rootGroupIds: flatten(next.columns) };
+}
+
+/** Append `pageId` to a leaf's history, truncating any forward entries and
+ *  deduping a repeat of the current page. Returns a new histories map. */
+function pushNav(
+  histories: ReadonlyMap<LeafId, NavHistory>,
+  leafId: LeafId,
+  pageId: string,
+): ReadonlyMap<LeafId, NavHistory> {
+  const slot = histories.get(leafId) ?? { entries: [], cursor: -1 };
+  if (slot.entries[slot.cursor] === pageId) return histories; // already current
+  const trimmed = slot.cursor < slot.entries.length - 1
+    ? slot.entries.slice(0, slot.cursor + 1)
+    : slot.entries.slice();
+  trimmed.push(pageId);
+  return new Map(histories).set(leafId, { entries: trimmed, cursor: trimmed.length - 1 });
 }
 
 function findColumnIndex(
@@ -190,10 +222,12 @@ export function openOrFocusPage(
     !(activeLeafObj.state.type === "page" && activeLeafObj.state.pinned);
 
   if (canReplace && activeLeafObj) {
+    // Navigate-in-place: same leaf, new page → push onto its history.
     const updated: Leaf = { id: activeLeafObj.id, state: { type: "page", pageId } };
     return withDerived({
       ...state,
       leaves: new Map(state.leaves).set(updated.id, updated),
+      histories: pushNav(state.histories, updated.id, pageId),
     });
   }
 
@@ -202,7 +236,7 @@ export function openOrFocusPage(
   leaves.set(id, { id, state: { type: "page", pageId } });
   const groups = new Map(state.groups);
   groups.set(groupId, { ...group, leafIds: [...group.leafIds, id], activeLeafId: id });
-  return withDerived({ ...state, leaves, groups });
+  return withDerived({ ...state, leaves, groups, histories: pushNav(state.histories, id, pageId) });
 }
 
 /** Open a fresh empty (index) tab in the active group, always appending. */
@@ -417,6 +451,53 @@ export function togglePinned(state: WorkspaceState, leafId: LeafId): WorkspaceSt
     ...state,
     leaves: new Map(state.leaves).set(leafId, { ...leaf, state: nextState }),
   });
+}
+
+// ── per-leaf nav history ────────────────────────────────────────────────────
+
+/** Move a leaf's history cursor by `delta` (±1) and point the leaf at the
+ *  pageId there. No-op when out of range or the leaf isn't a page. Crucially
+ *  does NOT push history (it moves the cursor), and because the leaf then shows
+ *  that page, the route reconciler's openOrFocusPage is a no-op → no loop. */
+function stepHistory(state: WorkspaceState, leafId: LeafId, delta: 1 | -1): WorkspaceState {
+  const leaf = state.leaves.get(leafId);
+  if (!leaf || leaf.state.type !== "page") return state;
+  const slot = state.histories.get(leafId);
+  if (!slot) return state;
+  const nextCursor = slot.cursor + delta;
+  if (nextCursor < 0 || nextCursor >= slot.entries.length) return state;
+  const pageId = slot.entries[nextCursor];
+  const histories = new Map(state.histories).set(leafId, { ...slot, cursor: nextCursor });
+  // Preserve the pinned flag across a back/forward move.
+  const pinned = leaf.state.pinned;
+  const nextLeafState: WikiLeafState = pinned
+    ? { type: "page", pageId, pinned }
+    : { type: "page", pageId };
+  return withDerived({
+    ...state,
+    leaves: new Map(state.leaves).set(leafId, { ...leaf, state: nextLeafState }),
+    histories,
+  });
+}
+
+/** Navigate a leaf back one entry in its history. */
+export function goBack(state: WorkspaceState, leafId: LeafId): WorkspaceState {
+  return stepHistory(state, leafId, -1);
+}
+
+/** Navigate a leaf forward one entry in its history. */
+export function goForward(state: WorkspaceState, leafId: LeafId): WorkspaceState {
+  return stepHistory(state, leafId, 1);
+}
+
+export function canGoBack(state: WorkspaceState, leafId: LeafId): boolean {
+  const slot = state.histories.get(leafId);
+  return !!slot && slot.cursor > 0;
+}
+
+export function canGoForward(state: WorkspaceState, leafId: LeafId): boolean {
+  const slot = state.histories.get(leafId);
+  return !!slot && slot.cursor < slot.entries.length - 1;
 }
 
 /** Toggle a group's stacked (vertical tab column) rendering. */

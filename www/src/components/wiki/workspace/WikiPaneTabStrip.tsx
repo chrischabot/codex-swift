@@ -1,5 +1,5 @@
 import * as React from "react";
-import { X, Plus, Rows, Columns, SplitSquareHorizontal, SplitSquareVertical, Pin, PinOff } from "lucide-react";
+import { X, Plus, Rows, Columns, SplitSquareHorizontal, SplitSquareVertical, Pin, PinOff, ChevronLeft, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   ContextMenu,
@@ -24,6 +24,9 @@ export interface PaneTabActions {
   onNewTab: (groupId: TabGroupId) => void;
   onToggleStacked: (groupId: TabGroupId) => void;
   onCloseGroup: (groupId: TabGroupId) => void;
+  /** Back/forward within the group's active leaf history. */
+  onBack: (leafId: string) => void;
+  onForward: (leafId: string) => void;
 }
 
 interface Props {
@@ -35,6 +38,9 @@ interface Props {
   canCloseGroup: boolean;
   /** Page id → display title (live page list). Falls back to "Untitled". */
   titleById: ReadonlyMap<string, string>;
+  /** History availability for the group's active leaf. */
+  canBack: boolean;
+  canForward: boolean;
   actions: PaneTabActions;
 }
 
@@ -57,6 +63,8 @@ export function WikiPaneTabStrip({
   stacked,
   canCloseGroup,
   titleById,
+  canBack,
+  canForward,
   actions,
 }: Props) {
   const innerRef = React.useRef<HTMLDivElement>(null);
@@ -104,6 +112,24 @@ export function WikiPaneTabStrip({
       onDragLeave={() => setInsertBefore(undefined)}
       onDrop={onDrop}
     >
+      {!stacked && (
+        <div className="flex shrink-0 items-center gap-0.5 pl-1.5 py-1">
+          <StripButton
+            ariaLabel="Back"
+            disabled={!canBack || !activeLeafId}
+            onClick={() => activeLeafId && actions.onBack(activeLeafId)}
+          >
+            <ChevronLeft className="size-3.5" />
+          </StripButton>
+          <StripButton
+            ariaLabel="Forward"
+            disabled={!canForward || !activeLeafId}
+            onClick={() => activeLeafId && actions.onForward(activeLeafId)}
+          >
+            <ChevronRight className="size-3.5" />
+          </StripButton>
+        </div>
+      )}
       <div
         ref={innerRef}
         role="tablist"
@@ -261,10 +287,12 @@ export function WikiPaneTabStrip({
 function StripButton({
   ariaLabel,
   onClick,
+  disabled,
   children,
 }: {
   ariaLabel: string;
   onClick: () => void;
+  disabled?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -272,7 +300,8 @@ function StripButton({
       type="button"
       aria-label={ariaLabel}
       onClick={onClick}
-      className="inline-flex size-6 items-center justify-center rounded-md text-[color:var(--color-text-tertiary)] hover:bg-[color:var(--color-surface-hover)] hover:text-foreground"
+      disabled={disabled}
+      className="inline-flex size-6 items-center justify-center rounded-md text-[color:var(--color-text-tertiary)] enabled:hover:bg-[color:var(--color-surface-hover)] enabled:hover:text-foreground disabled:cursor-default disabled:opacity-30"
     >
       {children}
     </button>
