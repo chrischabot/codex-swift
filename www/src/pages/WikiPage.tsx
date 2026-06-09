@@ -1,7 +1,14 @@
 import * as React from "react";
 import { useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
 import { resolveWikilinkNav } from "@/components/wiki/markdown/wikiRemarkPlugins";
-import { Pencil, FilePlus2, Sparkles, LayoutGrid, Table2 } from "lucide-react";
+import { Pencil, FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import { BUILTIN_TEMPLATES, applyTemplate } from "@/components/wiki/templates/templates";
 import { useWikiPage, useWikiRecents } from "@/state/wiki";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { toast } from "@/components/ui/sonner";
@@ -285,6 +292,23 @@ function WikiIndex({ onOpenSettings }: { onOpenSettings?: () => void }) {
   const canCreate = status.kind === "connected" && typeof connector.saveWikiPage === "function";
   const [creating, setCreating] = React.useState<null | "canvas" | "base">(null);
 
+  // Create a page from a named template (placeholders resolved) then open it.
+  const createFromTemplate = async (templateId: string) => {
+    const tpl = BUILTIN_TEMPLATES.find((t) => t.id === templateId);
+    if (!tpl || !connector.saveWikiPage || creating) return;
+    setCreating("canvas"); // reuse the busy flag to disable the buttons
+    try {
+      const { title, body } = applyTemplate(tpl, { date: new Date() });
+      const res = await connector.saveWikiPage({ title, body });
+      if (res) navigate(`/wiki/${res.id}`);
+      else toast.error("Failed to create page");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to create page");
+    } finally {
+      setCreating(null);
+    }
+  };
+
   // Create a typed doc (canvas/base) then route to it; WikiPage branches on the
   // wiki_type frontmatter and opens the dedicated view.
   const createTyped = async (kind: "canvas" | "base") => {
@@ -318,6 +342,22 @@ function WikiIndex({ onOpenSettings }: { onOpenSettings?: () => void }) {
           </Button>
           {canCreate && (
             <>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="outline" size="xs" disabled={!!creating}>
+                    <FileStack className="mr-1 size-3" /> Template
+                    <ChevronDown className="ml-1 size-3" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  {BUILTIN_TEMPLATES.map((t) => (
+                    <DropdownMenuItem key={t.id} onSelect={() => void createFromTemplate(t.id)} className="flex flex-col items-start gap-0.5">
+                      <span className="text-[13px]">{t.name}</span>
+                      <span className="text-[11px] text-[color:var(--color-text-tertiary)]">{t.description}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
               <Button variant="outline" size="xs" disabled={!!creating} onClick={() => void createTyped("canvas")}>
                 <LayoutGrid className="mr-1 size-3" /> New canvas
               </Button>
