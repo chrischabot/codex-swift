@@ -32,6 +32,10 @@ let mlxEnabled = false
 let mlxDependencies: [Package.Dependency] = mlxEnabled ? [
     .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.3"),
     .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
+    // Real tokenizer for the on-device lane: this mlx-swift-lm fork strips
+    // swift-transformers and exposes a BYO `TokenizerLoader` hook. We supply a
+    // swift-transformers-backed loader (see CodexKitHubDownloader). MLX-only.
+    .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.17"),
 ] : []
 
 // MLX is on by default on macOS (opt out with CODEXKIT_MLX=0); never on Linux.
@@ -43,6 +47,9 @@ func makeMLXProducts() -> [Target.Dependency] {
     deps.append(.product(name: "MLXEmbedders", package: "mlx-swift-lm"))
     deps.append(.product(name: "MLX", package: "mlx-swift"))
     deps.append(.product(name: "MLXNN", package: "mlx-swift"))
+    // swift-transformers' Tokenizers — backs the real TokenizerLoader the
+    // mlx-swift-lm fork leaves for us to supply (CodexKitHubDownloader).
+    deps.append(.product(name: "Transformers", package: "swift-transformers"))
     return deps
 }
 let mlxProducts: [Target.Dependency] = makeMLXProducts()

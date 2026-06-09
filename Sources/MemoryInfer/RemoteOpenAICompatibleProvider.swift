@@ -150,10 +150,31 @@ enum ExtractionPrompt {
         return lines.joined(separator: "\n")
     }
 
+    /// Pull a JSON object out of a raw model response: drop reasoning-model
+    /// `<think>…</think>` blocks and ```fences```, then take the span from the
+    /// first `{` to the last `}`. Robust to a preamble/epilogue of prose.
+    static func sanitizeJSONResponse(_ raw: String) -> String {
+        var s = raw
+        // Strip <think>…</think> reasoning blocks (Qwen3 etc.).
+        while let open = s.range(of: "<think>"),
+              let close = s.range(of: "</think>", range: open.upperBound..<s.endIndex) {
+            s.removeSubrange(open.lowerBound..<close.upperBound)
+        }
+        // A dangling/unterminated <think> with no JSON after → nothing usable.
+        s = s.replacingOccurrences(of: "```json", with: "```")
+        s = s.replacingOccurrences(of: "```", with: "")
+        guard let first = s.firstIndex(of: "{"), let last = s.lastIndex(of: "}"),
+              first <= last else {
+            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return String(s[first...last])
+    }
+
     static func parseJSON(_ raw: String,
                           batch: ChunkBatch,
                           schema: ExtractionSchema) throws -> [ExtractedChunk] {
-        guard let data = raw.data(using: .utf8) else {
+        let cleaned = sanitizeJSONResponse(raw)
+        guard let data = cleaned.data(using: .utf8) else {
             throw InferenceError.malformedResponse("non-utf8 response")
         }
         let object: [String: Any]

@@ -1,6 +1,7 @@
 #if CODEXKIT_MLX
 import Foundation
 import MLXLMCommon
+import Tokenizers
 
 /// Minimal HuggingFace Hub Downloader for the Memory Wiki's MLXLocalProvider.
 /// Uses `/usr/bin/curl` to fetch repo snapshots into the standard HuggingFace
@@ -143,25 +144,51 @@ public struct CodexKitHubDownloader: Downloader {
     }
 }
 
-/// Stand-in `TokenizerLoader` that delegates to the JSON-driven tokenizer
-/// parser shipped with HuggingFace's `tokenizers` repository. Until the
-/// CodexKit build pulls in `swift-transformers` (or wires the
-/// `@HuggingFaceIntegration` macro), this loader throws a structured error
-/// pointing the user at the correct integration step.
-///
-/// The MLXLocalProvider checks `MLXLocalProvider.isAvailable` before calling
-/// any of these paths; in environments without a real Tokenizer, the
-/// assembler falls back to the remote provider.
+/// Real `TokenizerLoader` for the on-device lane, backed by swift-transformers.
+/// The mlx-swift-lm fork strips swift-transformers and defines its own minimal
+/// `MLXLMCommon.Tokenizer` protocol plus this `TokenizerLoader` hook; we supply
+/// the implementation by loading the model folder's `tokenizer.json` /
+/// `tokenizer_config.json` via `AutoTokenizer.from(modelFolder:)` and adapting
+/// the result to the fork's protocol.
 public struct CodexKitTokenizerLoader: TokenizerLoader {
     public init() {}
 
-    public func load(from directory: URL) async throws -> any Tokenizer {
-        throw NSError(
-            domain: "CodexKitTokenizerLoader", code: 1,
-            userInfo: [NSLocalizedDescriptionKey:
-                "BYO tokenizer required. Wire MLXHuggingFace + swift-transformers and " +
-                "register your tokenizer loader by replacing CodexKitTokenizerLoader. " +
-                "Until then the remote/mock inference provider is the only path."])
+    public func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        let inner = try await AutoTokenizer.from(modelFolder: directory)
+        return SwiftTransformersTokenizerAdapter(inner: inner)
+    }
+}
+
+/// Bridges swift-transformers' `Tokenizers.Tokenizer` to the fork's
+/// `MLXLMCommon.Tokenizer`. The inner tokenizer is a reference type that isn't
+/// marked `Sendable`; the import/extract lane drives it serially per model
+/// container, so `@unchecked Sendable` is sound here.
+struct SwiftTransformersTokenizerAdapter: MLXLMCommon.Tokenizer, @unchecked Sendable {
+    let inner: any Tokenizers.Tokenizer
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        inner.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        inner.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+    }
+    func convertTokenToId(_ token: String) -> Int? { inner.convertTokenToId(token) }
+    func convertIdToToken(_ id: Int) -> String? { inner.convertIdToToken(id) }
+    var bosToken: String? { inner.bosToken }
+    var eosToken: String? { inner.eosToken }
+    var unknownToken: String? { inner.unknownToken }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        // Message / ToolSpec are both `[String: Any]` typealiases and collide
+        // between Tokenizers and MLXLMCommon — use the raw dictionary type.
+        let msgs: [[String: Any]] = messages.map { $0.mapValues { $0 as Any } }
+        let toolSpecs: [[String: Any]]? = tools?.map { $0.mapValues { $0 as Any } }
+        let ctx: [String: Any]? = additionalContext?.mapValues { $0 as Any }
+        return try inner.applyChatTemplate(messages: msgs, tools: toolSpecs, additionalContext: ctx)
     }
 }
 #endif

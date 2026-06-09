@@ -20,6 +20,9 @@ struct MarkdownImportOptions: Sendable {
     var batchSize: Int = 64
     var maxBytes: Int64 = 10 * 1024 * 1024
     var stateRoot: String?
+    /// When set, a small JSON progress snapshot is rewritten after every file
+    /// so an external monitor can poll live counts (imported / failed / total).
+    var progressPath: String?
     var clock: @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970) }
 }
 
@@ -195,7 +198,9 @@ public enum CodexMemoryMarkdownImport {
         var completedByURI = Dictionary(uniqueKeysWithValues:
             completedEntries.map { ($0.sourceURI, $0) })
 
+        writeProgress(report, to: options.progressPath)
         for entry in entries where entry.skipReason == nil {
+            defer { writeProgress(report, to: options.progressPath) }
             do {
                 guard let raw = try readMarkdown(entry: entry, maxBytes: options.maxBytes) else {
                     report.skipped += 1
@@ -592,6 +597,12 @@ private func parseArgs(_ args: [String]) throws -> (options: MarkdownImportOptio
                 throw argumentError("--batch-size requires a positive integer")
             }
             options.batchSize = n
+        case "--progress-file":
+            i += 1
+            guard i < args.count else { throw argumentError("--progress-file requires a value") }
+            options.progressPath = args[i]
+        case let s where s.hasPrefix("--progress-file="):
+            options.progressPath = String(s.dropFirst("--progress-file=".count))
         case "--max-bytes":
             i += 1
             guard i < args.count, let n = Int64(args[i]), n > 0 else {
@@ -615,4 +626,24 @@ private func parseArgs(_ args: [String]) throws -> (options: MarkdownImportOptio
 private func argumentError(_ message: String) -> NSError {
     NSError(domain: "CodexMemoryMarkdownImport", code: 2,
             userInfo: [NSLocalizedDescriptionKey: message])
+}
+
+/// Rewrite a tiny JSON progress snapshot (atomically) so an external monitor
+/// can poll live counts. No-op when no progress path was requested.
+func writeProgress(_ report: MarkdownImportReport, to path: String?) {
+    guard let path else { return }
+    let processed = report.imported + report.unchanged + report.failed
+    let obj: [String: Any] = [
+        "discovered": report.discovered,
+        "processed": processed,
+        "imported": report.imported,
+        "unchanged": report.unchanged,
+        "skipped": report.skipped,
+        "failed": report.failed,
+        "chunks": report.chunks,
+        "entities": report.entities,
+        "updated_at": Int(Date().timeIntervalSince1970),
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
+    try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
 }

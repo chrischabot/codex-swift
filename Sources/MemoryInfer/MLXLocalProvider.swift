@@ -51,6 +51,16 @@ public struct LocalChatMessage: Sendable, Equatable {
 /// in docs/notes/gemma4-moe-mlx-port.md. Deferred: the Qwen3 MoE above already
 /// covers this niche.
 public actor MLXLocalProvider: LocalInferenceProvider {
+    /// Default on-device extractor. The mlx-community repo is `…-4bit` (no
+    /// `-MLX` suffix — that id 401s / doesn't exist). Overridable via
+    /// `CODEX_MEMORY_LOCAL_EXTRACTOR_MODEL` so a different MoE/quant can be
+    /// swapped without a rebuild.
+    public static var defaultExtractorModelID: String {
+        let env = ProcessInfo.processInfo.environment["CODEX_MEMORY_LOCAL_EXTRACTOR_MODEL"]
+        if let env, !env.isEmpty { return env }
+        return "mlx-community/Qwen3-30B-A3B-4bit"
+    }
+
     public struct Config: Sendable {
         public var extractorModelID: String
         public var embedderModelID: String
@@ -61,12 +71,15 @@ public actor MLXLocalProvider: LocalInferenceProvider {
         public var temperature: Float
         public var resourceCaps: InferenceResourceCaps
 
-        public init(extractorModelID: String = "mlx-community/Qwen3-30B-A3B-4bit-MLX",
+        public init(extractorModelID: String = MLXLocalProvider.defaultExtractorModelID,
                     embedderModelID: String = "nomic-ai/nomic-embed-text-v1.5",
                     rerankerModelID: String = "BAAI/bge-reranker-v2-m3",
                     rerankerMaxTokens: Int = 8192,
                     allowCosineRerankFallback: Bool = true,
-                    generateMaxTokens: Int = 1024,
+                    // Extraction emits a JSON object covering every chunk in the
+                    // batch; 1024 truncated multi-chunk docs mid-object. Free
+                    // text (contextualise) stops at EOS well before this cap.
+                    generateMaxTokens: Int = 6144,
                     temperature: Float = 0.0,
                     resourceCaps: InferenceResourceCaps = .default) {
             self.extractorModelID = extractorModelID
@@ -348,8 +361,16 @@ public actor MLXLocalProvider: LocalInferenceProvider {
             maxTokens: config.generateMaxTokens,
             temperature: config.temperature)
         let result = try await container.perform { context in
+            // Feed the prompt as a chat MESSAGE (not raw .text) so the model's
+            // real chat template is applied, and disable reasoning via the
+            // template's `enable_thinking` switch — Qwen3 otherwise spends the
+            // whole token budget inside <think>…</think> and never emits the
+            // requested JSON. additionalContext is forwarded to the Jinja
+            // template; models that ignore it are unaffected.
             let input = try await context.processor.prepare(
-                input: UserInput(prompt: .text(prompt)))
+                input: UserInput(
+                    messages: [["role": "user", "content": prompt]],
+                    additionalContext: ["enable_thinking": false]))
             // Modern AsyncStream-based generate. Cancellation/deadline are
             // observed in the for-await loop; the iterator is dropped on
             // break, which tears down the underlying task cleanly.
