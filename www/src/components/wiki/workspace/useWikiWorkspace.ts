@@ -82,14 +82,20 @@ export function useWikiWorkspace(opts: { sync?: boolean } = {}): UseWikiWorkspac
   const [state, setState] = React.useState<WorkspaceState>(load);
 
   // ── cross-window sync (granite parity) ────────────────────────────────────
-  // Other wiki windows mirror this workspace via BroadcastChannel. Guards
-  // against the cross-tab loop class: a monotonic timestamp (newer wins), an
-  // echo-suppression flag so applying a peer snapshot never re-broadcasts, and
-  // skipping the initial broadcast so a freshly-opened window can't clobber a
-  // peer with its restored-from-storage state. Pop-out windows pass sync:false.
+  // Other wiki windows mirror this workspace via BroadcastChannel. The
+  // loop/divergence guard is CONTENT-based, not a one-shot flag: `lastSyncJson`
+  // holds the serialized snapshot we last sent OR accepted. We only broadcast
+  // when the current state serializes to something DIFFERENT (so a peer apply,
+  // which sets lastSyncJson to the applied snapshot, won't echo — but a real
+  // local change that coalesced into the same commit still differs and DOES
+  // broadcast, so no local change is ever lost). Inbound snapshots identical to
+  // what we already have are dropped (no churn / no pane remounts). A monotonic
+  // timestamp drops stale/out-of-order messages; the initial state is recorded
+  // without broadcasting so a fresh window can't clobber a peer. Pop-out
+  // windows pass sync:false.
   const syncRef = React.useRef<WorkspaceSync | null>(null);
   const lastMsRef = React.useRef(0);
-  const suppressRef = React.useRef(false);
+  const lastSyncJsonRef = React.useRef<string | null>(null);
   const mountedRef = React.useRef(false);
 
   React.useEffect(() => {
@@ -98,10 +104,12 @@ export function useWikiWorkspace(opts: { sync?: boolean } = {}): UseWikiWorkspac
     syncRef.current = sync;
     const unsub = sync.subscribe((msg) => {
       if (msg.updatedMs <= lastMsRef.current) return; // stale / out-of-order
+      const incoming = msg.snapshot ? JSON.stringify(msg.snapshot) : null;
+      if (incoming === lastSyncJsonRef.current) return; // already have it — no churn
       const restored = deserialize(msg.snapshot);
       if (!restored) return;
       lastMsRef.current = msg.updatedMs;
-      suppressRef.current = true; // the resulting setState must NOT re-broadcast
+      lastSyncJsonRef.current = incoming; // recording this BLOCKS the echo below
       setState(restored);
     });
     return () => {
@@ -112,20 +120,21 @@ export function useWikiWorkspace(opts: { sync?: boolean } = {}): UseWikiWorkspac
   }, [syncEnabled]);
 
   // Persist on every change (serialize() skips the pristine empty workspace),
-  // then broadcast to peers — unless this change came FROM a peer.
+  // then broadcast to peers — but only when the content actually differs from
+  // the last snapshot we sent or accepted.
   React.useEffect(() => {
     persist(state);
     if (!syncEnabled) return;
+    const json = JSON.stringify(serialize(state));
     if (!mountedRef.current) {
-      mountedRef.current = true; // skip the initial broadcast (no clobber)
+      mountedRef.current = true; // record initial without broadcasting (no clobber)
+      lastSyncJsonRef.current = json;
       return;
     }
-    if (suppressRef.current) {
-      suppressRef.current = false; // peer apply — don't echo it back
-      return;
-    }
+    if (json === lastSyncJsonRef.current) return; // nothing new to propagate
     const sync = syncRef.current;
     if (!sync) return;
+    lastSyncJsonRef.current = json;
     const ms = Math.max(Date.now(), lastMsRef.current + 1); // strictly monotonic
     lastMsRef.current = ms;
     sync.postWorkspaceUpdated(serialize(state), ms);

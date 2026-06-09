@@ -85,11 +85,16 @@ function WikiPopoutPage() {
     (title: string) => idByTitle.get(title.trim().toLowerCase()),
     [idByTitle],
   );
-  // Keep ?popout=1 on every in-pop-out navigation so the window stays bare.
+  // Keep popout=1 on every in-pop-out navigation so the window stays bare,
+  // preserving any query (e.g. an unresolved link → /wiki?q=…) and hash.
   const popNav = (to: string) => {
-    if (to.startsWith("#")) { navigate({ pathname: location.pathname, hash: to, search: "?popout=1" }); return; }
-    const [path, hash] = to.split("#");
-    navigate({ pathname: path, search: "?popout=1", ...(hash ? { hash: `#${hash}` } : {}) });
+    if (to.startsWith("#")) {
+      navigate({ pathname: location.pathname, hash: to, search: "?popout=1" });
+      return;
+    }
+    const u = new URL(to, window.location.origin);
+    u.searchParams.set("popout", "1");
+    navigate({ pathname: u.pathname, search: u.search, hash: u.hash });
   };
   const callbacks: LeafBodyCallbacks = {
     onWikiLink: (target) => popNav(resolveWikilinkNav(target, resolveWikiLink)),

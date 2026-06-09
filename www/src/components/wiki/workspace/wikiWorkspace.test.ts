@@ -530,6 +530,41 @@ describe("serialize / deserialize", () => {
     expect(activePageId(restored)).toBe(activePageId(s));
   });
 
+  it("serialize∘deserialize is a STABLE fixed point (JSON-identical)", () => {
+    // The cross-window sync's echo-suppression relies on this: applying a peer
+    // snapshot then re-serializing must reproduce the SAME JSON, else two
+    // windows would ping-pong forever. Cover the full feature surface.
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2", { newTab: true });
+    s = togglePinned(s, groupLeafIds(s)[0]);
+    const gA = s.activeGroupId!;
+    s = splitLeaf(s, groupLeafIds(s, gA)[0], "down");
+    s = toggleStacked(s, s.activeGroupId!);
+    s = openOrFocusPage(s, "p3");
+    s = splitLeaf(s, s.groups.get(s.activeGroupId!)!.activeLeafId!, "right");
+    s = resizeColumns(s, 0, 1.4, 0.6);
+    const snap = serialize(s)!;
+    const once = serialize(deserialize(snap)!)!;
+    const twice = serialize(deserialize(once)!)!;
+    expect(JSON.stringify(once)).toBe(JSON.stringify(snap));
+    expect(JSON.stringify(twice)).toBe(JSON.stringify(snap));
+  });
+
+  it("resized column width survives closing the column's first group", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = splitLeaf(s, groupLeafIds(s, s.rootGroupIds[0])[0], "right"); // 2 cols
+    // make the right column a stacked pair, then widen it
+    const rightG = s.activeGroupId!;
+    s = splitLeaf(s, s.groups.get(rightG)!.activeLeafId!, "down");
+    s = resizeColumns(s, 0, 0.5, 1.5); // right column weight 1.5
+    expect(columnWidthWeight(s, 1)).toBeCloseTo(1.5);
+    // close the TOP group of the right column → second becomes first
+    const topOfRight = s.columns[1][0];
+    s = closeGroup(s, topOfRight);
+    expect(s.columns).toHaveLength(2);
+    expect(columnWidthWeight(s, 1)).toBeCloseTo(1.5); // weight retained
+  });
+
   it("preserves the stacked flag", () => {
     let s = openOrFocusPage(buildInitial(), "p1");
     s = openOrFocusPage(s, "p2", { newTab: true });

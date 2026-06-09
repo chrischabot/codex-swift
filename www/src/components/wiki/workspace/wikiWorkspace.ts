@@ -558,13 +558,17 @@ export function resizeColumns(
   leftW: number,
   rightW: number,
 ): WorkspaceState {
-  const left = state.columns[leftColIdx]?.[0];
-  const right = state.columns[leftColIdx + 1]?.[0];
-  if (!left || !right) return state;
+  const leftCol = state.columns[leftColIdx];
+  const rightCol = state.columns[leftColIdx + 1];
+  if (!leftCol?.length || !rightCol?.length) return state;
   const lw = Math.max(MIN_WEIGHT, leftW);
   const rw = Math.max(MIN_WEIGHT, rightW);
-  let sizes = setSize(state.groupSizes, left, { w: lw });
-  sizes = setSize(sizes, right, { w: rw });
+  // Write the width to EVERY group in each column (not just the first), so the
+  // weight survives if the current first group is later closed/moved and a
+  // sibling becomes the column's new lead. columnWidthWeight reads the first.
+  let sizes = state.groupSizes;
+  for (const g of leftCol) sizes = setSize(sizes, g, { w: lw });
+  for (const g of rightCol) sizes = setSize(sizes, g, { w: rw });
   return withDerived({ ...state, groupSizes: sizes });
 }
 

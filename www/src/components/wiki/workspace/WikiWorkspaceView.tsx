@@ -46,22 +46,28 @@ function ResizeHandle({
     const span = (horizontal ? nr.right : nr.bottom) - start;
     if (span <= 0) return;
     const total = leftWeight + rightWeight;
+    // One AbortController tears down ALL listeners + restores global styles, so
+    // a missed pointerup (drag leaves the window, focus steal, pointercancel)
+    // can't wedge the cursor/userSelect or leak listeners across drags.
+    const ctrl = new AbortController();
+    const { signal } = ctrl;
     const move = (ev: PointerEvent) => {
       const pos = horizontal ? ev.clientX : ev.clientY;
       let frac = (pos - start) / span;
       frac = Math.max(0.05, Math.min(0.95, frac));
       onResize(frac * total, (1 - frac) * total);
     };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
+    const end = () => {
+      ctrl.abort();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
     document.body.style.cursor = horizontal ? "col-resize" : "row-resize";
     document.body.style.userSelect = "none";
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+    window.addEventListener("pointermove", move, { signal });
+    window.addEventListener("pointerup", end, { signal });
+    window.addEventListener("pointercancel", end, { signal });
+    window.addEventListener("blur", end, { signal });
   };
   return (
     <div
