@@ -11,6 +11,7 @@ import {
   type Leaf,
   type TabGroupId,
 } from "./wikiWorkspace";
+import { popOutPage } from "./popout";
 import type { UseWikiWorkspace } from "./useWikiWorkspace";
 
 /**
@@ -105,6 +106,10 @@ export function WikiWorkspace({ ws, titleById, buildCallbacks }: Props) {
       onCloseRight: ws.closeRight,
       onSplit: ws.split,
       onTogglePinned: ws.togglePinned,
+      onPopOut: (leafId) => {
+        const leaf = ws.state.leaves.get(leafId);
+        if (leaf?.state.type === "page") popOutPage(leaf.state.pageId);
+      },
       onMove: ws.moveTab,
       onNewTab: (gid) => {
         ws.focusGroup(gid);

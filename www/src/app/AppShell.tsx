@@ -1,4 +1,5 @@
 import { Outlet, useLocation } from "react-router-dom";
+import { isPopoutWindow } from "@/components/wiki/workspace/popout";
 import { Sidebar } from "@/components/sidebar/Sidebar";
 import { TopBar, TOP_BAR_HEIGHT } from "@/components/shell/TopBar";
 import { CommandPalette } from "@/components/shell/CommandPalette";
@@ -13,6 +14,20 @@ import { cn } from "@/lib/utils";
 export function AppShell() {
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
   const location = useLocation();
+
+  // Pop-out windows (?popout=1) render chrome-less: just the routed page, no
+  // sidebar / top bar / palette. The wiki page itself drops its workspace +
+  // rail in this mode (see WikiPage).
+  if (isPopoutWindow()) {
+    return (
+      <div className="flex h-full w-full overflow-hidden bg-background">
+        <main className="flex h-full min-w-0 flex-1 flex-col">
+          <Outlet />
+        </main>
+        <Toaster />
+      </div>
+    );
+  }
 
   return (
     <PaletteProvider>

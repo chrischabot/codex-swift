@@ -34,7 +34,8 @@ import { isBaseBody } from "@/components/wiki/bases/basesSchema";
 import { useWikiWorkspace } from "@/components/wiki/workspace/useWikiWorkspace";
 import { WikiWorkspace } from "@/components/wiki/workspace/WikiWorkspaceView";
 import { activePageId, isPristine, type Leaf, type TabGroupId } from "@/components/wiki/workspace/wikiWorkspace";
-import type { LeafBodyCallbacks } from "@/components/wiki/workspace/WikiLeafBody";
+import { WikiLeafBody, type LeafBodyCallbacks } from "@/components/wiki/workspace/WikiLeafBody";
+import { isPopoutWindow } from "@/components/wiki/workspace/popout";
 import { useWikiCommands } from "@/components/wiki/commands/useWikiCommands";
 import { WikiCommandPalette } from "@/components/wiki/commands/WikiCommandPalette";
 import { WikiSettingsModal } from "@/components/wiki/settings/WikiSettingsModal";
@@ -50,6 +51,69 @@ import { Settings as SettingsIcon } from "lucide-react";
  * active leaf.
  */
 export function WikiPage() {
+  // Pop-out windows render a single chrome-less page (no workspace / rail /
+  // overlays / cross-window sync). The branch is stable per window load.
+  if (isPopoutWindow()) return <WikiPopoutPage />;
+  return <WikiWorkspacePage />;
+}
+
+/**
+ * Chrome-less single-page view for a `?popout=1` window. Reuses the per-leaf
+ * body (reading / canvas / base + inline edit); wikilinks navigate within the
+ * pop-out (keeping it chrome-less). No multi-pane workspace, no right rail.
+ */
+function WikiPopoutPage() {
+  const { pageId } = useParams();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { connector, status } = useRuntime();
+  const [idByTitle, setIdByTitle] = React.useState<Map<string, string>>(new Map());
+  React.useEffect(() => {
+    if (status.kind !== "connected" || !connector.listWikiPages) return;
+    let alive = true;
+    connector.listWikiPages({ limit: 1000 })
+      .then((ps) => {
+        if (!alive) return;
+        const m = new Map<string, string>();
+        for (const p of ps) m.set(p.title.toLowerCase(), p.id);
+        setIdByTitle(m);
+      })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [connector, status.kind]);
+  const resolveWikiLink = React.useCallback(
+    (title: string) => idByTitle.get(title.trim().toLowerCase()),
+    [idByTitle],
+  );
+  // Keep ?popout=1 on every in-pop-out navigation so the window stays bare.
+  const popNav = (to: string) => {
+    if (to.startsWith("#")) { navigate({ pathname: location.pathname, hash: to, search: "?popout=1" }); return; }
+    const [path, hash] = to.split("#");
+    navigate({ pathname: path, search: "?popout=1", ...(hash ? { hash: `#${hash}` } : {}) });
+  };
+  const callbacks: LeafBodyCallbacks = {
+    onWikiLink: (target) => popNav(resolveWikilinkNav(target, resolveWikiLink)),
+    onTag: () => {},
+    onJump: (slug) => document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    resolveWikiLink,
+    onOpenSettings: () => {},
+    onDeleted: () => window.close(),
+    onPageSaved: () => {},
+  };
+  if (!pageId) return <div className="p-6 text-[13px] text-[color:var(--color-text-secondary)]">No page.</div>;
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <WikiLeafBody
+        key={`popout:${pageId}`}
+        leaf={{ id: `popout:${pageId}`, state: { type: "page", pageId } }}
+        isActive
+        callbacks={callbacks}
+      />
+    </div>
+  );
+}
+
+function WikiWorkspacePage() {
   const { pageId } = useParams();
   const navigate = useNavigate();
   const { connector, status } = useRuntime();

@@ -23,6 +23,7 @@ import {
   type TabGroupId,
   type WorkspaceState,
 } from "./wikiWorkspace";
+import { createWorkspaceSync, type WorkspaceSync } from "./wikiWorkspaceSync";
 
 const STORAGE_KEY = "wiki:workspace";
 
@@ -76,11 +77,59 @@ export interface UseWikiWorkspace {
  * here — the caller (WikiPage) drives `openPage` from the route and navigates
  * when the active page changes, so the hook stays router-agnostic + testable.
  */
-export function useWikiWorkspace(): UseWikiWorkspace {
+export function useWikiWorkspace(opts: { sync?: boolean } = {}): UseWikiWorkspace {
+  const syncEnabled = opts.sync ?? true;
   const [state, setState] = React.useState<WorkspaceState>(load);
 
-  // Persist on every change. serialize() skips the pristine empty workspace.
-  React.useEffect(() => { persist(state); }, [state]);
+  // ── cross-window sync (granite parity) ────────────────────────────────────
+  // Other wiki windows mirror this workspace via BroadcastChannel. Guards
+  // against the cross-tab loop class: a monotonic timestamp (newer wins), an
+  // echo-suppression flag so applying a peer snapshot never re-broadcasts, and
+  // skipping the initial broadcast so a freshly-opened window can't clobber a
+  // peer with its restored-from-storage state. Pop-out windows pass sync:false.
+  const syncRef = React.useRef<WorkspaceSync | null>(null);
+  const lastMsRef = React.useRef(0);
+  const suppressRef = React.useRef(false);
+  const mountedRef = React.useRef(false);
+
+  React.useEffect(() => {
+    if (!syncEnabled || typeof window === "undefined") return;
+    const sync = createWorkspaceSync();
+    syncRef.current = sync;
+    const unsub = sync.subscribe((msg) => {
+      if (msg.updatedMs <= lastMsRef.current) return; // stale / out-of-order
+      const restored = deserialize(msg.snapshot);
+      if (!restored) return;
+      lastMsRef.current = msg.updatedMs;
+      suppressRef.current = true; // the resulting setState must NOT re-broadcast
+      setState(restored);
+    });
+    return () => {
+      unsub();
+      sync.close();
+      syncRef.current = null;
+    };
+  }, [syncEnabled]);
+
+  // Persist on every change (serialize() skips the pristine empty workspace),
+  // then broadcast to peers — unless this change came FROM a peer.
+  React.useEffect(() => {
+    persist(state);
+    if (!syncEnabled) return;
+    if (!mountedRef.current) {
+      mountedRef.current = true; // skip the initial broadcast (no clobber)
+      return;
+    }
+    if (suppressRef.current) {
+      suppressRef.current = false; // peer apply — don't echo it back
+      return;
+    }
+    const sync = syncRef.current;
+    if (!sync) return;
+    const ms = Math.max(Date.now(), lastMsRef.current + 1); // strictly monotonic
+    lastMsRef.current = ms;
+    sync.postWorkspaceUpdated(serialize(state), ms);
+  }, [state, syncEnabled]);
 
   // Each action applies its pure reducer; setState bails the render when the
   // reducer returns the same reference (the reducers are no-op-stable).

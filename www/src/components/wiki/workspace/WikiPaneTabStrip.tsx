@@ -1,5 +1,5 @@
 import * as React from "react";
-import { X, Plus, Rows, Columns, SplitSquareHorizontal, SplitSquareVertical, Pin, PinOff, ChevronLeft, ChevronRight } from "lucide-react";
+import { X, Plus, Rows, Columns, SplitSquareHorizontal, SplitSquareVertical, Pin, PinOff, ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   ContextMenu,
@@ -20,6 +20,7 @@ export interface PaneTabActions {
   onCloseRight: (leafId: string) => void;
   onSplit: (leafId: string, direction: "right" | "down") => void;
   onTogglePinned: (leafId: string) => void;
+  onPopOut: (leafId: string) => void;
   onMove: (leafId: string, targetGroupId: TabGroupId, beforeLeafId: string | null) => void;
   onNewTab: (groupId: TabGroupId) => void;
   onToggleStacked: (groupId: TabGroupId) => void;
@@ -247,6 +248,9 @@ export function WikiPaneTabStrip({
                           <Pin className="mr-2 size-3.5" /> Pin
                         </>
                       )}
+                    </ContextMenuItem>
+                    <ContextMenuItem onSelect={() => actions.onPopOut(leaf.id)}>
+                      <ExternalLink className="mr-2 size-3.5" /> Open in new window
                     </ContextMenuItem>
                   </>
                 )}
