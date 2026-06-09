@@ -117,14 +117,35 @@ public actor MLXLocalProvider: LocalInferenceProvider {
                         deadline: Deadline) async throws -> ExtractionResult {
         #if CODEXKIT_MLX
         let container = try await loadExtractor()
-        let prompt = ExtractionPrompt.render(batch: batch, schema: schema)
-        let text = try await generate(container: container, prompt: prompt,
-                                       deadline: deadline)
-        let perChunk = try ExtractionPrompt.parseJSON(
-            text, batch: batch, schema: schema)
+        // Sub-batch the document's chunks so each extraction JSON stays within
+        // the generation budget. A whole large document in a single call
+        // overflowed generateMaxTokens and truncated the JSON mid-object
+        // (parse error / lost entities). A failed sub-batch is skipped so one
+        // bad slice doesn't drop the whole document's extractions.
+        let maxChunksPerCall = 3
+        var perChunk: [ExtractedChunk] = []
+        var tokensIn = 0
+        var tokensOut = 0
+        var idx = 0
+        while idx < batch.chunks.count {
+            if deadline.hasPassed { break }
+            let end = min(idx + maxChunksPerCall, batch.chunks.count)
+            let sub = ChunkBatch(documentTitle: batch.documentTitle,
+                                 documentURI: batch.documentURI,
+                                 chunks: Array(batch.chunks[idx..<end]))
+            idx = end
+            let prompt = ExtractionPrompt.render(batch: sub, schema: schema)
+            let text = try await generate(container: container, prompt: prompt,
+                                          deadline: deadline)
+            tokensIn += max(1, prompt.utf8.count / 4)
+            tokensOut += max(1, text.utf8.count / 4)
+            if let parsed = try? ExtractionPrompt.parseJSON(text, batch: sub, schema: schema) {
+                perChunk.append(contentsOf: parsed)
+            }
+        }
         return ExtractionResult(perChunk: perChunk,
-                                tokensInput: max(1, prompt.utf8.count / 4),
-                                tokensOutput: max(1, text.utf8.count / 4))
+                                tokensInput: tokensIn,
+                                tokensOutput: tokensOut)
         #else
         throw InferenceError.providerUnavailable(
             "MLX Swift LM not linked — rebuild with MLX enabled")
