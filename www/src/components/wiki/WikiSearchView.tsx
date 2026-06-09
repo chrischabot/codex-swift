@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { highlightMatch } from "./highlightMatch";
-import { parseSearchQuery, matchSummary, type SearchQuery } from "./search/searchQuery";
+import { parseSearchQuery, matchSummary, requiresFullCorpus, type SearchQuery } from "./search/searchQuery";
 
 interface Props {
   /** The active query — typically driven from the `?q=` search param. */
@@ -82,19 +82,18 @@ function useWikiSearch(query: string): SearchState {
     // Any non-`term` predicate is an operator that filters client-side, so we
     // need a wider candidate window than the top-50 BM25 hits.
     const hasOperators = groups.some((g) => g.some((p) => p.kind !== "term"));
+    // BM25 can only seed groups that contain a free term. If ANY OR-group is
+    // operator-only (e.g. `title:Roadmap OR urgent`) we MUST list the corpus, or
+    // that group's matches are silently lost.
+    const useBM25 = fullText.length > 0 && !requiresFullCorpus(parsed);
     let alive = true;
     setState((s) => ({ ...s, loading: true }));
     const handle = setTimeout(() => {
       // Free terms seed the BM25 fetch (wider when operators will filter it);
-      // an operator-only query lists pages to filter against.
-      const cap =
-        fullText.length > 0
-          ? hasOperators
-            ? OPERATOR_CANDIDATES
-            : SEARCH_LIMIT
-          : LIST_CANDIDATES;
+      // otherwise list pages to filter against.
+      const cap = useBM25 ? (hasOperators ? OPERATOR_CANDIDATES : SEARCH_LIMIT) : LIST_CANDIDATES;
       const fetcher =
-        fullText.length > 0
+        useBM25
           ? connector.searchWiki!(fullText, { limit: cap })
           : connector.listWikiPages
             ? connector.listWikiPages({ limit: cap })

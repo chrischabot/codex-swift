@@ -167,7 +167,10 @@ function toPredicate(token: string): Predicate | null {
   }
   if (t.startsWith("/")) {
     const close = t.lastIndexOf("/");
-    if (close > 0) {
+    // Only a WELL-FORMED `/pattern/flags` is a regex. A path-like token such as
+    // `/v1/memories` has a non-flag tail ("memories") → treat it as a literal
+    // term instead of a regex that matches nothing.
+    if (close > 0 && /^[gimsuy]*$/.test(t.slice(close + 1))) {
       const pattern = t.slice(1, close);
       const flags = t.slice(close + 1);
       return { kind: "regex", value: pattern, re: compileSafeRegex(pattern, flags), negate };
@@ -269,4 +272,18 @@ function predicateMatches(pred: Predicate, summary: WikiPageSummary): boolean {
 export function matchSummary(summary: WikiPageSummary, query: SearchQuery): boolean {
   if (!query.hasQuery) return true;
   return query.groups.some((group) => group.every((p) => predicateMatches(p, summary)));
+}
+
+/**
+ * True when the BM25 `fullText` fetch cannot surface candidates for every
+ * OR-group — i.e. some group has NO positive free-text/tag/phrase seed (it's
+ * operator-only, like `title:Roadmap` in `title:Roadmap OR urgent`). In that
+ * case the caller must list the corpus and filter, or that group's matches are
+ * silently lost. A blank query never requires the full corpus.
+ */
+export function requiresFullCorpus(query: SearchQuery): boolean {
+  if (!query.hasQuery) return false;
+  return !query.groups.every((group) =>
+    group.some((p) => !p.negate && (p.kind === "term" || p.kind === "tag" || p.kind === "phrase")),
+  );
 }

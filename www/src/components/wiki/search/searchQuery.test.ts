@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSearchQuery, matchSummary } from "./searchQuery";
+import { parseSearchQuery, matchSummary, requiresFullCorpus } from "./searchQuery";
 import type { WikiPageSummary } from "@/runtime/connector";
 
 const page = (over: Partial<WikiPageSummary> = {}): WikiPageSummary => ({
@@ -94,6 +94,36 @@ describe("parseSearchQuery", () => {
     expect(values).toContain("term:report");
     expect(values).toContain("term:[oops");
     expect(q.hasQuery).toBe(true);
+  });
+
+  it("a path-like /v1/memories is a literal TERM, not a malformed regex", () => {
+    const q = parseSearchQuery("/v1/memories");
+    expect(q.groups[0][0].kind).toBe("term");
+    expect(q.groups[0][0].value).toBe("/v1/memories");
+    expect(q.fullText).toBe("/v1/memories"); // so BM25 is seeded, not empty
+  });
+
+  it("still parses a well-formed /re/flags as a regex", () => {
+    expect(parseSearchQuery("/foo/i").groups[0][0].kind).toBe("regex");
+    expect(parseSearchQuery("/foo bar/").groups[0][0].kind).toBe("regex");
+  });
+});
+
+describe("requiresFullCorpus (OR seeding correctness)", () => {
+  it("is false when every group has a free-text seed", () => {
+    expect(requiresFullCorpus(parseSearchQuery("alpha OR beta"))).toBe(false);
+    expect(requiresFullCorpus(parseSearchQuery("alpha #tag"))).toBe(false);
+  });
+  it("is TRUE when an OR-group is operator-only (would be missed by BM25)", () => {
+    // title:Roadmap has no free term → BM25 on 'urgent' can't surface it.
+    expect(requiresFullCorpus(parseSearchQuery("title:Roadmap OR urgent"))).toBe(true);
+  });
+  it("is true for a single operator-only query", () => {
+    expect(requiresFullCorpus(parseSearchQuery("title:Roadmap"))).toBe(true);
+    expect(requiresFullCorpus(parseSearchQuery("-draft"))).toBe(true);
+  });
+  it("is false for a blank query", () => {
+    expect(requiresFullCorpus(parseSearchQuery(""))).toBe(false);
   });
 });
 
