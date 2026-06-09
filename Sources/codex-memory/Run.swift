@@ -260,13 +260,34 @@ public enum CodexMemoryRun {
                                       embeddingEndpoint: String,
                                       storeConfig: MemoryStoreConfig)
     -> any LocalInferenceProvider {
+        let env = ProcessInfo.processInfo.environment
+        // Concurrent in-flight extract calls. Default 4 (on-device GPU); raise
+        // for the remote/split path where overlapping network calls is the win.
+        let extractInFlight = env["CODEX_MEMORY_EXTRACT_INFLIGHT"].flatMap(Int.init) ?? 4
         let inferenceConfig = MemoryInferConfig(
-            embeddingDimension: storeConfig.embeddingDimension)
+            embeddingDimension: storeConfig.embeddingDimension,
+            extractInFlight: max(1, extractInFlight))
         switch plan.backend {
         case .local:
-            return BoundedInferenceProvider(
+            let localProvider = BoundedInferenceProvider(
                 MLXLocalProvider(embeddingDimension: storeConfig.embeddingDimension),
                 config: inferenceConfig)
+            // Split: keep nomic embeddings LOCAL (store stays consistent) but
+            // run extraction/contextualise on the faster REMOTE provider.
+            if env["CODEX_MEMORY_SPLIT_REMOTE_EXTRACT"] == "1", let openAIAuth {
+                let bridge = ModelClientBridge(
+                    modelClient: openAIAuth.modelClient,
+                    modelName: extractorModel,
+                    embeddings: ModelClientBridge.EmbeddingsEndpoint(
+                        url: embeddingEndpoint, apiKey: "",
+                        authProvider: openAIAuth.embeddingAuthProvider,
+                        model: embeddingModel, dimensions: storeConfig.embeddingDimension))
+                let remoteExtractor = BoundedInferenceProvider(
+                    bridge.makeProvider(embeddingDimension: storeConfig.embeddingDimension),
+                    config: inferenceConfig)
+                return SplitInferenceProvider(embedder: localProvider, extractor: remoteExtractor)
+            }
+            return localProvider
         case .remote:
             guard let openAIAuth else {
                 return BoundedInferenceProvider(

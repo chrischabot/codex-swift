@@ -112,6 +112,43 @@ public actor BoundedInferenceProvider: LocalInferenceProvider {
     }
 }
 
+/// Routes embedding/rerank to one provider and extraction/contextualisation to
+/// another. Used to keep the store's vectors on the LOCAL embedder (so the
+/// stamped `embedding_provider_id` stays consistent — embeddings are all that
+/// affects stored vectors) while running the slow extraction/contextualise LLM
+/// calls on a faster REMOTE provider. `embeddingDimension` follows the embedder.
+public struct SplitInferenceProvider: LocalInferenceProvider {
+    nonisolated public let embeddingDimension: Int
+    private let embedder: any LocalInferenceProvider
+    private let extractor: any LocalInferenceProvider
+
+    public init(embedder: any LocalInferenceProvider, extractor: any LocalInferenceProvider) {
+        self.embedder = embedder
+        self.extractor = extractor
+        self.embeddingDimension = embedder.embeddingDimension
+    }
+
+    public func extract(_ batch: ChunkBatch, schema: ExtractionSchema,
+                        deadline: Deadline) async throws -> ExtractionResult {
+        try await extractor.extract(batch, schema: schema, deadline: deadline)
+    }
+    public func contextualize(_ chunk: Chunk, in document: DocumentDigest,
+                              deadline: Deadline) async throws -> String {
+        try await extractor.contextualize(chunk, in: document, deadline: deadline)
+    }
+    public func embed(_ texts: [String], deadline: Deadline) async throws -> [Embedding] {
+        try await embedder.embed(texts, deadline: deadline)
+    }
+    public func rerank(_ query: String, candidates: [String],
+                       deadline: Deadline) async throws -> [Float] {
+        try await embedder.rerank(query, candidates: candidates, deadline: deadline)
+    }
+    public func logprob(_ text: String, given: String?,
+                        deadline: Deadline) async throws -> Double {
+        try await extractor.logprob(text, given: given, deadline: deadline)
+    }
+}
+
 /// Counting-semaphore actor with cancellation-safe acquire. Pure async/await
 /// — no condition variables, no dispatch primitives. Fair FIFO via array
 /// backed continuation queue; a cancelled waiter is removed from the queue

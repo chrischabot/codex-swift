@@ -20,6 +20,12 @@ struct MarkdownImportOptions: Sendable {
     var batchSize: Int = 64
     var maxBytes: Int64 = 10 * 1024 * 1024
     var stateRoot: String?
+    /// Number of documents processed concurrently. >1 overlaps the per-document
+    /// LLM calls (contextualise/extract) — a big win for the network-bound
+    /// remote backend. The store/processor are actors, so writes still
+    /// serialise; only the LLM awaits run in parallel. Local MLX gets little
+    /// benefit (single GPU). Default 1 = the original serial behaviour.
+    var concurrency: Int = 1
     /// When set, a small JSON progress snapshot is rewritten after every file
     /// so an external monitor can poll live counts (imported / failed / total).
     var progressPath: String?
@@ -97,6 +103,14 @@ struct MarkdownManifestEntry: Sendable, Equatable {
             return value
         }
     }
+}
+
+/// Result of processing one document, merged serially into the report.
+enum EntryOutcome: Sendable {
+    case skipped
+    case unchanged(uri: String, sha: String, expectedChunks: Int)
+    case imported(uri: String, sha: String, expectedChunks: Int, chunks: Int, entities: Int)
+    case failed(relativeID: String, error: String)
 }
 
 private struct MarkdownImportState: Codable {
@@ -199,12 +213,16 @@ public enum CodexMemoryMarkdownImport {
             completedEntries.map { ($0.sourceURI, $0) })
 
         writeProgress(report, to: options.progressPath)
-        for entry in entries where entry.skipReason == nil {
-            defer { writeProgress(report, to: options.progressPath) }
+        let work = entries.filter { $0.skipReason == nil }
+        let concurrency = max(1, options.concurrency)
+
+        // Per-document work (independent; only touches the store/processor
+        // actors). Runs on the task group; the shared report/state merge below
+        // is serial, so no data races on the counters or the resume state.
+        @Sendable func processOne(_ entry: MarkdownManifestEntry) async -> EntryOutcome {
             do {
                 guard let raw = try readMarkdown(entry: entry, maxBytes: options.maxBytes) else {
-                    report.skipped += 1
-                    continue
+                    return .skipped
                 }
                 let canonical = normalizeMarkdown(raw)
                 let sha = Normaliser.contentSHA(canonical)
@@ -214,16 +232,7 @@ public enum CodexMemoryMarkdownImport {
                    try await isCompleteDocument(store: store, sourceURI: entry.sourceURI,
                                                 sha: sha, expectedChunks: expectedChunks,
                                                 extractMode: options.extractMode) {
-                    report.unchanged += 1
-                    completedByURI[entry.sourceURI] = CompletedMarkdownImport(
-                        sourceURI: entry.sourceURI,
-                        sha256: shaHex,
-                        expectedChunks: expectedChunks)
-                    try saveState(jobID: jobID, manifestDigest: manifestDigest,
-                                  extractMode: options.extractMode,
-                                  completed: Array(completedByURI.values),
-                                  updatedAt: options.clock(), to: stateURL)
-                    continue
+                    return .unchanged(uri: entry.sourceURI, sha: shaHex, expectedChunks: expectedChunks)
                 }
                 let stagedURI = "codex-memory://import-markdown/staging/\(jobID)/\(shaHex)/\(entry.relativeID)"
                 let doc = IngestedDocument(
@@ -249,20 +258,52 @@ public enum CodexMemoryMarkdownImport {
                     sourceURI: entry.sourceURI,
                     bodyPath: finalBodyPath,
                     title: entry.title)
-                report.imported += 1
-                report.chunks += processed.chunksWritten
-                report.entities += processed.entitiesUpserted
-                completedByURI[entry.sourceURI] = CompletedMarkdownImport(
-                    sourceURI: entry.sourceURI,
-                    sha256: shaHex,
-                    expectedChunks: expectedChunks)
-                try saveState(jobID: jobID, manifestDigest: manifestDigest,
-                              extractMode: options.extractMode,
-                              completed: Array(completedByURI.values),
-                              updatedAt: options.clock(), to: stateURL)
+                return .imported(uri: entry.sourceURI, sha: shaHex, expectedChunks: expectedChunks,
+                                 chunks: processed.chunksWritten, entities: processed.entitiesUpserted)
             } catch {
+                return .failed(relativeID: entry.relativeID, error: "\(error)")
+            }
+        }
+
+        func merge(_ outcome: EntryOutcome) {
+            switch outcome {
+            case .skipped:
+                report.skipped += 1
+            case let .unchanged(uri, sha, expectedChunks):
+                report.unchanged += 1
+                completedByURI[uri] = CompletedMarkdownImport(
+                    sourceURI: uri, sha256: sha, expectedChunks: expectedChunks)
+            case let .imported(uri, sha, expectedChunks, chunks, entities):
+                report.imported += 1
+                report.chunks += chunks
+                report.entities += entities
+                completedByURI[uri] = CompletedMarkdownImport(
+                    sourceURI: uri, sha256: sha, expectedChunks: expectedChunks)
+            case let .failed(relativeID, error):
                 report.failed += 1
-                report.errors.append("\(entry.relativeID): \(error)")
+                report.errors.append("\(relativeID): \(error)")
+            }
+            try? saveState(jobID: jobID, manifestDigest: manifestDigest,
+                           extractMode: options.extractMode,
+                           completed: Array(completedByURI.values),
+                           updatedAt: options.clock(), to: stateURL)
+            writeProgress(report, to: options.progressPath)
+        }
+
+        await withTaskGroup(of: EntryOutcome.self) { group in
+            var next = 0
+            // Seed up to `concurrency` documents in flight.
+            while next < work.count && next < concurrency {
+                let entry = work[next]; next += 1
+                group.addTask { await processOne(entry) }
+            }
+            // Drain: merge each completed outcome (serially), then top up.
+            while let outcome = await group.next() {
+                merge(outcome)
+                if next < work.count {
+                    let entry = work[next]; next += 1
+                    group.addTask { await processOne(entry) }
+                }
             }
         }
         return report
@@ -603,6 +644,17 @@ private func parseArgs(_ args: [String]) throws -> (options: MarkdownImportOptio
             options.progressPath = args[i]
         case let s where s.hasPrefix("--progress-file="):
             options.progressPath = String(s.dropFirst("--progress-file=".count))
+        case "--concurrency":
+            i += 1
+            guard i < args.count, let n = Int(args[i]), n > 0 else {
+                throw argumentError("--concurrency requires a positive integer")
+            }
+            options.concurrency = n
+        case let s where s.hasPrefix("--concurrency="):
+            guard let n = Int(s.dropFirst("--concurrency=".count)), n > 0 else {
+                throw argumentError("--concurrency requires a positive integer")
+            }
+            options.concurrency = n
         case "--max-bytes":
             i += 1
             guard i < args.count, let n = Int64(args[i]), n > 0 else {
