@@ -18,6 +18,7 @@ import {
   serialize,
   splitLeaf,
   toggleStacked,
+  togglePinned,
   type WorkspaceState,
 } from "./wikiWorkspace";
 
@@ -255,6 +256,61 @@ describe("toggleStacked", () => {
     expect(s.groups.get(g)!.stacked).toBe(true);
     s = toggleStacked(s, g);
     expect(s.groups.get(g)!.stacked).toBeUndefined();
+  });
+});
+
+describe("togglePinned", () => {
+  it("flips the pinned flag on a page leaf and drops it when off", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    const id = groupLeafIds(s)[0];
+    s = togglePinned(s, id);
+    expect((s.leaves.get(id)!.state as { pinned?: boolean }).pinned).toBe(true);
+    s = togglePinned(s, id);
+    expect((s.leaves.get(id)!.state as { pinned?: boolean }).pinned).toBeUndefined();
+  });
+
+  it("is a no-op on an empty leaf", () => {
+    const s = buildInitial();
+    expect(togglePinned(s, groupLeafIds(s)[0])).toBe(s);
+  });
+
+  it("a pinned active tab is NOT replaced in place — a new tab opens", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    const pinnedId = groupLeafIds(s)[0];
+    s = togglePinned(s, pinnedId);
+    s = openOrFocusPage(s, "p2"); // would normally replace p1
+    expect(groupLeafIds(s)).toHaveLength(2); // appended instead
+    expect(s.leaves.get(pinnedId)!.state).toMatchObject({ pageId: "p1", pinned: true });
+    expect(activePageId(s)).toBe("p2");
+  });
+
+  it("focusing an already-open pinned tab for the page still dedupes (no new tab)", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = togglePinned(s, groupLeafIds(s)[0]);
+    s = openOrFocusPage(s, "p2", { newTab: true });
+    s = openOrFocusPage(s, "p1"); // p1 pinned + open → focus it, don't duplicate
+    expect(groupLeafIds(s)).toHaveLength(2);
+    expect(activePageId(s)).toBe("p1");
+  });
+
+  it("close-others keeps the target AND pinned tabs", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2", { newTab: true });
+    s = openOrFocusPage(s, "p3", { newTab: true });
+    const [p1, p2, p3] = groupLeafIds(s);
+    s = togglePinned(s, p1); // pin p1
+    s = closeOtherLeaves(s, p3); // keep p3 + pinned p1
+    expect([...groupLeafIds(s)].sort()).toEqual([p1, p3].sort());
+    expect(s.leaves.has(p2)).toBe(false);
+  });
+
+  it("pinned survives serialize round-trip", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openOrFocusPage(s, "p2", { newTab: true });
+    s = togglePinned(s, groupLeafIds(s)[0]);
+    const restored = deserialize(serialize(s))!;
+    const first = leavesOfGroup(restored, restored.rootGroupIds[0])[0];
+    expect(first.state).toMatchObject({ pageId: "p1", pinned: true });
   });
 });
 

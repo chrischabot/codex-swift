@@ -23,7 +23,13 @@ export type TabGroupId = string;
  */
 export type WikiLeafState =
   | { readonly type: "empty" }
-  | { readonly type: "page"; readonly pageId: string };
+  | {
+      readonly type: "page";
+      readonly pageId: string;
+      /** Pinned tabs are never replaced by navigate-in-place (a new tab opens
+       *  instead) and resist close-others; toggled from the tab UI. */
+      readonly pinned?: boolean;
+    };
 
 export interface Leaf {
   readonly id: LeafId;
@@ -177,7 +183,11 @@ export function openOrFocusPage(
 
   const activeLeafObj = group.activeLeafId ? state.leaves.get(group.activeLeafId) : null;
   const canReplace =
-    !opts.newTab && activeLeafObj && REPLACEABLE.includes(activeLeafObj.state.type);
+    !opts.newTab &&
+    activeLeafObj &&
+    REPLACEABLE.includes(activeLeafObj.state.type) &&
+    // A pinned page tab is never replaced in place — open a new tab instead.
+    !(activeLeafObj.state.type === "page" && activeLeafObj.state.pinned);
 
   if (canReplace && activeLeafObj) {
     const updated: Leaf = { id: activeLeafObj.id, state: { type: "page", pageId } };
@@ -286,16 +296,22 @@ export function closeLeaf(state: WorkspaceState, leafId: LeafId): WorkspaceState
   return withDerived({ ...state, leaves, groups, columns, activeGroupId });
 }
 
-/** Close every tab in `leafId`'s group except `leafId` itself. */
+/** Close every tab in `leafId`'s group except `leafId` itself and any PINNED
+ *  tabs (pinned tabs survive close-others, matching Obsidian). */
 export function closeOtherLeaves(state: WorkspaceState, leafId: LeafId): WorkspaceState {
   const gid = groupOfLeaf(state, leafId);
   if (!gid) return state;
   const group = state.groups.get(gid);
   if (!group) return state;
+  const isPinned = (id: LeafId) => {
+    const l = state.leaves.get(id);
+    return l?.state.type === "page" && !!l.state.pinned;
+  };
+  const kept = group.leafIds.filter((id) => id === leafId || isPinned(id));
   const leaves = new Map(state.leaves);
-  for (const id of group.leafIds) if (id !== leafId) leaves.delete(id);
+  for (const id of group.leafIds) if (!kept.includes(id)) leaves.delete(id);
   const groups = new Map(state.groups);
-  groups.set(gid, { ...group, leafIds: [leafId], activeLeafId: leafId });
+  groups.set(gid, { ...group, leafIds: kept, activeLeafId: leafId });
   return withDerived({ ...state, leaves, groups });
 }
 
@@ -388,6 +404,19 @@ export function closeGroup(state: WorkspaceState, groupId: TabGroupId): Workspac
       null;
   }
   return withDerived({ ...state, leaves, groups, columns, activeGroupId });
+}
+
+/** Toggle a page leaf's pinned flag (no-op for empty leaves). Canonical: the
+ *  key is dropped when turning off (truthy-only, matching serialize). */
+export function togglePinned(state: WorkspaceState, leafId: LeafId): WorkspaceState {
+  const leaf = state.leaves.get(leafId);
+  if (!leaf || leaf.state.type !== "page") return state;
+  const { pinned: _was, ...rest } = leaf.state;
+  const nextState: WikiLeafState = leaf.state.pinned ? rest : { ...rest, pinned: true };
+  return withDerived({
+    ...state,
+    leaves: new Map(state.leaves).set(leafId, { ...leaf, state: nextState }),
+  });
 }
 
 /** Toggle a group's stacked (vertical tab column) rendering. */

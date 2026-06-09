@@ -1,5 +1,5 @@
 import * as React from "react";
-import { X, Plus, Rows, Columns, SplitSquareHorizontal, SplitSquareVertical } from "lucide-react";
+import { X, Plus, Rows, Columns, SplitSquareHorizontal, SplitSquareVertical, Pin, PinOff } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   ContextMenu,
@@ -19,6 +19,7 @@ export interface PaneTabActions {
   onCloseOthers: (leafId: string) => void;
   onCloseRight: (leafId: string) => void;
   onSplit: (leafId: string, direction: "right" | "down") => void;
+  onTogglePinned: (leafId: string) => void;
   onMove: (leafId: string, targetGroupId: TabGroupId, beforeLeafId: string | null) => void;
   onNewTab: (groupId: TabGroupId) => void;
   onToggleStacked: (groupId: TabGroupId) => void;
@@ -115,6 +116,7 @@ export function WikiPaneTabStrip({
         {leaves.map((leaf) => {
           const active = leaf.id === activeLeafId;
           const title = leafTitle(leaf, titleById);
+          const pinned = leaf.state.type === "page" && !!leaf.state.pinned;
           return (
             <ContextMenu key={leaf.id}>
               <ContextMenuTrigger asChild>
@@ -156,17 +158,33 @@ export function WikiPaneTabStrip({
                   )}
                 >
                   <span className="truncate">{title}</span>
-                  <button
-                    type="button"
-                    aria-label={`Close ${title}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      actions.onClose(leaf.id);
-                    }}
-                    className="inline-flex size-4 shrink-0 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[color:var(--border)] group-hover:opacity-100"
-                  >
-                    <X className="size-3" />
-                  </button>
+                  {pinned ? (
+                    // A pinned tab shows a persistent pin (click to unpin) in
+                    // place of the hover-close X — matching Obsidian.
+                    <button
+                      type="button"
+                      aria-label={`Unpin ${title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        actions.onTogglePinned(leaf.id);
+                      }}
+                      className="inline-flex size-4 shrink-0 items-center justify-center rounded text-[color:var(--color-text-tertiary)] hover:bg-[color:var(--border)]"
+                    >
+                      <Pin className="size-3" />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      aria-label={`Close ${title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        actions.onClose(leaf.id);
+                      }}
+                      className="inline-flex size-4 shrink-0 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[color:var(--border)] group-hover:opacity-100"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  )}
                 </div>
               </ContextMenuTrigger>
               <ContextMenuContent className="w-48">
@@ -190,6 +208,22 @@ export function WikiPaneTabStrip({
                 <ContextMenuItem onSelect={() => actions.onSplit(leaf.id, "down")}>
                   <SplitSquareVertical className="mr-2 size-3.5" /> Split down
                 </ContextMenuItem>
+                {leaf.state.type === "page" && (
+                  <>
+                    <ContextMenuSeparator />
+                    <ContextMenuItem onSelect={() => actions.onTogglePinned(leaf.id)}>
+                      {pinned ? (
+                        <>
+                          <PinOff className="mr-2 size-3.5" /> Unpin
+                        </>
+                      ) : (
+                        <>
+                          <Pin className="mr-2 size-3.5" /> Pin
+                        </>
+                      )}
+                    </ContextMenuItem>
+                  </>
+                )}
               </ContextMenuContent>
             </ContextMenu>
           );

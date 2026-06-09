@@ -14,6 +14,7 @@ import {
   serialize,
   splitLeaf as splitLeafOp,
   toggleStacked as toggleStackedOp,
+  togglePinned as togglePinnedOp,
   type LeafId,
   type TabGroupId,
   type WorkspaceState,
@@ -57,6 +58,7 @@ export interface UseWikiWorkspace {
   closeGroup: (id: TabGroupId) => void;
   moveTab: (id: LeafId, targetGroupId: TabGroupId, beforeLeafId: LeafId | null) => void;
   toggleStacked: (id: TabGroupId) => void;
+  togglePinned: (id: LeafId) => void;
 }
 
 /**
@@ -99,6 +101,7 @@ export function useWikiWorkspace(): UseWikiWorkspace {
     (id: TabGroupId) => setState((s) => toggleStackedOp(s, id)),
     [],
   );
+  const togglePinned = React.useCallback((id: LeafId) => setState((s) => togglePinnedOp(s, id)), []);
 
   return {
     state,
@@ -113,5 +116,6 @@ export function useWikiWorkspace(): UseWikiWorkspace {
     closeGroup,
     moveTab,
     toggleStacked,
+    togglePinned,
   };
 }

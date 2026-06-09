@@ -32,6 +32,7 @@ export function WikiWorkspace({ ws, titleById, buildCallbacks }: Props) {
       onCloseOthers: ws.closeOthers,
       onCloseRight: ws.closeRight,
       onSplit: ws.split,
+      onTogglePinned: ws.togglePinned,
       onMove: ws.moveTab,
       onNewTab: (gid) => {
         ws.focusGroup(gid);
