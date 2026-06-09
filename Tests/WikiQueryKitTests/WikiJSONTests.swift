@@ -228,6 +228,40 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertFalse(staleIds.contains(newId!), "old chunks purged — no stale search hit")
     }
 
+    /// CLAIM: wiki/page/delete removes the page AND its derived chunks/FTS rows,
+    /// so a deleted page is no longer fetchable or searchable; deleting a missing
+    /// id is idempotent ({deleted:false}, no throw). SEVERITY: severe — this is
+    /// destructive and the index must stay consistent.
+    func testDeletePurgesPageAndSearchIndex() async throws {
+        let root = dir + "/bodies"
+        let created = try await WikiJSON.upsert(store, bodyRoot: root, id: nil, title: "Doomed",
+                                                body: "A page about quokkas and capybaras.")
+        let id = created.obj?["id"]?.int
+        XCTAssertNotNil(id)
+        // Precondition: it's fetchable and searchable.
+        let prePage = try await WikiJSON.pageGet(store, id: id!)
+        XCTAssertNotNil(prePage)
+        let preHits = try await WikiJSON.search(store, query: "quokkas", k: 10)
+        XCTAssertTrue((preHits.obj?["data"]?.arr ?? []).compactMap { $0.obj?["id"]?.int }.contains(id!))
+
+        // Delete it.
+        let del = try await WikiJSON.delete(store, id: id!)
+        XCTAssertEqual(del.obj?["deleted"]?.bool, true, "a present page reports deleted:true")
+        XCTAssertEqual(del.obj?["id"]?.int, id!)
+
+        // Postcondition: not fetchable, and the FTS index no longer surfaces it
+        // (a raw delete that orphaned chunk_fts rows would still return a hit).
+        let postPage = try await WikiJSON.pageGet(store, id: id!)
+        XCTAssertNil(postPage, "deleted page is gone")
+        let postHits = try await WikiJSON.search(store, query: "quokkas", k: 10)
+        XCTAssertFalse((postHits.obj?["data"]?.arr ?? []).compactMap { $0.obj?["id"]?.int }.contains(id!),
+                       "deleted page's chunks were purged from the search index")
+
+        // Idempotent: deleting the now-gone id does not throw and reports false.
+        let again = try await WikiJSON.delete(store, id: id!)
+        XCTAssertEqual(again.obj?["deleted"]?.bool, false, "re-deleting a missing id is a no-op")
+    }
+
     // MARK: - brief (enrich)
 
     /// CLAIM: wiki/brief produces a structured payload (object) from lexical
@@ -283,4 +317,5 @@ private extension JSONValue {
     var arr: [JSONValue]? { if case .array(let a) = self { return a }; return nil }
     var str: String? { if case .string(let s) = self { return s }; return nil }
     var int: Int64? { if case .int(let i) = self { return i }; return nil }
+    var bool: Bool? { if case .bool(let b) = self { return b }; return nil }
 }
