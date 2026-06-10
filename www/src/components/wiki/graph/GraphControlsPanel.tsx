@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronRight, RotateCcw } from "lucide-react";
+import { ChevronRight, Plus, RotateCcw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_GRAPH_SETTINGS,
@@ -7,9 +7,20 @@ import {
   GRAPH_DISPLAY_SLIDERS,
   GRAPH_FORCE_SLIDERS,
   type GraphColorBy,
+  type GraphColorGroup,
   type GraphSettings,
   type GraphSliderSpec,
 } from "./GraphControls";
+
+/** Default color offered when adding a new group (first of the palette). */
+const NEW_GROUP_COLOR = "#4aa3ff";
+
+/** Best-effort unique id for a new color group (crypto when available). */
+function newGroupId(): string {
+  const c = typeof crypto !== "undefined" ? crypto : undefined;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return `grp-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
 
 interface Props {
   settings: GraphSettings;
@@ -73,6 +84,23 @@ export function GraphControlsPanel({ settings, onChange }: Props) {
         open={open.filters}
         onToggle={() => toggle("filters")}
       >
+        <Field label="Filter">
+          <input
+            type="text"
+            value={settings.textFilter}
+            onChange={(e) => set("textFilter", e.currentTarget.value)}
+            placeholder="Label, or kind:person"
+            aria-label="Filter nodes by label or kind"
+            spellCheck={false}
+            autoComplete="off"
+            autoCapitalize="off"
+            className={cn(
+              "w-full rounded border border-[color:var(--border)] bg-transparent px-1.5 py-1 text-sm",
+              "text-foreground placeholder:text-[color:var(--color-text-quaternary)]",
+              "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            )}
+          />
+        </Field>
         <Field label="Color by">
           <select
             value={settings.colorBy}
@@ -86,6 +114,10 @@ export function GraphControlsPanel({ settings, onChange }: Props) {
             <option value="none">Neutral</option>
           </select>
         </Field>
+        <ColorGroupsEditor
+          groups={settings.colorGroups}
+          onChange={(groups) => set("colorGroups", groups)}
+        />
         <SliderRow spec={GRAPH_DEPTH_SLIDER} value={settings.depth} onChange={set} />
         <p className="text-[11px] leading-snug text-[color:var(--color-text-quaternary)]">
           Depth controls how many hops out from a selected entity are explored.
@@ -174,6 +206,91 @@ function Field({ label, children }: FieldProps) {
       </span>
       {children}
     </label>
+  );
+}
+
+interface ColorGroupsEditorProps {
+  groups: ReadonlyArray<GraphColorGroup>;
+  onChange: (groups: GraphColorGroup[]) => void;
+}
+
+/**
+ * Compact CRUD editor for color groups. Each group is a {query, color} pair:
+ * the query is a label substring or a `kind:` prefix; matching nodes render in
+ * the chosen color (first match wins, overriding the default colorBy). Rows
+ * edit in place; the trailing "Add group" button appends an empty group.
+ */
+function ColorGroupsEditor({ groups, onChange }: ColorGroupsEditorProps) {
+  const update = (id: string, patch: Partial<GraphColorGroup>) =>
+    onChange(groups.map((g) => (g.id === id ? { ...g, ...patch } : g)));
+  const remove = (id: string) => onChange(groups.filter((g) => g.id !== id));
+  const add = () =>
+    onChange([...groups, { id: newGroupId(), query: "", color: NEW_GROUP_COLOR }]);
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[11px] font-medium text-[color:var(--color-text-secondary)]">
+        Color groups
+      </span>
+      {groups.length === 0 ? (
+        <p className="text-[11px] leading-snug text-[color:var(--color-text-quaternary)]">
+          No groups. Add one to tint matching nodes (label or <code>kind:</code>).
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {groups.map((g) => (
+            <li key={g.id} className="flex items-center gap-1.5">
+              <input
+                type="color"
+                value={g.color}
+                onChange={(e) => update(g.id, { color: e.currentTarget.value })}
+                aria-label="Group color"
+                className="h-6 w-6 shrink-0 cursor-pointer rounded border border-[color:var(--border)] bg-transparent p-0.5"
+              />
+              <input
+                type="text"
+                value={g.query}
+                onChange={(e) => update(g.id, { query: e.currentTarget.value })}
+                placeholder="Label or kind:x"
+                aria-label="Group query"
+                spellCheck={false}
+                autoComplete="off"
+                autoCapitalize="off"
+                className={cn(
+                  "min-w-0 flex-1 rounded border border-[color:var(--border)] bg-transparent px-1.5 py-1 text-sm",
+                  "text-foreground placeholder:text-[color:var(--color-text-quaternary)]",
+                  "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                )}
+              />
+              <button
+                type="button"
+                onClick={() => remove(g.id)}
+                title="Remove group"
+                aria-label="Remove color group"
+                className={cn(
+                  "flex h-6 w-6 shrink-0 items-center justify-center rounded",
+                  "text-[color:var(--color-text-tertiary)] hover:bg-[color:var(--color-surface-hover)] hover:text-foreground",
+                )}
+              >
+                <X size={12} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <button
+        type="button"
+        onClick={add}
+        className={cn(
+          "flex items-center justify-center gap-1 rounded border border-dashed py-1 text-[11px] font-medium",
+          "border-[color:var(--border)] text-[color:var(--color-text-tertiary)]",
+          "hover:bg-[color:var(--color-surface-hover)] hover:text-foreground",
+        )}
+      >
+        <Plus size={11} />
+        Add group
+      </button>
+    </div>
   );
 }
 

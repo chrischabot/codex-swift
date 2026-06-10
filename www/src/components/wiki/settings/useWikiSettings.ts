@@ -1,5 +1,5 @@
 import * as React from "react";
-import { DEFAULT_GRAPH_SETTINGS, type GraphSettings } from "../graph/GraphControls";
+import { DEFAULT_GRAPH_SETTINGS, type GraphColorGroup, type GraphSettings } from "../graph/GraphControls";
 
 // Wiki UI preferences, persisted to localStorage and synced across tabs +
 // across hook instances in the same tab.
@@ -25,6 +25,7 @@ export const WIKI_RAIL_TABS = [
   "tags",
   "outline",
   "bookmarks",
+  "recents",
   "properties",
 ] as const;
 export type WikiRailTab = (typeof WIKI_RAIL_TABS)[number];
@@ -114,6 +115,16 @@ function coerce(raw: unknown): WikiSettings {
       textSize: num(g.textSize, d.graphDefaults.textSize),
       colorBy: g.colorBy === "none" ? "none" : "kind",
       depth: num(g.depth, d.graphDefaults.depth),
+      textFilter: typeof g.textFilter === "string" ? g.textFilter : d.graphDefaults.textFilter,
+      colorGroups: Array.isArray(g.colorGroups)
+        ? (g.colorGroups as GraphColorGroup[]).filter(
+            (x) =>
+              !!x &&
+              typeof (x as GraphColorGroup).id === "string" &&
+              typeof (x as GraphColorGroup).query === "string" &&
+              typeof (x as GraphColorGroup).color === "string",
+          )
+        : d.graphDefaults.colorGroups,
     },
     defaultRailTab: isRailTab(o.defaultRailTab) ? o.defaultRailTab : d.defaultRailTab,
   };

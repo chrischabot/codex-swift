@@ -17,11 +17,15 @@
 
 import * as React from "react";
 import {
+  ArrowLeft,
+  ArrowRight,
   FileText,
   Frame,
   Link as LinkIcon,
   Magnet,
   Maximize2,
+  Minus,
+  MoveHorizontal,
   Trash2,
   Type as TypeIcon,
   ZoomIn,
@@ -39,14 +43,20 @@ import {
   type NodeType,
   newCanvasId,
   cloneSelection,
+  edgeEnds,
 } from "./canvasSchema";
 import { useCanvasDoc } from "./useCanvasDoc";
 import { WikiMarkdown } from "../WikiMarkdown";
 
 export interface WikiCanvasViewProps {
   pageId: string;
-  /** Optional: open a wiki page (e.g. router push) on page-card double-click. */
-  onOpenPage?: (pageId: string) => void;
+  /**
+   * Optional: open a wiki page (e.g. router push) on page-card double-click.
+   * The second arg is the node's optional in-page fragment ("#heading" /
+   * "#^block") so the caller can scroll to it. Backward-compatible with a
+   * `(id: string) => void` consumer (extra arg ignored).
+   */
+  onOpenPage?: (pageId: string, subpath?: string) => void;
   className?: string;
 }
 
@@ -125,6 +135,7 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
 
   const [view, setView] = React.useState<View>({ x: 0, y: 0, scale: 1 });
   const [selected, setSelected] = React.useState<string[]>([]);
+  const [selectedEdge, setSelectedEdge] = React.useState<string | null>(null);
   const [editingId, setEditingId] = React.useState<string | null>(null);
   const [snapOn, setSnapOn] = React.useState(true);
   const [marquee, setMarquee] = React.useState<{
@@ -143,10 +154,12 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
   const canvasRef = React.useRef<Canvas>(canvas);
   const viewRef = React.useRef<View>(view);
   const selectedRef = React.useRef<string[]>(selected);
+  const selectedEdgeRef = React.useRef<string | null>(selectedEdge);
   const snapRef = React.useRef(snapOn);
   React.useEffect(() => void (canvasRef.current = canvas), [canvas]);
   React.useEffect(() => void (viewRef.current = view), [view]);
   React.useEffect(() => void (selectedRef.current = selected), [selected]);
+  React.useEffect(() => void (selectedEdgeRef.current = selectedEdge), [selectedEdge]);
   React.useEffect(() => void (snapRef.current = snapOn), [snapOn]);
 
   // Interaction state (refs only — never trigger re-render mid-gesture).
@@ -250,6 +263,35 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
       });
     },
     [mutate],
+  );
+
+  const updateEdge = React.useCallback(
+    (id: string, patch: Partial<CanvasEdge>) => {
+      mutate({
+        ...canvasRef.current,
+        edges: canvasRef.current.edges.map((e) => (e.id === id ? { ...e, ...patch } : e)),
+      });
+    },
+    [mutate],
+  );
+
+  // Cycle an edge through the four end configurations (parity with Obsidian's
+  // edge-direction control): →  |  ←  |  ↔  |  —  (none). Persists fromEnd/toEnd
+  // explicitly so the chosen state round-trips.
+  const cycleEdgeDirection = React.useCallback(
+    (id: string) => {
+      const e = canvasRef.current.edges.find((x) => x.id === id);
+      if (!e) return;
+      const { fromEnd, toEnd } = edgeEnds(e);
+      // none/arrow → arrow/arrow → arrow/none → none/none → (loop) none/arrow
+      let next: { fromEnd: "none" | "arrow"; toEnd: "none" | "arrow" };
+      if (fromEnd === "none" && toEnd === "arrow") next = { fromEnd: "arrow", toEnd: "arrow" };
+      else if (fromEnd === "arrow" && toEnd === "arrow") next = { fromEnd: "arrow", toEnd: "none" };
+      else if (fromEnd === "arrow" && toEnd === "none") next = { fromEnd: "none", toEnd: "none" };
+      else next = { fromEnd: "none", toEnd: "arrow" };
+      updateEdge(id, next);
+    },
+    [updateEdge],
   );
 
   // Add a node centered in the current viewport.
@@ -539,6 +581,7 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
     }
     panRef.current = { x: e.clientX, y: e.clientY, vx: viewRef.current.x, vy: viewRef.current.y };
     setSelected([]);
+    setSelectedEdge(null);
     setEditingId(null);
   };
 
@@ -583,6 +626,7 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
   const onNodeMouseDown = (e: React.MouseEvent, node: CanvasNode) => {
     if (e.button !== 0 || spaceHeldRef.current) return;
     e.stopPropagation();
+    setSelectedEdge(null);
     const sel = selectedRef.current.includes(node.id)
       ? selectedRef.current
       : e.shiftKey
@@ -649,7 +693,19 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
         }
         return;
       }
-      if (selectedRef.current.length === 0) return;
+      // Edge-only selection: delete the selected edge.
+      if (selectedRef.current.length === 0) {
+        const eid = selectedEdgeRef.current;
+        if (eid && (ev.key === "Backspace" || ev.key === "Delete")) {
+          ev.preventDefault();
+          mutate({
+            ...canvasRef.current,
+            edges: canvasRef.current.edges.filter((e) => e.id !== eid),
+          });
+          setSelectedEdge(null);
+        }
+        return;
+      }
       const sel = new Set(selectedRef.current);
       if (mod && ev.key.toLowerCase() === "c") {
         ev.preventDefault();
@@ -671,7 +727,15 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
         deleteSelected();
         return;
       }
-      const step = ev.shiftKey ? GRID : snapRef.current ? GRID : 1;
+      // Nudge: 1px fine step; Shift accelerates by ×5 (or, when snap is on, a
+      // full grid jump — whichever moves further, so Shift always feels coarser
+      // than a plain press regardless of grid size).
+      const fine = 1;
+      const step = ev.shiftKey
+        ? snapRef.current
+          ? Math.max(GRID, fine * 5)
+          : fine * 5
+        : fine;
       let dx = 0;
       let dy = 0;
       if (ev.key === "ArrowLeft") dx = -step;
@@ -695,6 +759,10 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
 
   const selectedNode =
     selected.length === 1 ? (canvas.nodes.find((n) => n.id === selected[0]) ?? null) : null;
+  const selectedEdgeObj = selectedEdge
+    ? (canvas.edges.find((e) => e.id === selectedEdge) ?? null)
+    : null;
+  const selectedEnds = selectedEdgeObj ? edgeEnds(selectedEdgeObj) : null;
 
   // ── render ──
   if (status === "missing") {
@@ -735,8 +803,22 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
       {/* Edge layer (SVG bezier paths) */}
       <svg className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden>
         <defs>
+          {/* End marker (points along the path toward the target). */}
           <marker
             id="wiki-canvas-arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="6"
+            markerHeight="6"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted-foreground)" />
+          </marker>
+          {/* Start marker: same geometry; `auto-start-reverse` flips it so it
+              points back toward the source when used as markerStart. */}
+          <marker
+            id="wiki-canvas-arrow-start"
             viewBox="0 0 10 10"
             refX="9"
             refY="5"
@@ -754,15 +836,39 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
             if (!a || !b) return null;
             const stroke = edgeStroke(e, resolvedColors);
             const mid = edgeMidpoint(a, b, e);
+            const ends = edgeEnds(e);
+            const isSel = selectedEdge === e.id;
+            const d = edgePath(a, b, e);
             return (
               <g key={e.id}>
+                {/* Wide transparent hit area so the thin edge is easy to click. */}
+                <path
+                  d={d}
+                  fill="none"
+                  stroke="transparent"
+                  strokeWidth={14}
+                  style={{ pointerEvents: "stroke", cursor: "pointer" }}
+                  onMouseDown={(ev) => {
+                    ev.stopPropagation();
+                    setSelected([]);
+                    setSelectedEdge(e.id);
+                  }}
+                  onDoubleClick={(ev) => {
+                    ev.stopPropagation();
+                    cycleEdgeDirection(e.id);
+                  }}
+                />
                 <path
                   data-edge={e.id}
-                  d={edgePath(a, b, e)}
+                  d={d}
                   fill="none"
-                  stroke={stroke}
-                  strokeWidth={1.5}
-                  markerEnd="url(#wiki-canvas-arrow)"
+                  stroke={isSel ? "var(--primary)" : stroke}
+                  strokeWidth={isSel ? 2.5 : 1.5}
+                  style={{ pointerEvents: "none" }}
+                  markerStart={
+                    ends.fromEnd === "arrow" ? "url(#wiki-canvas-arrow-start)" : undefined
+                  }
+                  markerEnd={ends.toEnd === "arrow" ? "url(#wiki-canvas-arrow)" : undefined}
                 />
                 {e.label ? (
                   <text
@@ -913,6 +1019,46 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
             </div>
           </>
         ) : null}
+        {selectedEdgeObj && selectedEnds ? (
+          <>
+            <div className="mx-0.5 h-5 w-px bg-border" />
+            <ToolButton
+              label={
+                selectedEnds.fromEnd === "arrow" && selectedEnds.toEnd === "arrow"
+                  ? "Arrows: both"
+                  : selectedEnds.fromEnd === "arrow"
+                    ? "Arrow: from"
+                    : selectedEnds.toEnd === "arrow"
+                      ? "Arrow: to"
+                      : "Arrows: none"
+              }
+              onClick={() => cycleEdgeDirection(selectedEdgeObj.id)}
+            >
+              {selectedEnds.fromEnd === "arrow" && selectedEnds.toEnd === "arrow" ? (
+                <MoveHorizontal className="size-4" />
+              ) : selectedEnds.fromEnd === "arrow" ? (
+                <ArrowLeft className="size-4" />
+              ) : selectedEnds.toEnd === "arrow" ? (
+                <ArrowRight className="size-4" />
+              ) : (
+                <Minus className="size-4" />
+              )}
+            </ToolButton>
+            <ToolButton
+              label="Delete edge"
+              danger
+              onClick={() => {
+                mutate({
+                  ...canvasRef.current,
+                  edges: canvasRef.current.edges.filter((e) => e.id !== selectedEdgeObj.id),
+                });
+                setSelectedEdge(null);
+              }}
+            >
+              <Trash2 className="size-4" />
+            </ToolButton>
+          </>
+        ) : null}
         {selected.length > 0 ? (
           <>
             <div className="mx-0.5 h-5 w-px bg-border" />
@@ -1027,7 +1173,7 @@ interface CanvasNodeViewProps {
   onTextCommit: (text: string) => void;
   onTextCancel: () => void;
   onStartEdit: () => void;
-  onOpenPage?: (pageId: string) => void;
+  onOpenPage?: (pageId: string, subpath?: string) => void;
 }
 
 const CanvasNodeView = React.memo(function CanvasNodeView({
@@ -1045,8 +1191,15 @@ const CanvasNodeView = React.memo(function CanvasNodeView({
 }: CanvasNodeViewProps) {
   const rgb = colorRgb(node.color, colors);
   const isGroup = node.type === "group";
+  // Group background: an explicit `backgroundColor` (swatch id or hex) fills the
+  // group faintly; otherwise it stays transparent so nested nodes show through.
+  const groupBgRgb = isGroup ? colorRgb(node.backgroundColor, colors) : null;
   const bg = isGroup
-    ? "transparent"
+    ? groupBgRgb
+      ? groupBgRgb.startsWith("#")
+        ? groupBgRgb
+        : `rgba(${groupBgRgb}, 0.10)`
+      : "transparent"
     : rgb && !rgb.startsWith("#")
       ? `rgba(${rgb}, 0.08)`
       : rgb
@@ -1067,7 +1220,7 @@ const CanvasNodeView = React.memo(function CanvasNodeView({
         onMouseDown={onMouseDown}
         onDoubleClick={() => {
           if (node.type === "text") onStartEdit();
-          else if (node.type === "page" && node.pageId) onOpenPage?.(node.pageId);
+          else if (node.type === "page" && node.pageId) onOpenPage?.(node.pageId, node.subpath);
           else if (node.type === "link" && node.url) window.open(node.url, "_blank", "noopener");
         }}
         className="pointer-events-auto absolute box-border overflow-hidden rounded-lg text-card-foreground"
@@ -1166,8 +1319,13 @@ function PageCard({ node }: { node: CanvasNode }) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-1.5 border-b border-border bg-secondary px-2 py-1 text-[11px] text-muted-foreground">
-        <FileText className="size-3" />
+        <FileText className="size-3 shrink-0" />
         <span className="truncate">{heading}</span>
+        {node.subpath ? (
+          <span className="truncate opacity-70" title={node.subpath}>
+            {node.subpath}
+          </span>
+        ) : null}
       </div>
       <div className="overflow-hidden p-2.5 text-xs text-muted-foreground">
         {loading ? "Loading…" : excerpt || "Double-click to open"}

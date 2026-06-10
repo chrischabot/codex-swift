@@ -29,6 +29,7 @@ import { WikiQuickSwitcher } from "@/components/wiki/WikiQuickSwitcher";
 import { useWikiSwitcherHotkey } from "@/components/wiki/useWikiSwitcherHotkey";
 import { WikiBacklinksPanel } from "@/components/wiki/panels/WikiBacklinksPanel";
 import { WikiBookmarksPanel } from "@/components/wiki/panels/WikiBookmarksPanel";
+import { WikiRecentsPanel } from "@/components/wiki/panels/WikiRecentsPanel";
 import { isCanvasDoc } from "@/components/wiki/canvas/canvasSchema";
 import { isBaseBody } from "@/components/wiki/bases/basesSchema";
 import { useWikiWorkspace } from "@/components/wiki/workspace/useWikiWorkspace";
@@ -351,6 +352,7 @@ function WikiRightRail({
           <TabsTrigger value="tags">Tags</TabsTrigger>
           <TabsTrigger value="outline">Outline</TabsTrigger>
           <TabsTrigger value="bookmarks">Saved</TabsTrigger>
+          <TabsTrigger value="recents">Recents</TabsTrigger>
           <TabsTrigger value="properties">Info</TabsTrigger>
         </TabsList>
         {/* Graph tab fills the rail height (a canvas), so it sits OUTSIDE the
@@ -372,6 +374,9 @@ function WikiRightRail({
             </TabsContent>
             <TabsContent value="bookmarks" className="mt-0">
               <WikiBookmarksPanel onSelect={onOpenPage} />
+            </TabsContent>
+            <TabsContent value="recents" className="mt-0">
+              <WikiRecentsPanel onSelect={onOpenPage} />
             </TabsContent>
             <TabsContent value="tags" className="mt-0">
               <WikiTagsPanel onSelectTag={onTag} />

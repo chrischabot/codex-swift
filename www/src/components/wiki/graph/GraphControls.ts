@@ -10,6 +10,107 @@
 /** How node colors are derived in the canvas render loop. */
 export type GraphColorBy = "kind" | "none";
 
+/**
+ * A user-defined color group. `query` is either a plain substring (matched
+ * case-insensitively against the node label) or a `kind:` prefix (matched
+ * against the entity kind). Nodes matching a group render in `color`,
+ * overriding {@link GraphSettings.colorBy}; the FIRST group in array order
+ * whose query matches wins. Mirrors granite's search-query coloring groups,
+ * rescoped to the label/kind data the wiki entity graph actually carries.
+ */
+export interface GraphColorGroup {
+  /** Stable id (keys React elements + remove). */
+  readonly id: string;
+  /** Substring or `kind:x` query. Empty query never matches. */
+  readonly query: string;
+  /** CSS color applied to matching nodes (hex, e.g. `#4aa3ff`). */
+  readonly color: string;
+}
+
+/** Minimal node shape the filter/group logic reads. Subset of WikiGraphNode. */
+export interface GraphFilterNode {
+  /** Entity title / label. */
+  readonly title: string;
+  /** Entity kind (e.g. `person`), if known. */
+  readonly kind?: string;
+}
+
+/**
+ * A parsed filter/group query. A `kind:` prefix targets the entity kind; any
+ * other text is a plain label substring. Both are lower-cased for
+ * case-insensitive matching.
+ */
+export interface ParsedGraphQuery {
+  /** `"kind"` → match against node.kind; `"label"` → substring of node.title. */
+  readonly mode: "kind" | "label";
+  /** Lower-cased needle (kind value or label substring). */
+  readonly term: string;
+}
+
+/** `kind:` prefix marker for the text filter + color-group queries. */
+const KIND_PREFIX = "kind:";
+
+/**
+ * Parse a raw filter/group query string. Leading/trailing whitespace is
+ * trimmed; a `kind:` prefix (case-insensitive) switches to kind-matching on the
+ * remainder. Everything else is a label substring. Pure.
+ */
+export function parseGraphQuery(raw: string): ParsedGraphQuery {
+  const trimmed = raw.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith(KIND_PREFIX)) {
+    return { mode: "kind", term: lower.slice(KIND_PREFIX.length).trim() };
+  }
+  return { mode: "label", term: lower };
+}
+
+/**
+ * Test whether a node matches a parsed query.
+ *  - `label` mode: case-insensitive substring of the node title. An EMPTY term
+ *    matches everything (so an empty text filter shows the whole graph).
+ *  - `kind` mode: case-insensitive substring of the node kind. An empty term
+ *    (`kind:`) matches any node that HAS a kind. A node with no kind never
+ *    matches a kind query.
+ * Pure over its arguments.
+ */
+export function nodeMatchesQuery(node: GraphFilterNode, q: ParsedGraphQuery): boolean {
+  if (q.mode === "kind") {
+    const kind = (node.kind ?? "").toLowerCase();
+    if (kind === "") return false;
+    if (q.term === "") return true;
+    return kind.includes(q.term);
+  }
+  if (q.term === "") return true;
+  return (node.title ?? "").toLowerCase().includes(q.term);
+}
+
+/**
+ * Whether a node passes the live text filter. An empty/whitespace filter shows
+ * every node. Convenience wrapper that parses + matches in one call.
+ */
+export function nodePassesFilter(node: GraphFilterNode, filter: string): boolean {
+  if (filter.trim() === "") return true;
+  return nodeMatchesQuery(node, parseGraphQuery(filter));
+}
+
+/**
+ * Resolve a node's color-group override: the color of the FIRST group whose
+ * (non-empty) query matches, or `null` if no group matches. Groups with an
+ * empty query are skipped so a half-typed group doesn't recolor everything.
+ * The caller falls back to its default `colorBy` color when this returns null.
+ * Pure over its arguments.
+ */
+export function resolveGroupColor(
+  node: GraphFilterNode,
+  groups: ReadonlyArray<GraphColorGroup>,
+): string | null {
+  for (const g of groups) {
+    if (g.query.trim() === "") continue;
+    if (nodeMatchesQuery(node, parseGraphQuery(g.query))) return g.color;
+  }
+  return null;
+}
+
 export interface GraphSettings {
   // --- Forces (passed into the force simulation) ---
   /** Node-node charge / repulsion strength. Higher spreads the graph out. */
@@ -43,6 +144,19 @@ export interface GraphSettings {
   colorBy: GraphColorBy;
   /** Neighborhood expansion radius when a node is seeded (local graph). */
   depth: number;
+  /**
+   * Live node filter. A plain substring matches the node label
+   * (case-insensitive); a `kind:` prefix matches the entity kind. Filtered-out
+   * nodes (and their now-dangling edges) are hidden from the sim/render. Empty
+   * shows the whole graph. Session-only by default (not persisted via the
+   * shared settings; see {@link GraphSettings.colorGroups} note).
+   */
+  textFilter: string;
+  /**
+   * User-defined color groups. The first group whose query matches a node
+   * recolors it, overriding {@link colorBy}. See {@link GraphColorGroup}.
+   */
+  colorGroups: GraphColorGroup[];
 }
 
 /**
@@ -60,6 +174,8 @@ export const DEFAULT_GRAPH_SETTINGS: GraphSettings = {
   textSize: 11,
   colorBy: "kind",
   depth: 2,
+  textFilter: "",
+  colorGroups: [],
 };
 
 /** Bounds + step for each numeric knob, shared by the panel sliders. */

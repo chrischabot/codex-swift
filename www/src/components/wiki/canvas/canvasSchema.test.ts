@@ -5,6 +5,7 @@ import {
   isCanvasDoc,
   normalizeCanvas,
   emptyCanvasBody,
+  edgeEnds,
   EMPTY_CANVAS,
   type Canvas,
 } from "./canvasSchema";
@@ -76,6 +77,117 @@ describe("isCanvasDoc hardening (anti-misrouting)", () => {
     expect(isCanvasDoc(null)).toBe(false);
     expect(isCanvasDoc("")).toBe(false);
     expect(isCanvasDoc(undefined)).toBe(false);
+  });
+});
+
+// M35: advanced authoring — edge arrow ends, group background, page subpath.
+describe("M35 edge arrow ends", () => {
+  it("edgeEnds applies Obsidian defaults (toEnd:'arrow', fromEnd:'none')", () => {
+    expect(edgeEnds({})).toEqual({ fromEnd: "none", toEnd: "arrow" });
+    expect(edgeEnds({ fromEnd: "arrow" })).toEqual({ fromEnd: "arrow", toEnd: "arrow" });
+    expect(edgeEnds({ toEnd: "none" })).toEqual({ fromEnd: "none", toEnd: "none" });
+    expect(edgeEnds({ fromEnd: "arrow", toEnd: "none" })).toEqual({
+      fromEnd: "arrow",
+      toEnd: "none",
+    });
+  });
+
+  it("round-trips explicit fromEnd/toEnd through serialize → parse", () => {
+    const c: Canvas = {
+      nodes: [
+        { id: "a", type: "text", x: 0, y: 0, w: 100, h: 50, text: "" },
+        { id: "b", type: "text", x: 200, y: 0, w: 100, h: 50, text: "" },
+      ],
+      edges: [
+        { id: "e1", fromNode: "a", toNode: "b", fromEnd: "arrow", toEnd: "none" },
+        { id: "e2", fromNode: "b", toNode: "a", toEnd: "arrow" },
+      ],
+    };
+    const { canvas } = parseCanvasDoc(serializeCanvasDoc(c));
+    expect(canvas.edges[0]).toMatchObject({ fromEnd: "arrow", toEnd: "none" });
+    // e2's explicit toEnd:'arrow' survives.
+    expect(canvas.edges[1]).toMatchObject({ toEnd: "arrow" });
+    expect(canvas.edges[1].fromEnd).toBeUndefined();
+  });
+
+  it("drops invalid end values rather than persisting junk", () => {
+    const c = normalizeCanvas({
+      nodes: [{ id: "a", type: "text", x: 0, y: 0, w: 1, h: 1 }],
+      edges: [{ id: "e", fromNode: "a", toNode: "a", fromEnd: "spike", toEnd: 7 }],
+    });
+    expect(c.edges[0].fromEnd).toBeUndefined();
+    expect(c.edges[0].toEnd).toBeUndefined();
+  });
+});
+
+describe("M35 group background + backgroundStyle", () => {
+  it("round-trips backgroundColor + backgroundStyle on a group", () => {
+    const c: Canvas = {
+      nodes: [
+        {
+          id: "g",
+          type: "group",
+          x: 0,
+          y: 0,
+          w: 400,
+          h: 300,
+          label: "G",
+          backgroundColor: "#112233",
+          backgroundStyle: "ratio",
+        },
+      ],
+      edges: [],
+    };
+    const { canvas } = parseCanvasDoc(serializeCanvasDoc(c));
+    expect(canvas.nodes[0]).toMatchObject({
+      backgroundColor: "#112233",
+      backgroundStyle: "ratio",
+    });
+  });
+
+  it("accepts Obsidian's `background` key as backgroundColor", () => {
+    const c = normalizeCanvas({
+      nodes: [{ id: "g", type: "group", x: 0, y: 0, w: 10, h: 10, background: "5" }],
+      edges: [],
+    });
+    expect(c.nodes[0].backgroundColor).toBe("5");
+  });
+
+  it("drops an invalid backgroundStyle", () => {
+    const c = normalizeCanvas({
+      nodes: [{ id: "g", type: "group", x: 0, y: 0, w: 10, h: 10, backgroundStyle: "wat" }],
+      edges: [],
+    });
+    expect(c.nodes[0].backgroundStyle).toBeUndefined();
+  });
+});
+
+describe("M35 page node subpath", () => {
+  it("round-trips a subpath and normalizes a leading '#'", () => {
+    const c: Canvas = {
+      nodes: [
+        { id: "p", type: "page", x: 0, y: 0, w: 180, h: 90, pageId: "42", subpath: "#Heading" },
+      ],
+      edges: [],
+    };
+    const { canvas } = parseCanvasDoc(serializeCanvasDoc(c));
+    expect(canvas.nodes[0].subpath).toBe("#Heading");
+  });
+
+  it("adds a missing leading '#' to a bare subpath on parse", () => {
+    const c = normalizeCanvas({
+      nodes: [{ id: "p", type: "page", x: 0, y: 0, w: 1, h: 1, file: "doc", subpath: "Section" }],
+      edges: [],
+    });
+    expect(c.nodes[0].subpath).toBe("#Section");
+  });
+
+  it("supports a block-ref subpath", () => {
+    const c = normalizeCanvas({
+      nodes: [{ id: "p", type: "page", x: 0, y: 0, w: 1, h: 1, pageId: "x", subpath: "#^blk1" }],
+      edges: [],
+    });
+    expect(c.nodes[0].subpath).toBe("#^blk1");
   });
 });
 

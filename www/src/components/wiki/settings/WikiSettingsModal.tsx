@@ -45,6 +45,7 @@ const RAIL_TAB_LABELS: Record<WikiRailTab, string> = {
   tags: "Tags",
   outline: "Outline",
   bookmarks: "Saved",
+  recents: "Recents",
   properties: "Info",
 };
 

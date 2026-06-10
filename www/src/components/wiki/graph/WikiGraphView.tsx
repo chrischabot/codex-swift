@@ -13,7 +13,12 @@ import {
   type DrawNode,
 } from "./drawGraph";
 import { GraphControlsPanel } from "./GraphControlsPanel";
-import { DEFAULT_GRAPH_SETTINGS, type GraphSettings } from "./GraphControls";
+import {
+  DEFAULT_GRAPH_SETTINGS,
+  nodePassesFilter,
+  resolveGroupColor,
+  type GraphSettings,
+} from "./GraphControls";
 
 export interface Props {
   /** Entity id to seed/centre the graph on. Re-seeds when it changes. */
@@ -61,7 +66,26 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
   settingsRef.current = settings;
   const [controlsOpen, setControlsOpen] = React.useState(false);
 
-  const graph = useWikiGraph({ seedEntityId, depth: settings.depth });
+  const rawGraph = useWikiGraph({ seedEntityId, depth: settings.depth });
+
+  // --- Apply the live text filter: hide non-matching nodes AND their now-
+  // dangling edges. The seed node is always kept so a filter can't orphan the
+  // explore target. Recomputed only when the data or the filter string change
+  // (NOT on every settings tweak), so dragging a slider doesn't rebuild the sim.
+  const textFilter = settings.textFilter;
+  const graph = React.useMemo(() => {
+    if (textFilter.trim() === "") return rawGraph;
+    const keep = new Set<string>();
+    for (const n of rawGraph.nodes) {
+      if (n.id === seedEntityId || nodePassesFilter(n, textFilter)) keep.add(n.id);
+    }
+    // No matches → fall back to the full graph rather than blanking the view;
+    // the empty state is reserved for "no data", not "nothing matched".
+    if (keep.size === 0) return rawGraph;
+    const nodes = rawGraph.nodes.filter((n) => keep.has(n.id));
+    const edges = rawGraph.edges.filter((e) => keep.has(e.source) && keep.has(e.target));
+    return { nodes, edges };
+  }, [rawGraph, textFilter, seedEntityId]);
 
   const containerRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -98,14 +122,28 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
   // kind → resolved colour, recomputed on theme change.
   const kindColorRef = React.useRef<Map<string, string>>(new Map());
 
-  // Resolve a node's fill from the current `colorBy` setting. `none` collapses
-  // every node onto the neutral fallback token; `kind` keys off the entity kind.
-  const colorForKind = React.useCallback((kind: string | undefined): string => {
-    const kindMap = kindColorRef.current;
-    const fallback = kindMap.get("") ?? "#888888";
-    if (settingsRef.current.colorBy === "none") return fallback;
-    return kindMap.get(kind ?? "") ?? fallback;
-  }, []);
+  // Resolve a node's fill. Custom color groups win FIRST (first matching group
+  // in array order), overriding `colorBy`. Otherwise `none` collapses every
+  // node onto the neutral fallback token and `kind` keys off the entity kind.
+  // `node` may be undefined (e.g. a stale index after a graph swap) — treated
+  // as the neutral fallback.
+  const colorForNode = React.useCallback(
+    (node: { title?: string; kind?: string } | undefined): string => {
+      const s = settingsRef.current;
+      if (node) {
+        const groupColor = resolveGroupColor(
+          { title: node.title ?? "", kind: node.kind },
+          s.colorGroups,
+        );
+        if (groupColor) return groupColor;
+      }
+      const kindMap = kindColorRef.current;
+      const fallback = kindMap.get("") ?? "#888888";
+      if (s.colorBy === "none") return fallback;
+      return kindMap.get(node?.kind ?? "") ?? fallback;
+    },
+    [],
+  );
 
   const rafRef = React.useRef(0);
   const draggingRef = React.useRef<{
@@ -151,9 +189,9 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
     const nodes = graph.nodes;
     const dn = drawNodesRef.current;
     for (let i = 0; i < dn.length; i++) {
-      (dn[i] as DrawNode).color = colorForKind(nodes[i]?.kind);
+      (dn[i] as DrawNode).color = colorForNode(nodes[i]);
     }
-  }, [graph.nodes, colorForKind]);
+  }, [graph.nodes, colorForNode]);
 
   // Re-resolve on the .dark class toggling (or any class change on <html>).
   React.useEffect(() => {
@@ -214,7 +252,7 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
     drawNodesRef.current = nodes.map((n, i) => ({
       x: sim.xAt(i),
       y: sim.yAt(i),
-      color: colorForKind(n.kind),
+      color: colorForNode(n),
       weight: n.weight ?? 1,
       label: n.title,
     }));
@@ -224,7 +262,7 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
     hoverRef.current = -1;
     setHoverState(-1);
     viewRef.current = { x: 0, y: 0, scale: 1 };
-  }, [graph, seedEntityId, colorForKind]);
+  }, [graph, seedEntityId, colorForNode]);
 
   // --- ResizeObserver: track CSS size + DPR for the backing store.
   React.useEffect(() => {
@@ -368,14 +406,15 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
         }
       }
     }
-    // Re-tint for the current colorBy (cheap; safe even when colorBy didn't change).
+    // Re-tint for the current colorBy + color groups (cheap; safe even when
+    // neither changed — covers colorBy toggles and color-group CRUD edits).
     const dn = drawNodesRef.current;
     const nodes = graph.nodes;
     for (let i = 0; i < dn.length; i++) {
-      (dn[i] as DrawNode).color = colorForKind(nodes[i]?.kind);
+      (dn[i] as DrawNode).color = colorForNode(nodes[i]);
     }
     wake();
-  }, [settings, graph.nodes, colorForKind, wake]);
+  }, [settings, graph.nodes, colorForNode, wake]);
 
   // --- Screen → world (inverse of drawGraph's transform).
   const screenToWorld = React.useCallback((clientX: number, clientY: number) => {

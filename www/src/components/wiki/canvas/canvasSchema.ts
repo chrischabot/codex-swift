@@ -12,6 +12,11 @@
 export type CanvasColor = "1" | "2" | "3" | "4" | "5" | "6" | string;
 export type NodeType = "text" | "page" | "group" | "link";
 export type EdgeSide = "top" | "right" | "bottom" | "left";
+/** Arrow head on an edge end (Obsidian `.canvas` parity). */
+export type EdgeEnd = "none" | "arrow";
+/** How a group's background image (if any) is laid out. Stored for round-trip;
+ *  rendering is intentionally basic (we have no background-image source yet). */
+export type GroupBackgroundStyle = "cover" | "ratio" | "repeat";
 
 export interface CanvasNode {
   id: string;
@@ -25,10 +30,18 @@ export interface CanvasNode {
   text?: string;
   /** page node: id of the wiki page this card previews / opens. */
   pageId?: string;
+  /** page node: optional in-page fragment ("#heading" or "#^blockId") that the
+   *  node should land on when opened. Carried through `onOpenPage`. Mirrors
+   *  Obsidian's file-node `subpath`. */
+  subpath?: string;
   /** link node: external URL. */
   url?: string;
   /** group / page label (group title, or cached page title). */
   label?: string;
+  /** group node: background color/image reference (Obsidian `background`). */
+  backgroundColor?: string;
+  /** group node: how the background image tiles/fits. Round-trip only. */
+  backgroundStyle?: GroupBackgroundStyle;
   /** swatch color ("1".."6") or a raw `#hex`. */
   color?: CanvasColor;
 }
@@ -39,6 +52,10 @@ export interface CanvasEdge {
   toNode: string;
   fromSide?: EdgeSide;
   toSide?: EdgeSide;
+  /** Arrow head at the source end. Default 'none' when omitted. */
+  fromEnd?: EdgeEnd;
+  /** Arrow head at the target end. Default 'arrow' (render with markerEnd). */
+  toEnd?: EdgeEnd;
   label?: string;
   color?: CanvasColor;
 }
@@ -109,6 +126,14 @@ function asSide(v: unknown): EdgeSide | undefined {
   if (v === "top" || v === "right" || v === "bottom" || v === "left") return v;
   return undefined;
 }
+function asEnd(v: unknown): EdgeEnd | undefined {
+  if (v === "none" || v === "arrow") return v;
+  return undefined;
+}
+function asBackgroundStyle(v: unknown): GroupBackgroundStyle | undefined {
+  if (v === "cover" || v === "ratio" || v === "repeat") return v;
+  return undefined;
+}
 
 // ── frontmatter split ───────────────────────────────────────────────────────
 
@@ -161,11 +186,20 @@ function parseNode(raw: unknown): CanvasNode | null {
     node.pageId = asString(o.pageId) ?? asString(o.file) ?? "";
     const label = asString(o.label);
     if (label) node.label = label;
+    // Obsidian stores the in-file fragment as `subpath` (e.g. "#heading"). We
+    // normalize a leading "#" on so callers can append it to a route verbatim.
+    const subpath = asString(o.subpath);
+    if (subpath) node.subpath = subpath.startsWith("#") ? subpath : `#${subpath}`;
   }
   if (type === "link") node.url = asString(o.url) ?? "";
   if (type === "group") {
     const label = asString(o.label);
     if (label) node.label = label;
+    // Accept ours (`backgroundColor`) and Obsidian's (`background`).
+    const bg = asString(o.backgroundColor) ?? asString(o.background);
+    if (bg) node.backgroundColor = bg;
+    const bgStyle = asBackgroundStyle(o.backgroundStyle);
+    if (bgStyle) node.backgroundStyle = bgStyle;
   }
   return node;
 }
@@ -182,6 +216,10 @@ function parseEdge(raw: unknown): CanvasEdge | null {
   const toSide = asSide(o.toSide);
   if (fromSide) edge.fromSide = fromSide;
   if (toSide) edge.toSide = toSide;
+  const fromEnd = asEnd(o.fromEnd);
+  const toEnd = asEnd(o.toEnd);
+  if (fromEnd) edge.fromEnd = fromEnd;
+  if (toEnd) edge.toEnd = toEnd;
   const label = asString(o.label);
   if (label) edge.label = label;
   const color = o.color;
@@ -270,6 +308,21 @@ export function isCanvasDoc(content: string | undefined | null): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Effective arrow heads for an edge, applying defaults: an absent `toEnd`
+ * defaults to `'arrow'` (matching Obsidian, where the target arrow is on by
+ * default) and an absent `fromEnd` defaults to `'none'`. Pure — used by the
+ * SVG renderer to decide markerStart/markerEnd. Keeping the default here (not
+ * baked into the stored schema) keeps the on-disk JSON minimal and round-trips
+ * cleanly: we only persist `fromEnd`/`toEnd` when they deviate from default.
+ */
+export function edgeEnds(e: Pick<CanvasEdge, "fromEnd" | "toEnd">): {
+  fromEnd: EdgeEnd;
+  toEnd: EdgeEnd;
+} {
+  return { fromEnd: e.fromEnd ?? "none", toEnd: e.toEnd ?? "arrow" };
 }
 
 /** Short random node/edge id, stable across browsers (Web Crypto). */

@@ -11,6 +11,8 @@ import {
   PencilLine,
   Search,
   Loader2,
+  ArrowDownUp,
+  Check,
 } from "lucide-react";
 import type { WikiPageSummary } from "@/runtime/connector";
 import { useRuntime } from "@/runtime/RuntimeProvider";
@@ -26,6 +28,14 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   Dialog,
   DialogContent,
   DialogHeader,
@@ -36,14 +46,30 @@ import {
 import { toast } from "@/components/ui/sonner";
 import { renameTabInStorage } from "@/components/wiki/tabs/useWikiTabs";
 import { cn } from "@/lib/utils";
+import {
+  SORT_MODES,
+  SORT_LABELS,
+  useSortMode,
+  compareNodes,
+  type SortMode,
+} from "./sort";
+import { recordWikiRecent } from "./useWikiRecents";
 
 // Context for the row-level actions (rename/delete/open) so the deeply-nested
 // FileRow can reach them without prop-drilling through TreeRow/FolderRow.
 interface ExplorerActions {
   canEdit: boolean;
   onOpen: (id: string) => void;
+  /** Open the rename MODAL (context-menu "Rename…"). */
   onRename: (node: FileNode) => void;
   onDelete: (node: FileNode) => void;
+  /** Begin INLINE (edit-in-place) rename on a row; null clears it. The id is
+   *  the file node's page id (matches FileNode.id). */
+  inlineRenameId: string | null;
+  beginInlineRename: (id: string | null) => void;
+  /** Commit an inline rename via the same connector path as the modal. Returns
+   *  a promise that resolves once the row should exit edit mode. */
+  commitInlineRename: (node: FileNode, nextTitle: string) => Promise<void>;
 }
 const ExplorerActionsContext = React.createContext<ExplorerActions | null>(null);
 function useExplorerActions(): ExplorerActions {
@@ -100,16 +126,15 @@ function sourceKey(p: WikiPageSummary): string {
   return s || "ungrouped";
 }
 
-function sortNodes(nodes: TreeNode[]): TreeNode[] {
-  // Folders first, then files; each alphabetical (locale-aware, case-insensitive).
-  return [...nodes].sort((a, b) => {
-    if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
-    return a.label.localeCompare(b.label, undefined, { sensitivity: "base" });
-  });
+function sortNodes(nodes: TreeNode[], mode: SortMode): TreeNode[] {
+  // Folders first, then files; ordering within each kind honours the sort mode
+  // (folders always fall back to label order — they carry no date). Delegated to
+  // the pure `compareNodes` so the ordering is independently unit-tested.
+  return [...nodes].sort((a, b) => compareNodes(a, b, mode));
 }
 
 /** Build the source → title-path tree from a flat page list. */
-function buildTree(pages: WikiPageSummary[]): FolderNode[] {
+function buildTree(pages: WikiPageSummary[], mode: SortMode): FolderNode[] {
   const roots = new Map<string, FolderNode>();
 
   for (const page of pages) {
@@ -143,7 +168,7 @@ function buildTree(pages: WikiPageSummary[]): FolderNode[] {
   // Recursive sort, then order groups: real sources alphabetical, "ungrouped" last.
   const sortRec = (n: FolderNode): FolderNode => ({
     ...n,
-    children: sortNodes(n.children).map((c) => (c.type === "folder" ? sortRec(c) : c)),
+    children: sortNodes(n.children, mode).map((c) => (c.type === "folder" ? sortRec(c) : c)),
   });
   return [...roots.values()]
     .map(sortRec)
@@ -229,22 +254,55 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
     typeof connector.deleteWikiPage === "function";
   const [renameTarget, setRenameTarget] = React.useState<FileNode | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<FileNode | null>(null);
+  const [inlineRenameId, setInlineRenameId] = React.useState<string | null>(null);
+
+  // Record opens into the recently-opened MRU (granite RecentsView semantics).
+  const openPage = React.useCallback(
+    (id: string) => {
+      const p = pages.find((pg) => pg.id === id);
+      recordWikiRecent(id, p?.title);
+      onOpenPage(id);
+    },
+    [pages, onOpenPage],
+  );
+
+  // Shared inline-rename commit — reuses the SAME connector path as the modal
+  // (renameWikiPage + tab-title sync + reload), so the two entry points stay
+  // behaviourally identical. Throws on failure so the row can surface it.
+  const commitInlineRename = React.useCallback(
+    async (node: FileNode, nextTitle: string) => {
+      const next = nextTitle.trim();
+      if (!connector.renameWikiPage || !next) return;
+      const res = await connector.renameWikiPage(node.id, next);
+      if (res === null) throw new Error("Rename failed");
+      if (!res.renamed) throw new Error("Page not found or empty title");
+      renameTabInStorage(node.id, next);
+      toast.success("Page renamed");
+      reload();
+    },
+    [connector, reload],
+  );
+
   const actions = React.useMemo<ExplorerActions>(
     () => ({
       canEdit,
-      onOpen: onOpenPage,
+      onOpen: openPage,
       onRename: (node) => setRenameTarget(node),
       onDelete: (node) => setDeleteTarget(node),
+      inlineRenameId,
+      beginInlineRename: setInlineRenameId,
+      commitInlineRename,
     }),
-    [canEdit, onOpenPage],
+    [canEdit, openPage, inlineRenameId, commitInlineRename],
   );
+  const [sortMode, setSortMode] = useSortMode();
   const [query, setQuery] = React.useState("");
   // Folders are EXPANDED by default; this set holds the explicitly-collapsed
   // paths (matches granite's `collapsed` semantics — empty = everything open).
   const [collapsed, setCollapsed] = React.useState<ReadonlySet<string>>(new Set());
 
   const filtered = React.useMemo(() => filterPages(pages, query), [pages, query]);
-  const tree = React.useMemo(() => buildTree(filtered), [filtered]);
+  const tree = React.useMemo(() => buildTree(filtered, sortMode), [filtered, sortMode]);
 
   // While filtering, force every folder open so matches deep in the tree are
   // visible; restore the user's collapse state when the query clears.
@@ -281,26 +339,29 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
           onDone={reload}
         />
       )}
-      {/* SEARCH / FILTER BOX */}
-      <div className="relative px-1 pb-2">
-        <Search
-          className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-[color:var(--color-text-tertiary)]"
-          aria-hidden
-        />
-        {loading && (
-          <Loader2
-            className="absolute right-3 top-1/2 size-3.5 -translate-y-1/2 animate-spin text-[color:var(--color-text-tertiary)]"
+      {/* SEARCH / FILTER BOX + SORT MENU */}
+      <div className="flex items-center gap-1 px-1 pb-2">
+        <div className="relative min-w-0 flex-1">
+          <Search
+            className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-[color:var(--color-text-tertiary)]"
             aria-hidden
           />
-        )}
-        <Input
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.currentTarget.value)}
-          placeholder="Filter pages…"
-          aria-label="Filter wiki pages"
-          className="h-8 pl-8 pr-8 text-[13px]"
-        />
+          {loading && (
+            <Loader2
+              className="absolute right-3 top-1/2 size-3.5 -translate-y-1/2 animate-spin text-[color:var(--color-text-tertiary)]"
+              aria-hidden
+            />
+          )}
+          <Input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.currentTarget.value)}
+            placeholder="Filter pages…"
+            aria-label="Filter wiki pages"
+            className="h-8 pl-8 pr-8 text-[13px]"
+          />
+        </div>
+        <SortMenu mode={sortMode} onChange={setSortMode} />
       </div>
 
       {/* TREE */}
@@ -321,7 +382,7 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
                 node={node}
                 depth={0}
                 activePageId={activePageId}
-                onOpenPage={onOpenPage}
+                onOpenPage={openPage}
                 isOpen={isOpen}
                 onToggle={toggle}
               />
@@ -331,6 +392,40 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
       </ScrollArea>
     </div>
     </ExplorerActionsContext.Provider>
+  );
+}
+
+// ── Sort menu ────────────────────────────────────────────────────────────────
+
+function SortMenu({ mode, onChange }: { mode: SortMode; onChange: (m: SortMode) => void }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="iconSm"
+          aria-label="Change sort order"
+          title="Sort"
+          className="size-8 shrink-0 text-[color:var(--color-text-tertiary)]"
+        >
+          <ArrowDownUp className="size-3.5" aria-hidden />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-52">
+        <DropdownMenuLabel>Sort order</DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {SORT_MODES.map((m) => (
+          <DropdownMenuItem
+            key={m}
+            onSelect={() => onChange(m)}
+            className="justify-between"
+          >
+            <span>{SORT_LABELS[m]}</span>
+            {m === mode && <Check className="size-3.5" aria-hidden />}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -473,10 +568,39 @@ function FileRow({ node, depth, activePageId, onOpenPage }: FileRowProps) {
   const active = node.id === activePageId;
   const actions = useExplorerActions();
   const ref = React.useRef<HTMLButtonElement>(null);
+  const editing = actions.canEdit && actions.inlineRenameId === node.id;
   // Reveal the active page when it changes (e.g. opened from search/links).
   React.useEffect(() => {
     if (active) ref.current?.scrollIntoView({ block: "nearest" });
   }, [active]);
+
+  // Keyboard shortcuts on the focused row (granite parity): F2 = inline rename,
+  // Delete / Cmd-Backspace = delete. Enter/Space open (native button behaviour).
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (!actions.canEdit) return;
+    if (e.key === "F2") {
+      e.preventDefault();
+      actions.beginInlineRename(node.id);
+    } else if (e.key === "Delete" || (e.key === "Backspace" && (e.metaKey || e.ctrlKey))) {
+      e.preventDefault();
+      actions.onDelete(node);
+    }
+  };
+
+  // INLINE RENAME — replaces the row with an edit-in-place input. Commit on
+  // Enter via the shared connector path; cancel on Esc/blur. Disabled while the
+  // save is in flight so a second Enter can't double-fire.
+  if (editing) {
+    return (
+      <InlineRenameRow
+        node={node}
+        depth={depth}
+        onCommit={(next) => actions.commitInlineRename(node, next)}
+        onClose={() => actions.beginInlineRename(null)}
+      />
+    );
+  }
+
   const rowButton = (
     <button
       ref={ref}
@@ -484,12 +608,14 @@ function FileRow({ node, depth, activePageId, onOpenPage }: FileRowProps) {
       title={node.label}
       aria-current={active ? "page" : undefined}
       onClick={() => onOpenPage(node.id)}
+      onKeyDown={onKeyDown}
       style={{ paddingInlineStart: 8 + depth * INDENT }}
       className={cn(
         "group flex h-7 w-full items-center gap-1.5 rounded-sm pr-2 text-left",
         "text-[13px] leading-none",
         "text-[color:var(--color-text-secondary)]",
         "transition-colors hover:bg-[color:var(--color-surface-hover)] hover:text-foreground",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[color:var(--color-text-link)]",
         active && "bg-[color:var(--color-surface-hover)] font-medium text-foreground",
       )}
     >
@@ -512,6 +638,10 @@ function FileRow({ node, depth, activePageId, onOpenPage }: FileRowProps) {
       <ContextMenuTrigger asChild>{rowButton}</ContextMenuTrigger>
       <ContextMenuContent className="w-44">
         <ContextMenuItem onSelect={() => actions.onOpen(node.id)}>Open</ContextMenuItem>
+        <ContextMenuItem onSelect={() => actions.beginInlineRename(node.id)}>
+          Rename
+          <span className="ml-auto pl-3 text-[11px] tabular-nums text-[color:var(--color-text-quaternary)]">F2</span>
+        </ContextMenuItem>
         <ContextMenuItem onSelect={() => actions.onRename(node)}>Rename…</ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
@@ -519,9 +649,94 @@ function FileRow({ node, depth, activePageId, onOpenPage }: FileRowProps) {
           className="text-[color:var(--color-red-500,#ef4444)] focus:text-[color:var(--color-red-500,#ef4444)]"
         >
           Delete…
+          <span className="ml-auto pl-3 text-[11px] tabular-nums text-[color:var(--color-text-quaternary)]">⌫</span>
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
+  );
+}
+
+// ── Inline (edit-in-place) rename row ────────────────────────────────────────
+// Replaces a file row with a text input. Commit on Enter (via the shared
+// connector path), cancel on Esc; blur also commits unless the value is
+// unchanged/empty. Matches the explorer's row metrics so the tree doesn't jump.
+function InlineRenameRow({
+  node,
+  depth,
+  onCommit,
+  onClose,
+}: {
+  node: FileNode;
+  depth: number;
+  onCommit: (next: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [value, setValue] = React.useState(node.page.title ?? node.label);
+  const [busy, setBusy] = React.useState(false);
+  // Guards against a blur-after-Enter (or Esc) firing a second commit/close.
+  const doneRef = React.useRef(false);
+  const aliveRef = React.useRef(true);
+  React.useEffect(() => () => { aliveRef.current = false; }, []);
+
+  const cancel = () => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    onClose();
+  };
+
+  const commit = async () => {
+    if (doneRef.current || busy) return;
+    const next = value.trim();
+    // Empty or unchanged → treat as a cancel (no needless RPC / toast).
+    if (!next || next === (node.page.title ?? node.label)) {
+      cancel();
+      return;
+    }
+    doneRef.current = true;
+    setBusy(true);
+    try {
+      await onCommit(next);
+      onClose();
+    } catch (err) {
+      // Re-open the editor so the user can retry / correct.
+      doneRef.current = false;
+      toast.error(err instanceof Error ? err.message : "Rename failed");
+    } finally {
+      if (aliveRef.current) setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      style={{ paddingInlineStart: 8 + depth * INDENT }}
+      className="flex h-7 w-full items-center gap-1.5 rounded-sm pr-2"
+    >
+      <FileText className="size-3.5 shrink-0 text-[color:var(--color-text-tertiary)]" aria-hidden />
+      <input
+        autoFocus
+        disabled={busy}
+        value={value}
+        aria-label={`Rename ${node.label}`}
+        onChange={(e) => setValue(e.currentTarget.value)}
+        onFocus={(e) => e.currentTarget.select()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            void commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            cancel();
+          }
+          // Stop Delete/F2 etc. from bubbling to the tree's row handlers.
+          e.stopPropagation();
+        }}
+        onBlur={() => void commit()}
+        className={cn(
+          "h-6 min-w-0 flex-1 rounded-sm bg-[color:var(--color-surface)] px-1.5 text-[13px] leading-none text-foreground",
+          "outline-none ring-1 ring-[color:var(--color-text-link)]",
+        )}
+      />
+    </div>
   );
 }
 
