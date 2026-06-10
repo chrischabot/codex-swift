@@ -1,6 +1,6 @@
 import * as React from "react";
-import { EditorView } from "@codemirror/view";
-import { Save, X, Eye, Pencil, Bold, Italic, Code, Link2, Heading2, Quote, List, Highlighter } from "lucide-react";
+import { EditorView, keymap } from "@codemirror/view";
+import { Save, X, Eye, Pencil, Bold, Italic, Code, Link2, Heading2, Quote, List, Highlighter, Hash } from "lucide-react";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +12,8 @@ import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { livePreview } from "./livePreview";
 import { wikiAutocomplete } from "./autocomplete";
 import { editorExtensions } from "./extensions";
+import { spellcheckChrome, readableWidthChrome } from "./editorChrome";
+import { insertBlockIdCommand } from "./blockId";
 import {
   formattingKeymap,
   boldCommand,
@@ -32,6 +34,13 @@ interface Props {
   /** Called with the saved page id (created or updated). */
   onSaved?: (id: string) => void;
   onCancel?: () => void;
+  /** Maps a (suffix-stripped) wikilink title to a page id — reused by the
+   *  source editor's Cmd/Ctrl-click navigation (same resolver as the reading
+   *  view). When omitted, link-click navigation is disabled. */
+  resolveWikiLink?: (title: string) => string | undefined;
+  /** Route an in-app path produced by a Cmd/Ctrl-click on a source link.
+   *  `newTab` is true for Shift-click. When omitted, navigation is disabled. */
+  onNavigate?: (path: string, opts: { newTab: boolean }) => void;
 }
 
 type Mode = "edit" | "preview";
@@ -46,7 +55,7 @@ type Mode = "edit" | "preview";
  * reports the new id via onSaved (the host navigates to it). With a `pageId` we
  * load the existing page and overwrite it on save.
  */
-export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
+export function WikiEditor({ pageId, onSaved, onCancel, resolveWikiLink, onNavigate }: Props) {
   const { connector, status } = useRuntime();
   const connected = status.kind === "connected";
   const canSave = connected && typeof connector.saveWikiPage === "function";
@@ -77,12 +86,41 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
     if (viewRef.current) cmd(viewRef.current);
   }, []);
 
+  // Latest title reachable from the (stable) block-id command without rebuilding
+  // the editor extensions each keystroke — the command reads it at call time so
+  // `[[<title>#^id]]` reflects the title as it stands when invoked.
+  const titleRef = React.useRef("");
+  titleRef.current = title;
+  // Latest navigation seam for the source-editor link-click handler. Kept in a
+  // ref so the (memoized) extension never reconfigures when the callback's
+  // identity changes between renders.
+  const onNavigateRef = React.useRef(onNavigate);
+  onNavigateRef.current = onNavigate;
+  const resolveWikiLinkRef = React.useRef(resolveWikiLink);
+  resolveWikiLinkRef.current = resolveWikiLink;
+  // Whether to install the source-editor link-click handler. A boolean (not the
+  // callback identity) so it only re-configures the editor when the host adds /
+  // removes navigation, not on every render.
+  const navEnabled = onNavigate != null;
+
+  // Block-id keymap (Cmd/Ctrl-Shift-6 — `^` lives on `6`): generate `^id`, append
+  // it to the cursor's line, and copy `[[<title>#^id]]` to the clipboard.
+  const blockIdKeymap = React.useMemo(
+    () => keymap.of([
+      { key: "Mod-Shift-6", run: insertBlockIdCommand(() => titleRef.current), preventDefault: true },
+    ]),
+    [],
+  );
+
   // CM6 extension bundle for the editor: Live Preview (render-as-you-type, when
   // enabled in settings) + formatting keymap (Cmd-B/I/`/K) + autocomplete
   // ([[ / # / /) + folding + multi-cursor. Memoized so the editor only
   // reconfigures when the providers/resolver/settings change.
   const cmExtensions = React.useMemo(() => [
     formattingKeymap,
+    blockIdKeymap,
+    spellcheckChrome(settings.spellcheck),
+    ...(settings.readableLineWidth ? [readableWidthChrome()] : []),
     ...(settings.editorLivePreview
       ? [livePreview({ isLinkResolved: (t) => knownTitles.has(t.split(/[#|]/)[0].trim().toLowerCase()) })]
       : []),
@@ -98,8 +136,34 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
         return t.map((x) => x.tag);
       },
     }),
-    editorExtensions({ fold: true }),
-  ], [connector, knownTitles, settings.editorLivePreview]);
+    editorExtensions({
+      fold: true,
+      vim: settings.editorVim,
+      autoPairBrackets: settings.autoPairBrackets,
+      indentOnInput: settings.indentOnInput,
+      // Read through refs so the click handler always uses the live callbacks
+      // without forcing the extension array (hence the editor) to reconfigure.
+      // Only install the handler when the host actually wired navigation, so a
+      // Cmd-click over a link isn't silently swallowed when there's nowhere to go.
+      linkNav: navEnabled
+        ? {
+            resolveWikiLink: (t) => resolveWikiLinkRef.current?.(t),
+            onNavigate: (path, opts) => onNavigateRef.current?.(path, opts),
+          }
+        : undefined,
+    }),
+  ], [
+    connector,
+    knownTitles,
+    blockIdKeymap,
+    navEnabled,
+    settings.editorLivePreview,
+    settings.spellcheck,
+    settings.readableLineWidth,
+    settings.editorVim,
+    settings.autoPairBrackets,
+    settings.indentOnInput,
+  ]);
 
   // Load the existing page (edit mode). New-page mode resets to a blank draft.
   React.useEffect(() => {
@@ -237,6 +301,13 @@ export function WikiEditor({ pageId, onSaved, onCancel }: Props) {
           <FormatButton label="Heading" onClick={() => runCmd(headingCommand(2))}><Heading2 className="size-3.5" /></FormatButton>
           <FormatButton label="Quote" onClick={() => runCmd(quoteCommand)}><Quote className="size-3.5" /></FormatButton>
           <FormatButton label="Bullet list" onClick={() => runCmd(bulletCommand)}><List className="size-3.5" /></FormatButton>
+          <div className="mx-1 h-4 w-px bg-[color:var(--border)]" />
+          <FormatButton
+            label="Block ID — copies [[Page#^id]] (⌘⇧6)"
+            onClick={() => runCmd(insertBlockIdCommand(() => titleRef.current))}
+          >
+            <Hash className="size-3.5" />
+          </FormatButton>
         </div>
       )}
 

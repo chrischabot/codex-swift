@@ -2,6 +2,7 @@ import {
   AlertTriangle,
   Bug,
   Check,
+  ChevronRight,
   CircleAlert,
   CircleHelp,
   Flame,
@@ -14,7 +15,7 @@ import {
   Star,
   X,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { cn } from "@/lib/utils";
 import type { CalloutType } from "./wikiRemarkPlugins";
 
@@ -23,6 +24,9 @@ interface Props {
   type: CalloutType;
   /** Header title; when null the capitalized type name is shown. */
   title?: string | null;
+  /** Foldable marker captured by remarkCallouts: `+` (foldable, open) /
+   *  `-` (foldable, collapsed) / null (not foldable — no toggle). */
+  fold?: "+" | "-" | null;
   children?: ReactNode;
 }
 
@@ -87,28 +91,58 @@ function capitalize(s: string): string {
  * row with a lucide icon and title, and the markdown body underneath.
  * Mirrors granite's reading-mode `.callout` block (renderer.ts:447-498).
  */
-export function Callout({ type, title, children }: Props) {
+export function Callout({ type, title, fold = null, children }: Props) {
   const style = styleFor(type);
   const Icon = style.icon;
+  const foldable = fold === "+" || fold === "-";
+  // Initial collapsed state follows the marker (`-` = start collapsed).
+  const [collapsed, setCollapsed] = useState(fold === "-");
+  const headerLabel = title ?? capitalize(type);
+
   return (
     <div
       className={cn(
         "wiki-callout my-4 overflow-hidden rounded-md border border-l-[3px]",
         "border-[color:var(--border)]",
         `wiki-callout-${type}`,
+        foldable && collapsed && "is-collapsed",
       )}
       data-callout={type}
       style={{ borderLeftColor: style.accent, backgroundColor: style.tint }}
     >
-      <div className="flex items-center gap-2 px-3 pt-2.5 pb-1 font-semibold">
-        <Icon className="size-4 shrink-0" style={{ color: style.accent }} aria-hidden />
-        <span className="text-[14px]" style={{ color: style.accent }}>
-          {title ?? capitalize(type)}
-        </span>
-      </div>
-      <div className="px-3 pb-2.5 text-[14px] leading-[1.65] text-foreground [&>:last-child]:mb-0">
-        {children}
-      </div>
+      {foldable ? (
+        <button
+          type="button"
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex w-full items-center gap-2 px-3 pt-2.5 pb-1 text-left font-semibold"
+        >
+          <ChevronRight
+            className={cn(
+              "size-3.5 shrink-0 transition-transform",
+              !collapsed && "rotate-90",
+            )}
+            style={{ color: style.accent }}
+            aria-hidden
+          />
+          <Icon className="size-4 shrink-0" style={{ color: style.accent }} aria-hidden />
+          <span className="text-[14px]" style={{ color: style.accent }}>
+            {headerLabel}
+          </span>
+        </button>
+      ) : (
+        <div className="flex items-center gap-2 px-3 pt-2.5 pb-1 font-semibold">
+          <Icon className="size-4 shrink-0" style={{ color: style.accent }} aria-hidden />
+          <span className="text-[14px]" style={{ color: style.accent }}>
+            {headerLabel}
+          </span>
+        </div>
+      )}
+      {!(foldable && collapsed) && (
+        <div className="px-3 pb-2.5 text-[14px] leading-[1.65] text-foreground [&>:last-child]:mb-0">
+          {children}
+        </div>
+      )}
     </div>
   );
 }

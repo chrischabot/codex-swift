@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useLocation } from "react-router-dom";
 import { Pencil, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Settings as SettingsIcon } from "lucide-react";
@@ -21,6 +22,10 @@ export interface LeafBodyCallbacks {
   onTag: (tag: string) => void;
   onJump: (slug: string) => void;
   resolveWikiLink: (title: string) => string | undefined;
+  /** Navigate to an already-resolved in-app route (used by the source-editor
+   *  Cmd/Ctrl+click and anything that already has a finished `/wiki/...` path).
+   *  `newTab` opens it in a new browser tab. */
+  onNavigatePath: (path: string, opts: { newTab: boolean }) => void;
   /** Open settings (gear). */
   onOpenSettings: () => void;
   /** Navigate the pane after a page is deleted / its body changes id. */
@@ -65,6 +70,7 @@ function PageLeafBody({
   callbacks: LeafBodyCallbacks;
 }) {
   const { connector, status } = useRuntime();
+  const location = useLocation();
   const [reloadKey, setReloadKey] = React.useState(0);
   const [editing, setEditing] = React.useState(false);
   const { page, loading } = useWikiPage(pageId, reloadKey);
@@ -112,6 +118,8 @@ function PageLeafBody({
     return (
       <WikiEditor
         pageId={pageId}
+        resolveWikiLink={callbacks.resolveWikiLink}
+        onNavigate={callbacks.onNavigatePath}
         onSaved={(id) => {
           // An in-pane editor always edits an existing page, so the saved id
           // matches pageId; reload this pane's body and refresh the live page
@@ -145,6 +153,8 @@ function PageLeafBody({
           onWikiLink={callbacks.onWikiLink}
           onTag={callbacks.onTag}
           resolveWikiLink={callbacks.resolveWikiLink}
+          fragment={isActive ? decodeURIComponent(location.hash.replace(/^#/, "")) || null : null}
+          onPageSaved={callbacks.onPageSaved}
         />
       </div>
     </ScrollArea>

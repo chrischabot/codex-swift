@@ -1,13 +1,16 @@
-import { codeFolding, foldGutter, foldKeymap } from "@codemirror/language";
+import { closeBrackets } from "@codemirror/autocomplete";
+import { codeFolding, foldGutter, foldKeymap, indentOnInput } from "@codemirror/language";
 import { search, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import {
   EditorView,
   crosshairCursor,
+  drawSelection,
   keymap,
   rectangularSelection,
 } from "@codemirror/view";
 import { vim } from "@replit/codemirror-vim";
+import { sourceLinkNav, type SourceLinkNavOptions } from "./sourceLinkNav";
 
 /**
  * Curated CodeMirror 6 productivity bundle for the wiki editor, ported from
@@ -50,6 +53,12 @@ export interface EditorExtensionsOptions {
   vim?: boolean;
   /** Enable code folding + the fold gutter. */
   fold?: boolean;
+  /** Auto-close brackets/quotes as you type (CM6 closeBrackets). */
+  autoPairBrackets?: boolean;
+  /** Re-indent the current line on input (CM6 indentOnInput). */
+  indentOnInput?: boolean;
+  /** Cmd/Ctrl-click navigation for `[[wikilinks]]` / `[md](url)` in source. */
+  linkNav?: SourceLinkNavOptions;
 }
 
 /**
@@ -62,11 +71,25 @@ export interface EditorExtensionsOptions {
  * - The keymap is appended last so fold/search bindings win where they should;
  *   the host's base keymap (default + history) should be ordered before this
  *   bundle so defaults remain the fallback.
+ * - `autoPairBrackets` / `indentOnInput` are included only when enabled (they're
+ *   gated on the wiki settings); when off they contribute nothing.
+ * - `drawSelection({ drawRangeCursor: true })` replaces the native selection so
+ *   multi-cursor carets are drawn clearly at every range.
  */
-export function editorExtensions({ vim: vimOn = false, fold = true }: EditorExtensionsOptions = {}): Extension {
+export function editorExtensions({
+  vim: vimOn = false,
+  fold = true,
+  autoPairBrackets = false,
+  indentOnInput: indentOnInputOn = false,
+  linkNav,
+}: EditorExtensionsOptions = {}): Extension {
   return [
     multiSelectionExtensions(),
+    drawSelection({ drawRangeCursor: true }),
     EditorView.clickAddsSelectionRange.of(editorClickAddsSelectionRange),
+    autoPairBrackets ? closeBrackets() : [],
+    indentOnInputOn ? indentOnInput() : [],
+    linkNav ? sourceLinkNav(linkNav) : [],
     foldCompartment.of(fold ? foldExtensions() : []),
     vimCompartment.of(vimExtensions(vimOn)),
     search({ top: true }),

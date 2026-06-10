@@ -101,6 +101,7 @@ function WikiPopoutPage() {
     onTag: () => {},
     onJump: (slug) => document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" }),
     resolveWikiLink,
+    onNavigatePath: (path, { newTab }) => (newTab ? window.open(path, "_blank") : popNav(path)),
     onOpenSettings: () => {},
     onDeleted: () => window.close(),
     onPageSaved: () => {},
@@ -228,6 +229,15 @@ function WikiWorkspacePage() {
       onJump: (slug: string) =>
         document.getElementById(slug)?.scrollIntoView({ behavior: "smooth", block: "start" }),
       resolveWikiLink,
+      onNavigatePath: (path: string, { newTab }: { newTab: boolean }) => {
+        if (newTab) {
+          window.open(path, "_blank");
+          return;
+        }
+        ws.focusGroup(groupId);
+        if (path.startsWith("#")) navigate({ pathname: location.pathname, hash: path });
+        else navigate(path);
+      },
       onOpenSettings: () => setSettingsOpen(true),
       onDeleted: () => {
         ws.closeLeaf(leaf.id);
@@ -254,7 +264,12 @@ function WikiWorkspacePage() {
     return (
       <div className="flex min-h-0 flex-1 flex-col">
         {overlays}
-        <WikiEditor onSaved={(id) => navigate(`/wiki/${id}`)} onCancel={() => navigate("/wiki")} />
+        <WikiEditor
+          resolveWikiLink={resolveWikiLink}
+          onNavigate={(path, { newTab }) => (newTab ? window.open(path, "_blank") : navigate(path))}
+          onSaved={(id) => navigate(`/wiki/${id}`)}
+          onCancel={() => navigate("/wiki")}
+        />
       </div>
     );
   }

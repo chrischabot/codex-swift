@@ -31,6 +31,12 @@ export interface GraphSettings {
    * zoomed further out; higher hides them until you zoom in.
    */
   labelThreshold: number;
+  /**
+   * Node-label font size in screen px. Decoupled from {@link labelThreshold}
+   * (which only gates label VISIBILITY): this scales how large visible labels
+   * render. Read per-frame in the draw path.
+   */
+  textSize: number;
 
   // --- Filters / data shaping ---
   /** Node coloring mode. */
@@ -51,6 +57,7 @@ export const DEFAULT_GRAPH_SETTINGS: GraphSettings = {
   nodeSize: 5,
   linkThickness: 1,
   labelThreshold: 1.1,
+  textSize: 11,
   colorBy: "kind",
   depth: 2,
 };
@@ -68,6 +75,7 @@ export const GRAPH_DISPLAY_SLIDERS: GraphSliderSpec[] = [
   { key: "nodeSize", label: "Node size", min: 2, max: 12, step: 1 },
   { key: "linkThickness", label: "Link thickness", min: 0.2, max: 3, step: 0.1 },
   { key: "labelThreshold", label: "Label threshold", min: 0.4, max: 3, step: 0.1 },
+  { key: "textSize", label: "Text size", min: 8, max: 24, step: 1 },
 ];
 
 export const GRAPH_FORCE_SLIDERS: GraphSliderSpec[] = [

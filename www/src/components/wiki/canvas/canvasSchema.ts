@@ -20,7 +20,8 @@ export interface CanvasNode {
   y: number;
   w: number;
   h: number;
-  /** text node body (markdown-ish; rendered as plain text here). */
+  /** text node body (markdown; rendered read-only via WikiMarkdown when the
+   *  node is not being edited, raw in the textarea while editing). */
   text?: string;
   /** page node: id of the wiki page this card previews / opens. */
   pageId?: string;

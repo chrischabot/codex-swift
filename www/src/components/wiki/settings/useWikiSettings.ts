@@ -111,6 +111,7 @@ function coerce(raw: unknown): WikiSettings {
       nodeSize: num(g.nodeSize, d.graphDefaults.nodeSize),
       linkThickness: num(g.linkThickness, d.graphDefaults.linkThickness),
       labelThreshold: num(g.labelThreshold, d.graphDefaults.labelThreshold),
+      textSize: num(g.textSize, d.graphDefaults.textSize),
       colorBy: g.colorBy === "none" ? "none" : "kind",
       depth: num(g.depth, d.graphDefaults.depth),
     },

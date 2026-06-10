@@ -6,6 +6,7 @@ import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import { cn } from "@/lib/utils";
 import { CodeBlock } from "@/components/chat/CodeBlock";
+import { Mermaid } from "@/components/chat/Mermaid";
 import { Callout } from "./markdown/Callout";
 import { WikiEmbed } from "./markdown/WikiEmbed";
 import { WikiLinkWithHover } from "./hover/WikiLinkWithHover";
@@ -15,7 +16,9 @@ import {
   decodeWikiTarget,
   remarkBlockIds,
   remarkCallouts,
+  remarkHashtags,
   remarkHighlight,
+  remarkTaskListLines,
   remarkWikilinks,
   stripComments,
 } from "./markdown/wikiRemarkPlugins";
@@ -23,6 +26,10 @@ import {
 // here — the renderer that emits the .wiki-* classes — so it always loads with
 // the reading surface and switches with the app's .dark theme.
 import "@/styles/wiki.css";
+
+/** No-op handler for the controlled-but-readonly task checkbox (see `input`
+ *  override). Stable identity avoids a re-render churn. */
+const NOOP = () => {};
 
 interface Props {
   content: string;
@@ -35,6 +42,16 @@ interface Props {
    *  (typically a lowercased title→id Map from listWikiPages); returns undefined
    *  for dangling links, which then render as a plain anchor (no card). */
   resolveWikiLink?: (title: string) => string | undefined;
+  /** Invoked when an inline `#tag` link is clicked. Receives the bare tag (no
+   *  leading `#`). When omitted, inline tags render as plain styled spans. */
+  onTag?: (tag: string) => void;
+  /** Toggle a task-list checkbox. `line` is the 0-based source line of the
+   *  `- [ ]` / `- [x]` item; `checked` is the NEW desired state. When omitted
+   *  checkboxes stay read-only (matching the previous behavior). */
+  onToggleTask?: (line: number, checked: boolean) => void;
+  /** Constrain the rendered content to a readable max line width (from the
+   *  wiki `readableLineWidth` setting). */
+  readableLineWidth?: boolean;
 }
 
 /**
@@ -48,7 +65,14 @@ interface Props {
  *   - `==highlight==`                           → <mark>
  *   - footnotes `[^1]` (+ defs)                 → via remark-gfm; styled here
  */
-export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
+export function WikiMarkdown({
+  content,
+  onWikiLink,
+  resolveWikiLink,
+  onTag,
+  onToggleTask,
+  readableLineWidth,
+}: Props) {
   const src = stripComments(content);
 
   // The "wiki-embed" key is a custom element name not in JSX.IntrinsicElements,
@@ -75,6 +99,33 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
           >
             {children}
           </WikiLinkWithHover>
+        );
+      }
+      // Inline `#tag` links (emitted by remarkHashtags as `wikitag:<tag>`):
+      // route the click through onTag (bare tag, no leading #) instead of the
+      // browser. When no handler is wired, render a non-navigating styled span.
+      if (typeof href === "string" && href.startsWith("wikitag:")) {
+        const tag = decodeWikiTarget(href.slice("wikitag:".length));
+        const clickable = typeof onTag === "function";
+        return (
+          <a
+            href={`#${tag}`}
+            className={cn(
+              "wiki-tag text-[color:var(--text-link)] no-underline",
+              clickable && "cursor-pointer hover:underline",
+            )}
+            role={clickable ? "button" : undefined}
+            onClick={
+              clickable
+                ? (e) => {
+                    e.preventDefault();
+                    onTag!(tag);
+                  }
+                : (e) => e.preventDefault()
+            }
+          >
+            {children}
+          </a>
         );
       }
       // In-document fragment links (#heading, GFM footnote refs/backrefs) must
@@ -124,6 +175,7 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
         node?: unknown;
         "data-callout"?: string;
         "data-callout-title"?: string;
+        "data-callout-fold"?: string;
       };
       const calloutType = (rest as Record<string, unknown>)["data-callout"] as
         | string
@@ -132,8 +184,12 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
         const title = (rest as Record<string, unknown>)["data-callout-title"] as
           | string
           | undefined;
+        const foldRaw = (rest as Record<string, unknown>)["data-callout-fold"] as
+          | string
+          | undefined;
+        const fold = foldRaw === "+" || foldRaw === "-" ? foldRaw : null;
         return (
-          <Callout type={calloutType as CalloutType} title={title ?? null}>
+          <Callout type={calloutType as CalloutType} title={title ?? null} fold={fold}>
             {children}
           </Callout>
         );
@@ -164,27 +220,73 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
       </ul>
     ),
     ol: ({ children }) => <ol className="mb-3 list-decimal pl-5 last:mb-0">{children}</ol>,
-    li: ({ children, className: cls, node: _n, ...rest }) => (
-      <li
-        {...rest}
-        className={cn(
-          "mb-1 marker:text-[color:var(--color-text-quaternary)]",
-          (cls ?? "").includes("task-list-item") && "task-list-item flex list-none items-start gap-2",
-        )}
-      >
-        {children}
-      </li>
-    ),
+    li: (props) => {
+      const { children, className: cls, node: _n, ...rest } = props as ComponentProps<"li"> & {
+        node?: unknown;
+        "data-task-line"?: string;
+        "data-task-checked"?: string;
+      };
+      const isTask = (cls ?? "").includes("task-list-item");
+      // remarkTaskListLines stamps the 0-based source line + current state on the
+      // <li> (react-markdown v9 strips mdast position from the node it passes to
+      // overrides, so the line is recovered from this data-attr instead). When a
+      // toggle handler is wired we intercept clicks on the checkbox and report
+      // that source line + the new state.
+      const lineStr = (rest as Record<string, unknown>)["data-task-line"] as string | undefined;
+      const checkedStr = (rest as Record<string, unknown>)["data-task-checked"] as string | undefined;
+      const line = lineStr != null && /^\d+$/.test(lineStr) ? Number(lineStr) : undefined;
+      const editable = isTask && typeof onToggleTask === "function" && line != null;
+      // Strip our private data-attrs so they don't leak onto the DOM <li>.
+      delete (rest as Record<string, unknown>)["data-task-line"];
+      delete (rest as Record<string, unknown>)["data-task-checked"];
+      return (
+        <li
+          {...rest}
+          className={cn(
+            "mb-1 marker:text-[color:var(--color-text-quaternary)]",
+            isTask && "task-list-item flex list-none items-start gap-2",
+            editable && "[&>input[type=checkbox]]:cursor-pointer",
+          )}
+          // Capture-phase click on the (otherwise read-only) checkbox toggles
+          // the matching source line. Using onClick (not onChange) avoids React's
+          // controlled-checkbox warning while the box stays a read-only mirror of
+          // persisted state — the host re-renders with the new body after saving.
+          onClickCapture={
+            editable
+              ? (e) => {
+                  const t = e.target as HTMLElement;
+                  if (
+                    t instanceof HTMLInputElement &&
+                    t.type === "checkbox"
+                  ) {
+                    e.preventDefault();
+                    onToggleTask!(line!, checkedStr !== "true");
+                  }
+                }
+              : undefined
+          }
+        >
+          {children}
+        </li>
+      );
+    },
     input: (props) => {
       const { type } = props as { type?: string };
       if (type === "checkbox") {
+        // Task checkboxes render as a read-only mirror of the persisted state;
+        // the editable toggle is wired on the parent <li> (see above), so the
+        // box never desyncs from the saved body. Plain (non-task) inputs pass
+        // through untouched.
         return (
           <input
             type="checkbox"
-            disabled
-            checked={(props as { checked?: boolean }).checked}
-            className="mt-1 size-3.5 shrink-0 accent-[color:var(--color-blue-400)]"
             readOnly
+            checked={(props as { checked?: boolean }).checked ?? false}
+            // Controlled + readOnly: a no-op onChange silences React's warning;
+            // the real toggle is the parent <li>'s onClickCapture. When no
+            // handler is wired the click is harmless (readOnly = no state flip).
+            onChange={NOOP}
+            className="mt-1 size-3.5 shrink-0 accent-[color:var(--color-blue-400)]"
           />
         );
       }
@@ -206,6 +308,11 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
         );
       }
       const lang = langMatch ? langMatch[1] : "text";
+      // A ```mermaid fence renders as a live diagram (reusing the chat
+      // Mermaid component) rather than a syntax-highlighted source block.
+      if (lang === "mermaid") {
+        return <Mermaid content={text.replace(/\n$/, "")} />;
+      }
       return <CodeBlock language={lang} code={text.replace(/\n$/, "")} />;
     },
     pre: ({ children }) => <>{children}</>,
@@ -276,18 +383,25 @@ export function WikiMarkdown({ content, onWikiLink, resolveWikiLink }: Props) {
   } as Components;
 
   return (
-    <div className="wiki-markdown max-w-none text-[14px] leading-[1.65] text-foreground">
+    <div
+      className={cn(
+        "wiki-markdown text-[14px] leading-[1.65] text-foreground",
+        readableLineWidth ? "wiki-readable-width mx-auto max-w-[42rem]" : "max-w-none",
+      )}
+    >
       <ReactMarkdown
         // remarkCallouts runs BEFORE wikilinks/highlight so it sees the callout
         // header's first text node intact (a `[!tip] [[Home]]` title isn't split
         // out from under it).
-        remarkPlugins={[remarkGfm, remarkMath, remarkBlockIds, remarkCallouts, remarkWikilinks, remarkHighlight]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkTaskListLines, remarkBlockIds, remarkCallouts, remarkWikilinks, remarkHighlight, remarkHashtags]}
         rehypePlugins={[rehypeKatex, rehypeHeadingIds]}
         // Preserve the `wiki:` sentinel scheme that remarkWikilinks emits —
         // react-markdown's defaultUrlTransform would otherwise strip it to "",
         // breaking every internal link. Everything else still goes through the
         // default safe-protocol transform.
-        urlTransform={(url) => (url.startsWith("wiki:") ? url : defaultUrlTransform(url))}
+        urlTransform={(url) =>
+          url.startsWith("wiki:") || url.startsWith("wikitag:") ? url : defaultUrlTransform(url)
+        }
         components={components}
       >
         {src}

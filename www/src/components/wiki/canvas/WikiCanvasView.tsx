@@ -41,6 +41,7 @@ import {
   cloneSelection,
 } from "./canvasSchema";
 import { useCanvasDoc } from "./useCanvasDoc";
+import { WikiMarkdown } from "../WikiMarkdown";
 
 export interface WikiCanvasViewProps {
   pageId: string;
@@ -1084,9 +1085,19 @@ const CanvasNodeView = React.memo(function CanvasNodeView({
         {node.type === "text" ? (
           editing ? (
             <TextEditor initial={node.text ?? ""} onCommit={onTextCommit} onCancel={onTextCancel} />
+          ) : node.text ? (
+            // Read-only rendered markdown. `pointer-events-none` makes the whole
+            // rendered surface transparent to the pointer so a drag that starts
+            // inside the node still drags the node, and a double-click bubbles to
+            // the node's onDoubleClick → switches to raw edit (parity with the
+            // plain-text view it replaces). The renderer is reused as-is — no
+            // link callbacks, since nothing here is interactive.
+            <div className="pointer-events-none h-full overflow-auto p-2.5 text-card-foreground [&_.wiki-markdown]:text-[13px]">
+              <WikiMarkdown content={node.text} />
+            </div>
           ) : (
             <div className="h-full overflow-auto whitespace-pre-wrap p-2.5 text-sm">
-              {node.text || <span className="text-muted-foreground italic">Double-click to edit</span>}
+              <span className="text-muted-foreground italic">Double-click to edit</span>
             </div>
           )
         ) : null}

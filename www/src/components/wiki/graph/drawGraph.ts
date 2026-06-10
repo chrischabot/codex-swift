@@ -82,7 +82,8 @@ export interface DrawGraphOptions {
   nodeSize: number;
   /** Base link thickness in screen px. */
   linkThickness: number;
-  /** Label font size in screen px. */
+  /** Label font size in screen px. Decoupled from the zoom threshold that
+   *  gates `showLabels` — controls how large visible labels render. */
   labelSize: number;
   /** Whether to draw labels this frame (caller gates on the zoom threshold). */
   showLabels: boolean;

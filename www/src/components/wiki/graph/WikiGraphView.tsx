@@ -32,8 +32,6 @@ const MAX_SCALE = 3;
 /** Stop the rAF loop when alpha drops below this AND nothing is animating. */
 const COOL_ALPHA = 0.005;
 
-/** Label font size in screen px (not exposed as a slider; threshold is). */
-const LABEL_SIZE = 11;
 /** Padding (screen px) left around the graph when fitting to view. */
 const FIT_PADDING = 48;
 
@@ -288,7 +286,7 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
         neighborMask: mask,
         nodeSize: s.nodeSize,
         linkThickness: s.linkThickness,
-        labelSize: LABEL_SIZE,
+        labelSize: s.textSize,
         showLabels: viewRef.current.scale > s.labelThreshold,
         colors: colorsRef.current,
       });
@@ -335,8 +333,8 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
   //  - Force sliders → push into the running sim, reheat, and wake the loop so
   //    the layout re-settles under the new forces.
   //  - colorBy → re-tint the existing draw nodes (no reheat needed).
-  //  - Display sliders (nodeSize / linkThickness / labelThreshold) are read
-  //    per-frame from settingsRef, so a wake() is enough to repaint.
+  //  - Display sliders (nodeSize / linkThickness / labelThreshold / textSize)
+  //    are read per-frame from settingsRef, so a wake() is enough to repaint.
   const prevForcesRef = React.useRef<{ repulsion: number; attraction: number; linkDistance: number; centerGravity: number } | null>(null);
   React.useEffect(() => {
     const sim = simRef.current;
@@ -360,7 +358,7 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
           prev.linkDistance !== next.linkDistance ||
           prev.centerGravity !== next.centerGravity;
         // Only push forces + reheat when a FORCE slider actually moved. Display
-        // sliders (nodeSize/linkThickness/labelThreshold) and colorBy are read
+        // sliders (nodeSize/linkThickness/labelThreshold/textSize) and colorBy are read
         // per-frame / re-tinted below, so they just need a repaint — reheating on
         // them would visibly disturb an already-settled layout.
         if (forcesChanged) {

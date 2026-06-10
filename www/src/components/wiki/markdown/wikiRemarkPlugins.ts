@@ -158,6 +158,44 @@ export function remarkBlockIds() {
   }
 }
 
+/**
+ * remark transform: stamp the 0-based SOURCE LINE of each GFM task-list item
+ * onto its `data.hProperties` as `data-task-line`, plus the current checked
+ * state as `data-task-checked`. react-markdown v9 strips mdast `position` from
+ * the hast `node` it passes to component overrides, so the reading view cannot
+ * otherwise recover which source line a checkbox came from. The `li` override
+ * reads these back to wire an editable, line-targeted checkbox.
+ *
+ * Only items remark-gfm recognized as tasks (`checked` is boolean) are stamped;
+ * a `null` checked (plain list item) is left untouched.
+ */
+export function remarkTaskListLines() {
+  return (tree: MdastNode): void => walk(tree);
+
+  function walk(node: MdastNode): void {
+    if (!isParent(node)) return;
+    for (const child of node.children) {
+      if (
+        child.type === "listItem" &&
+        typeof (child as { checked?: unknown }).checked === "boolean"
+      ) {
+        const li = child as MdastParent & {
+          checked?: boolean;
+          position?: { start?: { line?: number } };
+        };
+        const line = li.position?.start?.line;
+        if (typeof line === "number") {
+          const data = (li.data ??= {} as MdastNodeData);
+          const props = (data.hProperties ??= {} as Record<string, unknown>);
+          props["data-task-line"] = String(line - 1); // 1-based → 0-based
+          props["data-task-checked"] = li.checked ? "true" : "false";
+        }
+      }
+      walk(child);
+    }
+  }
+}
+
 /** Decode a percent-encoded wiki link target back to its human title. rehype
  *  percent-encodes the `wiki:` URL (spaces → %20), so the title must be decoded
  *  before resolving against a title→id map. Tolerant of malformed escapes. */
@@ -496,6 +534,95 @@ export function remarkCallouts() {
     props["data-callout"] = header.type;
     if (header.title) props["data-callout-title"] = header.title;
     if (header.fold) props["data-callout-fold"] = header.fold;
+  }
+}
+
+// ── remarkHashtags (#tag → tag anchor) ──────────────────────────────────────
+
+// A hashtag body char: ASCII letter / digit / `-` `_` `/`, or any non-ASCII
+// (granite treats codepoints ≥ 0x80 as tag-continue, so unicode tags work).
+// Mirrors the char classes in granite renderer.ts:288-297.
+function isTagChar(c: string): boolean {
+  return /[A-Za-z0-9/_-]/.test(c) || c.charCodeAt(0) >= 0x80;
+}
+
+// A `#` only starts a tag at the very start of the text node OR when preceded
+// by a separator. Granite's inline rule allows ` `, `\n`, `\r`, `\t`, `(`, `[`.
+// (The text node has already been split out of code/inlineCode, so a `#` inside
+// a fence never reaches here.)
+function isTagBoundary(prev: string | undefined): boolean {
+  return prev === undefined || prev === " " || prev === "\n" || prev === "\r" || prev === "\t" || prev === "(" || prev === "[";
+}
+
+/**
+ * remark plugin: rewrite inline `#tag` tokens into mdast `link` nodes carrying a
+ * `wikitag:` URL sentinel + `data-wikitag` so WikiMarkdown's `a` override routes
+ * the click through the onTag handler. Ported from granite's `hashtag` inline
+ * rule (renderer.ts:272-314): a `#` must sit at a separator boundary, the body
+ * is letters/digits/`-_/`/unicode, and a purely-numeric body (e.g. `#1`, a
+ * heading-anchor-looking token) is NOT a tag. ATX headings are never affected —
+ * a `# Heading` line becomes a `heading` node, so its `#` is gone before we see
+ * the text. Operates on text nodes only (skips code/math/html literals).
+ */
+export function remarkHashtags() {
+  return (tree: MdastNode): void => {
+    transform(tree);
+  };
+
+  function transform(node: MdastNode): void {
+    if (!isParent(node)) return;
+    const out: MdastNode[] = [];
+    for (const child of node.children) {
+      if (child.type === "text") {
+        out.push(...splitText((child as MdastText).value));
+      } else {
+        if (!LITERAL_TYPES.has(child.type)) transform(child);
+        out.push(child);
+      }
+    }
+    node.children = out;
+  }
+
+  function splitText(value: string): MdastNode[] {
+    const nodes: MdastNode[] = [];
+    let last = 0;
+    let i = 0;
+    while (i < value.length) {
+      if (value[i] !== "#" || !isTagBoundary(i > 0 ? value[i - 1] : undefined)) {
+        i += 1;
+        continue;
+      }
+      let end = i + 1;
+      while (end < value.length && isTagChar(value[end]!)) end += 1;
+      const body = value.slice(i + 1, end);
+      // Empty (`# foo`) or all-digit (`#42`) bodies are not tags.
+      if (body.length === 0 || /^[0-9]+$/.test(body)) {
+        i = end > i + 1 ? end : i + 1;
+        continue;
+      }
+      if (i > last) {
+        nodes.push({ type: "text", value: value.slice(last, i) } as MdastText);
+      }
+      nodes.push({
+        type: "wikiTag",
+        url: `wikitag:${body}`,
+        children: [{ type: "text", value: `#${body}` } as MdastText],
+        data: {
+          hName: "a",
+          hProperties: {
+            href: `wikitag:${body}`,
+            "data-wikitag": body,
+            className: "wiki-tag",
+          },
+        },
+      } as MdastNode);
+      last = end;
+      i = end;
+    }
+    if (last < value.length) {
+      nodes.push({ type: "text", value: value.slice(last) } as MdastText);
+    }
+    return nodes.length > 0 ? nodes : [{ type: "text", value } as MdastText];
   }
 }
 
