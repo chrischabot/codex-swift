@@ -8,8 +8,8 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
-import { useRuntime } from "@/runtime/RuntimeProvider";
-import type { WikiPageSummary } from "@/runtime/connector";
+import { useWikiMetadataIndex } from "./useWikiMetadataIndex";
+import { fuzzyRank } from "./fuzzyRank";
 
 interface Props {
   open: boolean;
@@ -32,35 +32,22 @@ const itemClass =
  * a clean empty state rather than a throw).
  */
 export function WikiQuickSwitcher({ open, onOpenChange }: Props) {
-  const { connector, status } = useRuntime();
   const navigate = useNavigate();
-  const [pages, setPages] = React.useState<WikiPageSummary[]>([]);
-  const [loading, setLoading] = React.useState(false);
+  // The whole vault (no 500 cap), via the shared metadata index.
+  const { pages, loading } = useWikiMetadataIndex();
+  const [query, setQuery] = React.useState("");
 
+  // Reset the query each time the dialog reopens.
   React.useEffect(() => {
-    if (!open) return;
-    if (!connector.listWikiPages || status.kind !== "connected") {
-      setPages([]);
-      setLoading(false);
-      return;
-    }
-    let alive = true;
-    setLoading(true);
-    connector
-      .listWikiPages({ limit: 500 })
-      .then((p) => {
-        if (alive) setPages(p);
-      })
-      .catch(() => {
-        if (alive) setPages([]);
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [open, connector, status.kind]);
+    if (open) setQuery("");
+  }, [open]);
+
+  // Rank the entire vault in compute and render only the top matches, so 5k+
+  // pages stay fast (rendering every page for cmdk to score does not).
+  const ranked = React.useMemo(
+    () => fuzzyRank(query, pages, (p) => p.title || "Untitled", 50),
+    [query, pages],
+  );
 
   const go = (id: string) => {
     onOpenChange(false);
@@ -74,13 +61,15 @@ export function WikiQuickSwitcher({ open, onOpenChange }: Props) {
         <DialogDescription className="sr-only">
           Fuzzy-search wiki pages by title and open one
         </DialogDescription>
-        {/* cmdk filters on the value prop; we give each item its title as the
-            value so the built-in fuzzy scorer ranks by title. */}
-        <Command label="Jump to wiki page">
+        {/* We rank in compute (fuzzyRank) and render only the top matches, so
+            cmdk does NOT filter — shouldFilter=false. */}
+        <Command label="Jump to wiki page" shouldFilter={false}>
           <div className="flex items-center gap-2 border-b border-[color:var(--border)] px-3">
             <Search className="size-4 text-[color:var(--color-text-tertiary)]" />
             <Command.Input
               autoFocus
+              value={query}
+              onValueChange={setQuery}
               placeholder={loading ? "Loading pages…" : "Jump to page…"}
               className="h-11 flex-1 bg-transparent text-foreground outline-none placeholder:text-[color:var(--color-text-quaternary)]"
             />
@@ -96,12 +85,10 @@ export function WikiQuickSwitcher({ open, onOpenChange }: Props) {
                 {pages.length === 0 ? "No wiki pages" : "No matching pages"}
               </Command.Empty>
             )}
-            {pages.map((p) => (
+            {ranked.map(({ item: p }) => (
               <Command.Item
                 key={p.id}
-                // value drives cmdk's fuzzy match; suffix the id so distinct
-                // pages that share a title remain individually selectable.
-                value={`${p.title} ${p.id}`}
+                value={p.id}
                 onSelect={() => go(p.id)}
                 className={itemClass}
               >
