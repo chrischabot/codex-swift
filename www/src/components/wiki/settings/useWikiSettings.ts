@@ -34,6 +34,14 @@ export interface WikiSettings {
   readonly editorLivePreview: boolean;
   /** Vim keybindings in the CodeMirror editor. */
   readonly editorVim: boolean;
+  /** Auto-close brackets/quotes as you type (CM6 closeBrackets). */
+  readonly autoPairBrackets: boolean;
+  /** Re-indent the current line on input (CM6 indentOnInput). */
+  readonly indentOnInput: boolean;
+  /** Native browser spellcheck on the editor surface. */
+  readonly spellcheck: boolean;
+  /** Constrain editor + reading content to a readable max line width. */
+  readonly readableLineWidth: boolean;
   /** Editor font size in px. */
   readonly editorFontSize: number;
   /** Reading-view font size in px. */
@@ -49,6 +57,10 @@ export interface WikiSettings {
 export const DEFAULT_WIKI_SETTINGS: WikiSettings = {
   editorLivePreview: true,
   editorVim: false,
+  autoPairBrackets: true,
+  indentOnInput: true,
+  spellcheck: false,
+  readableLineWidth: false,
   editorFontSize: 15,
   readingFontSize: 16,
   showLineNumbers: false,
@@ -84,6 +96,10 @@ function coerce(raw: unknown): WikiSettings {
   return {
     editorLivePreview: bool(o.editorLivePreview, d.editorLivePreview),
     editorVim: bool(o.editorVim, d.editorVim),
+    autoPairBrackets: bool(o.autoPairBrackets, d.autoPairBrackets),
+    indentOnInput: bool(o.indentOnInput, d.indentOnInput),
+    spellcheck: bool(o.spellcheck, d.spellcheck),
+    readableLineWidth: bool(o.readableLineWidth, d.readableLineWidth),
     editorFontSize: num(o.editorFontSize, d.editorFontSize),
     readingFontSize: num(o.readingFontSize, d.readingFontSize),
     showLineNumbers: bool(o.showLineNumbers, d.showLineNumbers),

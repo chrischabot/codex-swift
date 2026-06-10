@@ -143,6 +143,50 @@ export function WikiSettingsModal({ open, onOpenChange }: WikiSettingsModalProps
                     }
                   />
                   <Row
+                    name="Auto-pair brackets"
+                    desc="Auto-close brackets and quotes as you type."
+                    control={
+                      <Switch
+                        checked={settings.autoPairBrackets}
+                        onCheckedChange={(v) => update({ autoPairBrackets: v })}
+                        aria-label="Auto-pair brackets"
+                      />
+                    }
+                  />
+                  <Row
+                    name="Indent on input"
+                    desc="Re-indent the line as you type."
+                    control={
+                      <Switch
+                        checked={settings.indentOnInput}
+                        onCheckedChange={(v) => update({ indentOnInput: v })}
+                        aria-label="Indent on input"
+                      />
+                    }
+                  />
+                  <Row
+                    name="Spellcheck"
+                    desc="Native browser spellcheck in the editor."
+                    control={
+                      <Switch
+                        checked={settings.spellcheck}
+                        onCheckedChange={(v) => update({ spellcheck: v })}
+                        aria-label="Spellcheck"
+                      />
+                    }
+                  />
+                  <Row
+                    name="Readable line width"
+                    desc="Constrain content to a comfortable max width."
+                    control={
+                      <Switch
+                        checked={settings.readableLineWidth}
+                        onCheckedChange={(v) => update({ readableLineWidth: v })}
+                        aria-label="Readable line width"
+                      />
+                    }
+                  />
+                  <Row
                     name="Font size"
                     desc={`${settings.editorFontSize}px`}
                     control={
