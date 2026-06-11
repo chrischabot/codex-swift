@@ -2,6 +2,14 @@ import * as React from "react";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import type { WikiPage } from "@/runtime/connector";
 import { WikiMarkdown } from "@/components/wiki/WikiMarkdown";
+import { WikiLiveProvider, type WikiLiveValue } from "@/components/wiki/markdown/WikiLiveContext";
+
+// A hover preview is a leaf: no transclusion, no live blocks, depth reset.
+const RESET_LIVE: WikiLiveValue = {
+  embedDepth: 0,
+  embedChain: new Set<string>(),
+  liveBlocks: false,
+};
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -81,7 +89,11 @@ export function WikiHoverCard({ pageId, title, onOpen, className }: Props) {
         ) : state === "missing" ? (
           <span className="text-[color:var(--color-text-tertiary)] italic">Page not found</span>
         ) : excerpt ? (
-          <WikiMarkdown content={excerpt} />
+          // Reset live context: a hover preview must not transclude embeds or
+          // run live blocks (it sits inside the reading view's provider tree).
+          <WikiLiveProvider value={RESET_LIVE}>
+            <WikiMarkdown content={excerpt} />
+          </WikiLiveProvider>
         ) : (
           <span className="text-[color:var(--color-text-tertiary)] italic">Empty page</span>
         )}

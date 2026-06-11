@@ -5,6 +5,7 @@ import { useRuntime } from "@/runtime/RuntimeProvider";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { WikiMarkdown } from "./WikiMarkdown";
+import type { EmbedLoader } from "./markdown/WikiLiveContext";
 import { useWikiSettings } from "./settings/useWikiSettings";
 import { stripComments } from "./markdown/wikiRemarkPlugins";
 import { scrollToFragment } from "./markdown/fragmentScroll";
@@ -26,6 +27,9 @@ interface Props {
   /** Notified after an in-place task-checkbox toggle persists, so the host can
    *  refetch the page list / right rail (the body changed). Receives the id. */
   onPageSaved?: (id: string) => void;
+  /** Open a page by id — wires the M27 live ```backlinks``` / ```query``` block
+   *  rows. When omitted those rows fall back to title-based navigation. */
+  onOpenPage?: (id: string) => void;
 }
 
 /**
@@ -48,10 +52,24 @@ export function WikiReadingView({
   resolveWikiLink,
   fragment,
   onPageSaved,
+  onOpenPage,
 }: Props) {
   const { connector } = useRuntime();
   const { settings } = useWikiSettings();
   const tags = page.tags ?? [];
+
+  // M27 transclusion loader: resolve `![[Title]]` → page id (via the host's
+  // title resolver) → fetch its body. Undefined when the connector can't read
+  // pages, which keeps embeds as placeholder cards.
+  const loadEmbed = React.useMemo<EmbedLoader | undefined>(() => {
+    if (!connector.getWikiPage) return undefined;
+    return async (title: string) => {
+      const id = resolveWikiLink?.(title);
+      if (!id) return null;
+      const p = await connector.getWikiPage!(id);
+      return p ? { id: p.id, title: p.title, content: p.content } : null;
+    };
+  }, [connector, resolveWikiLink]);
 
   // Optimistic local copy of the body so a checkbox flips immediately while the
   // save is in flight. Reset whenever the upstream page (id OR content) changes.
@@ -165,6 +183,9 @@ export function WikiReadingView({
         resolveWikiLink={resolveWikiLink}
         onToggleTask={canSave ? handleToggleTask : undefined}
         readableLineWidth={settings.readableLineWidth}
+        loadEmbed={loadEmbed}
+        liveContext={{ pageId: page.id, pageTitle: page.title }}
+        onOpenPageId={onOpenPage}
       />
     </article>
   );

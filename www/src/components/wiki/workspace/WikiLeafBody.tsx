@@ -155,6 +155,7 @@ function PageLeafBody({
           resolveWikiLink={callbacks.resolveWikiLink}
           fragment={isActive ? decodeURIComponent(location.hash.replace(/^#/, "")) || null : null}
           onPageSaved={callbacks.onPageSaved}
+          onOpenPage={(id) => callbacks.onNavigatePath(`/wiki/${id}`, { newTab: false })}
         />
       </div>
     </ScrollArea>

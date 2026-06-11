@@ -9,6 +9,13 @@ import { CodeBlock } from "@/components/chat/CodeBlock";
 import { Mermaid } from "@/components/chat/Mermaid";
 import { Callout } from "./markdown/Callout";
 import { WikiEmbed } from "./markdown/WikiEmbed";
+import {
+  useWikiLive,
+  WikiLiveProvider,
+  type EmbedLoader,
+  type WikiLiveValue,
+} from "./markdown/WikiLiveContext";
+import { WikiBacklinksBlock, WikiQueryBlock } from "./markdown/WikiLiveBlocks";
 import { WikiLinkWithHover } from "./hover/WikiLinkWithHover";
 import {
   type CalloutType,
@@ -52,6 +59,15 @@ interface Props {
   /** Constrain the rendered content to a readable max line width (from the
    *  wiki `readableLineWidth` setting). */
   readableLineWidth?: boolean;
+  /** Loads a page body by wikilink title for `![[Page]]` transclusion (M27).
+   *  When supplied, embeds render the referenced note inline (depth-guarded);
+   *  otherwise they stay placeholder cards. */
+  loadEmbed?: EmbedLoader;
+  /** Enables live ```query``` / ```backlinks``` blocks for this page (top-level
+   *  reading view only). `pageId` scopes the backlinks block. */
+  liveContext?: { pageId?: string; pageTitle?: string };
+  /** Open a page by id — used by live blocks (backlinks/query rows). */
+  onOpenPageId?: (id: string) => void;
 }
 
 /**
@@ -72,8 +88,24 @@ export function WikiMarkdown({
   onTag,
   onToggleTask,
   readableLineWidth,
+  loadEmbed,
+  liveContext,
+  onOpenPageId,
 }: Props) {
   const src = stripComments(content);
+
+  // Merge our props onto any inherited live context (an embed wraps a nested
+  // WikiMarkdown in its own provider; we must NOT reset its depth/chain). The
+  // top-level reading view supplies loadEmbed + liveContext to turn features on.
+  const inherited = useWikiLive();
+  const liveValue: WikiLiveValue = {
+    loadEmbed: loadEmbed ?? inherited.loadEmbed,
+    embedDepth: inherited.embedDepth,
+    embedChain: inherited.embedChain,
+    currentPageId: liveContext?.pageId ?? inherited.currentPageId,
+    currentPageTitle: liveContext?.pageTitle ?? inherited.currentPageTitle,
+    liveBlocks: liveContext ? true : inherited.liveBlocks,
+  };
 
   // The "wiki-embed" key is a custom element name not in JSX.IntrinsicElements,
   // so the object is typed loosely then cast to Components. react-markdown
@@ -313,6 +345,14 @@ export function WikiMarkdown({
       if (lang === "mermaid") {
         return <Mermaid content={text.replace(/\n$/, "")} />;
       }
+      // Live blocks (M27) — only at the top reading view (liveBlocks gate), so
+      // they don't run inside hover cards or embeds. Elsewhere → plain code.
+      if (liveValue.liveBlocks && (lang === "backlinks" || lang === "wiki-backlinks")) {
+        return <WikiBacklinksBlock onOpen={onOpenPageId} />;
+      }
+      if (liveValue.liveBlocks && (lang === "query" || lang === "wiki-query")) {
+        return <WikiQueryBlock source={text} onOpen={onOpenPageId} />;
+      }
       return <CodeBlock language={lang} code={text.replace(/\n$/, "")} />;
     },
     pre: ({ children }) => <>{children}</>,
@@ -383,6 +423,7 @@ export function WikiMarkdown({
   } as Components;
 
   return (
+    <WikiLiveProvider value={liveValue}>
     <div
       className={cn(
         "wiki-markdown text-[14px] leading-[1.65] text-foreground",
@@ -407,5 +448,6 @@ export function WikiMarkdown({
         {src}
       </ReactMarkdown>
     </div>
+    </WikiLiveProvider>
   );
 }
