@@ -6,6 +6,7 @@ import {
   FilePlus2,
   Network,
   PanelsTopLeft,
+  Tags,
   Keyboard,
   Search,
   Sparkles,
@@ -206,6 +207,13 @@ const BUILTIN_WIKI_COMMANDS: ReadonlyArray<WikiCommand> = [
     name: "Open enrich",
     icon: Sparkles,
     run: (ctx) => ctx.navigate("/wiki/enrich"),
+  },
+  {
+    id: "wiki:open-properties",
+    category: "View",
+    name: "Open properties",
+    icon: Tags,
+    run: (ctx) => ctx.navigate("/wiki/properties"),
   },
   {
     id: "wiki:toggle-live-preview",

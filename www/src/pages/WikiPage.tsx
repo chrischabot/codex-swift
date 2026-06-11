@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
 import { resolveWikilinkNav } from "@/components/wiki/markdown/wikiRemarkPlugins";
-import { FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown } from "lucide-react";
+import { FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown, Tags } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -504,6 +504,9 @@ function WikiIndex({ onOpenSettings }: { onOpenSettings?: () => void }) {
           >
             Open graph
           </button>
+          <Button variant="outline" size="xs" onClick={() => navigate("/wiki/properties")}>
+            <Tags className="mr-1 size-3" /> Properties
+          </Button>
           {onOpenSettings && (
             <Button variant="outline" size="xs" onClick={onOpenSettings} aria-label="Wiki settings">
               <SettingsIcon className="size-3" />
