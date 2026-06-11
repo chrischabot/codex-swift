@@ -9,6 +9,12 @@ import {
   type WikiCommand,
   type WikiCommandContext,
 } from "./commandRegistry";
+import { parseHotkey, matchesHotkey, isEditableTarget } from "./hotkeyMatch";
+
+// Chords owned by dedicated bindings elsewhere — the dispatcher must NOT also
+// fire them or they'd double-toggle. Cmd-P (palette) lives in this hook; Cmd-O
+// (quick switcher) lives in useWikiSwitcherHotkey.
+const DISPATCH_RESERVED = new Set(["wiki:quick-switcher"]);
 
 interface UseWikiCommandsArgs {
   /** Scope the Cmd-P hotkey to the wiki section. Pass false elsewhere so the
@@ -170,6 +176,34 @@ export function useWikiCommands({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [enabled]);
+
+  // M29 hotkey dispatcher: bind every registered command's accelerator hint so
+  // the SAME string both displays in the palette and fires the action. Skips
+  // reserved chords (owned elsewhere) and unavailable commands; a bare-key chord
+  // (no modifier) is suppressed while a text field has focus.
+  React.useEffect(() => {
+    if (!enabled) return;
+    // Precompute (command, parsed-chord) pairs once per registry/enabled change.
+    const bound = registered
+      .filter((c) => c.hotkey && !DISPATCH_RESERVED.has(c.id))
+      .map((c) => ({ c, hk: parseHotkey(c.hotkey!) }))
+      .filter((b): b is { c: WikiCommand; hk: NonNullable<typeof b.hk> } => b.hk !== null);
+    if (bound.length === 0) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      for (const { c, hk } of bound) {
+        if (!matchesHotkey(e, hk)) continue;
+        const bareKey = !hk.mod && !hk.ctrl && !hk.alt;
+        if (bareKey && isEditableTarget(e.target)) return;
+        const ctx = buildContext();
+        if (c.isAvailable && !c.isAvailable(ctx)) return;
+        e.preventDefault();
+        c.run(ctx);
+        return;
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [enabled, registered, buildContext]);
 
   return { open, setOpen, commands, run };
 }

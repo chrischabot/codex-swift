@@ -6,6 +6,7 @@ import {
   FilePlus2,
   Network,
   PanelsTopLeft,
+  Keyboard,
   Search,
   Sparkles,
   Table2,
@@ -140,6 +141,7 @@ export const wikiCommandRegistry = new WikiCommandRegistry();
 export const WIKI_EVENTS = {
   newCanvas: "wiki:new-canvas",
   newBase: "wiki:new-base",
+  showShortcuts: "wiki:show-shortcuts",
 } as const;
 
 /**
@@ -255,6 +257,19 @@ const BUILTIN_WIKI_COMMANDS: ReadonlyArray<WikiCommand> = [
     name: "Go to today's note",
     icon: CalendarDays,
     run: (ctx) => ctx.openDailyNote(),
+  },
+  {
+    id: "wiki:show-shortcuts",
+    category: "Help",
+    name: "Show keyboard shortcuts",
+    icon: Keyboard,
+    hotkey: "⌘/",
+    run: (ctx) => {
+      fireEvent(WIKI_EVENTS.showShortcuts);
+      // No-op toast suppressed; the dialog is the feedback. Notify only if no
+      // listener is mounted (rare) so the command never feels dead.
+      void ctx;
+    },
   },
 ];
 

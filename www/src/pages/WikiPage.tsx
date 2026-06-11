@@ -39,6 +39,7 @@ import { WikiLeafBody, type LeafBodyCallbacks } from "@/components/wiki/workspac
 import { isPopoutWindow } from "@/components/wiki/workspace/popout";
 import { useWikiCommands } from "@/components/wiki/commands/useWikiCommands";
 import { WikiCommandPalette } from "@/components/wiki/commands/WikiCommandPalette";
+import { WikiShortcutsDialog } from "@/components/wiki/commands/WikiShortcutsDialog";
 import { WikiSettingsModal } from "@/components/wiki/settings/WikiSettingsModal";
 import { Settings as SettingsIcon } from "lucide-react";
 
@@ -254,6 +255,7 @@ function WikiWorkspacePage() {
     <>
       <WikiQuickSwitcher open={switcher.open} onOpenChange={switcher.setOpen} />
       <WikiCommandPalette open={cmds.open} onOpenChange={cmds.setOpen} commands={cmds.commands} onRun={cmds.run} />
+      <WikiShortcutsDialog />
       <WikiSettingsModal open={settingsOpen} onOpenChange={setSettingsOpen} />
     </>
   );
