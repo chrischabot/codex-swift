@@ -989,6 +989,24 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         return (r.data ?? []).map((t) => ({ tag: pick(t, "tag", "name"), count: numOrU(t.count) ?? 0 })).filter((t) => t.tag);
       } catch { return []; }
     },
+    getWikiIndex: async () => {
+      try {
+        const r = (await rpc("wiki/index", {})) as { data?: Record<string, unknown>[] };
+        return (r.data ?? []).map((e) => {
+          const links = Array.isArray(e.links)
+            ? (e.links as unknown[]).filter((x): x is string => typeof x === "string")
+            : [];
+          const props: Record<string, string> = {};
+          const rawProps = e.props;
+          if (rawProps && typeof rawProps === "object") {
+            for (const [k, v] of Object.entries(rawProps as Record<string, unknown>)) {
+              if (typeof v === "string") props[k] = v;
+            }
+          }
+          return { id: idStr(e.id), title: pick(e, "title"), links, props };
+        }).filter((e) => e.id);
+      } catch { return []; }
+    },
     saveWikiPage: async (input) => {
       const params: Record<string, unknown> = { body: input.body };
       if (input.title != null) params.title = input.title;

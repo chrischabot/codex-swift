@@ -10,18 +10,25 @@ import {
 } from "@/components/ui/collapsible";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { useWikiMetadataIndex } from "../useWikiMetadataIndex";
+import { useWikiLinkIndex, backlinksOf } from "../useWikiLinkIndex";
 
 // Granite ports BacklinksView + OutgoingLinksView + unlinked-mentions into a
-// single right-rail panel. Granite has a metadata link index; this connector
-// does NOT — there is no reverse-link RPC — so backlinks/unlinked-mentions are
-// derived from a debounced `searchWiki("\"title\"")` and the resolved set comes
-// from one `listWikiPages` pass. All link parsing matches the wiki markdown
-// dialect ([[Target]], [[Target|Display]], [[Target#Heading]], ![[Embed]]).
+// single right-rail panel. As of M26 BACKLINKS are exact and vault-wide: the
+// `wiki/index` link index gives every page's outgoing `[[wikilinks]]`, and we
+// reverse it (resolving title→id via the metadata index) so a backlink is a
+// page that ACTUALLY links here — no excerpt heuristic, no 80-hit search cap.
+// UNLINKED MENTIONS still need a full-text search (the index has no body text),
+// so they stay search-derived, minus any page already counted as a backlink.
+// All link parsing matches the wiki dialect ([[Target]], [[Target|Display]],
+// [[Target#Heading]], ![[Embed]]).
 
 interface Props {
   page: WikiPage;
   /** Optional navigation override. Defaults to react-router → /wiki/<id>. */
   onOpenPage?: (id: string) => void;
+  /** Bumps when a page is saved/renamed/deleted → refreshes the link index. */
+  dataVersion?: number;
 }
 
 const DEBOUNCE_MS = 250;
@@ -148,12 +155,6 @@ function findUnlinkedMentions(content: string, title: string, max = 5): MentionM
   return out;
 }
 
-/** Does `content` contain a wikilink whose target resolves to `title`? */
-function linksTo(content: string, title: string): boolean {
-  const t = norm(title);
-  return parseWikilinks(content).some((l) => norm(l.target) === t);
-}
-
 // ── View-model types ────────────────────────────────────────────────────────
 
 interface BacklinkVM {
@@ -264,7 +265,7 @@ function Row({ title, meta, snippet, interactive = true, onOpen }: RowProps) {
 
 // ── Panel ─────────────────────────────────────────────────────────────────
 
-export function WikiBacklinksPanel({ page, onOpenPage }: Props) {
+export function WikiBacklinksPanel({ page, onOpenPage, dataVersion = 0 }: Props) {
   const navigate = useNavigate();
   const { connector, status } = useRuntime();
   const connected = status.kind === "connected";
@@ -277,28 +278,16 @@ export function WikiBacklinksPanel({ page, onOpenPage }: Props) {
     [onOpenPage, navigate],
   );
 
-  // OUTGOING — parse this page's body, resolve targets against the page index.
-  const outgoingLinks = React.useMemo(() => parseWikilinks(page.content), [page.content]);
-  const [pageIndex, setPageIndex] = React.useState<WikiPageSummary[] | null>(null);
+  // Shared vault indexes: titles (→ id resolution) and the body link graph.
+  const { pages: allPages, resolve, byId } = useWikiMetadataIndex(dataVersion);
+  const { entries: linkEntries, loading: indexLoading } = useWikiLinkIndex(dataVersion);
 
-  React.useEffect(() => {
-    if (!connected || !connector.listWikiPages) {
-      setPageIndex(null);
-      return;
-    }
-    let alive = true;
-    connector
-      .listWikiPages({ limit: 500 })
-      .then((p) => alive && setPageIndex(p))
-      .catch(() => alive && setPageIndex([]));
-    return () => {
-      alive = false;
-    };
-  }, [connector, connected]);
+  // OUTGOING — parse this page's body, resolve targets against the title index.
+  const outgoingLinks = React.useMemo(() => parseWikilinks(page.content), [page.content]);
 
   const outgoing = React.useMemo<OutgoingVM[]>(() => {
     const byTitle = new Map<string, WikiPageSummary>();
-    for (const p of pageIndex ?? []) byTitle.set(norm(p.title), p);
+    for (const p of allPages) byTitle.set(norm(p.title), p);
     // De-dupe by target so repeated links to the same page collapse to one row.
     const seen = new Set<string>();
     const out: OutgoingVM[] = [];
@@ -309,10 +298,27 @@ export function WikiBacklinksPanel({ page, onOpenPage }: Props) {
       out.push({ link, resolved: byTitle.get(key) ?? null });
     }
     return out;
-  }, [outgoingLinks, pageIndex]);
+  }, [outgoingLinks, allPages]);
 
-  // BACKLINKS + UNLINKED MENTIONS — debounced search on the (quoted) title, then
-  // split into linked (excerpt has a [[title]]) vs unlinked (plain-text mention).
+  // BACKLINKS — exact, vault-wide: reverse the link index resolved via titles.
+  const backlinks = React.useMemo<BacklinkVM[]>(() => {
+    return backlinksOf(linkEntries, page.id, resolve).map((b) => {
+      const summary = byId.get(b.id);
+      return {
+        page: summary ?? { id: b.id, title: b.title },
+        snippet: summary?.excerpt,
+      };
+    });
+  }, [linkEntries, page.id, resolve, byId]);
+  // Ids already linking here → excluded from "unlinked mentions".
+  const backlinkIds = React.useMemo(
+    () => new Set(backlinks.map((b) => b.page.id)),
+    [backlinks],
+  );
+
+  // UNLINKED MENTIONS — debounced full-text search on the (quoted) title; a hit
+  // is "unlinked" when it mentions the title as plain text but is NOT already an
+  // index backlink. (Backlinks themselves no longer come from search.)
   const title = page.title;
   const [search, setSearch] = React.useState<{
     results: WikiPageSummary[];
@@ -341,27 +347,18 @@ export function WikiBacklinksPanel({ page, onOpenPage }: Props) {
     };
   }, [connector, connected, title]);
 
-  // Partition search hits. The connector returns no full body for search rows,
-  // so we use the excerpt as the linkable haystack: a hit is a BACKLINK when its
-  // title or excerpt carries a [[title]] wikilink, an UNLINKED mention when the
-  // title appears as plain text without a link. Self is always excluded.
-  const { backlinks, unlinked } = React.useMemo(() => {
-    const back: BacklinkVM[] = [];
+  // Unlinked mentions: a search hit that mentions the title as plain text, is
+  // not self, and is NOT already an index backlink (those would be "linked").
+  const unlinked = React.useMemo<UnlinkedVM[]>(() => {
     const un: UnlinkedVM[] = [];
     for (const r of search.results) {
       if (r.id === page.id || norm(r.title) === norm(title)) continue;
-      const haystack = r.excerpt ?? "";
-      if (linksTo(haystack, title) || linksTo(r.title, title)) {
-        back.push({ page: r, snippet: r.excerpt });
-      } else {
-        // Only an actual textual mention is an "unlinked mention" — a generic
-        // search hit with zero matches is NOT (was a false-positive bug).
-        const matches = findUnlinkedMentions(haystack, title);
-        if (matches.length > 0) un.push({ page: r, matches });
-      }
+      if (backlinkIds.has(r.id)) continue;
+      const matches = findUnlinkedMentions(r.excerpt ?? "", title);
+      if (matches.length > 0) un.push({ page: r, matches });
     }
-    return { backlinks: back, unlinked: un };
-  }, [search.results, page.id, title]);
+    return un;
+  }, [search.results, page.id, title, backlinkIds]);
 
   return (
     <div className="flex flex-col">
@@ -370,10 +367,10 @@ export function WikiBacklinksPanel({ page, onOpenPage }: Props) {
         title="Backlinks"
         count={backlinks.length}
         defaultOpen
-        loading={search.loading}
+        loading={indexLoading}
       >
-        {search.loading && !search.ran ? (
-          <EmptyRow>Searching…</EmptyRow>
+        {indexLoading && backlinks.length === 0 ? (
+          <EmptyRow>Loading…</EmptyRow>
         ) : backlinks.length === 0 ? (
           <EmptyRow>No backlinks</EmptyRow>
         ) : (

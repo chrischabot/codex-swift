@@ -171,6 +171,18 @@ export interface WikiTag {
   tag: string;
   count: number;
 }
+/**
+ * One page's contribution to the vault link + property index (wiki/index).
+ * `links` are the bare outgoing `[[wikilink]]` targets (alias/heading/block
+ * suffixes stripped); `props` are flat parsed frontmatter key→value pairs.
+ * Pages with neither links nor props are omitted from the index payload.
+ */
+export interface WikiIndexEntry {
+  id: string;
+  title: string;
+  links: string[];
+  props: Record<string, string>;
+}
 export interface WikiGraphNode {
   id: string;
   title: string;
@@ -308,6 +320,10 @@ export interface Connector {
   // id — the backend graph is the entity/edge graph. Omit it for the whole graph.
   getWikiGraph?(opts?: { seedEntityId?: string; depth?: number }): Promise<WikiGraph>;
   getWikiTags?(): Promise<WikiTag[]>;
+  /** Vault link + property index: per-page outgoing `[[wikilinks]]` + parsed
+   *  frontmatter props. Powers backlinks / unlinked-mentions / property-catalog
+   *  and rename link-rewrite from a single read. */
+  getWikiIndex?(): Promise<WikiIndexEntry[]>;
   /** Create (id omitted) or overwrite a wiki page. Returns the page id. */
   saveWikiPage?(input: { id?: string; title?: string; body: string }): Promise<{ id: string } | null>;
   /** Delete a wiki page (and its derived chunks / index rows). Returns whether a

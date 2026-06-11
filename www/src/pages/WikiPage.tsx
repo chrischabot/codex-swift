@@ -367,7 +367,7 @@ function WikiRightRail({
         <ScrollArea className="min-h-0 flex-1">
           <div className="px-3 py-4">
             <TabsContent value="connections" className="mt-0">
-              <WikiBacklinksPanel page={page} onOpenPage={onOpenPage} />
+              <WikiBacklinksPanel page={page} onOpenPage={onOpenPage} dataVersion={dataVersion} />
               <div className="mt-4 border-t border-[color:var(--border)] pt-3">
                 <WikiConnectionsPanel page={page} onSelectEntity={(_id, canonical) => onWikiLink(canonical)} />
               </div>

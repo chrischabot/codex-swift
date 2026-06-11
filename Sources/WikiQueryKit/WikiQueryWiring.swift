@@ -54,6 +54,7 @@ public enum WikiQueryWiring {
             graph:     { try await WikiJSON.graph(store, seed: $0, depth: $1) },
             backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
             tags:      { try await WikiJSON.tags(store) },
+            index:     { try await WikiJSON.index(store) },
             upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
             delete:    { try await WikiJSON.delete(store, id: $0) },
             rename:    { try await WikiJSON.rename(store, id: $0, title: $1) },
@@ -80,6 +81,117 @@ public enum WikiJSON {
                 "updatedAt": ms(s.document.fetchedAt),
                 "chunkCount": .int(Int64(s.chunkCount)),
             ])
+        }
+        return .object(["data": .array(items)])
+    }
+
+    // MARK: link + property index (M26)
+
+    /// Mask fenced ```code``` blocks and `inline code` to spaces so wikilinks
+    /// inside code are not indexed — mirrors the client's backlinks maskCode so
+    /// the server-side reverse index agrees with what the editor renders.
+    private static func maskCode(_ s: String) -> String {
+        var out = s
+        for pat in ["(?s)```.*?```", "`[^`\\n]*`"] {
+            guard let re = try? NSRegularExpression(pattern: pat) else { continue }
+            let ns = out as NSString
+            out = re.stringByReplacingMatches(
+                in: out, range: NSRange(location: 0, length: ns.length), withTemplate: " ")
+        }
+        return out
+    }
+
+    /// Outgoing `[[wikilink]]` targets in a body, de-duped, order-preserving.
+    /// The target is the part before any `|` alias, `#` heading, or `^` block ref
+    /// (a leading `!` embed is already stripped by matching only the inner text).
+    private static func wikilinkTargets(in body: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: "\\[\\[([^\\]]+)\\]\\]") else { return [] }
+        let masked = maskCode(body)
+        let ns = masked as NSString
+        var seen = Set<String>()
+        var out: [String] = []
+        for m in re.matches(in: masked, range: NSRange(location: 0, length: ns.length)) {
+            let inner = ns.substring(with: m.range(at: 1))
+            // Cut at the first of | # ^ to get the bare target, then trim.
+            let target = inner.prefix { $0 != "|" && $0 != "#" && $0 != "^" }
+                .trimmingCharacters(in: .whitespaces)
+            guard !target.isEmpty else { continue }
+            let key = target.lowercased()
+            if seen.insert(key).inserted { out.append(target) }
+        }
+        return out
+    }
+
+    /// Parse leading YAML frontmatter (`---` … `---`) into flat string props.
+    /// Best-effort scalar parsing: `key: value` lines, with simple `- item`
+    /// list members folded into a comma-joined value. Anything fancier (nested
+    /// maps, multi-line scalars) is skipped rather than mis-parsed.
+    private static func frontmatterProps(in body: String) -> [String: String] {
+        guard body.hasPrefix("---\n") || body.hasPrefix("---\r\n") else { return [:] }
+        let lines = body.components(separatedBy: "\n")
+        guard lines.first?.trimmingCharacters(in: .whitespaces) == "---" else { return [:] }
+        var props: [String: String] = [:]
+        var lastKey: String? = nil
+        var listAccum: [String] = []
+        func flushList() {
+            if let k = lastKey, !listAccum.isEmpty {
+                props[k] = listAccum.joined(separator: ", ")
+            }
+            listAccum = []
+        }
+        for raw in lines.dropFirst() {
+            let line = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
+            if line.trimmingCharacters(in: .whitespaces) == "---" { break }
+            // A `  - item` list member continues the previous key.
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("- "), lastKey != nil {
+                let v = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                if !v.isEmpty { listAccum.append(unquote(v)) }
+                continue
+            }
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            flushList()
+            let key = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty, !key.hasPrefix("#") else { lastKey = nil; continue }
+            let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+            lastKey = key
+            if value.isEmpty { continue } // value may be a following list
+            props[key] = unquote(value)
+        }
+        flushList()
+        return props
+    }
+
+    private static func unquote(_ s: String) -> String {
+        if s.count >= 2, (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("'") && s.hasSuffix("'")) {
+            return String(s.dropFirst().dropLast())
+        }
+        return s
+    }
+
+    /// Vault link + property index (M26). One pass over every page body: extract
+    /// outgoing `[[wikilinks]]` and parse leading YAML frontmatter. Pages with
+    /// neither are omitted to keep the payload small. The client derives
+    /// backlinks (reverse of `links`), unlinked-mention candidates, link-rewrite
+    /// targets, and the property catalog from this single shape. Returns
+    /// `{data: [{id, title, links: [String], props: {String: String}}]}`.
+    public static func index(_ store: MemoryStore) async throws -> JSONValue {
+        let rows = try await store.documentChunkSummaries(limit: 100_000, orderByRecency: false)
+        var items: [JSONValue] = []
+        items.reserveCapacity(rows.count)
+        for s in rows {
+            let body = (try? String(contentsOfFile: s.document.bodyPath, encoding: .utf8)) ?? ""
+            guard !body.isEmpty else { continue }
+            let links = wikilinkTargets(in: body)
+            let props = frontmatterProps(in: body)
+            if links.isEmpty && props.isEmpty { continue }
+            var obj: [String: JSONValue] = [
+                "id": .int(s.document.id),
+                "title": .string(s.document.title ?? s.document.sourceURI),
+            ]
+            if !links.isEmpty { obj["links"] = .array(links.map { JSONValue.string($0) }) }
+            if !props.isEmpty { obj["props"] = .object(props.mapValues { JSONValue.string($0) }) }
+            items.append(.object(obj))
         }
         return .object(["data": .array(items)])
     }

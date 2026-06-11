@@ -2173,6 +2173,8 @@ public actor RequestRouter {
             await replyWiki(conn, id) { try await $0.backlinks(p.entityId) }
         case .wikiTags(let id):
             await replyWiki(conn, id) { try await $0.tags() }
+        case .wikiIndex(let id):
+            await replyWiki(conn, id) { try await $0.index() }
         case .wikiPageUpsert(let id, let p):
             await replyWiki(conn, id) { try await $0.upsert(p.id, p.title, p.body) }
         case .wikiPageDelete(let id, let p):

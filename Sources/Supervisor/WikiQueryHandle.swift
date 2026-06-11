@@ -22,6 +22,10 @@ public struct WikiQueryHandle: Sendable {
     public var backlinks: @Sendable (_ entityId: Int64) async throws -> JSONValue
     /// Tag entities with counts.
     public var tags: @Sendable () async throws -> JSONValue
+    /// Vault link + property index: per-page outgoing `[[wikilinks]]` + parsed
+    /// frontmatter props. Powers backlinks / unlinked-mentions / property-catalog
+    /// and rename link-rewrite (M26/M28/M30) from a single read.
+    public var index: @Sendable () async throws -> JSONValue
     /// Insert/overwrite a page (id nil → create). Returns `{id}`. The wiki UI is
     /// the edit environment, so this WRITE lives on the same deny-default handle.
     public var upsert: @Sendable (_ id: Int64?, _ title: String?, _ body: String) async throws -> JSONValue
@@ -41,6 +45,7 @@ public struct WikiQueryHandle: Sendable {
         graph: @escaping @Sendable (Int64?, Int) async throws -> JSONValue,
         backlinks: @escaping @Sendable (Int64) async throws -> JSONValue,
         tags: @escaping @Sendable () async throws -> JSONValue,
+        index: @escaping @Sendable () async throws -> JSONValue,
         upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue,
         delete: @escaping @Sendable (Int64) async throws -> JSONValue,
         rename: @escaping @Sendable (Int64, String) async throws -> JSONValue,
@@ -52,6 +57,7 @@ public struct WikiQueryHandle: Sendable {
         self.graph = graph
         self.backlinks = backlinks
         self.tags = tags
+        self.index = index
         self.upsert = upsert
         self.delete = delete
         self.rename = rename
