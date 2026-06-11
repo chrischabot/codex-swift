@@ -54,6 +54,8 @@ import {
   type SortMode,
 } from "./sort";
 import { recordWikiRecent } from "./useWikiRecents";
+import { useWikiLinkIndex } from "../useWikiLinkIndex";
+import { rewriteBacklinksOnRename } from "../wikiLinkRewrite";
 
 // Context for the row-level actions (rename/delete/open) so the deeply-nested
 // FileRow can reach them without prop-drilling through TreeRow/FolderRow.
@@ -248,6 +250,7 @@ function useExplorerPages(limit = 200): { pages: WikiPageSummary[]; loading: boo
 export function WikiExplorer({ activePageId, onOpenPage }: Props) {
   const { connector, status } = useRuntime();
   const { pages, loading, reload } = useExplorerPages();
+  const { entries: linkEntries } = useWikiLinkIndex();
   const canEdit =
     status.kind === "connected" &&
     typeof connector.renameWikiPage === "function" &&
@@ -273,14 +276,17 @@ export function WikiExplorer({ activePageId, onOpenPage }: Props) {
     async (node: FileNode, nextTitle: string) => {
       const next = nextTitle.trim();
       if (!connector.renameWikiPage || !next) return;
+      const oldTitle = node.page.title ?? "";
       const res = await connector.renameWikiPage(node.id, next);
       if (res === null) throw new Error("Rename failed");
       if (!res.renamed) throw new Error("Page not found or empty title");
       renameTabInStorage(node.id, next);
-      toast.success("Page renamed");
+      // M28 rename-safety: rewrite every [[oldTitle]] across the vault.
+      const rw = await rewriteBacklinksOnRename(connector, linkEntries, oldTitle, next, node.id);
+      toast.success(rw.rewritten > 0 ? `Page renamed · ${rw.rewritten} link${rw.rewritten === 1 ? "" : "s"} updated` : "Page renamed");
       reload();
     },
-    [connector, reload],
+    [connector, reload, linkEntries],
   );
 
   const actions = React.useMemo<ExplorerActions>(
@@ -433,6 +439,7 @@ function SortMenu({ mode, onChange }: { mode: SortMode; onChange: (m: SortMode) 
 
 function RenamePageDialog({ node, onClose, onDone }: { node: FileNode; onClose: () => void; onDone: () => void }) {
   const { connector } = useRuntime();
+  const { entries: linkEntries } = useWikiLinkIndex();
   const [title, setTitle] = React.useState(node.page.title ?? node.label);
   const [busy, setBusy] = React.useState(false);
   const aliveRef = React.useRef(true);
@@ -445,12 +452,15 @@ function RenamePageDialog({ node, onClose, onDone }: { node: FileNode; onClose: 
     // skip a legit rename. The backend no-ops a true identical title cheaply.
     if (!connector.renameWikiPage || busy || !next) return;
     setBusy(true);
+    const oldTitle = node.page.title ?? "";
     try {
       const res = await connector.renameWikiPage(node.id, next);
       if (res === null) { toast.error("Rename failed"); return; }
       if (!res.renamed) { toast.error("Page not found or empty title"); return; }
       renameTabInStorage(node.id, next); // keep any open tab's title fresh
-      toast.success("Page renamed");
+      // M28 rename-safety: rewrite every [[oldTitle]] across the vault.
+      const rw = await rewriteBacklinksOnRename(connector, linkEntries, oldTitle, next, node.id);
+      toast.success(rw.rewritten > 0 ? `Page renamed · ${rw.rewritten} link${rw.rewritten === 1 ? "" : "s"} updated` : "Page renamed");
       onDone();
       onClose();
     } catch (err) {
