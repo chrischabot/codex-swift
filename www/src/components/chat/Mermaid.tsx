@@ -14,6 +14,11 @@ interface Props {
 export function Mermaid({ content }: Props) {
   const ref = React.useRef<HTMLDivElement | null>(null);
   const [svg, setSvg] = React.useState<string>("");
+  // Render errors are kept SEPARATE from the (trusted) SVG and rendered as a
+  // React text node below — never via dangerouslySetInnerHTML. Mermaid error
+  // messages can echo the diagram source, so interpolating them into innerHTML
+  // would be an XSS vector for malicious ```mermaid blocks in imported content.
+  const [error, setError] = React.useState<string | null>(null);
   const [expanded, setExpanded] = React.useState(false);
   const [copied, setCopied] = React.useState(false);
 
@@ -33,9 +38,15 @@ export function Mermaid({ content }: Props) {
         });
         const id = `m-${Math.random().toString(36).slice(2, 9)}`;
         const result = await mermaid.render(id, content);
-        if (!cancelled) setSvg(result.svg);
+        if (!cancelled) {
+          setSvg(result.svg);
+          setError(null);
+        }
       } catch (err) {
-        if (!cancelled) setSvg(`<pre class="font-mono text-xs">${String(err)}</pre>`);
+        if (!cancelled) {
+          setSvg("");
+          setError(String(err));
+        }
       }
     })();
     return () => {
@@ -88,7 +99,13 @@ export function Mermaid({ content }: Props) {
             <TooltipContent>{copied ? "Copied" : "Copy mermaid"}</TooltipContent>
           </Tooltip>
         </div>
-        <div dangerouslySetInnerHTML={{ __html: svg }} />
+        {error !== null ? (
+          // React escapes {error} — never inject the error string as HTML.
+          <pre className="font-mono text-xs whitespace-pre-wrap">{error}</pre>
+        ) : (
+          // Trusted: mermaid.render output with securityLevel "strict".
+          <div dangerouslySetInnerHTML={{ __html: svg }} />
+        )}
         <pre className="sr-only whitespace-pre-wrap">{content}</pre>
       </div>
     </TooltipProvider>

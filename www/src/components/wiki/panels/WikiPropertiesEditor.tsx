@@ -1067,7 +1067,6 @@ function ListEditor({
   return (
     <div className="flex flex-col gap-1 py-0.5">
       {row.list.map((item, idx) => (
-        // eslint-disable-next-line react/no-array-index-key
         <div key={idx} className="flex items-center gap-1">
           <Input
             type="text"

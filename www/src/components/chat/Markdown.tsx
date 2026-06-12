@@ -122,7 +122,6 @@ export function Markdown({ content, className, streaming }: Props) {
           // Original hr: my-4 border-t border-token-border.
           hr: () => <hr className="my-4 border-t border-[color:var(--border)]" />,
           img: (props) => (
-            // eslint-disable-next-line @next/next/no-img-element
             <img
               {...props}
               alt={(props as { alt?: string }).alt ?? ""}
