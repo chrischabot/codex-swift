@@ -1,85 +1,43 @@
-import * as React from "react";
+import { createPersistentStore } from "@/lib/persistentStore";
 
 // M29+ user hotkey rebinding. A localStorage-backed map of commandId → custom
-// accelerator hint that LAYERS over the registry's built-in `hotkey`. The
-// dispatcher (useWikiCommands) reads the effective binding; the shortcuts dialog
-// captures + edits them. Cross-tab sync via the storage event + a same-tab
-// notifier, mirroring useWikiSettings.
+// accelerator hint that LAYERS over the registry's built-in `hotkey`. Backed by
+// the shared persistentStore (key "wiki:hotkeys"); cross-tab synced.
 
-const STORAGE_KEY = "wiki:hotkeys";
 type Overrides = Record<string, string>;
 
-let cache: Overrides | null = null;
-const listeners = new Set<() => void>();
-
-function read(): Overrides {
-  if (cache) return cache;
-  if (typeof window === "undefined") {
-    cache = {};
-    return cache;
-  }
-  let next: Overrides = {};
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : {};
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-        if (typeof v === "string" && v) next[k] = v;
-      }
+const store = createPersistentStore<Overrides>({
+  key: "wiki:hotkeys",
+  defaultValue: {},
+  coerce: (raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: Overrides = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "string" && v) out[k] = v;
     }
-  } catch {
-    next = {};
-  }
-  cache = next;
-  return next;
-}
-
-function write(next: Overrides) {
-  cache = next;
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-  } catch {
-    /* ignore quota / disabled storage */
-  }
-  for (const l of listeners) l();
-}
+    return out;
+  },
+});
 
 /** Get all overrides (referentially stable until a write). */
 export function getHotkeyOverrides(): Overrides {
-  return read();
+  return store.get();
 }
 
 /** Set (empty value clears) the override for a command, then notify. */
 export function setHotkeyOverride(commandId: string, accel: string): void {
-  const cur = read();
-  const next = { ...cur };
+  const next = { ...store.get() };
   if (accel.trim()) next[commandId] = accel.trim();
   else delete next[commandId];
-  write(next);
+  store.set(next);
 }
 
 /** Clear every custom binding. */
 export function resetHotkeyOverrides(): void {
-  write({});
+  store.set({});
 }
 
-if (typeof window !== "undefined") {
-  window.addEventListener("storage", (e) => {
-    if (e.key === STORAGE_KEY) {
-      cache = null;
-      for (const l of listeners) l();
-    }
-  });
-}
-
-/** Subscribe to override changes (for useSyncExternalStore). */
+/** Subscribe to override changes (for useSyncExternalStore consumers). */
 export function useHotkeyOverrides(): Overrides {
-  return React.useSyncExternalStore(
-    React.useCallback((cb) => {
-      listeners.add(cb);
-      return () => listeners.delete(cb);
-    }, []),
-    read,
-    read,
-  );
+  return store.useStore();
 }
