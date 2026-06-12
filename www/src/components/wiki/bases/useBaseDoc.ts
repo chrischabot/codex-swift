@@ -208,6 +208,11 @@ export function useBaseRows(config: BaseConfig): UseBaseRows {
   const { connector, status } = useRuntime();
   const connected = status.kind === "connected";
   const [state, setState] = React.useState<BaseRowsState>({ rows: [], loading: true, error: null, truncated: false });
+  // Mirror the latest committed state so editCell can read the current rows
+  // SYNCHRONOUSLY — a setState updater's side effects are not available until
+  // the next render, so editCell must not depend on them (see editCell below).
+  const stateRef = React.useRef(state);
+  stateRef.current = state;
 
   const tag = config.source.tag ?? "";
   const query = config.source.query ?? "";
@@ -274,33 +279,33 @@ export function useBaseRows(config: BaseConfig): UseBaseRows {
     async (pageId: string, key: string, value: string): Promise<string | null> => {
       const save = connector.saveWikiPage;
       if (!save) return "This connection can't save pages.";
-      let prevRow: BaseRow | undefined;
-      let nextContent = "";
-      let title = "";
+      // Read the target row SYNCHRONOUSLY from the live state ref. (Previously
+      // this read a `prevRow` set inside the setState updater, but React runs
+      // the updater on a later render, so prevRow was always undefined here and
+      // the save was silently skipped — base cell-edits never persisted.)
+      const prevRow = stateRef.current.rows.find((r) => r.page.id === pageId);
+      if (!prevRow || prevRow.content == null) return null; // missing / summary-only → not editable
+      const nextContent = setFrontmatterProperty(prevRow.content, key, value);
+      const title = prevRow.page.title;
+      // Optimistic update via a PURE updater (no external side effects).
       setState((s) => {
         const idx = s.rows.findIndex((r) => r.page.id === pageId);
         if (idx === -1) return s;
-        prevRow = s.rows[idx];
-        if (prevRow.content == null) return s; // summary-only → not editable
-        nextContent = setFrontmatterProperty(prevRow.content, key, value);
-        title = prevRow.page.title;
         const rows = s.rows.slice();
-        rows[idx] = makeRow(prevRow.page, nextContent); // optimistic
+        rows[idx] = makeRow(prevRow.page, nextContent);
         return { ...s, rows };
       });
-      if (!prevRow || prevRow.content == null) return null;
       try {
         const res = await save({ id: pageId, title, body: nextContent });
         if (!res) throw new Error("save failed");
         return null;
       } catch (err) {
         // Revert the optimistic row.
-        const original = prevRow;
         setState((s) => {
           const idx = s.rows.findIndex((r) => r.page.id === pageId);
           if (idx === -1) return s;
           const rows = s.rows.slice();
-          rows[idx] = original;
+          rows[idx] = prevRow;
           return { ...s, rows };
         });
         return err instanceof Error ? err.message : "Failed to save";
