@@ -14,17 +14,24 @@
 //   title:foo        title substring
 //   path:foo         source/path substring
 //   /re/flags        JavaScript regex over title+excerpt
+//   [key]            page has frontmatter property `key`
+//   [key:value]      property `key`'s value contains `value` (case-insensitive)
 //
-// `[key]` / `[key:value]` property filters need page frontmatter (absent from
-// the summary) and are intentionally parsed-but-ignored here (deferred).
+// `[key]` / `[key:value]` property filters need page frontmatter, which the
+// summary lacks — the caller supplies a per-page `props` map (from the wiki
+// link/property index) to `matchSummary`. Without props, a property predicate
+// matches nothing (so the filter never silently passes everything).
 
 import type { WikiPageSummary } from "@/runtime/connector";
 
-export type PredicateKind = "term" | "phrase" | "tag" | "title" | "path" | "regex";
+export type PredicateKind = "term" | "phrase" | "tag" | "title" | "path" | "regex" | "prop";
 
 export interface Predicate {
   readonly kind: PredicateKind;
   readonly value: string;
+  /** For `prop` predicates: the value to match (substring, case-insensitive);
+   *  undefined → an existence check (`[key]`). */
+  readonly propValue?: string;
   /** Compiled once for regex predicates (null if the pattern was invalid). */
   readonly re?: RegExp | null;
   readonly negate: boolean;
@@ -176,9 +183,17 @@ function toPredicate(token: string): Predicate | null {
       return { kind: "regex", value: pattern, re: compileSafeRegex(pattern, flags), negate };
     }
   }
-  // A well-formed `[…]` property filter is deferred (ignored). An unterminated
-  // `[foo` is NOT a property filter — fall through so it becomes a literal term.
-  if (t.startsWith("[") && t.endsWith("]")) return null;
+  // A well-formed `[key]` / `[key:value]` property filter. An unterminated
+  // `[foo` is NOT a property filter — it never reaches here (tokenize emits it
+  // as a plain token), so a bare bracket falls through to a literal term.
+  if (t.startsWith("[") && t.endsWith("]") && t.length >= 3) {
+    const inner = t.slice(1, -1);
+    const colon = inner.indexOf(":");
+    const key = (colon === -1 ? inner : inner.slice(0, colon)).trim();
+    if (!key) return null;
+    const propValue = colon === -1 ? undefined : inner.slice(colon + 1).trim();
+    return { kind: "prop", value: key, propValue, negate };
+  }
   if (lower.startsWith("tag:") && t.length > 4) {
     return { kind: "tag", value: t.slice(4).replace(/^#/, ""), negate };
   }
@@ -234,7 +249,27 @@ function mentionsWord(hay: string, term: string): boolean {
   return new RegExp(`(^|[^\\w#])${esc}([^\\w]|$)`, "i").test(hay);
 }
 
-function predicateMatches(pred: Predicate, summary: WikiPageSummary): boolean {
+function propMatches(pred: Predicate, props: Record<string, string> | undefined): boolean {
+  if (!props) return false;
+  // Case-insensitive key lookup (frontmatter keys are author-cased).
+  const wantKey = pred.value.toLowerCase();
+  let value: string | undefined;
+  for (const [k, v] of Object.entries(props)) {
+    if (k.toLowerCase() === wantKey) {
+      value = v;
+      break;
+    }
+  }
+  if (value === undefined) return false; // key absent → existence fails
+  if (pred.propValue === undefined) return true; // `[key]` existence check
+  return value.toLowerCase().includes(pred.propValue.toLowerCase());
+}
+
+function predicateMatches(
+  pred: Predicate,
+  summary: WikiPageSummary,
+  props?: Record<string, string>,
+): boolean {
   const title = summary.title ?? "";
   const excerpt = summary.excerpt ?? "";
   const source = summary.source ?? "";
@@ -242,6 +277,9 @@ function predicateMatches(pred: Predicate, summary: WikiPageSummary): boolean {
   const lowerBody = body.toLowerCase();
   let raw: boolean;
   switch (pred.kind) {
+    case "prop":
+      raw = propMatches(pred, props);
+      break;
     case "term":
       raw = lowerBody.includes(pred.value.toLowerCase());
       break;
@@ -268,10 +306,18 @@ function predicateMatches(pred: Predicate, summary: WikiPageSummary): boolean {
   return pred.negate ? !raw : raw;
 }
 
-/** Does a summary satisfy the query (ANY OR-group fully matches)? */
-export function matchSummary(summary: WikiPageSummary, query: SearchQuery): boolean {
+/**
+ * Does a summary satisfy the query (ANY OR-group fully matches)? `props` is the
+ * page's frontmatter (from the wiki property index) — required for `[key]` /
+ * `[key:value]` predicates; omit it and those predicates match nothing.
+ */
+export function matchSummary(
+  summary: WikiPageSummary,
+  query: SearchQuery,
+  props?: Record<string, string>,
+): boolean {
   if (!query.hasQuery) return true;
-  return query.groups.some((group) => group.every((p) => predicateMatches(p, summary)));
+  return query.groups.some((group) => group.every((p) => predicateMatches(p, summary, props)));
 }
 
 /**

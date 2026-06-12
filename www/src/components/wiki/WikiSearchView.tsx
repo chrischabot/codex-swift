@@ -9,6 +9,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { highlightMatch } from "./highlightMatch";
 import { parseSearchQuery, matchSummary, requiresFullCorpus, type SearchQuery } from "./search/searchQuery";
+import { useWikiLinkIndex } from "./useWikiLinkIndex";
 
 interface Props {
   /** The active query — typically driven from the `?q=` search param. */
@@ -35,6 +36,8 @@ function operatorChips(parsed: SearchQuery): string[] {
       if (p.kind === "tag") chips.push(`${prefix}#${p.value}`);
       else if (p.kind === "phrase") chips.push(`${prefix}"${p.value}"`);
       else if (p.kind === "regex") chips.push(`${prefix}/${p.value}/`);
+      else if (p.kind === "prop")
+        chips.push(`${prefix}[${p.value}${p.propValue !== undefined ? `:${p.propValue}` : ""}]`);
       else chips.push(`${prefix}${p.kind}:${p.value}`);
     }
   }
@@ -68,6 +71,9 @@ function useWikiSearch(query: string): SearchState {
   const [state, setState] = React.useState<SearchState>({ results: [], loading: false, ran: "", truncated: false });
   const connected = status.kind === "connected";
   const parsed = React.useMemo(() => parseSearchQuery(query), [query]);
+  // Per-page frontmatter for `[key:value]` property predicates. The id→props
+  // map comes from the shared link/property index.
+  const { byId: propIndex } = useWikiLinkIndex();
 
   React.useEffect(() => {
     const { fullText, hasQuery, groups } = parsed;
@@ -103,7 +109,7 @@ function useWikiSearch(query: string): SearchState {
           if (!alive) return;
           // The candidate set hit its cap → there may be matches beyond it.
           const hitCap = rows.length >= cap;
-          const matched = rows.filter((r) => matchSummary(r, parsed));
+          const matched = rows.filter((r) => matchSummary(r, parsed, propIndex.get(r.id)?.props));
           const filtered = matched.slice(0, SEARCH_LIMIT);
           setState({
             results: filtered,
@@ -120,7 +126,7 @@ function useWikiSearch(query: string): SearchState {
       alive = false;
       clearTimeout(handle);
     };
-  }, [connector, connected, parsed, query]);
+  }, [connector, connected, parsed, query, propIndex]);
 
   return state;
 }

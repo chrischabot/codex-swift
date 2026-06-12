@@ -56,9 +56,17 @@ describe("parseSearchQuery", () => {
     expect(q.groups[0][0].re).toBeNull();
   });
 
-  it("ignores [property] filters (deferred) without crashing", () => {
+  it("parses [property] filters alongside free terms", () => {
     const q = parseSearchQuery("[status:done] real");
-    expect(q.groups[0].map((p) => p.value)).toEqual(["real"]);
+    expect(q.groups[0].map((p) => p.kind)).toEqual(["prop", "term"]);
+    expect(q.groups[0].map((p) => p.value)).toEqual(["status", "real"]);
+    // The property predicate is not a BM25 seed; only the free term is.
+    expect(q.fullText).toBe("real");
+  });
+
+  it("an unterminated [bracket is a literal term, not a property filter", () => {
+    const q = parseSearchQuery("[status real");
+    expect(q.groups[0].every((p) => p.kind === "term")).toBe(true);
   });
 
   it("treats a blank query as no query (matches all)", () => {
@@ -183,5 +191,48 @@ describe("matchSummary", () => {
     const q = parseSearchQuery("/report/g");
     const pages = [1, 2, 3, 4].map((i) => page({ id: String(i), title: `Weekly Report ${i}` }));
     expect(pages.filter((pg) => matchSummary(pg, q)).map((pg) => pg.id)).toEqual(["1", "2", "3", "4"]);
+  });
+});
+
+describe("property [key:value] filters", () => {
+  const p = page({ title: "Roadmap" });
+  const props = { status: "Draft", area: "devrel, growth" };
+  const m = (raw: string, pr?: Record<string, string>) =>
+    matchSummary(p, parseSearchQuery(raw), pr);
+
+  it("parses [key] as an existence predicate and [key:value] with a value", () => {
+    const a = parseSearchQuery("[status]").groups[0][0];
+    expect(a).toMatchObject({ kind: "prop", value: "status", propValue: undefined });
+    const b = parseSearchQuery("[status:draft]").groups[0][0];
+    expect(b).toMatchObject({ kind: "prop", value: "status", propValue: "draft" });
+  });
+
+  it("[key] matches when the page has that property", () => {
+    expect(m("[status]", props)).toBe(true);
+    expect(m("[missing]", props)).toBe(false);
+  });
+
+  it("[key:value] matches case-insensitively as a substring of the value", () => {
+    expect(m("[status:draft]", props)).toBe(true); // 'Draft' contains 'draft'
+    expect(m("[area:growth]", props)).toBe(true); // comma list substring
+    expect(m("[status:done]", props)).toBe(false);
+  });
+
+  it("a property predicate matches nothing without a props map", () => {
+    expect(m("[status:draft]")).toBe(false);
+  });
+
+  it("negation flips a property predicate", () => {
+    expect(m("-[status:done]", props)).toBe(true);
+    expect(m("-[status:draft]", props)).toBe(false);
+  });
+
+  it("a property-only query requires the full corpus (no BM25 seed)", () => {
+    expect(requiresFullCorpus(parseSearchQuery("[status:draft]"))).toBe(true);
+  });
+
+  it("combines a free term with a property filter", () => {
+    expect(m("roadmap [status:draft]", props)).toBe(true);
+    expect(m("roadmap [status:done]", props)).toBe(false);
   });
 });
