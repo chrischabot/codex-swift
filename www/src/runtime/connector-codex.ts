@@ -992,19 +992,7 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
     getWikiIndex: async () => {
       try {
         const r = (await rpc("wiki/index", {})) as { data?: Record<string, unknown>[] };
-        return (r.data ?? []).map((e) => {
-          const links = Array.isArray(e.links)
-            ? (e.links as unknown[]).filter((x): x is string => typeof x === "string")
-            : [];
-          const props: Record<string, string> = {};
-          const rawProps = e.props;
-          if (rawProps && typeof rawProps === "object") {
-            for (const [k, v] of Object.entries(rawProps as Record<string, unknown>)) {
-              if (typeof v === "string") props[k] = v;
-            }
-          }
-          return { id: idStr(e.id), title: pick(e, "title"), links, props };
-        }).filter((e) => e.id);
+        return (r.data ?? []).map(mapWikiIndexEntry).filter((e) => e.id);
       } catch { return []; }
     },
     saveWikiPage: async (input) => {
@@ -1045,7 +1033,9 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
 }
 
 // ── Wiki mappers (ids arrive as integers on the wire; stringify for routing). ──
-function idStr(v: unknown): string {
+// Exported for characterization tests (see connectorWikiMappers.test.ts) — they
+// lock the wire contract between the Swift wiki/* RPCs and the UI types.
+export function idStr(v: unknown): string {
   if (typeof v === "number") return String(v);
   if (typeof v === "string") return v;
   return "";
@@ -1057,7 +1047,7 @@ function normalizeEpochMs(v: unknown): number | undefined {
   if (typeof v !== "number" || v <= 0) return undefined;
   return v < 1e12 ? v * 1000 : v;
 }
-function mapWikiSummary(o: Record<string, unknown>): WikiPageSummary {
+export function mapWikiSummary(o: Record<string, unknown>): WikiPageSummary {
   return {
     id: idStr(o.id),
     title: pick(o, "title", "name") || "Untitled",
@@ -1066,7 +1056,7 @@ function mapWikiSummary(o: Record<string, unknown>): WikiPageSummary {
     updatedAt: normalizeEpochMs(o.updatedAt),
   };
 }
-function mapWikiPage(o: Record<string, unknown>): WikiPage {
+export function mapWikiPage(o: Record<string, unknown>): WikiPage {
   const tags = Array.isArray(o.tags) ? (o.tags as unknown[]).filter((t): t is string => typeof t === "string") : undefined;
   const connections = Array.isArray(o.connections)
     ? (o.connections as Record<string, unknown>[]).map((c) => ({
@@ -1083,6 +1073,22 @@ function mapWikiPage(o: Record<string, unknown>): WikiPage {
     tags: tags?.length ? tags : undefined,
     connections: connections?.length ? connections : undefined,
   };
+}
+
+/** Map one wire `wiki/index` entry → WikiIndexEntry (string links + props only,
+ *  id stringified). Extracted from the connector closure for unit testing. */
+export function mapWikiIndexEntry(e: Record<string, unknown>): { id: string; title: string; links: string[]; props: Record<string, string> } {
+  const links = Array.isArray(e.links)
+    ? (e.links as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  const props: Record<string, string> = {};
+  const rawProps = e.props;
+  if (rawProps && typeof rawProps === "object") {
+    for (const [k, v] of Object.entries(rawProps as Record<string, unknown>)) {
+      if (typeof v === "string") props[k] = v;
+    }
+  }
+  return { id: idStr(e.id), title: pick(e, "title"), links, props };
 }
 
 // ── block / delta helpers ───────────────────────────────────────────────────
