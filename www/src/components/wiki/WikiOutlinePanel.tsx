@@ -70,6 +70,45 @@ function parseHeadings(content: string): OutlineHeading[] {
   return out;
 }
 
+interface Footnote {
+  /** The footnote label, e.g. "1" or "note". */
+  id: string;
+  /** First-line definition text, inline-markdown stripped. */
+  text: string;
+  /** The rendered anchor id of the definition (remark-gfm clobber scheme). */
+  anchorId: string;
+}
+
+/**
+ * Parse footnote DEFINITIONS (`[^id]: text`) out of markdown, skipping fenced
+ * code. The rendered definition lands in `<section class="footnotes">` with
+ * `id="user-content-fn-<label>"` (remark-gfm's default clobber prefix), so the
+ * panel can scroll to it via the same getElementById onJump the outline uses.
+ */
+export function parseFootnotes(content: string): Footnote[] {
+  const lines = content.split(/\r?\n/);
+  const out: Footnote[] = [];
+  const seen = new Set<string>();
+  let fence: string | null = null;
+  for (const line of lines) {
+    const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0];
+      if (fence === null) fence = marker;
+      else if (marker === fence) fence = null;
+      continue;
+    }
+    if (fence !== null) continue;
+    const m = line.match(/^\s{0,3}\[\^([^\]]+)\]:\s*(.*)$/);
+    if (!m) continue;
+    const id = m[1].trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, text: renderedText(m[2].trim()) || `Footnote ${id}`, anchorId: `user-content-fn-${id}` });
+  }
+  return out;
+}
+
 interface Props {
   content: string;
   onJump?: (slug: string) => void;
@@ -77,6 +116,7 @@ interface Props {
 
 export function WikiOutlinePanel({ content, onJump }: Props) {
   const headings = useMemo(() => parseHeadings(content), [content]);
+  const footnotes = useMemo(() => parseFootnotes(content), [content]);
 
   // Normalize indentation against the shallowest heading present so a doc that
   // starts at h2 doesn't waste a level of left padding.
@@ -85,7 +125,7 @@ export function WikiOutlinePanel({ content, onJump }: Props) {
     [headings],
   );
 
-  if (headings.length === 0) {
+  if (headings.length === 0 && footnotes.length === 0) {
     return (
       <div className="px-3 py-4 text-[length:var(--text-sm)] text-[color:var(--color-text-quaternary)]">
         No headings
@@ -116,6 +156,37 @@ export function WikiOutlinePanel({ content, onJump }: Props) {
           </button>
         );
       })}
+
+      {footnotes.length > 0 && (
+        <>
+          <div
+            className={cn(
+              "mt-2 px-2 pb-1 pt-2 text-[11px] font-semibold uppercase tracking-[0.05em]",
+              "text-[color:var(--color-text-quaternary)]",
+              headings.length > 0 && "border-t border-[color:var(--border)]",
+            )}
+          >
+            Footnotes
+          </div>
+          {footnotes.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              title={f.text}
+              onClick={() => onJump?.(f.anchorId)}
+              style={{ paddingInlineStart: 8 }}
+              className={cn(
+                "flex w-full items-center gap-1.5 truncate rounded-sm py-1 pr-2 text-left",
+                "text-[length:var(--text-sm)] leading-tight text-[color:var(--color-text-secondary)]",
+                "transition-colors hover:bg-[color:var(--color-surface-hover)] hover:text-foreground",
+              )}
+            >
+              <span className="shrink-0 font-mono text-[11px] text-[color:var(--text-link)]">[{f.id}]</span>
+              <span className="truncate">{f.text}</span>
+            </button>
+          ))}
+        </>
+      )}
     </nav>
   );
 }
