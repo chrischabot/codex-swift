@@ -380,11 +380,72 @@ function coerceScalar(s: string): string | number | boolean {
 export interface BaseRow {
   readonly page: WikiPageSummary;
   readonly props: Record<string, unknown>;
+  /** The hydrated page content (when fetched), so inline cell-edit can rewrite
+   *  this page's frontmatter without a second round-trip. Undefined → the row
+   *  is summary-only and its property cells are not editable. */
+  readonly content?: string | null;
 }
 
 /** Build a BaseRow from a (possibly full) page + its content for properties. */
 export function makeRow(page: WikiPageSummary, content?: string | null): BaseRow {
-  return { page, props: readPageProperties(content) };
+  return { page, props: readPageProperties(content), content };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frontmatter property WRITE (inline cell-edit) — preserves everything else
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Quote a scalar value when bare YAML would mis-parse it. */
+function quoteYamlScalar(value: string): string {
+  if (value === "") return '""';
+  // Bare is fine for simple words/numbers/booleans; quote anything with YAML-
+  // significant chars or surrounding whitespace.
+  if (/[:#,[\]{}'"]|^\s|\s$|^[-?&*!|>%@`]/.test(value)) {
+    return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  return value;
+}
+
+/**
+ * Set (or, with an empty value, remove) a single scalar frontmatter property on
+ * a page's `content`, preserving ALL other frontmatter lines, their order, and
+ * the entire body verbatim (so hand-authored frontmatter + prose survive a base
+ * cell-edit). Creates a frontmatter block when none exists. Intended for SCALAR
+ * properties only — block/flow LIST values are left to the page's own editor.
+ */
+export function setFrontmatterProperty(
+  content: string | undefined | null,
+  key: string,
+  value: string,
+): string {
+  const text = content ?? "";
+  const { frontmatter, body, newline } = splitFrontmatter(text);
+  const nl = newline;
+  const remove = value.trim() === "";
+  const formatted = `${key}: ${quoteYamlScalar(value)}`;
+  const keyLine = new RegExp(`^(\\s*)${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:.*$`);
+
+  if (frontmatter === null) {
+    if (remove) return text; // nothing to remove; leave the page untouched
+    return `---${nl}${formatted}${nl}---${nl}${text}`;
+  }
+
+  const lines = frontmatter.split(/\r?\n/);
+  let found = false;
+  const next: string[] = [];
+  for (const line of lines) {
+    if (keyLine.test(line)) {
+      found = true;
+      if (!remove) next.push(formatted); // replace in place (drops any prior indent — scalar keys are top-level)
+      continue;
+    }
+    next.push(line);
+  }
+  if (!found && !remove) next.push(formatted);
+  // Drop blank lines we may have introduced by removing a key, but keep author
+  // structure otherwise.
+  const fmText = next.join(nl).replace(new RegExp(`(${nl}){3,}`, "g"), `${nl}${nl}`);
+  return `---${nl}${fmText}${nl}---${nl}${body}`;
 }
 
 /** Extract a column's raw value from a row. */

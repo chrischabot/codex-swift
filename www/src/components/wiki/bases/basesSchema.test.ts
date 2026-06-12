@@ -3,6 +3,7 @@ import {
   parseBaseConfig,
   serializeBaseConfig,
   readPageProperties,
+  setFrontmatterProperty,
   isBaseBody,
   makeRow,
   cellValue,
@@ -146,5 +147,46 @@ describe("rows: filter / sort / group / columns", () => {
     expect(cellValue(r, "title")).toBe("Beta");
     expect(cellValue(r, "status")).toBe("active");
     expect(formatCell(["a", "b"], "tags")).toContain("a");
+  });
+});
+
+describe("setFrontmatterProperty", () => {
+  const doc = "---\ntitle: My Page\nstatus: draft\n---\n# Body\n\nProse here.";
+
+  it("replaces an existing scalar in place, preserving other keys and body", () => {
+    const out = setFrontmatterProperty(doc, "status", "done");
+    expect(out).toBe("---\ntitle: My Page\nstatus: done\n---\n# Body\n\nProse here.");
+  });
+
+  it("appends a new key when absent", () => {
+    const out = setFrontmatterProperty(doc, "prio", "high");
+    expect(readPageProperties(out)).toMatchObject({ status: "draft", prio: "high" });
+    expect(out).toContain("# Body"); // body preserved
+  });
+
+  it("removes a key when the value is blank", () => {
+    const out = setFrontmatterProperty(doc, "status", "");
+    expect(readPageProperties(out).status).toBeUndefined();
+    expect(readPageProperties(out).title).toBe("My Page");
+  });
+
+  it("creates a frontmatter block when none exists", () => {
+    const out = setFrontmatterProperty("Just prose.", "status", "draft");
+    expect(out).toBe("---\nstatus: draft\n---\nJust prose.");
+  });
+
+  it("quotes values with YAML-significant characters", () => {
+    const out = setFrontmatterProperty(doc, "note", "a: b, c");
+    expect(out).toContain('note: "a: b, c"');
+    expect(readPageProperties(out).note).toBe("a: b, c");
+  });
+
+  it("preserves hand-authored frontmatter keys it doesn't touch", () => {
+    const rich = "---\ntitle: T\ncustom_field: keep-me\naliases: [a, b]\n---\nbody";
+    const out = setFrontmatterProperty(rich, "status", "new");
+    const props = readPageProperties(out);
+    expect(props.custom_field).toBe("keep-me");
+    expect(props.aliases).toEqual(["a", "b"]);
+    expect(props.status).toBe("new");
   });
 });

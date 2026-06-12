@@ -14,6 +14,7 @@ import {
   parseBaseConfig,
   rowTags,
   serializeBaseConfig,
+  setFrontmatterProperty,
 } from "./basesSchema";
 
 const ROW_LIMIT = 200;
@@ -188,6 +189,14 @@ export interface BaseRowsState {
   truncated: boolean;
 }
 
+export interface UseBaseRows extends BaseRowsState {
+  /** Inline-edit a scalar frontmatter property on a row page: rewrites that
+   *  page's frontmatter (preserving everything else) and saves it. Optimistically
+   *  updates the row; reverts + returns an error string on failure. A no-op (and
+   *  returns null) for summary-only rows (no hydrated content) or no connector. */
+  editCell(pageId: string, key: string, value: string): Promise<string | null>;
+}
+
 /**
  * Fetch the rows for a base. Uses searchWiki when `source.query` is set,
  * otherwise listWikiPages; then client-filters by `source.tag` against each
@@ -195,7 +204,7 @@ export interface BaseRowsState {
  * page content (getWikiPage) for each summary — capped at ROW_LIMIT so a large
  * corpus doesn't fan out unbounded.
  */
-export function useBaseRows(config: BaseConfig): BaseRowsState {
+export function useBaseRows(config: BaseConfig): UseBaseRows {
   const { connector, status } = useRuntime();
   const connected = status.kind === "connected";
   const [state, setState] = React.useState<BaseRowsState>({ rows: [], loading: true, error: null, truncated: false });
@@ -261,5 +270,44 @@ export function useBaseRows(config: BaseConfig): BaseRowsState {
     };
   }, [connector, connected, tag, query]);
 
-  return state;
+  const editCell = React.useCallback(
+    async (pageId: string, key: string, value: string): Promise<string | null> => {
+      const save = connector.saveWikiPage;
+      if (!save) return "This connection can't save pages.";
+      let prevRow: BaseRow | undefined;
+      let nextContent = "";
+      let title = "";
+      setState((s) => {
+        const idx = s.rows.findIndex((r) => r.page.id === pageId);
+        if (idx === -1) return s;
+        prevRow = s.rows[idx];
+        if (prevRow.content == null) return s; // summary-only → not editable
+        nextContent = setFrontmatterProperty(prevRow.content, key, value);
+        title = prevRow.page.title;
+        const rows = s.rows.slice();
+        rows[idx] = makeRow(prevRow.page, nextContent); // optimistic
+        return { ...s, rows };
+      });
+      if (!prevRow || prevRow.content == null) return null;
+      try {
+        const res = await save({ id: pageId, title, body: nextContent });
+        if (!res) throw new Error("save failed");
+        return null;
+      } catch (err) {
+        // Revert the optimistic row.
+        const original = prevRow;
+        setState((s) => {
+          const idx = s.rows.findIndex((r) => r.page.id === pageId);
+          if (idx === -1) return s;
+          const rows = s.rows.slice();
+          rows[idx] = original;
+          return { ...s, rows };
+        });
+        return err instanceof Error ? err.message : "Failed to save";
+      }
+    },
+    [connector],
+  );
+
+  return { ...state, editCell };
 }

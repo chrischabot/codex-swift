@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/sonner";
 import { computeSummary, SUMMARY_OPS, SUMMARY_LABEL, type SummaryOp } from "./baseSummaries";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -66,7 +67,7 @@ interface Props {
 
 export function WikiBaseView({ pageId }: Props) {
   const { title, config, loading, saving, error, update } = useBaseDoc(pageId);
-  const { rows: allRows, loading: rowsLoading, error: rowsError } = useBaseRows(config);
+  const { rows: allRows, loading: rowsLoading, error: rowsError, editCell } = useBaseRows(config);
 
   // Filter → sort → group, all client-side.
   const visibleRows = React.useMemo(() => {
@@ -124,7 +125,7 @@ export function WikiBaseView({ pageId }: Props) {
         ) : config.view === "cards" ? (
           <CardsView config={config} rows={visibleRows} grouped={grouped} />
         ) : (
-          <TableView config={config} rows={visibleRows} grouped={grouped} onChange={update} />
+          <TableView config={config} rows={visibleRows} grouped={grouped} onChange={update} editCell={editCell} />
         )}
       </div>
     </div>
@@ -591,6 +592,87 @@ function useOpenRow() {
 
 // ── Cell rendering ────────────────────────────────────────────────────────────
 
+/** Is a column an editable scalar frontmatter property on this row? Built-in
+ *  pseudo-columns and array (list/tags) values are not inline-editable. */
+function isEditableCell(row: BaseRow, columnKey: ColumnKey): boolean {
+  if ((BUILTIN_COLUMNS as string[]).includes(columnKey)) return false;
+  if (row.content == null) return false; // summary-only row → no write target
+  const v = cellValue(row, columnKey);
+  return !Array.isArray(v) && typeof v !== "object";
+}
+
+/**
+ * An inline-editable scalar property cell. Click (or focus + Enter) enters edit
+ * mode with an input; Enter/blur commits via `onCommit`, Escape cancels. Clicks
+ * are stopped from bubbling so they don't trigger the row's open-on-click.
+ */
+function EditableCell({
+  value,
+  columnKey,
+  onCommit,
+}: {
+  value: unknown;
+  columnKey: ColumnKey;
+  onCommit: (next: string) => Promise<string | null>;
+}) {
+  const initial = formatCell(value, columnKey);
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState(initial);
+  const [busy, setBusy] = React.useState(false);
+
+  const start = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDraft(initial);
+    setEditing(true);
+  };
+  const commit = async () => {
+    if (busy) return;
+    if (draft === initial) {
+      setEditing(false);
+      return;
+    }
+    setBusy(true);
+    const err = await onCommit(draft);
+    setBusy(false);
+    setEditing(false);
+    if (err) toast.error(err);
+  };
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={start}
+        title="Click to edit"
+        className="-mx-1 min-h-[1.4em] w-[calc(100%+0.5rem)] rounded px-1 text-left hover:bg-[color:var(--color-surface-active)]"
+      >
+        {initial || <span className="text-[color:var(--color-text-quaternary)]">—</span>}
+      </button>
+    );
+  }
+  return (
+    <input
+      autoFocus
+      value={draft}
+      disabled={busy}
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setDraft(e.currentTarget.value)}
+      onBlur={() => void commit()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") {
+          e.preventDefault();
+          void commit();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          setEditing(false);
+        }
+      }}
+      className="w-full rounded border border-[color:var(--text-link)] bg-[color:var(--color-card)] px-1 py-0.5 text-[13px] text-foreground outline-none"
+    />
+  );
+}
+
 function CellContent({ value, columnKey }: { value: unknown; columnKey: ColumnKey }) {
   if (columnKey === "tags" && Array.isArray(value)) {
     return (
@@ -628,7 +710,11 @@ function TableView({
   rows,
   grouped,
   onChange,
-}: ViewProps & { onChange: (next: BaseConfig) => void }) {
+  editCell,
+}: ViewProps & {
+  onChange: (next: BaseConfig) => void;
+  editCell: (pageId: string, key: ColumnKey, value: string) => Promise<string | null>;
+}) {
   const open = useOpenRow();
   const cols = config.columns;
 
@@ -656,7 +742,15 @@ function TableView({
       >
         {cols.map((c) => (
           <td key={c.key} className="px-3 py-2 align-top text-[13px] text-foreground">
-            <CellContent value={cellValue(row, c.key)} columnKey={c.key} />
+            {isEditableCell(row, c.key) ? (
+              <EditableCell
+                value={cellValue(row, c.key)}
+                columnKey={c.key}
+                onCommit={(next) => editCell(row.page.id, c.key, next)}
+              />
+            ) : (
+              <CellContent value={cellValue(row, c.key)} columnKey={c.key} />
+            )}
           </td>
         ))}
       </tr>
