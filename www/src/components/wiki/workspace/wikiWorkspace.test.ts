@@ -18,6 +18,7 @@ import {
   leavesOfGroup,
   moveTab,
   newTab,
+  openView,
   columnWidthWeight,
   groupHeightWeight,
   resizeColumns,
@@ -92,6 +93,47 @@ describe("newTab", () => {
     s = newTab(s);
     expect(groupLeafIds(s)).toHaveLength(2);
     expect(activeLeaf(s)?.state).toEqual({ type: "empty" });
+  });
+});
+
+describe("openView (M32 non-page leaves)", () => {
+  it("replaces a replaceable active leaf in place", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openView(s, { type: "graph" });
+    expect(groupLeafIds(s)).toHaveLength(1);
+    expect(activeLeaf(s)?.state).toEqual({ type: "graph" });
+  });
+
+  it("appends when newTab is set and carries the search query", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openView(s, { type: "search", query: "tag:devrel" }, { newTab: true });
+    expect(groupLeafIds(s)).toHaveLength(2);
+    expect(activeLeaf(s)?.state).toEqual({ type: "search", query: "tag:devrel" });
+  });
+
+  it("does not replace a pinned page tab (appends instead)", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = togglePinned(s, activeLeaf(s)!.id);
+    s = openView(s, { type: "graph" });
+    expect(groupLeafIds(s)).toHaveLength(2);
+  });
+
+  it("opening a page over a view pane appends (never clobbers the view)", () => {
+    let s = openView(buildInitial(), { type: "graph" });
+    s = openOrFocusPage(s, "p1");
+    expect(groupLeafIds(s)).toHaveLength(2);
+    expect(activePageId(s)).toBe("p1");
+  });
+
+  it("survives a serialize → deserialize round-trip", () => {
+    let s = openOrFocusPage(buildInitial(), "p1");
+    s = openView(s, { type: "search", query: "roadmap" }, { newTab: true });
+    s = openView(s, { type: "graph" }, { newTab: true });
+    const restored = deserialize(serialize(s))!;
+    const states = [...restored.leaves.values()].map((l) => l.state.type).sort();
+    expect(states).toEqual(["graph", "page", "search"]);
+    const search = [...restored.leaves.values()].find((l) => l.state.type === "search");
+    expect(search?.state).toEqual({ type: "search", query: "roadmap" });
   });
 });
 

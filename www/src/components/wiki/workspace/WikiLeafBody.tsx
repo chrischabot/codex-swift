@@ -10,6 +10,8 @@ import { WikiEditor } from "@/components/wiki/editor/WikiEditor";
 import { WikiReadingView } from "@/components/wiki/WikiReadingView";
 import { WikiCanvasView } from "@/components/wiki/canvas/WikiCanvasView";
 import { WikiBaseView } from "@/components/wiki/bases/WikiBaseView";
+import { WikiGraphView } from "@/components/wiki/graph/WikiGraphView";
+import { WikiSearchView } from "@/components/wiki/WikiSearchView";
 import { isCanvasDoc } from "@/components/wiki/canvas/canvasSchema";
 import { isBaseBody } from "@/components/wiki/bases/basesSchema";
 import { BookmarkButton } from "@/components/wiki/panels/BookmarkButton";
@@ -32,6 +34,8 @@ export interface LeafBodyCallbacks {
   onDeleted: () => void;
   /** Force the right rail (and anything keyed on it) to refetch after a save. */
   onPageSaved: (id: string) => void;
+  /** Open a non-page view (graph / search) in this pane (M32). */
+  onOpenView?: (view: { type: "graph" } | { type: "search"; query: string }) => void;
 }
 
 interface Props {
@@ -54,10 +58,48 @@ export function WikiLeafBody({ leaf, isActive, callbacks }: Props) {
         <FileText className="size-8 opacity-40" />
         <div className="text-[13px]">No page open in this pane</div>
         <div className="text-[12px]">Open one from the explorer, or press ⌘O to switch pages.</div>
+        {callbacks.onOpenView && (
+          <div className="mt-2 flex items-center gap-2">
+            <Button variant="outline" size="xs" onClick={() => callbacks.onOpenView!({ type: "graph" })}>
+              Open graph here
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => callbacks.onOpenView!({ type: "search", query: "" })}
+            >
+              Open search here
+            </Button>
+          </div>
+        )}
       </div>
     );
   }
+  if (leaf.state.type === "graph") {
+    return (
+      <div className="flex min-h-0 flex-1">
+        <WikiGraphView
+          depth={2}
+          onSelectEntity={() => {}}
+          className="min-h-0 flex-1"
+        />
+      </div>
+    );
+  }
+  if (leaf.state.type === "search") {
+    return <SearchLeafBody initialQuery={leaf.state.query} />;
+  }
   return <PageLeafBody pageId={leaf.state.pageId} isActive={isActive} callbacks={callbacks} />;
+}
+
+/** A search pane: owns its own query box state, seeded from the leaf. */
+function SearchLeafBody({ initialQuery }: { initialQuery: string }) {
+  const [query, setQuery] = React.useState(initialQuery);
+  return (
+    <div className="flex min-h-0 flex-1 flex-col p-3">
+      <WikiSearchView query={query} onQueryChange={setQuery} />
+    </div>
+  );
 }
 
 function PageLeafBody({

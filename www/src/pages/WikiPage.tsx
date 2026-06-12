@@ -246,6 +246,10 @@ function WikiWorkspacePage() {
         setDataVersion((v) => v + 1);
       },
       onPageSaved: () => setDataVersion((v) => v + 1),
+      onOpenView: (view) => {
+        ws.focusGroup(groupId);
+        ws.openView(view);
+      },
     }),
     [resolveWikiLink, ws, navigate, location.pathname, onTag],
   );

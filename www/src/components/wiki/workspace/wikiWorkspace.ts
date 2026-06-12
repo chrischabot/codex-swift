@@ -29,7 +29,17 @@ export type WikiLeafState =
       /** Pinned tabs are never replaced by navigate-in-place (a new tab opens
        *  instead) and resist close-others; toggled from the tab UI. */
       readonly pinned?: boolean;
-    };
+    }
+  // M32: non-page panes. A pane can host the graph or a search surface, not just
+  // pages — so the workspace tree is a true leaf-TYPE union. These carry no
+  // pageId, so the route reconciler leaves the URL untouched while one is active.
+  | { readonly type: "graph"; readonly pinned?: boolean }
+  | { readonly type: "search"; readonly query: string; readonly pinned?: boolean };
+
+/** Non-page view leaf kinds (everything except empty/page). */
+export type WikiViewLeaf =
+  | { readonly type: "graph" }
+  | { readonly type: "search"; readonly query: string };
 
 export interface Leaf {
   readonly id: LeafId;
@@ -259,6 +269,42 @@ export function openOrFocusPage(
   const groups = new Map(state.groups);
   groups.set(groupId, { ...group, leafIds: [...group.leafIds, id], activeLeafId: id });
   return withDerived({ ...state, leaves, groups, histories: pushNav(state.histories, id, pageId) });
+}
+
+/**
+ * Open a non-page VIEW (graph / search) in the active group (M32). Replaces the
+ * active replaceable, non-pinned leaf in place when `newTab` is false; otherwise
+ * (or when the active leaf is pinned) appends a new tab. Unlike pages, views are
+ * not de-duplicated — two graph panes are allowed.
+ */
+export function openView(
+  state: WorkspaceState,
+  view: WikiViewLeaf,
+  opts: { newTab?: boolean } = {},
+): WorkspaceState {
+  const groupId = state.activeGroupId;
+  if (!groupId) return state;
+  const group = state.groups.get(groupId);
+  if (!group) return state;
+
+  const activeLeafObj = group.activeLeafId ? state.leaves.get(group.activeLeafId) : null;
+  const canReplace =
+    !opts.newTab &&
+    activeLeafObj &&
+    REPLACEABLE.includes(activeLeafObj.state.type) &&
+    !(activeLeafObj.state.type === "page" && activeLeafObj.state.pinned);
+
+  if (canReplace && activeLeafObj) {
+    const updated: Leaf = { id: activeLeafObj.id, state: { ...view } };
+    return withDerived({ ...state, leaves: new Map(state.leaves).set(updated.id, updated) });
+  }
+
+  const id = newId("l");
+  const leaves = new Map(state.leaves);
+  leaves.set(id, { id, state: { ...view } });
+  const groups = new Map(state.groups);
+  groups.set(groupId, { ...group, leafIds: [...group.leafIds, id], activeLeafId: id });
+  return withDerived({ ...state, leaves, groups });
 }
 
 /** Open a fresh empty (index) tab in the active group, always appending. */
@@ -784,5 +830,7 @@ function isLeafState(v: unknown): v is WikiLeafState {
   const t = (v as { type?: unknown }).type;
   if (t === "empty") return true;
   if (t === "page") return typeof (v as { pageId?: unknown }).pageId === "string" && (v as { pageId: string }).pageId.length > 0;
+  if (t === "graph") return true;
+  if (t === "search") return typeof (v as { query?: unknown }).query === "string";
   return false;
 }

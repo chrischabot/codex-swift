@@ -46,8 +46,16 @@ interface Props {
 }
 
 function leafTitle(leaf: Leaf, titleById: ReadonlyMap<string, string>): string {
-  if (leaf.state.type === "empty") return "New tab";
-  return titleById.get(leaf.state.pageId) || "Untitled";
+  switch (leaf.state.type) {
+    case "empty":
+      return "New tab";
+    case "graph":
+      return "Graph";
+    case "search":
+      return leaf.state.query ? `Search: ${leaf.state.query}` : "Search";
+    case "page":
+      return titleById.get(leaf.state.pageId) || "Untitled";
+  }
 }
 
 /**

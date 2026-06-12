@@ -15,6 +15,7 @@ import {
   moveTab as moveTabOp,
   newTab as newTabOp,
   openOrFocusPage,
+  openView as openViewOp,
   serialize,
   splitLeaf as splitLeafOp,
   toggleStacked as toggleStackedOp,
@@ -22,6 +23,7 @@ import {
   type LeafId,
   type TabGroupId,
   type WorkspaceState,
+  type WikiViewLeaf,
 } from "./wikiWorkspace";
 import { createWorkspaceSync, type WorkspaceSync } from "./wikiWorkspaceSync";
 
@@ -53,6 +55,8 @@ export interface UseWikiWorkspace {
   state: WorkspaceState;
   /** Open/focus a page in the active group (replace-in-place by default). */
   openPage: (pageId: string, opts?: { newTab?: boolean }) => void;
+  /** Open a non-page view (graph / search) in the active pane (M32). */
+  openView: (view: WikiViewLeaf, opts?: { newTab?: boolean }) => void;
   newTab: () => void;
   focusLeaf: (id: LeafId) => void;
   focusGroup: (id: TabGroupId) => void;
@@ -147,6 +151,10 @@ export function useWikiWorkspace(opts: { sync?: boolean } = {}): UseWikiWorkspac
       setState((s) => openOrFocusPage(s, pageId, opts)),
     [],
   );
+  const openView = React.useCallback(
+    (view: WikiViewLeaf, opts?: { newTab?: boolean }) => setState((s) => openViewOp(s, view, opts)),
+    [],
+  );
   const newTab = React.useCallback(() => setState(newTabOp), []);
   const focusLeaf = React.useCallback((id: LeafId) => setState((s) => focusLeafOp(s, id)), []);
   const focusGroup = React.useCallback((id: TabGroupId) => setState((s) => focusGroupOp(s, id)), []);
@@ -184,6 +192,7 @@ export function useWikiWorkspace(opts: { sync?: boolean } = {}): UseWikiWorkspac
   return {
     state,
     openPage,
+    openView,
     newTab,
     focusLeaf,
     focusGroup,
