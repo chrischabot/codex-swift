@@ -10,6 +10,7 @@ import {
   type WikiCommandContext,
 } from "./commandRegistry";
 import { parseHotkey, matchesHotkey, isEditableTarget } from "./hotkeyMatch";
+import { useHotkeyOverrides } from "./hotkeyOverrides";
 
 // Chords owned by dedicated bindings elsewhere — the dispatcher must NOT also
 // fire them or they'd double-toggle. Cmd-P (palette) lives in this hook; Cmd-O
@@ -63,6 +64,7 @@ export function useWikiCommands({
   const params = useParams();
   const { connector, status } = useRuntime();
   const { toggle: toggleBookmark } = useBookmarks();
+  const overrides = useHotkeyOverrides();
 
   // Open today's daily note, creating it (date-titled, from a template) when it
   // doesn't exist yet. Fire-and-forget from the sync command context.
@@ -183,10 +185,13 @@ export function useWikiCommands({
   // (no modifier) is suppressed while a text field has focus.
   React.useEffect(() => {
     if (!enabled) return;
-    // Precompute (command, parsed-chord) pairs once per registry/enabled change.
+    // Precompute (command, parsed-chord) pairs. The effective accelerator is the
+    // user override (if any) layered over the registry's built-in hotkey.
     const bound = registered
-      .filter((c) => c.hotkey && !DISPATCH_RESERVED.has(c.id))
-      .map((c) => ({ c, hk: parseHotkey(c.hotkey!) }))
+      .filter((c) => !DISPATCH_RESERVED.has(c.id))
+      .map((c) => ({ c, accel: overrides[c.id] ?? c.hotkey }))
+      .filter((b): b is { c: WikiCommand; accel: string } => !!b.accel)
+      .map((b) => ({ c: b.c, hk: parseHotkey(b.accel) }))
       .filter((b): b is { c: WikiCommand; hk: NonNullable<typeof b.hk> } => b.hk !== null);
     if (bound.length === 0) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -203,7 +208,7 @@ export function useWikiCommands({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [enabled, registered, buildContext]);
+  }, [enabled, registered, buildContext, overrides]);
 
   return { open, setOpen, commands, run };
 }

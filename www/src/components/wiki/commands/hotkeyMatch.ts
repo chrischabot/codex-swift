@@ -69,6 +69,46 @@ export function matchesHotkey(e: KeyboardEvent, h: Hotkey): boolean {
   return e.key.toLowerCase() === h.key;
 }
 
+// Modifier symbols, in display order, matching the registry hint convention
+// (⌘ first, e.g. "⌘⇧F"). parseHotkey is order-agnostic, but keeping the same
+// order means a captured chord renders identically to a built-in.
+const MOD_SYMBOLS: Array<[keyof KeyboardEvent, string]> = [
+  ["metaKey", "⌘"],
+  ["ctrlKey", "⌃"],
+  ["altKey", "⌥"],
+  ["shiftKey", "⇧"],
+];
+
+/** Pretty-printed names for non-printable keys captured during rebinding. */
+const KEY_LABEL: Record<string, string> = {
+  " ": "Space",
+  arrowup: "↑",
+  arrowdown: "↓",
+  arrowleft: "←",
+  arrowright: "→",
+  escape: "Esc",
+  enter: "↵",
+  backspace: "⌫",
+  delete: "⌦",
+  tab: "⇥",
+};
+
+/**
+ * Format a KeyboardEvent into a display accelerator hint (e.g. "⌘⇧F"), the same
+ * dialect parseHotkey reads — so a captured chord round-trips through the
+ * dispatcher. Returns null when the event is a bare modifier press (no real
+ * key yet) so the capture UI can keep waiting.
+ */
+export function formatHotkey(e: KeyboardEvent): string | null {
+  const key = e.key;
+  if (key === "Control" || key === "Alt" || key === "Shift" || key === "Meta") return null;
+  let out = "";
+  for (const [prop, sym] of MOD_SYMBOLS) if (e[prop]) out += sym;
+  const lower = key.toLowerCase();
+  const label = KEY_LABEL[lower] ?? (key.length === 1 ? key.toUpperCase() : key);
+  return out + label;
+}
+
 /** True when focus is in a text-entry surface, where bare-key chords (no mod)
  *  should NOT fire. Mod chords are allowed through. */
 export function isEditableTarget(target: EventTarget | null): boolean {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseHotkey, matchesHotkey, isEditableTarget } from "./hotkeyMatch";
+import { parseHotkey, matchesHotkey, isEditableTarget, formatHotkey } from "./hotkeyMatch";
 
 const ev = (key: string, mods: Partial<KeyboardEvent> = {}) =>
   ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods }) as KeyboardEvent;
@@ -40,6 +40,31 @@ describe("matchesHotkey", () => {
     const slash = parseHotkey("/")!;
     expect(matchesHotkey(ev("/"), slash)).toBe(true);
     expect(matchesHotkey(ev("/", { metaKey: true }), slash)).toBe(false);
+  });
+});
+
+describe("formatHotkey", () => {
+  const ke = (key: string, mods: Partial<KeyboardEvent> = {}) =>
+    ({ key, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods }) as KeyboardEvent;
+
+  it("formats modifiers in canonical order + uppercases the key", () => {
+    expect(formatHotkey(ke("f", { metaKey: true, shiftKey: true }))).toBe("⌘⇧F");
+    expect(formatHotkey(ke("k", { ctrlKey: true, altKey: true }))).toBe("⌃⌥K");
+  });
+
+  it("labels special keys", () => {
+    expect(formatHotkey(ke("Enter", { metaKey: true }))).toBe("⌘↵");
+    expect(formatHotkey(ke("ArrowUp", { metaKey: true }))).toBe("⌘↑");
+  });
+
+  it("returns null for a bare modifier press", () => {
+    expect(formatHotkey(ke("Meta", { metaKey: true }))).toBeNull();
+    expect(formatHotkey(ke("Shift", { shiftKey: true }))).toBeNull();
+  });
+
+  it("round-trips through parseHotkey", () => {
+    const formatted = formatHotkey(ke("f", { metaKey: true, shiftKey: true }))!;
+    expect(parseHotkey(formatted)).toEqual({ mod: true, shift: true, alt: false, ctrl: false, key: "f" });
   });
 });
 

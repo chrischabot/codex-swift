@@ -6,7 +6,14 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
+import { RotateCcw } from "lucide-react";
 import { wikiCommandRegistry, WIKI_EVENTS, type WikiCommand } from "./commandRegistry";
+import { formatHotkey } from "./hotkeyMatch";
+import {
+  useHotkeyOverrides,
+  setHotkeyOverride,
+  resetHotkeyOverrides,
+} from "./hotkeyOverrides";
 
 // M29 keyboard-shortcuts help overlay. Opened by the "Show keyboard shortcuts"
 // command (⌘/, dispatched by useWikiCommands) via a window CustomEvent, so any
@@ -26,8 +33,62 @@ function groupByCategory(commands: ReadonlyArray<WikiCommand>): Array<[string, W
   return Array.from(groups.entries());
 }
 
+/** A rebindable accelerator chip: click to capture a new chord, Esc cancels,
+ *  Backspace/Delete clears the override (restores the built-in). */
+function HotkeyChip({ command, custom }: { command: WikiCommand; custom?: string }) {
+  const [capturing, setCapturing] = React.useState(false);
+  const accel = custom ?? command.hotkey ?? "";
+
+  React.useEffect(() => {
+    if (!capturing) return;
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        setCapturing(false);
+        return;
+      }
+      if (e.key === "Backspace" || e.key === "Delete") {
+        setHotkeyOverride(command.id, ""); // clear → built-in restored
+        setCapturing(false);
+        return;
+      }
+      const next = formatHotkey(e);
+      if (!next) return; // bare modifier — keep waiting
+      setHotkeyOverride(command.id, next);
+      setCapturing(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [capturing, command.id]);
+
+  return (
+    <span className="flex shrink-0 items-center gap-1">
+      <button
+        type="button"
+        onClick={() => setCapturing((v) => !v)}
+        title="Click to rebind"
+        className="rounded border border-[color:var(--border)] bg-[color:var(--code-surface)] px-1.5 py-0.5 font-mono text-[12px] text-[color:var(--color-text-secondary)] hover:border-[color:var(--text-link)]"
+      >
+        {capturing ? "press keys…" : accel || "—"}
+      </button>
+      {custom ? (
+        <button
+          type="button"
+          onClick={() => setHotkeyOverride(command.id, "")}
+          title="Reset to default"
+          className="text-[color:var(--color-text-quaternary)] hover:text-foreground"
+        >
+          <RotateCcw className="size-3" />
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
 export function WikiShortcutsDialog() {
   const [open, setOpen] = React.useState(false);
+  const overrides = useHotkeyOverrides();
 
   React.useEffect(() => {
     const onShow = () => setOpen(true);
@@ -61,9 +122,7 @@ export function WikiShortcutsDialog() {
                   className="flex items-center justify-between gap-3 rounded-md px-2 py-1.5 text-[13px] hover:bg-[color:var(--color-surface-hover)]"
                 >
                   <span className="min-w-0 truncate text-foreground">{c.name}</span>
-                  <kbd className="shrink-0 rounded border border-[color:var(--border)] bg-[color:var(--code-surface)] px-1.5 py-0.5 font-mono text-[12px] text-[color:var(--color-text-secondary)]">
-                    {c.hotkey}
-                  </kbd>
+                  <HotkeyChip command={c} custom={overrides[c.id]} />
                 </div>
               ))}
             </div>
@@ -79,6 +138,18 @@ export function WikiShortcutsDialog() {
                 ⌘P
               </kbd>
             </div>
+          </div>
+          <div className="mt-3 flex items-center justify-between border-t border-[color:var(--border)] pt-2 text-[11px] text-[color:var(--color-text-quaternary)]">
+            <span>Click a shortcut to rebind · Esc cancels · ⌫ clears</span>
+            {Object.keys(overrides).length > 0 ? (
+              <button
+                type="button"
+                onClick={() => resetHotkeyOverrides()}
+                className="inline-flex items-center gap-1 hover:text-foreground"
+              >
+                <RotateCcw className="size-3" /> Reset all
+              </button>
+            ) : null}
           </div>
         </div>
       </DialogContent>
