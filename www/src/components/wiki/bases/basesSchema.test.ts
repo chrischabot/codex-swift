@@ -4,6 +4,8 @@ import {
   serializeBaseConfig,
   readPageProperties,
   setFrontmatterProperty,
+  applyFormulas,
+  formulaColumnKeys,
   isBaseBody,
   makeRow,
   cellValue,
@@ -188,5 +190,50 @@ describe("setFrontmatterProperty", () => {
     expect(props.custom_field).toBe("keep-me");
     expect(props.aliases).toEqual(["a", "b"]);
     expect(props.status).toBe("new");
+  });
+});
+
+describe("applyFormulas", () => {
+  const content = "---\nprice: 10\nqty: 3\n---\nbody";
+  const row = makeRow({ id: "1", title: "Widget" }, content);
+
+  it("injects computed values into row props under the column key", () => {
+    const cols = [
+      { key: "title", label: "Title" },
+      { key: "total", label: "Total", formula: "price * qty" },
+    ];
+    const [out] = applyFormulas([row], cols);
+    expect(out.props.total).toBe(30);
+    // The computed value flows through cellValue + formatCell + sort/group.
+    expect(cellValue(out, "total")).toBe(30);
+  });
+
+  it("a formula can reference built-in fields", () => {
+    const cols = [{ key: "label", label: "Label", formula: 'concat(title, " x", qty)' }];
+    expect(applyFormulas([row], cols)[0].props.label).toBe("Widget x3");
+  });
+
+  it("returns rows unchanged when no column has a formula", () => {
+    const cols = [{ key: "title", label: "Title" }];
+    expect(applyFormulas([row], cols)[0]).toBe(row);
+  });
+
+  it("formulaColumnKeys lists only computed columns", () => {
+    const cols = [
+      { key: "a", label: "A" },
+      { key: "b", label: "B", formula: "1+1" },
+      { key: "c", label: "C", formula: "  " }, // blank → not computed
+    ];
+    expect([...formulaColumnKeys(cols)]).toEqual(["b"]);
+  });
+
+  it("round-trips a formula column through serialize/parse", () => {
+    const cfg = parseBaseConfig(
+      serializeBaseConfig({
+        ...DEFAULT_BASE,
+        columns: [{ key: "total", label: "Total", formula: "price * qty" }],
+      }),
+    );
+    expect(cfg.columns[0].formula).toBe("price * qty");
   });
 });

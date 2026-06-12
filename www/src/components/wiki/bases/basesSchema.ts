@@ -18,6 +18,7 @@
 // property key read from the row page's own `content` frontmatter.
 
 import type { WikiPage, WikiPageSummary } from "@/runtime/connector";
+import { evalFormula, type Scope } from "./formula";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -60,6 +61,11 @@ export const UNARY_OPS: ReadonlySet<FilterOp> = new Set<FilterOp>(["exists", "em
 export interface BaseColumn {
   readonly key: ColumnKey;
   readonly label: string;
+  /** When set, this is a COMPUTED column: its cell value is `evalFormula(formula,
+   *  row)` rather than a page field. The `key` is a synthetic id used only for
+   *  identity (sort/group/summary still work because the computed value is
+   *  injected into `row.props[key]` by applyFormulas). */
+  readonly formula?: string;
 }
 
 export interface BaseFilter {
@@ -191,7 +197,8 @@ function asColumns(v: unknown): BaseColumn[] {
     const key = typeof rec.key === "string" ? rec.key : null;
     if (!key) continue;
     const label = typeof rec.label === "string" && rec.label ? rec.label : defaultColumnLabel(key);
-    out.push({ key, label });
+    const formula = typeof rec.formula === "string" && rec.formula ? rec.formula : undefined;
+    out.push(formula ? { key, label, formula } : { key, label });
   }
   return out.length > 0 ? out : [...DEFAULT_BASE.columns];
 }
@@ -277,7 +284,7 @@ export function serializeBaseConfig(config: BaseConfig): string {
   const json: Record<string, unknown> = {
     view: config.view,
     source: config.source,
-    columns: config.columns.map((c) => ({ key: c.key, label: c.label })),
+    columns: config.columns.map((c) => (c.formula ? { key: c.key, label: c.label, formula: c.formula } : { key: c.key, label: c.label })),
     filters: config.filters.map((f) => ({ key: f.key, op: f.op, value: f.value })),
     sort: config.sort.map((s) => ({ key: s.key, dir: s.dir })),
   };
@@ -389,6 +396,42 @@ export interface BaseRow {
 /** Build a BaseRow from a (possibly full) page + its content for properties. */
 export function makeRow(page: WikiPageSummary, content?: string | null): BaseRow {
   return { page, props: readPageProperties(content), content };
+}
+
+/** A formula scope over a row: built-in pseudo-fields + own frontmatter props.
+ *  Uses hasOwn so a prototype member can never leak into the formula sandbox. */
+function formulaScope(row: BaseRow): Scope {
+  return (name: string) => {
+    if (name === "title" || name === "source" || name === "updatedAt" || name === "tags") {
+      return cellValue(row, name);
+    }
+    return Object.prototype.hasOwnProperty.call(row.props, name) ? row.props[name] : undefined;
+  };
+}
+
+/**
+ * Inject each formula column's computed value into `row.props[column.key]`, so
+ * all downstream machinery (cellValue / sort / filter / group / summaries /
+ * render) treats a computed column exactly like a property column. Returns the
+ * rows unchanged when no column has a formula. Pure.
+ */
+export function applyFormulas(
+  rows: ReadonlyArray<BaseRow>,
+  columns: ReadonlyArray<BaseColumn>,
+): BaseRow[] {
+  const formulaCols = columns.filter((c) => c.formula && c.formula.trim());
+  if (formulaCols.length === 0) return [...rows];
+  return rows.map((row) => {
+    const scope = formulaScope(row);
+    const props = { ...row.props };
+    for (const c of formulaCols) props[c.key] = evalFormula(c.formula!, scope).value;
+    return { ...row, props };
+  });
+}
+
+/** Keys of the columns that are formula-computed (for read-only gating). */
+export function formulaColumnKeys(columns: ReadonlyArray<BaseColumn>): Set<ColumnKey> {
+  return new Set(columns.filter((c) => c.formula && c.formula.trim()).map((c) => c.key));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

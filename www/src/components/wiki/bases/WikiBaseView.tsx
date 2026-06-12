@@ -47,11 +47,13 @@ import {
   FILTER_OPS,
   FILTER_OP_LABEL,
   UNARY_OPS,
+  applyFormulas,
   cellValue,
   defaultColumnLabel,
   discoverColumnKeys,
   filterRows,
   formatCell,
+  formulaColumnKeys,
   groupRows,
   sortRows,
 } from "./basesSchema";
@@ -69,11 +71,16 @@ export function WikiBaseView({ pageId }: Props) {
   const { title, config, loading, saving, error, update } = useBaseDoc(pageId);
   const { rows: allRows, loading: rowsLoading, error: rowsError, editCell } = useBaseRows(config);
 
-  // Filter → sort → group, all client-side.
+  // Compute formula columns first (their values are injected into row props), so
+  // filter / sort / group / summaries all see them. Then filter → sort → group.
+  const computedRows = React.useMemo(
+    () => applyFormulas(allRows, config.columns),
+    [allRows, config.columns],
+  );
   const visibleRows = React.useMemo(() => {
-    const filtered = filterRows(allRows, config.filters);
+    const filtered = filterRows(computedRows, config.filters);
     return sortRows(filtered, config.sort);
-  }, [allRows, config.filters, config.sort]);
+  }, [computedRows, config.filters, config.sort]);
 
   const grouped = React.useMemo(
     () => (config.group ? groupRows(visibleRows, config.group) : null),
@@ -494,6 +501,21 @@ function ColumnsPopover({
       ...config,
       columns: config.columns.map((c) => (c.key === key ? { ...c, label } : c)),
     });
+  const setFormula = (key: ColumnKey, formula: string) =>
+    onChange({
+      ...config,
+      columns: config.columns.map((c) =>
+        c.key === key ? (formula.trim() ? { ...c, formula } : { key: c.key, label: c.label }) : c,
+      ),
+    });
+  const addFormulaColumn = () => {
+    // A unique synthetic key so the computed value has a stable home in props.
+    let n = 1;
+    const keys = new Set(config.columns.map((c) => c.key));
+    while (keys.has(`formula_${n}`)) n++;
+    const key = `formula_${n}`;
+    onChange({ ...config, columns: [...config.columns, { key, label: `Formula ${n}`, formula: "" }] });
+  };
 
   return (
     <Popover>
@@ -505,38 +527,54 @@ function ColumnsPopover({
       <PopoverContent align="start" className="w-72 space-y-2">
         <div className="text-[12px] font-medium text-foreground">Columns</div>
         {config.columns.map((c) => (
-          <div key={c.key} className="flex items-center gap-1">
-            <Input
-              value={c.label}
-              onChange={(e) => relabel(c.key, e.currentTarget.value)}
-              className="h-8 flex-1 text-[12px]"
-            />
-            <span className="max-w-[6rem] truncate text-[11px] text-[color:var(--color-text-quaternary)]">
-              {c.key}
-            </span>
-            <Button variant="ghost" size="iconSm" onClick={() => removeColumn(c.key)} aria-label="Remove column">
-              <Trash2 className="size-3" />
-            </Button>
+          <div key={c.key} className="space-y-1">
+            <div className="flex items-center gap-1">
+              <Input
+                value={c.label}
+                onChange={(e) => relabel(c.key, e.currentTarget.value)}
+                className="h-8 flex-1 text-[12px]"
+              />
+              <span className="max-w-[6rem] truncate text-[11px] text-[color:var(--color-text-quaternary)]">
+                {c.formula !== undefined ? "ƒ" : c.key}
+              </span>
+              <Button variant="ghost" size="iconSm" onClick={() => removeColumn(c.key)} aria-label="Remove column">
+                <Trash2 className="size-3" />
+              </Button>
+            </div>
+            {c.formula !== undefined && (
+              <Input
+                value={c.formula}
+                onChange={(e) => setFormula(c.key, e.currentTarget.value)}
+                placeholder="formula, e.g. round(price * qty, 2)"
+                className="h-7 w-full font-mono text-[11px]"
+                aria-label={`${c.label} formula`}
+              />
+            )}
           </div>
         ))}
-        {available.length > 0 && (
-          <div className="border-t border-[color:var(--border)] pt-2">
-            <div className="mb-1 text-[11px] text-[color:var(--color-text-tertiary)]">Add column</div>
-            <div className="flex flex-wrap gap-1">
-              {available.map((k) => (
-                <Button
-                  key={k}
-                  variant="outline"
-                  size="xs"
-                  className="gap-1"
-                  onClick={() => addColumn(k)}
-                >
-                  <Plus className="size-3" /> {defaultColumnLabel(k)}
-                </Button>
-              ))}
-            </div>
-          </div>
-        )}
+        <div className="border-t border-[color:var(--border)] pt-2">
+          {available.length > 0 && (
+            <>
+              <div className="mb-1 text-[11px] text-[color:var(--color-text-tertiary)]">Add column</div>
+              <div className="mb-2 flex flex-wrap gap-1">
+                {available.map((k) => (
+                  <Button
+                    key={k}
+                    variant="outline"
+                    size="xs"
+                    className="gap-1"
+                    onClick={() => addColumn(k)}
+                  >
+                    <Plus className="size-3" /> {defaultColumnLabel(k)}
+                  </Button>
+                ))}
+              </div>
+            </>
+          )}
+          <Button variant="outline" size="xs" className="gap-1" onClick={addFormulaColumn}>
+            <Plus className="size-3" /> Formula column
+          </Button>
+        </div>
       </PopoverContent>
     </Popover>
   );
@@ -594,8 +632,9 @@ function useOpenRow() {
 
 /** Is a column an editable scalar frontmatter property on this row? Built-in
  *  pseudo-columns and array (list/tags) values are not inline-editable. */
-function isEditableCell(row: BaseRow, columnKey: ColumnKey): boolean {
+function isEditableCell(row: BaseRow, columnKey: ColumnKey, formulaKeys: Set<ColumnKey>): boolean {
   if ((BUILTIN_COLUMNS as string[]).includes(columnKey)) return false;
+  if (formulaKeys.has(columnKey)) return false; // computed column → not a write target
   if (row.content == null) return false; // summary-only row → no write target
   const v = cellValue(row, columnKey);
   return !Array.isArray(v) && typeof v !== "object";
@@ -717,6 +756,7 @@ function TableView({
 }) {
   const open = useOpenRow();
   const cols = config.columns;
+  const formulaKeys = React.useMemo(() => formulaColumnKeys(cols), [cols]);
 
   const sortFor = (key: ColumnKey) => config.sort.find((s) => s.key === key);
   const toggleSort = (key: ColumnKey) => {
@@ -742,7 +782,7 @@ function TableView({
       >
         {cols.map((c) => (
           <td key={c.key} className="px-3 py-2 align-top text-[13px] text-foreground">
-            {isEditableCell(row, c.key) ? (
+            {isEditableCell(row, c.key, formulaKeys) ? (
               <EditableCell
                 value={cellValue(row, c.key)}
                 columnKey={c.key}
