@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { slugify } from "./markdown/wikiRemarkPlugins";
+import { maskFencedCode } from "./markdown/codeFences";
 
 /**
  * Heading slug — delegates to the SAME `slugify` the reading view's
@@ -40,25 +41,11 @@ interface OutlineHeading {
  * hashes (`## Foo ##`) are stripped, matching CommonMark.
  */
 function parseHeadings(content: string): OutlineHeading[] {
-  const lines = content.split(/\r?\n/);
+  // Fenced-code lines are blanked (shared masker); inline code is preserved so
+  // heading text stays intact for slug computation.
+  const lines = maskFencedCode(content, { inlineCode: false });
   const out: OutlineHeading[] = [];
-  let fence: string | null = null; // active fence marker char run, e.g. "```" or "~~~~"
-
   for (const line of lines) {
-    const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-    if (fenceMatch) {
-      const marker = fenceMatch[1];
-      if (fence === null) {
-        // opening fence
-        fence = marker[0]; // remember the fence char (` or ~)
-      } else if (marker[0] === fence) {
-        // closing fence (same fence char)
-        fence = null;
-      }
-      continue;
-    }
-    if (fence !== null) continue; // inside a code block — skip headings
-
     const headingMatch = line.match(/^\s{0,3}(#{1,6})\s+(.*?)\s*$/);
     if (!headingMatch) continue;
     const level = headingMatch[1].length;
@@ -86,19 +73,12 @@ interface Footnote {
  * panel can scroll to it via the same getElementById onJump the outline uses.
  */
 export function parseFootnotes(content: string): Footnote[] {
-  const lines = content.split(/\r?\n/);
+  // Fenced-code lines blanked (shared masker) so a `[^x]:` inside a code block
+  // isn't read as a definition; inline code preserved for the definition text.
+  const lines = maskFencedCode(content, { inlineCode: false });
   const out: Footnote[] = [];
   const seen = new Set<string>();
-  let fence: string | null = null;
   for (const line of lines) {
-    const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-    if (fenceMatch) {
-      const marker = fenceMatch[1][0];
-      if (fence === null) fence = marker;
-      else if (marker === fence) fence = null;
-      continue;
-    }
-    if (fence !== null) continue;
     const m = line.match(/^\s{0,3}\[\^([^\]]+)\]:\s*(.*)$/);
     if (!m) continue;
     const id = m[1].trim();

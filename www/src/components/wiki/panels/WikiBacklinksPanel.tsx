@@ -12,6 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { useWikiMetadataIndex } from "../useWikiMetadataIndex";
 import { useWikiLinkIndex, backlinksOf } from "../useWikiLinkIndex";
+import { maskFencedCode } from "../markdown/codeFences";
 
 // Granite ports BacklinksView + OutgoingLinksView + unlinked-mentions into a
 // single right-rail panel. As of M26 BACKLINKS are exact and vault-wide: the
@@ -51,29 +52,10 @@ interface ParsedWikilink {
 const WIKILINK_RE = /(!?)\[\[([^\]|#^]+)(?:[#^][^\]|]*)?(?:\|([^\]]+))?\]\]/g;
 
 /** Mask fenced code blocks (``` / ~~~) and inline code spans so wikilinks and
- *  plain-text mentions inside code aren't treated as links/mentions. Returns the
- *  text with code regions blanked (length-preserving) so line numbers survive. */
+ *  plain-text mentions inside code aren't treated as links/mentions. Delegates
+ *  to the shared length-preserving masker (line numbers survive). */
 function maskCode(content: string): string[] {
-  const lines = content.split(/\r?\n/);
-  const out: string[] = [];
-  let fence: string | null = null;
-  for (const line of lines) {
-    const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
-    if (fenceMatch) {
-      const marker = fenceMatch[1][0];
-      if (fence === null) fence = marker;
-      else if (marker === fence) fence = null;
-      out.push("");
-      continue;
-    }
-    if (fence !== null) {
-      out.push("");
-      continue;
-    }
-    // Blank inline code spans (length-preserving) so backtick'd text is ignored.
-    out.push(line.replace(/`[^`]*`/g, (m) => " ".repeat(m.length)));
-  }
-  return out;
+  return maskFencedCode(content); // inline code blanked by default
 }
 
 /** Parse every wikilink out of `content`, skipping fenced/inline code. */
