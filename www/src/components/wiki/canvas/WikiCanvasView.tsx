@@ -47,6 +47,7 @@ import {
 } from "./canvasSchema";
 import { useCanvasDoc } from "./useCanvasDoc";
 import { WikiMarkdown } from "../WikiMarkdown";
+import { sliceForFragment } from "../markdown/transclude";
 
 export interface WikiCanvasViewProps {
   pageId: string;
@@ -357,6 +358,17 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
     };
     setView(v);
     applyViewTransform(v);
+  }, [applyViewTransform]);
+
+  // Center the viewport on a world-space point (used by the minimap click/drag),
+  // preserving the current zoom.
+  const panToWorld = React.useCallback((wx: number, wy: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const v = viewRef.current;
+    const nv = { ...v, x: rect.width / 2 - wx * v.scale, y: rect.height / 2 - wy * v.scale };
+    setView(nv);
+    applyViewTransform(nv);
   }, [applyViewTransform]);
 
   // Fit once when the document first becomes ready.
@@ -1086,6 +1098,9 @@ export function WikiCanvasView({ pageId, onOpenPage, className }: WikiCanvasView
           <span className="opacity-70">· read-only</span>
         )}
       </div>
+
+      {/* Minimap overview navigator (bottom-right) */}
+      <CanvasMinimap nodes={canvas.nodes} view={view} containerRef={containerRef} onPanTo={panToWorld} />
     </div>
   );
 }
@@ -1290,6 +1305,123 @@ const CanvasNodeView = React.memo(function CanvasNodeView({
 });
 
 // Page card resolves the referenced wiki page's title + excerpt via getWikiPage.
+// ── Minimap overview navigator ───────────────────────────────────────────────
+
+const MINIMAP_W = 170;
+const MINIMAP_H = 120;
+const MINIMAP_PAD = 6;
+
+/**
+ * A small overview of the whole canvas in the corner: every node drawn to scale
+ * plus the current viewport rectangle. Click (or drag) re-centers the canvas on
+ * that point. Reads the live container size on each render (it re-renders when
+ * `view` changes). Hidden on an empty canvas.
+ */
+function CanvasMinimap({
+  nodes,
+  view,
+  containerRef,
+  onPanTo,
+}: {
+  nodes: ReadonlyArray<CanvasNode>;
+  view: View;
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  onPanTo: (wx: number, wy: number) => void;
+}) {
+  const svgRef = React.useRef<SVGSVGElement>(null);
+  const draggingRef = React.useRef(false);
+
+  const bounds = React.useMemo(() => {
+    if (nodes.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodes) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + n.w);
+      maxY = Math.max(maxY, n.y + n.h);
+    }
+    return { minX, minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY) };
+  }, [nodes]);
+
+  if (!bounds) return null;
+
+  const innerW = MINIMAP_W - MINIMAP_PAD * 2;
+  const innerH = MINIMAP_H - MINIMAP_PAD * 2;
+  const s = Math.min(innerW / bounds.w, innerH / bounds.h);
+  // World → minimap px (centered within the inner box).
+  const offX = MINIMAP_PAD + (innerW - bounds.w * s) / 2;
+  const offY = MINIMAP_PAD + (innerH - bounds.h * s) / 2;
+  const toMx = (x: number) => offX + (x - bounds.minX) * s;
+  const toMy = (y: number) => offY + (y - bounds.minY) * s;
+
+  // Current viewport in world coords (from the view transform + container size).
+  const rect = containerRef.current?.getBoundingClientRect();
+  const vp = rect
+    ? {
+        x: toMx(-view.x / view.scale),
+        y: toMy(-view.y / view.scale),
+        w: (rect.width / view.scale) * s,
+        h: (rect.height / view.scale) * s,
+      }
+    : null;
+
+  // Minimap px → world coords, then center the viewport there.
+  const panFromEvent = (e: React.MouseEvent) => {
+    const r = svgRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const mx = e.clientX - r.left;
+    const my = e.clientY - r.top;
+    const wx = (mx - offX) / s + bounds.minX;
+    const wy = (my - offY) / s + bounds.minY;
+    onPanTo(wx, wy);
+  };
+
+  return (
+    <div className="absolute bottom-2 right-2 z-10 overflow-hidden rounded-md border border-border bg-card/95 shadow-sm backdrop-blur">
+      <svg
+        ref={svgRef}
+        width={MINIMAP_W}
+        height={MINIMAP_H}
+        className="block cursor-pointer"
+        onMouseDown={(e) => {
+          draggingRef.current = true;
+          panFromEvent(e);
+        }}
+        onMouseMove={(e) => {
+          if (draggingRef.current) panFromEvent(e);
+        }}
+        onMouseUp={() => (draggingRef.current = false)}
+        onMouseLeave={() => (draggingRef.current = false)}
+        aria-label="Canvas minimap"
+      >
+        {nodes.map((n) => (
+          <rect
+            key={n.id}
+            x={toMx(n.x)}
+            y={toMy(n.y)}
+            width={Math.max(1, n.w * s)}
+            height={Math.max(1, n.h * s)}
+            rx={1}
+            className={n.type === "group" ? "fill-muted-foreground/20 stroke-muted-foreground/40" : "fill-primary/40 stroke-primary/60"}
+            strokeWidth={0.5}
+          />
+        ))}
+        {vp && (
+          <rect
+            x={vp.x}
+            y={vp.y}
+            width={vp.w}
+            height={vp.h}
+            className="fill-primary/10 stroke-primary"
+            strokeWidth={1}
+            pointerEvents="none"
+          />
+        )}
+      </svg>
+    </div>
+  );
+}
+
 function PageCard({ node }: { node: CanvasNode }) {
   const { connector, status } = useRuntime();
   const [page, setPage] = React.useState<WikiPage | null>(null);
@@ -1314,7 +1446,21 @@ function PageCard({ node }: { node: CanvasNode }) {
   }, [node.pageId, connector, status.kind]);
 
   const heading = page?.title || node.label || (node.pageId ? "Untitled page" : "(no page)");
-  const excerpt = page?.excerpt ?? page?.content?.slice(0, 240);
+
+  // The embedded slice: the whole body, or just the #heading / #^block section
+  // named by the node's subpath (reusing the M27 transclusion slicer). Rendered
+  // with the full markdown pipeline (standalone → live blocks off, no nested
+  // transclusion fetch storm), scrollable inside the fixed-size card.
+  const body = page?.content ?? "";
+  const sliced = React.useMemo(() => {
+    if (!body) return "";
+    if (!node.subpath) return body;
+    const frag = node.subpath.replace(/^#/, "");
+    const pf = frag.startsWith("^")
+      ? { title: "", block: frag.slice(1) }
+      : { title: "", heading: frag };
+    return sliceForFragment(body, pf) ?? body;
+  }, [body, node.subpath]);
 
   return (
     <div className="flex h-full flex-col">
@@ -1327,8 +1473,14 @@ function PageCard({ node }: { node: CanvasNode }) {
           </span>
         ) : null}
       </div>
-      <div className="overflow-hidden p-2.5 text-xs text-muted-foreground">
-        {loading ? "Loading…" : excerpt || "Double-click to open"}
+      <div className="wiki-canvas-embed min-h-0 flex-1 overflow-auto p-2.5 text-xs">
+        {loading ? (
+          <span className="text-muted-foreground">Loading…</span>
+        ) : sliced ? (
+          <WikiMarkdown content={sliced} />
+        ) : (
+          <span className="text-muted-foreground">Double-click to open</span>
+        )}
       </div>
     </div>
   );
