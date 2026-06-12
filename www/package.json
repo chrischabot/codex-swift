@@ -56,7 +56,6 @@
     "react-resizable-panels": "^4.11.1",
     "react-router-dom": "^7.10.1",
     "rehype-katex": "^7.0.1",
-    "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
     "shiki": "^3.13.0",
