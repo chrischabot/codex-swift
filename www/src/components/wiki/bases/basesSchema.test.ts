@@ -6,6 +6,7 @@ import {
   setFrontmatterProperty,
   applyFormulas,
   formulaColumnKeys,
+  collectMapPoints,
   isBaseBody,
   makeRow,
   cellValue,
@@ -235,5 +236,46 @@ describe("applyFormulas", () => {
       }),
     );
     expect(cfg.columns[0].formula).toBe("price * qty");
+  });
+});
+
+describe("collectMapPoints", () => {
+  const cfg = { ...DEFAULT_BASE, view: "map" as const, mapLatitude: "lat", mapLongitude: "lng" };
+  const row = (id: string, lat: unknown, lng: unknown) =>
+    makeRow({ id, title: id }, `---\nlat: ${lat}\nlng: ${lng}\n---\n`);
+
+  it("projects valid coordinates into 0–100% (lng→x, lat→y)", () => {
+    const [p] = collectMapPoints([row("a", 0, 0)], cfg);
+    expect(p.xPct).toBe(50); // lng 0 → middle
+    expect(p.yPct).toBe(50); // lat 0 → middle
+  });
+
+  it("skips rows missing or out-of-range coordinates", () => {
+    const pts = collectMapPoints(
+      [row("a", 40.7, -74), row("b", "n/a", 10), row("c", 200, 0)],
+      cfg,
+    );
+    expect(pts.map((p) => p.row.page.id)).toEqual(["a"]);
+  });
+
+  it("returns nothing when lat/long properties aren't configured", () => {
+    expect(collectMapPoints([row("a", 0, 0)], { ...DEFAULT_BASE })).toEqual([]);
+  });
+});
+
+describe("base-doc frontmatter preservation", () => {
+  it("preserves hand-authored frontmatter on the base doc across save", () => {
+    const doc = '---\nwiki_type: base\ntags: [maps]\nowner: chris\n---\n{"view":"map","mapLatitude":"lat","mapLongitude":"lng"}';
+    const cfg = parseBaseConfig(doc);
+    expect(cfg.view).toBe("map");
+    expect(cfg.mapLatitude).toBe("lat");
+    expect(cfg.extraFrontmatter).toContain("tags: [maps]");
+    expect(cfg.extraFrontmatter).toContain("owner: chris");
+    // Re-serialize → the extra keys (and wiki_type) survive; map keys persist.
+    const out = serializeBaseConfig(cfg);
+    expect(out).toContain("wiki_type: base");
+    expect(out).toContain("tags: [maps]");
+    expect(out).toContain("owner: chris");
+    expect(parseBaseConfig(out).mapLatitude).toBe("lat");
   });
 });

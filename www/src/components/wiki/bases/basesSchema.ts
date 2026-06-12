@@ -24,7 +24,7 @@ import { evalFormula, type Scope } from "./formula";
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type BaseViewType = "table" | "list" | "cards";
+export type BaseViewType = "table" | "list" | "cards" | "map";
 
 export type SortDir = "asc" | "desc";
 
@@ -96,6 +96,13 @@ export interface BaseConfig {
   /** Per-column footer summary op (e.g. {prio: "sum"}). Op strings are validated
    *  by the view (baseSummaries.SummaryOp); kept loose here to avoid a cycle. */
   readonly summaries?: Readonly<Record<string, string>>;
+  /** Map view: which frontmatter property holds each row's latitude / longitude. */
+  readonly mapLatitude?: ColumnKey;
+  readonly mapLongitude?: ColumnKey;
+  /** Hand-authored frontmatter on the base DOC (everything except `wiki_type`),
+   *  preserved verbatim across config saves so a base page can carry its own
+   *  tags/aliases/etc. without losing them on the next edit. */
+  readonly extraFrontmatter?: string;
 }
 
 export const DEFAULT_BASE: BaseConfig = {
@@ -185,7 +192,21 @@ export function isBaseBody(content: string | undefined | null): boolean {
 }
 
 function asView(v: unknown): BaseViewType {
-  return v === "list" || v === "cards" ? v : "table";
+  return v === "list" || v === "cards" || v === "map" ? v : "table";
+}
+
+/** Frontmatter lines minus the `wiki_type` sentinel (preserved across saves). */
+function extraFrontmatterFrom(frontmatter: string | null): string | undefined {
+  if (!frontmatter) return undefined;
+  const kept = frontmatter
+    .split(/\r?\n/)
+    .filter((line) => {
+      const m = /^([^\s:][^:]*?):/.exec(line);
+      return !(m && m[1].trim() === "wiki_type");
+    })
+    .join("\n")
+    .trim();
+  return kept ? kept : undefined;
 }
 
 function asColumns(v: unknown): BaseColumn[] {
@@ -258,6 +279,7 @@ export function parseBaseConfig(content: string | undefined | null): BaseConfig 
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return DEFAULT_BASE;
   const obj = parsed as Record<string, unknown>;
   const group = typeof obj.group === "string" && obj.group ? (obj.group as ColumnKey) : undefined;
+  const extra = extraFrontmatterFrom(frontmatter);
   const config: BaseConfig = {
     view: asView(obj.view),
     source: asSource(obj.source),
@@ -265,6 +287,9 @@ export function parseBaseConfig(content: string | undefined | null): BaseConfig 
     filters: asFilters(obj.filters),
     sort: asSort(obj.sort),
     summaries: asSummaries(obj.summaries),
+    ...(typeof obj.mapLatitude === "string" && obj.mapLatitude ? { mapLatitude: obj.mapLatitude as ColumnKey } : {}),
+    ...(typeof obj.mapLongitude === "string" && obj.mapLongitude ? { mapLongitude: obj.mapLongitude as ColumnKey } : {}),
+    ...(extra ? { extraFrontmatter: extra } : {}),
   };
   return group ? { ...config, group } : config;
 }
@@ -290,7 +315,13 @@ export function serializeBaseConfig(config: BaseConfig): string {
   };
   if (config.group) json.group = config.group;
   if (config.summaries && Object.keys(config.summaries).length > 0) json.summaries = config.summaries;
-  return `---\nwiki_type: ${WIKI_TYPE}\n---\n${JSON.stringify(json, null, 2)}\n`;
+  if (config.mapLatitude) json.mapLatitude = config.mapLatitude;
+  if (config.mapLongitude) json.mapLongitude = config.mapLongitude;
+  // Re-emit hand-authored frontmatter (everything except wiki_type) so a base
+  // page's own tags/aliases/etc. survive a config save.
+  const extra = config.extraFrontmatter?.trim();
+  const fm = extra ? `wiki_type: ${WIKI_TYPE}\n${extra}` : `wiki_type: ${WIKI_TYPE}`;
+  return `---\n${fm}\n---\n${JSON.stringify(json, null, 2)}\n`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,6 +463,48 @@ export function applyFormulas(
 /** Keys of the columns that are formula-computed (for read-only gating). */
 export function formulaColumnKeys(columns: ReadonlyArray<BaseColumn>): Set<ColumnKey> {
   return new Set(columns.filter((c) => c.formula && c.formula.trim()).map((c) => c.key));
+}
+
+// ── Map view (geographic) ─────────────────────────────────────────────────────
+
+export interface MapPoint {
+  readonly row: BaseRow;
+  readonly lat: number;
+  readonly lng: number;
+  /** Equirectangular projection into a 0–100% box (x = lng, y = lat). */
+  readonly xPct: number;
+  readonly yPct: number;
+}
+
+function asCoordinate(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * Plot rows that carry valid lat/long frontmatter properties (named by
+ * `config.mapLatitude` / `mapLongitude`) onto an equirectangular 0–100% box.
+ * Rows missing either coordinate, or out of the valid lat/long range, are
+ * skipped. Pure (ported from granite's collectMapPoints).
+ */
+export function collectMapPoints(
+  rows: ReadonlyArray<BaseRow>,
+  config: BaseConfig,
+): MapPoint[] {
+  if (!config.mapLatitude || !config.mapLongitude) return [];
+  const out: MapPoint[] = [];
+  for (const row of rows) {
+    const lat = asCoordinate(cellValue(row, config.mapLatitude));
+    const lng = asCoordinate(cellValue(row, config.mapLongitude));
+    if (lat === null || lng === null) continue;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) continue;
+    out.push({ row, lat, lng, xPct: ((lng + 180) / 360) * 100, yPct: ((90 - lat) / 180) * 100 });
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

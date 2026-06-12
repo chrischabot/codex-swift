@@ -17,6 +17,7 @@ import {
   LayoutGrid,
   List as ListIcon,
   Loader2,
+  MapPin,
   Plus,
   Table2,
   Tag,
@@ -49,6 +50,7 @@ import {
   UNARY_OPS,
   applyFormulas,
   cellValue,
+  collectMapPoints,
   defaultColumnLabel,
   discoverColumnKeys,
   filterRows,
@@ -131,6 +133,8 @@ export function WikiBaseView({ pageId }: Props) {
           <ListView config={config} rows={visibleRows} grouped={grouped} />
         ) : config.view === "cards" ? (
           <CardsView config={config} rows={visibleRows} grouped={grouped} />
+        ) : config.view === "map" ? (
+          <MapView config={config} rows={visibleRows} discoveredKeys={discoveredKeys} onChange={update} />
         ) : (
           <TableView config={config} rows={visibleRows} grouped={grouped} onChange={update} editCell={editCell} />
         )}
@@ -158,6 +162,7 @@ const VIEW_OPTIONS: ReadonlyArray<{ key: BaseViewType; label: string; icon: type
   { key: "table", label: "Table", icon: Table2 },
   { key: "list", label: "List", icon: ListIcon },
   { key: "cards", label: "Cards", icon: LayoutGrid },
+  { key: "map", label: "Map", icon: MapPin },
 ];
 
 interface ToolbarProps {
@@ -963,6 +968,80 @@ function CardsView({ config, rows, grouped }: ViewProps) {
             </div>
           ))
         : renderGrid(rows)}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Map view (geographic — rows with lat/long frontmatter plotted on a world box)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function MapView({
+  config,
+  rows,
+  discoveredKeys,
+  onChange,
+}: {
+  config: BaseConfig;
+  rows: ReadonlyArray<BaseRow>;
+  discoveredKeys: ColumnKey[];
+  onChange: (next: BaseConfig) => void;
+}) {
+  const open = useOpenRow();
+  const keyOptions = columnKeyOptions(config, discoveredKeys);
+  const points = React.useMemo(() => collectMapPoints(rows, config), [rows, config]);
+  const configured = Boolean(config.mapLatitude && config.mapLongitude);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2 text-[12px] text-[color:var(--color-text-tertiary)]">
+        <span>Latitude</span>
+        <KeySelect
+          value={config.mapLatitude ?? ""}
+          options={keyOptions}
+          onChange={(key) => onChange({ ...config, mapLatitude: key })}
+        />
+        <span>Longitude</span>
+        <KeySelect
+          value={config.mapLongitude ?? ""}
+          options={keyOptions}
+          onChange={(key) => onChange({ ...config, mapLongitude: key })}
+        />
+        <span className="text-[color:var(--color-text-quaternary)]">
+          {configured ? `${points.length} of ${rows.length} placed` : "pick lat/long properties"}
+        </span>
+      </div>
+
+      {/* Equirectangular plot box (2:1). Points sit at their projected %. */}
+      <div className="relative w-full overflow-hidden rounded-md border border-[color:var(--border)] bg-[color:var(--code-surface)]" style={{ aspectRatio: "2 / 1" }}>
+        {/* graticule */}
+        <div className="pointer-events-none absolute inset-0">
+          <div className="absolute left-1/2 top-0 h-full w-px bg-[color:var(--border)]" />
+          <div className="absolute left-0 top-1/2 h-px w-full bg-[color:var(--border)]" />
+        </div>
+        {!configured ? (
+          <div className="absolute inset-0 flex items-center justify-center text-[12px] text-[color:var(--color-text-quaternary)]">
+            Choose which properties hold latitude and longitude.
+          </div>
+        ) : points.length === 0 ? (
+          <div className="absolute inset-0 flex items-center justify-center text-[12px] text-[color:var(--color-text-quaternary)]">
+            No rows have valid coordinates.
+          </div>
+        ) : (
+          points.map((p) => (
+            <button
+              key={p.row.page.id}
+              type="button"
+              onClick={() => open(p.row)}
+              title={`${p.row.page.title} (${p.lat}, ${p.lng})`}
+              style={{ left: `${p.xPct}%`, top: `${p.yPct}%` }}
+              className="absolute -translate-x-1/2 -translate-y-1/2"
+            >
+              <MapPin className="size-4 text-[color:var(--text-link)] drop-shadow hover:scale-125" />
+            </button>
+          ))
+        )}
+      </div>
     </div>
   );
 }
