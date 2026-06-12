@@ -1,6 +1,5 @@
-import * as React from "react";
-import { useRuntime } from "@/runtime/RuntimeProvider";
 import type { WikiIndexEntry } from "@/runtime/connector";
+import { createCachedIndex } from "./useCachedIndex";
 
 // M26 (vault link + property index). The body-derived companion to
 // useWikiMetadataIndex: one shared, module-cached load of `wiki/index` giving
@@ -16,24 +15,9 @@ import type { WikiIndexEntry } from "@/runtime/connector";
 // Cached at module scope like the metadata index; a `version` bump (the same
 // dataVersion the page editor bumps on save/rename/delete) forces a refresh.
 
-interface CacheEntry {
-  version: number;
+interface LinkIndexEntry {
   entries: WikiIndexEntry[];
   byId: Map<string, WikiIndexEntry>;
-}
-
-let cache: CacheEntry | null = null;
-const subscribers = new Set<() => void>();
-let inflight: Promise<void> | null = null;
-
-function buildEntry(version: number, entries: WikiIndexEntry[]): CacheEntry {
-  const byId = new Map<string, WikiIndexEntry>();
-  for (const e of entries) byId.set(e.id, e);
-  return { version, entries, byId };
-}
-
-function emit() {
-  for (const s of subscribers) s();
 }
 
 export interface WikiLinkIndex {
@@ -44,61 +28,31 @@ export interface WikiLinkIndex {
   loading: boolean;
 }
 
+const EMPTY_BY_ID: ReadonlyMap<string, WikiIndexEntry> = new Map();
+
+// One module-scoped cached index over `wiki/index`, behind the shared factory.
+const useLinkIndexInternal = createCachedIndex<LinkIndexEntry>({
+  fetch: (connector) =>
+    connector.getWikiIndex
+      ? () =>
+          connector.getWikiIndex!().then((entries) => {
+            const byId = new Map<string, WikiIndexEntry>();
+            for (const e of entries) byId.set(e.id, e);
+            return { entries, byId };
+          })
+      : null,
+});
+
 /**
  * Shared, cached link + property index. `version` refreshes the cache when a
  * page is created/renamed/deleted (pass WikiPage's dataVersion). The fetch is
- * deduped across all concurrent consumers via `inflight`.
+ * deduped across all concurrent consumers.
  */
 export function useWikiLinkIndex(version = 0): WikiLinkIndex {
-  const { connector, status } = useRuntime();
-  const [, forceRender] = React.useReducer((n: number) => n + 1, 0);
-  const [loading, setLoading] = React.useState(() => cache?.version !== version);
-
-  React.useEffect(() => {
-    const onChange = () => forceRender();
-    subscribers.add(onChange);
-    return () => {
-      subscribers.delete(onChange);
-    };
-  }, []);
-
-  React.useEffect(() => {
-    if (status.kind !== "connected" || !connector.getWikiIndex) {
-      setLoading(false);
-      return;
-    }
-    if (cache && cache.version === version) {
-      setLoading(false);
-      return;
-    }
-    let alive = true;
-    setLoading(true);
-    const load = async () => {
-      try {
-        const entries = (await connector.getWikiIndex?.()) ?? [];
-        cache = buildEntry(version, entries);
-        emit();
-      } catch {
-        if (!cache) cache = buildEntry(version, []);
-      }
-    };
-    if (!inflight || cache?.version !== version) {
-      inflight = load().finally(() => {
-        inflight = null;
-      });
-    }
-    inflight.then(() => {
-      if (alive) setLoading(false);
-    });
-    return () => {
-      alive = false;
-    };
-  }, [connector, status.kind, version]);
-
-  const entry = cache && cache.version === version ? cache : cache;
+  const { entry, loading } = useLinkIndexInternal(version);
   return {
     entries: entry?.entries ?? [],
-    byId: entry?.byId ?? new Map(),
+    byId: entry?.byId ?? EMPTY_BY_ID,
     loading,
   };
 }
