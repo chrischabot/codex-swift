@@ -47,6 +47,9 @@ public enum WikiQueryWiring {
         guard let store = opened else { return nil }
         // Body files for manually-edited pages live next to the DB.
         let bodyRoot = (path as NSString).deletingLastPathComponent + "/wiki-bodies"
+        // One process-lifetime cache for the wiki/index shaper (incremental
+        // re-parse keyed on body-file mtime). Shared by every index() call.
+        let indexCache = WikiIndexCache()
         return WikiQueryHandle(
             list:      { try await WikiJSON.list(store, limit: $0) },
             pageGet:   { try await WikiJSON.pageGet(store, id: $0) },
@@ -54,7 +57,7 @@ public enum WikiQueryWiring {
             graph:     { try await WikiJSON.graph(store, seed: $0, depth: $1) },
             backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
             tags:      { try await WikiJSON.tags(store) },
-            index:     { try await WikiJSON.index(store) },
+            index:     { try await WikiJSON.index(store, cache: indexCache) },
             upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
             delete:    { try await WikiJSON.delete(store, id: $0) },
             rename:    { try await WikiJSON.rename(store, id: $0, title: $1) },
@@ -175,15 +178,26 @@ public enum WikiJSON {
     /// backlinks (reverse of `links`), unlinked-mention candidates, link-rewrite
     /// targets, and the property catalog from this single shape. Returns
     /// `{data: [{id, title, links: [String], props: {String: String}}]}`.
-    public static func index(_ store: MemoryStore) async throws -> JSONValue {
+    public static func index(_ store: MemoryStore, cache: WikiIndexCache) async throws -> JSONValue {
         let rows = try await store.documentChunkSummaries(limit: 100_000, orderByRecency: false)
         var items: [JSONValue] = []
         items.reserveCapacity(rows.count)
+        var livePaths = Set<String>()
         for s in rows {
-            let body = (try? String(contentsOfFile: s.document.bodyPath, encoding: .utf8)) ?? ""
-            guard !body.isEmpty else { continue }
-            let links = wikilinkTargets(in: body)
-            let props = frontmatterProps(in: body)
+            let path = s.document.bodyPath
+            livePaths.insert(path)
+            let mtime = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate]) as? Date
+            let links: [String]
+            let props: [String: String]
+            if let mtime, let hit = await cache.cached(path: path, mtime: mtime) {
+                links = hit.links
+                props = hit.props
+            } else {
+                let body = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+                links = body.isEmpty ? [] : wikilinkTargets(in: body)
+                props = body.isEmpty ? [:] : frontmatterProps(in: body)
+                if let mtime { await cache.store(path: path, mtime: mtime, links: links, props: props) }
+            }
             if links.isEmpty && props.isEmpty { continue }
             var obj: [String: JSONValue] = [
                 "id": .int(s.document.id),
@@ -193,6 +207,7 @@ public enum WikiJSON {
             if !props.isEmpty { obj["props"] = .object(props.mapValues { JSONValue.string($0) }) }
             items.append(.object(obj))
         }
+        await cache.prune(livePaths: livePaths)
         return .object(["data": .array(items)])
     }
 

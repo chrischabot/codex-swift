@@ -228,6 +228,41 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertFalse(staleIds.contains(newId!), "old chunks purged — no stale search hit")
     }
 
+    /// CLAIM: wiki/index extracts a page's outgoing [[wikilinks]] + frontmatter
+    /// props, the mtime cache returns identical data on a re-call, and a page
+    /// edit (new body file → new mtime) is reflected. SEVERITY: severe — the
+    /// cache must never serve stale data nor change the RPC payload.
+    func testIndexCachesAndReflectsEdits() async throws {
+        let root = dir + "/bodies"
+        let cache = WikiIndexCache()
+        let created = try await WikiJSON.upsert(
+            store, bodyRoot: root, id: nil, title: "Linker",
+            body: "---\nstatus: draft\n---\nSee [[Target]] for details.")
+        let id = created.obj?["id"]?.int
+        XCTAssertNotNil(id)
+
+        // First index: the page appears with its link + prop.
+        let r1 = try await WikiJSON.index(store, cache: cache)
+        let entries1 = r1.obj?["data"]?.arr ?? []
+        let e1 = entries1.first { $0.obj?["id"]?.int == id }
+        XCTAssertNotNil(e1, "the linking page is in the index")
+        XCTAssertEqual(e1?.obj?["links"]?.arr?.compactMap { $0.str }, ["Target"])
+        XCTAssertEqual(e1?.obj?["props"]?.obj?["status"]?.str, "draft")
+
+        // Second call (cache hit) returns the same number of entries.
+        let r2 = try await WikiJSON.index(store, cache: cache)
+        XCTAssertEqual(r2.obj?["data"]?.arr?.count, entries1.count, "cache hit is output-equivalent")
+
+        // Editing the page (new body → new body file → new mtime) is reflected.
+        _ = try await WikiJSON.upsert(
+            store, bodyRoot: root, id: id, title: "Linker",
+            body: "---\nstatus: done\n---\nNow links to [[Other]].")
+        let r3 = try await WikiJSON.index(store, cache: cache)
+        let e3 = (r3.obj?["data"]?.arr ?? []).first { $0.obj?["id"]?.int == id }
+        XCTAssertEqual(e3?.obj?["links"]?.arr?.compactMap { $0.str }, ["Other"], "index reflects the edit")
+        XCTAssertEqual(e3?.obj?["props"]?.obj?["status"]?.str, "done")
+    }
+
     /// CLAIM: wiki/page/delete removes the page AND its derived chunks/FTS rows,
     /// so a deleted page is no longer fetchable or searchable; deleting a missing
     /// id is idempotent ({deleted:false}, no throw). SEVERITY: severe — this is
