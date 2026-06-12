@@ -143,6 +143,13 @@ function KeyGroup({
   onOpen: (id: string) => void;
 }) {
   const [open, setOpen] = React.useState(false);
+  // Precompute pages per value ONCE per (entries, key) — pagesForValue scans the
+  // whole entries array, so calling it inline per value on every render is O(values×entries).
+  const valuePages = React.useMemo(() => {
+    const map = new Map<string, Array<{ id: string; title: string }>>();
+    for (const v of catalogKey.values) map.set(v.value, pagesForValue(entries, catalogKey.key, v.value));
+    return map;
+  }, [entries, catalogKey]);
   return (
     <Collapsible
       open={open}
@@ -169,7 +176,7 @@ function KeyGroup({
               key={v.value}
               value={v.value}
               count={v.count}
-              pages={pagesForValue(entries, catalogKey.key, v.value)}
+              pages={valuePages.get(v.value) ?? []}
               onOpen={onOpen}
             />
           ))}
