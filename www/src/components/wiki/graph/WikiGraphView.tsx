@@ -217,6 +217,19 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
       return;
     }
 
+    // Capture the pinned nodes' positions from the OUTGOING sim BEFORE we drop
+    // its index map below. A depth/seed change rebuilds the graph from scratch;
+    // without this, a node the user dragged-to-pin snaps back to the seed ring.
+    // Keyed by stable node id so it survives node-set churn (re-pin only the
+    // ids that still exist).
+    const carriedPins = new Map<string, { x: number; y: number }>();
+    const prevSim = simRef.current;
+    if (prevSim) {
+      for (const [id, idx] of idToIndexRef.current) {
+        if (prevSim.isPinned(idx)) carriedPins.set(id, { x: prevSim.xAt(idx), y: prevSim.yAt(idx) });
+      }
+    }
+
     const idToIndex = new Map<string, number>();
     for (let i = 0; i < nodes.length; i++) idToIndex.set(nodes[i]!.id, i);
     idToIndexRef.current = idToIndex;
@@ -248,6 +261,16 @@ export function WikiGraphView({ seedEntityId, depth, onSelectEntity, className }
     drawEdgesRef.current = drawEdges;
     neighborSetsRef.current = neighborSets;
     neighborMaskRef.current = new Uint8Array(nodes.length);
+
+    // Restore carried pins (position + pinned flag) for nodes that survived the
+    // rebuild — done before the draw-node snapshot so they paint in place.
+    for (const [id, pos] of carriedPins) {
+      const ni = idToIndex.get(id);
+      if (ni !== undefined) {
+        sim.setNodePosition(ni, pos.x, pos.y);
+        sim.pin(ni);
+      }
+    }
 
     drawNodesRef.current = nodes.map((n, i) => ({
       x: sim.xAt(i),
