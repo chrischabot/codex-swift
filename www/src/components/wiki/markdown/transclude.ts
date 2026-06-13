@@ -3,6 +3,8 @@
 // the referenced heading-section or block out of a page body. Used by the smart
 // WikiEmbed, which then renders the slice with WikiMarkdown (depth-guarded).
 
+import { parseWikilinkInner } from "./wikiLinks";
+
 export interface ParsedFragment {
   /** Bare page title (target before any `#`). */
   title: string;
@@ -12,14 +14,13 @@ export interface ParsedFragment {
   block?: string;
 }
 
-/** Split a wikilink target into `{title, heading?, block?}`. */
+/** Split a wikilink target into `{title, heading?, block?}` (canonical parser). */
 export function parseFragment(fullTarget: string): ParsedFragment {
-  const hash = fullTarget.indexOf("#");
-  if (hash === -1) return { title: fullTarget.trim() };
-  const title = fullTarget.slice(0, hash).trim();
-  const frag = fullTarget.slice(hash + 1).trim();
-  if (frag.startsWith("^")) return { title, block: frag.slice(1).trim() };
-  return { title, heading: frag };
+  const p = parseWikilinkInner(fullTarget);
+  const out: ParsedFragment = { title: p.target };
+  if (p.heading) out.heading = p.heading;
+  if (p.block) out.block = p.block;
+  return out;
 }
 
 const HEADING_RE = /^(#{1,6})\s+(.*?)\s*$/;

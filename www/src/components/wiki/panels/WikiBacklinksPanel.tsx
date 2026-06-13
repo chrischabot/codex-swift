@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { useWikiMetadataIndex } from "../useWikiMetadataIndex";
 import { useWikiLinkIndex, backlinksOf } from "../useWikiLinkIndex";
 import { maskFencedCode } from "../markdown/codeFences";
+import { findWikilinks, type FoundWikilink } from "../markdown/wikiLinks";
 
 // Granite ports BacklinksView + OutgoingLinksView + unlinked-mentions into a
 // single right-rail panel. As of M26 BACKLINKS are exact and vault-wide: the
@@ -36,51 +37,13 @@ const DEBOUNCE_MS = 250;
 const SEARCH_LIMIT = 80;
 
 // ── Wikilink parsing ────────────────────────────────────────────────────────
+// Finding + parsing wikilinks now lives in the canonical markdown/wikiLinks.ts;
+// this panel just consumes findWikilinks (FoundWikilink rows).
 
-interface ParsedWikilink {
-  /** The link target as written (before "|", "#", "^"), trimmed. */
-  target: string;
-  /** Display text (alias after "|"), or the target if none. */
-  display: string;
-  /** True for transclusions `![[…]]`. */
-  embed: boolean;
-  /** Zero-based source line. */
-  line: number;
-}
-
-// Matches [[Target]], [[Target|Display]], [[Target#Heading|Display]], ![[Embed]].
-const WIKILINK_RE = /(!?)\[\[([^\]|#^]+)(?:[#^][^\]|]*)?(?:\|([^\]]+))?\]\]/g;
-
-/** Mask fenced code blocks (``` / ~~~) and inline code spans so wikilinks and
- *  plain-text mentions inside code aren't treated as links/mentions. Delegates
- *  to the shared length-preserving masker (line numbers survive). */
+/** Mask fenced code blocks (``` / ~~~) and inline code spans so plain-text
+ *  mentions inside code aren't treated as mentions (length-preserving). */
 function maskCode(content: string): string[] {
   return maskFencedCode(content); // inline code blanked by default
-}
-
-/** Parse every wikilink out of `content`, skipping fenced/inline code. */
-function parseWikilinks(content: string): ParsedWikilink[] {
-  const lines = maskCode(content);
-  const out: ParsedWikilink[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Cheap prefilter + length cap so a pathological single long line can't
-    // drive the regex into O(n^2) backtracking.
-    if (!line.includes("[[") || line.length > 20000) continue;
-    WIKILINK_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = WIKILINK_RE.exec(line)) !== null) {
-      const target = (m[2] ?? "").trim();
-      if (!target) continue;
-      out.push({
-        target,
-        display: (m[3] ?? target).trim(),
-        embed: m[1] === "!",
-        line: i,
-      });
-    }
-  }
-  return out;
 }
 
 const WORD_CHAR_RE = /[A-Za-z0-9_]/;
@@ -146,7 +109,7 @@ interface BacklinkVM {
 }
 
 interface OutgoingVM {
-  link: ParsedWikilink;
+  link: FoundWikilink;
   /** Resolved target page, or null when unresolved. */
   resolved: WikiPageSummary | null;
 }
@@ -265,7 +228,7 @@ export function WikiBacklinksPanel({ page, onOpenPage, dataVersion = 0 }: Props)
   const { entries: linkEntries, loading: indexLoading } = useWikiLinkIndex(dataVersion);
 
   // OUTGOING — parse this page's body, resolve targets against the title index.
-  const outgoingLinks = React.useMemo(() => parseWikilinks(page.content), [page.content]);
+  const outgoingLinks = React.useMemo(() => findWikilinks(page.content), [page.content]);
 
   const outgoing = React.useMemo<OutgoingVM[]>(() => {
     const byTitle = new Map<string, WikiPageSummary>();

@@ -25,6 +25,8 @@
 // ── mdast node shapes (minimal, structural) ─────────────────────────────────
 // We avoid importing @types/mdast (not a direct dep) and type structurally.
 
+import { parseWikilinkInner } from "./wikiLinks";
+
 interface MdastText {
   type: "text";
   value: string;
@@ -71,26 +73,15 @@ export interface WikilinkParts {
 }
 
 export function parseWikilink(raw: string): WikilinkParts {
-  let target = raw;
-  let display: string | null = null;
-  const pipeIdx = raw.indexOf("|");
-  if (pipeIdx !== -1) {
-    target = raw.slice(0, pipeIdx);
-    display = raw.slice(pipeIdx + 1);
-  }
-  let heading: string | null = null;
-  let block: string | null = null;
-  const hashIdx = target.indexOf("#");
-  if (hashIdx !== -1) {
-    const after = target.slice(hashIdx + 1);
-    target = target.slice(0, hashIdx);
-    if (after.startsWith("^")) {
-      block = after.slice(1);
-    } else {
-      heading = after;
-    }
-  }
-  return { target: target.trim(), display, heading, block };
+  // Canonical parser (markdown/wikiLinks.ts), adapted to this module's
+  // null-valued WikilinkParts shape (the remark plugin expects null).
+  const p = parseWikilinkInner(raw);
+  return {
+    target: p.target,
+    display: p.alias ?? null,
+    heading: p.heading ?? null,
+    block: p.block ?? null,
+  };
 }
 
 // ── Heading slugs (ported verbatim from granite renderer.ts:534-542) ────────
