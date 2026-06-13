@@ -1,11 +1,13 @@
-# Design: guarded agent wiki-write tools (spike)
+# Guarded agent wiki-write tools
 
-**Status: design + ready-to-wire prototype, intentionally NOT exposed yet.**
-Giving the agent write access to the Memory Wiki is a security-relevant
-capability change; per the plan's gating rules it stays **off until the
-maintainer signs off**. This doc specifies the tools, the safety locks, the
-exact opt-in wiring, and the open questions — the actual exposure is a one-line,
-well-understood follow-up (see "Wiring", below).
+**Status: SHIPPED, deny-default.** `WikiCreatePageTool`
+(`Sources/MemoryMCP/WikiWriteTools.swift`) is implemented + tested
+(`Tests/MemoryMCPTests/WikiWriteToolsTests.swift`) and wired into
+`MemoryToolset.tools()` behind the env opt-in `CODEXKIT_WIKI_AGENT_WRITE=1`. With
+the flag unset (the default) the agent's capability surface is unchanged. This
+doc specifies the tools, the safety locks, the wiring, and the open questions for
+the follow-ons (`wiki_update_page` with the source-URI lock; later
+delete/rename).
 
 ## The asymmetry being closed
 

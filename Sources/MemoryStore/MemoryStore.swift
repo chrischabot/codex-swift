@@ -97,6 +97,9 @@ public actor MemoryStore {
     private let handle: MemorySQLiteHandle
     private var db: OpaquePointer { handle.ptr }
     private let config: MemoryStoreConfig
+    /// The on-disk SQLite path (nonisolated so callers can derive sibling paths,
+    /// e.g. the `wiki-bodies` dir, without awaiting the actor).
+    nonisolated public let databasePath: String
     /// True when sqlite-vec's vec0 virtual table is available on this build.
     nonisolated public let vecAvailable: Bool
 
@@ -158,6 +161,7 @@ public actor MemoryStore {
 
     public init(_ config: MemoryStoreConfig = .default) throws {
         self.config = config
+        self.databasePath = config.path
         ensureSqliteVecRegistered()
         try Self.ensureParentDirectory(config.path)
         var raw: OpaquePointer?

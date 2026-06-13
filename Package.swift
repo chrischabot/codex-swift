@@ -315,7 +315,8 @@ let package = Package(
                 swiftSettings: strict),
         .target(name: "MemoryMCP",
                 dependencies: ["MCP", "Tools", "MemoryRetrieve", "MemoryScore", "MemoryStore", "MemoryInfer",
-                               "ModelClient", "ProtocolModel", "Config"],
+                               "ModelClient", "ProtocolModel", "Config",
+                               .product(name: "Crypto", package: "swift-crypto")],
                 swiftSettings: strict),
         // Phase 1 extension: the Memory Wiki as a MemoryProvider (impl #1).
         // The composition factory (`makeWikiMemoryProvider`) builds the full

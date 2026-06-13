@@ -28,7 +28,7 @@ public struct MemoryToolset: Sendable {
     }
 
     public func tools() -> [any Tool] {
-        return [
+        var tools: [any Tool] = [
             HybridSearchTool(retriever: retriever, personas: personas),
             GraphWalkTool(store: store),
             RecentInterestingTool(store: store, retriever: retriever, personas: personas),
@@ -41,5 +41,13 @@ public struct MemoryToolset: Sendable {
             WikiAngleTool(store: store),
             WikiPMFitTool(store: store),
         ]
+        // Agent wiki WRITE — deny-default. Off unless the operator opts in via
+        // CODEXKIT_WIKI_AGENT_WRITE=1, so the agent's default capability surface
+        // is unchanged. The tool itself is idempotent + zero-spend; see
+        // docs/notes/wiki-agent-write-tools.md.
+        if ProcessInfo.processInfo.environment["CODEXKIT_WIKI_AGENT_WRITE"] == "1" {
+            tools.append(WikiCreatePageTool(store: store))
+        }
+        return tools
     }
 }
