@@ -56,6 +56,7 @@ public enum WikiQueryWiring {
             search:    { try await WikiJSON.search(store, query: $0, k: $1) },
             graph:     { try await WikiJSON.graph(store, seed: $0, depth: $1) },
             backlinks: { try await WikiJSON.backlinks(store, entityId: $0) },
+            entityBacklinks: { try await WikiJSON.entityBacklinks(store, entityId: $0) },
             tags:      { try await WikiJSON.tags(store) },
             index:     { try await WikiJSON.index(store, cache: indexCache) },
             upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
@@ -356,6 +357,34 @@ public enum WikiJSON {
                 "dst": .int(e.dst),
                 "relation": .string(e.relation),
                 "weight": .double(e.weight),
+            ])
+        }
+        return .object(["data": .array(items)])
+    }
+
+    /// Pages that MENTION an entity (entity→page backlinks). Reverses the
+    /// chunk→entity mention index: `chunksMentioning` → each chunk's document,
+    /// grouped to one row per page with a snippet from the first mentioning
+    /// chunk. `{data: [{id, title, excerpt}]}`. (Distinct from `backlinks`,
+    /// which returns entity→entity EDGES.)
+    public static func entityBacklinks(_ store: MemoryStore, entityId: Int64) async throws -> JSONValue {
+        let chunkIds = try await store.chunksMentioning(entityId, limit: 200)
+        var byDoc: [Int64: (title: String, excerpt: String)] = [:]
+        var order: [Int64] = []
+        for cid in chunkIds {
+            guard let chunk = try await store.chunk(id: cid),
+                  let doc = try await store.document(id: chunk.documentId) else { continue }
+            if byDoc[doc.id] == nil {
+                byDoc[doc.id] = (doc.title ?? doc.sourceURI, String(chunk.text.prefix(240)))
+                order.append(doc.id)
+            }
+        }
+        let items = order.map { did -> JSONValue in
+            let h = byDoc[did]!
+            return .object([
+                "id": .int(did),
+                "title": .string(h.title),
+                "excerpt": .string(h.excerpt),
             ])
         }
         return .object(["data": .array(items)])

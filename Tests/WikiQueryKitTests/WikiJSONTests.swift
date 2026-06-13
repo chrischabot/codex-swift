@@ -193,6 +193,24 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(count, liveDegree.map(Int64.init))
     }
 
+    /// CLAIM: wiki/entityBacklinks returns the PAGES that mention an entity
+    /// (reverse of the chunk→entity mention index), one row per page with a
+    /// snippet; an entity nothing mentions returns empty. SEVERITY: normal —
+    /// read-only discovery surface.
+    func testEntityBacklinksReturnsMentioningPages() async throws {
+        // tagAI is mentioned by chunk c1, which belongs to doc1 "Alpha".
+        let r = try await WikiJSON.entityBacklinks(store, entityId: tagAI)
+        let pages = r.obj?["data"]?.arr ?? []
+        let ids = pages.compactMap { $0.obj?["id"]?.int }
+        XCTAssertTrue(ids.contains(doc1), "the page whose chunk mentions the entity is returned")
+        let alpha = pages.first { $0.obj?["id"]?.int == doc1 }
+        XCTAssertEqual(alpha?.obj?["title"]?.str, "Alpha")
+        XCTAssertTrue((alpha?.obj?["excerpt"]?.str ?? "").contains("machine learning"))
+        // An entity nothing mentions → empty.
+        let none = try await WikiJSON.entityBacklinks(store, entityId: 9_999_999)
+        XCTAssertEqual(none.obj?["data"]?.arr?.count, 0)
+    }
+
     // MARK: - upsert (write path)
 
     /// CLAIM: upsert creates a page (body written, doc + lexical chunks inserted),

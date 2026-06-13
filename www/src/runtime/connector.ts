@@ -320,6 +320,9 @@ export interface Connector {
   // id — the backend graph is the entity/edge graph. Omit it for the whole graph.
   getWikiGraph?(opts?: { seedEntityId?: string; depth?: number }): Promise<WikiGraph>;
   getWikiTags?(): Promise<WikiTag[]>;
+  /** Pages that MENTION an entity (entity→page backlinks). `entityId` is an
+   *  ENTITY id (e.g. a WikiConnection.entityId), not a page id. */
+  getWikiEntityBacklinks?(entityId: string): Promise<WikiPageSummary[]>;
   /** Vault link + property index: per-page outgoing `[[wikilinks]]` + parsed
    *  frontmatter props. Powers backlinks / unlinked-mentions / property-catalog
    *  and rename link-rewrite from a single read. */

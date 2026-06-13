@@ -20,6 +20,8 @@ public struct WikiQueryHandle: Sendable {
     public var graph: @Sendable (_ seed: Int64?, _ depth: Int) async throws -> JSONValue
     /// In/out edges for an entity.
     public var backlinks: @Sendable (_ entityId: Int64) async throws -> JSONValue
+    /// Pages that MENTION an entity (entity→page backlinks).
+    public var entityBacklinks: @Sendable (_ entityId: Int64) async throws -> JSONValue
     /// Tag entities with counts.
     public var tags: @Sendable () async throws -> JSONValue
     /// Vault link + property index: per-page outgoing `[[wikilinks]]` + parsed
@@ -44,6 +46,7 @@ public struct WikiQueryHandle: Sendable {
         search: @escaping @Sendable (String, Int) async throws -> JSONValue,
         graph: @escaping @Sendable (Int64?, Int) async throws -> JSONValue,
         backlinks: @escaping @Sendable (Int64) async throws -> JSONValue,
+        entityBacklinks: @escaping @Sendable (Int64) async throws -> JSONValue,
         tags: @escaping @Sendable () async throws -> JSONValue,
         index: @escaping @Sendable () async throws -> JSONValue,
         upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue,
@@ -56,6 +59,7 @@ public struct WikiQueryHandle: Sendable {
         self.search = search
         self.graph = graph
         self.backlinks = backlinks
+        self.entityBacklinks = entityBacklinks
         self.tags = tags
         self.index = index
         self.upsert = upsert

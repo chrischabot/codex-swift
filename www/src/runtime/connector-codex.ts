@@ -989,6 +989,14 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         return (r.data ?? []).map((t) => ({ tag: pick(t, "tag", "name"), count: numOrU(t.count) ?? 0 })).filter((t) => t.tag);
       } catch { return []; }
     },
+    getWikiEntityBacklinks: async (entityId) => {
+      const n = Number(entityId);
+      if (!Number.isInteger(n)) return [];
+      try {
+        const r = (await rpc("wiki/entityBacklinks", { entityId: n })) as { data?: Record<string, unknown>[] };
+        return (r.data ?? []).map(mapWikiSummary);
+      } catch { return []; }
+    },
     getWikiIndex: async () => {
       try {
         const r = (await rpc("wiki/index", {})) as { data?: Record<string, unknown>[] };

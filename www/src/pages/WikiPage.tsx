@@ -375,7 +375,7 @@ function WikiRightRail({
             <TabsContent value="connections" className="mt-0">
               <WikiBacklinksPanel page={page} onOpenPage={onOpenPage} dataVersion={dataVersion} />
               <div className="mt-4 border-t border-[color:var(--border)] pt-3">
-                <WikiConnectionsPanel page={page} onSelectEntity={(_id, canonical) => onWikiLink(canonical)} />
+                <WikiConnectionsPanel page={page} onSelectEntity={(_id, canonical) => onWikiLink(canonical)} onOpenPage={onOpenPage} />
               </div>
             </TabsContent>
             <TabsContent value="bookmarks" className="mt-0">

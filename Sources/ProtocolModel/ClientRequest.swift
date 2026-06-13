@@ -633,6 +633,7 @@ public enum ClientRequest: Sendable {
     case wikiSearch(RequestId, WikiSearchParams)
     case wikiGraph(RequestId, WikiGraphParams)
     case wikiBacklinks(RequestId, WikiBacklinksParams)
+    case wikiEntityBacklinks(RequestId, WikiBacklinksParams)
     case wikiTags(RequestId)
     case wikiIndex(RequestId)
     case wikiPageUpsert(RequestId, WikiPageUpsertParams)
@@ -675,7 +676,7 @@ public enum ClientRequest: Sendable {
         "thread/goal/set", "thread/goal/get", "thread/goal/clear",
         "thread/memoryMode/set", "memory/reset",
         "wiki/list", "wiki/page/get", "wiki/search",
-        "wiki/graph", "wiki/backlinks", "wiki/tags", "wiki/index", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief",
+        "wiki/graph", "wiki/backlinks", "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief",
         "turn/start", "turn/interrupt", "turn/steer", "review/start",
         "model/list", "modelProvider/capabilities/read", "config/read",
         "account/read", "account/rateLimits/read", "skills/list",
@@ -698,7 +699,7 @@ public enum ClientRequest: Sendable {
              .threadGoalGet(let i, _), .threadGoalClear(let i, _),
              .threadMemoryModeSet(let i, _), .memoryReset(let i),
              .wikiList(let i, _), .wikiPageGet(let i, _), .wikiSearch(let i, _),
-             .wikiGraph(let i, _), .wikiBacklinks(let i, _), .wikiTags(let i), .wikiIndex(let i),
+             .wikiGraph(let i, _), .wikiBacklinks(let i, _), .wikiEntityBacklinks(let i, _), .wikiTags(let i), .wikiIndex(let i),
              .wikiPageUpsert(let i, _), .wikiPageDelete(let i, _), .wikiPageRename(let i, _), .wikiBrief(let i, _),
              .turnStart(let i, _), .turnInterrupt(let i, _), .turnSteer(let i, _),
              .reviewStart(let i, _), .modelList(let i, _),
@@ -752,6 +753,7 @@ public enum ClientRequest: Sendable {
         case .wikiSearch: return "wiki/search"
         case .wikiGraph: return "wiki/graph"
         case .wikiBacklinks: return "wiki/backlinks"
+        case .wikiEntityBacklinks: return "wiki/entityBacklinks"
         case .wikiTags: return "wiki/tags"
         case .wikiIndex: return "wiki/index"
         case .wikiPageUpsert: return "wiki/page/upsert"
@@ -831,6 +833,7 @@ public enum ClientRequest: Sendable {
             return .wikiGraph(r.id, try JSONBridge.paramsAllowingEmpty(
                 WikiGraphParams.self, from: r.params, default: WikiGraphParams()))
         case "wiki/backlinks":  return .wikiBacklinks(r.id, try p(WikiBacklinksParams.self))
+        case "wiki/entityBacklinks": return .wikiEntityBacklinks(r.id, try p(WikiBacklinksParams.self))
         case "wiki/tags":       return .wikiTags(r.id)
         case "wiki/index":      return .wikiIndex(r.id)
         case "wiki/page/upsert": return .wikiPageUpsert(r.id, try p(WikiPageUpsertParams.self))

@@ -2171,6 +2171,8 @@ public actor RequestRouter {
             await replyWiki(conn, id) { try await $0.graph(p.seed, Self.clampWikiDepth(p.depth)) }
         case .wikiBacklinks(let id, let p):
             await replyWiki(conn, id) { try await $0.backlinks(p.entityId) }
+        case .wikiEntityBacklinks(let id, let p):
+            await replyWiki(conn, id) { try await $0.entityBacklinks(p.entityId) }
         case .wikiTags(let id):
             await replyWiki(conn, id) { try await $0.tags() }
         case .wikiIndex(let id):
