@@ -2,7 +2,8 @@
 
 Orientation lives in [`README.md`](README.md); per-module status in
 [`STATUS.md`](STATUS.md); deep design under [`docs/`](docs/). This file captures
-high-signal, easy-to-trip-over operational facts.
+high-signal, easy-to-trip-over operational facts. **Frontend (the Memory Wiki
+UI):** see [`www/ARCHITECTURE.md`](www/ARCHITECTURE.md).
 
 ## On-device MLX inference lane
 
