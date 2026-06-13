@@ -23,25 +23,48 @@ backend plans.
 
 ## Execution order & status
 
+All 17 plans were executed 2026-06-13 (directly, in the implementing session —
+not via dispatched executors). Two real bugs were uncovered + fixed by the test
+plans, and a few sub-parts were deliberately deferred (see notes below).
+
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
-| 001 | ESLint static-analysis gate | P1 | M | MED | — | TODO |
-| 002 | Connector wiki wire-mapper tests | P1 | M | LOW | — | TODO |
-| 003 | Mutation-orchestrator tests (rewrite + editCell) | P1 | M | LOW | — | TODO |
-| 006 | Mermaid error XSS fix | P2 | S | LOW | — | TODO |
-| 005 | wiki/index incremental server cache | P2 | M | MED | (002 nice-to-have) | TODO |
-| 004 | Consolidate index hooks + fix no-op ternary | P2 | M | MED | 001 | TODO |
-| 007 | Dead code: rehype-raw + WikiTabStrip | P3 | S | LOW | — | TODO |
-| 008 | Remove dead `effect` AppStore shim | P3 | S–M | MED | — | TODO |
-| 009 | Memoize properties-page value scan | P3 | S | LOW | — | TODO |
-| 010 | Shared fenced-code/wikilink helpers | P3 | M | MED | 001 | TODO |
-| 011 | localStorage store factory | P3 | L | MED | 001, 007 | TODO |
-| 012 | God-file characterization tests + roadmap | P3 | L | LOW | 001 | TODO |
-| 013 | www wiki architecture doc | P3 | M | LOW | — | TODO |
-| 014 | [SPIKE] Agent wiki-write tools | P3 | M | MED | — | TODO |
-| 015 | Entity→page backlinks (RPC + UI) | P3 | M | LOW | — | TODO |
-| 016 | [SPIKE] Durable claim schema | P3 | M | MED | — | TODO |
-| 017 | Bulk-import crash/restart resume PROOF | P3 | M | LOW | — | TODO |
+| 001 | ESLint static-analysis gate | P1 | M | MED | — | DONE |
+| 002 | Connector wiki wire-mapper tests | P1 | M | LOW | — | DONE |
+| 003 | Mutation-orchestrator tests (rewrite + editCell) | P1 | M | LOW | — | DONE (found+fixed a real cell-edit bug) |
+| 006 | Mermaid error XSS fix | P2 | S | LOW | — | DONE |
+| 005 | wiki/index incremental server cache | P2 | M | MED | (002 nice-to-have) | DONE |
+| 004 | Consolidate index hooks + fix no-op ternary | P2 | M | MED | 001 | DONE (factory thunk also fixed a latent over-fetch) |
+| 007 | Dead code: rehype-raw + WikiTabStrip | P3 | S | LOW | — | DONE |
+| 008 | Remove dead `effect` AppStore shim | P3 | S–M | MED | — | DONE |
+| 009 | Memoize properties-page value scan | P3 | S | LOW | — | DONE |
+| 010 | Shared fenced-code/wikilink helpers | P3 | M | MED | 001 | DONE (phase A; phase B wikilink-parse deferred) |
+| 011 | localStorage store factory | P3 | L | MED | 001, 007 | DONE (hotkeys+recents migrated; settings+tabs deferred) |
+| 012 | God-file characterization tests + roadmap | P3 | L | LOW | 001 | DONE (tests + roadmap; refactor deferred by design) |
+| 013 | www wiki architecture doc | P3 | M | LOW | — | DONE |
+| 014 | [SPIKE] Agent wiki-write tools | P3 | M | MED | — | DONE (design + prototype sketch; exposure awaits sign-off) |
+| 015 | Entity→page backlinks (RPC + UI) | P3 | M | LOW | — | DONE |
+| 016 | [SPIKE] Durable claim schema | P3 | M | MED | — | DONE (design doc) |
+| 017 | Bulk-import crash/restart resume PROOF | P3 | M | LOW | — | DONE |
+
+## Execution notes (2026-06-13)
+
+- **Plan 003 uncovered a real shipped bug**: base inline cell-edit (`editCell`)
+  read `prevRow` from inside a `setState` updater then checked it synchronously —
+  React runs the updater later, so `prevRow` was always undefined and edits
+  silently never saved. Fixed by reading the row from a state ref. Fix +
+  characterization tests landed together.
+- **Plan 004's factory** uses a thunk-returning `fetch` contract; the naive
+  extraction would have fired an RPC on every effect run (cache hit / disconnect
+  included). Caught by a factory test.
+- **Deferred sub-parts** (risk-based, each noted in its commit): 010 phase B
+  (the three wikilink-target regexes differ in capture semantics); 011's
+  `useWikiSettings` (load-bearing, intricate coerce, no test guard) +
+  `useWikiTabs` (sessionStorage + imperative API) — the factory is ready;
+  012's actual component extraction (tests-first; roadmap in
+  `docs/notes/wiki-godfile-extraction.md`); 014's live tool exposure (agent
+  write access needs maintainer sign-off — design + gating in
+  `docs/notes/wiki-agent-write-tools.md`).
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale).
 
