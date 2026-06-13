@@ -207,6 +207,63 @@ final class ImportMarkdownTests: XCTestCase {
         XCTAssertEqual(countAfterResume, 1)
     }
 
+    /// CLAIM (crash/restart proof): if an import is interrupted after some files
+    /// land (simulated here by importing a subset first), a `--resume` re-run over
+    /// the full corpus COMPLETES the remaining files WITHOUT re-importing the ones
+    /// already done — and a later content change to a done file IS re-imported.
+    func testResumeCompletesPartialImportWithoutRedoingDoneFiles() async throws {
+        let root = try tempDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let state = try tempDir("state"); defer { try? FileManager.default.removeItem(atPath: state) }
+        let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }
+
+        // "Before the crash": only file A exists and gets imported. Pin the jobID
+        // so the resume run reads the SAME state file across a corpus change.
+        let fileA = root + "/a.md"
+        try "# A\nalpha body".write(toFile: fileA, atomically: true, encoding: .utf8)
+        var opts = options(stateRoot: state)
+        opts.jobID = "crash-test"
+        opts.resume = true
+        let first = try await CodexMemoryMarkdownImport.importRoots(
+            [root], options: opts, store: store, processor: processor)
+        XCTAssertEqual(first.imported, 1)
+
+        // "After restart": file B has appeared; resume over [A, B]. A is unchanged
+        // (store still holds it, same SHA) and is NOT re-imported; B is new.
+        try "# B\nbeta body".write(toFile: root + "/b.md", atomically: true, encoding: .utf8)
+        let resumed = try await CodexMemoryMarkdownImport.importRoots(
+            [root], options: opts, store: store, processor: processor)
+        let countAfterResume = try await store.documentCount()
+        XCTAssertEqual(resumed.imported, 1, "only the not-yet-done file is imported")
+        XCTAssertEqual(resumed.unchanged, 1, "the already-done file is skipped, not redone")
+        XCTAssertEqual(countAfterResume, 2, "no duplicates; both pages present")
+
+        // Editing a done file changes its SHA → it IS re-imported on the next resume.
+        try "# A\nalpha body EDITED".write(toFile: fileA, atomically: true, encoding: .utf8)
+        let afterEdit = try await CodexMemoryMarkdownImport.importRoots(
+            [root], options: opts, store: store, processor: processor)
+        let countAfterEdit = try await store.documentCount()
+        XCTAssertEqual(afterEdit.imported, 1, "the changed file is re-imported")
+        XCTAssertEqual(afterEdit.unchanged, 1, "the unchanged file stays skipped")
+        XCTAssertEqual(countAfterEdit, 2, "still no duplicates")
+    }
+
+    /// CLAIM: `--resume` with no prior state file (a fresh run that opts into
+    /// resume) degrades gracefully to a normal import — no crash, everything
+    /// imported.
+    func testResumeWithNoPriorStateImportsEverything() async throws {
+        let root = try tempDir(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let state = try tempDir("state"); defer { try? FileManager.default.removeItem(atPath: state) }
+        let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }
+        try "# Fresh\nbody".write(toFile: root + "/fresh.md", atomically: true, encoding: .utf8)
+        var opts = options(stateRoot: state)
+        opts.resume = true // resume requested but no state exists yet
+        let report = try await CodexMemoryMarkdownImport.importRoots(
+            [root], options: opts, store: store, processor: processor)
+        let count = try await store.documentCount()
+        XCTAssertEqual(report.imported, 1)
+        XCTAssertEqual(count, 1)
+    }
+
     func testExtractModeRerunReplacesWithoutDuplicatingUntilCompletionMarkerExists() async throws {
         let root = try tempDir(); defer { try? FileManager.default.removeItem(atPath: root) }
         let state = try tempDir("state"); defer { try? FileManager.default.removeItem(atPath: state) }
