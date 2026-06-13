@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { splitFrontmatter, parseSegments, serialize } from "./WikiPropertiesEditor";
+import { splitFrontmatter, parseSegments, serialize } from "./frontmatterModel";
 
 // These suites lock in the CRITICAL data-loss fixes for the frontmatter editor.
 // CLAIM: parse → serialize is byte-for-byte verbatim for any unedited doc, and
