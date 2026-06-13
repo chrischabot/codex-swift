@@ -25,7 +25,11 @@ backend plans.
 
 All 17 plans were executed 2026-06-13 (directly, in the implementing session —
 not via dispatched executors). Two real bugs were uncovered + fixed by the test
-plans, and a few sub-parts were deliberately deferred (see notes below).
+plans. The sub-parts initially deferred (010B, 011 settings+tabs, 012 refactor,
+014 tool wiring) were subsequently picked up and completed 2026-06-13 at the
+maintainer's request; the one remaining deferral is documented as a deliberate
+keep-separate design decision (the cross-file `splitFrontmatter` merge — see
+notes below).
 
 | Plan | Title | Priority | Effort | Risk | Depends on | Status |
 |------|-------|----------|--------|------|------------|--------|
@@ -38,11 +42,11 @@ plans, and a few sub-parts were deliberately deferred (see notes below).
 | 007 | Dead code: rehype-raw + WikiTabStrip | P3 | S | LOW | — | DONE |
 | 008 | Remove dead `effect` AppStore shim | P3 | S–M | MED | — | DONE |
 | 009 | Memoize properties-page value scan | P3 | S | LOW | — | DONE |
-| 010 | Shared fenced-code/wikilink helpers | P3 | M | MED | 001 | DONE (phase A; phase B wikilink-parse deferred) |
-| 011 | localStorage store factory | P3 | L | MED | 001, 007 | DONE (hotkeys+recents migrated; settings+tabs deferred) |
-| 012 | God-file characterization tests + roadmap | P3 | L | LOW | 001 | DONE (tests + roadmap; refactor deferred by design) |
+| 010 | Shared fenced-code/wikilink helpers | P3 | M | MED | 001 | DONE (phase A + phase B: `wikiLinks.ts` unifies all 3 parsers) |
+| 011 | localStorage store factory | P3 | L | MED | 001, 007 | DONE (hotkeys+recents+settings+tabs all migrated) |
+| 012 | God-file characterization tests + roadmap | P3 | L | LOW | 001 | DONE (tests + roadmap + the refactor: canvas/base/properties all extracted) |
 | 013 | www wiki architecture doc | P3 | M | LOW | — | DONE |
-| 014 | [SPIKE] Agent wiki-write tools | P3 | M | MED | — | DONE (design + prototype sketch; exposure awaits sign-off) |
+| 014 | [SPIKE] Agent wiki-write tools | P3 | M | MED | — | DONE (`WikiCreatePageTool` wired in MemoryToolset, gated by `CODEXKIT_WIKI_AGENT_WRITE=1`) |
 | 015 | Entity→page backlinks (RPC + UI) | P3 | M | LOW | — | DONE |
 | 016 | [SPIKE] Durable claim schema | P3 | M | MED | — | DONE (design doc) |
 | 017 | Bulk-import crash/restart resume PROOF | P3 | M | LOW | — | DONE |
@@ -57,14 +61,30 @@ plans, and a few sub-parts were deliberately deferred (see notes below).
 - **Plan 004's factory** uses a thunk-returning `fetch` contract; the naive
   extraction would have fired an RPC on every effect run (cache hit / disconnect
   included). Caught by a factory test.
-- **Deferred sub-parts** (risk-based, each noted in its commit): 010 phase B
-  (the three wikilink-target regexes differ in capture semantics); 011's
-  `useWikiSettings` (load-bearing, intricate coerce, no test guard) +
-  `useWikiTabs` (sessionStorage + imperative API) — the factory is ready;
-  012's actual component extraction (tests-first; roadmap in
-  `docs/notes/wiki-godfile-extraction.md`); 014's live tool exposure (agent
-  write access needs maintainer sign-off — design + gating in
-  `docs/notes/wiki-agent-write-tools.md`).
+- **Initially-deferred sub-parts — now COMPLETED 2026-06-13** (maintainer asked
+  to "get it all done; we're still early and can make changes"):
+  - **010 phase B** ✓ — `markdown/wikiLinks.ts` is now the canonical wikilink
+    parser (`parseWikilinkInner` + `WIKILINK_RE` + `findWikilinks`); the three
+    former consumers (`transclude.parseFragment`, `wikiRemarkPlugins.parseWikilink`,
+    `WikiBacklinksPanel`) are thin adapters. The differing capture semantics were
+    reconciled into one shape rather than kept apart.
+  - **011 settings + tabs** ✓ — `useWikiSettings` (localStorage) and `useWikiTabs`
+    (sessionStorage) both migrated onto `createPersistentStore`; the per-tab
+    sessionStorage isolation is covered by `useWikiTabs.test.ts`.
+  - **012 component extraction** ✓ — canvas (`canvasGeometry.ts` +
+    `canvasComponents.tsx`), base views (`baseViews.tsx`), and the properties
+    editor (`frontmatterModel.ts` + `FrontmatterSegmentEditor.tsx`) are all
+    extracted; the four god-files dropped to orchestrator size; 478 tests stay
+    green. Roadmap updated in `docs/notes/wiki-godfile-extraction.md`.
+  - **014 live tool exposure** ✓ — `WikiCreatePageTool` is wired into
+    `MemoryToolset.tools()`, gated behind `CODEXKIT_WIKI_AGENT_WRITE=1`
+    (idempotent, zero-spend, `wiki://manual/<uuid>` source). Off by default.
+- **One deferral kept by design**: the cross-file `splitFrontmatter` merge
+  (roadmap item 3, first bullet). The properties-editor and `basesSchema.ts`
+  copies have different return shapes/semantics; merging risks user-data
+  corruption. The pure model now lives in `frontmatterModel.ts`, so a future
+  merge behind a round-trip test is a one-import change — but it is intentionally
+  not forced here.
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED (one-line rationale).
 
@@ -95,7 +115,7 @@ Status values: TODO | IN PROGRESS | DONE | BLOCKED (one-line reason) | REJECTED 
 - **PERF-01 "per view-open" framing** — CORRECTED in plan 005: the client module-caches `wiki/index`, so the full-corpus scan fires on first use + after each edit (dataVersion bump), not per navigation. Still worth caching server-side (plan 005).
 - **DIRECTION-04 "no import resume"** — CORRECTED. `ImportMarkdown.swift` already has `--resume`, a state file, content-SHA, and idempotent skip/unchanged/imported tracking. STATUS.md's "Planned next" item is the crash/restart *proof* — plan 017 delivers that test, not the feature.
 - **`npm audit`** — clean (0 vulnerabilities) at audit time. No plan needed.
-- **God-file BIG-BANG refactors (DEBT-05/06/07)** — deliberately NOT planned as refactors. Per the audit playbook, high-churn + untested code is a characterization-tests-first candidate: plan 012 adds the safety-net tests + an extraction roadmap; the actual extraction is a future plan the maintainer can commission once the net exists.
+- **God-file BIG-BANG refactors (DEBT-05/06/07)** — originally NOT planned as refactors (characterization-tests-first per the audit playbook). Plan 012 landed the safety-net tests + an extraction roadmap; the maintainer then commissioned the extraction itself, which was executed seam-by-seam on top of that net (canvas/base/properties, all behavior-preserving, 478 tests green). The graph god-file (`WikiGraphView`) is the one shell left as-is by design — its heavy logic already lives in tested modules.
 
 ## Notes for the executor pool
 
