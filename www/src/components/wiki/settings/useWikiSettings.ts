@@ -1,21 +1,13 @@
 import * as React from "react";
+import { createPersistentStore } from "@/lib/persistentStore";
 import { DEFAULT_GRAPH_SETTINGS, type GraphColorGroup, type GraphSettings } from "../graph/GraphControls";
 
 // Wiki UI preferences, persisted to localStorage and synced across tabs +
-// across hook instances in the same tab.
+// across hook instances in the same tab (via the shared persistentStore).
 //
-// A www-idiomatic port of granite's SettingsModal storage layer. Granite
-// fans these out across a settings store + per-plugin stores backed by a vault
-// file; here the wiki is a single connector-backed view, so every preference
-// the modal exposes lives under one JSON blob (key "wiki:settings").
-//
-// The `storage` event fires ONLY in OTHER tabs, so a writing tab's other
-// useWikiSettings instances (e.g. the modal + the editor reading prefs) would
-// never observe the change. As with useBookmarks we dispatch CHANGE_EVENT on
-// every write and all instances re-read on it.
-
-const STORAGE_KEY = "wiki:settings";
-const CHANGE_EVENT = "wiki:settings:changed";
+// A www-idiomatic port of granite's SettingsModal storage layer: every
+// preference the modal exposes lives under one JSON blob (key "wiki:settings"),
+// validated by `coerce` on read so a partial/stale blob still loads cleanly.
 
 /** The set of right-rail tabs the modal can pin as the default. Kept in sync
  *  with the TabsTrigger values in WikiPage. */
@@ -130,24 +122,11 @@ function coerce(raw: unknown): WikiSettings {
   };
 }
 
-function read(): WikiSettings {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_WIKI_SETTINGS;
-    return coerce(JSON.parse(raw) as unknown);
-  } catch {
-    return DEFAULT_WIKI_SETTINGS;
-  }
-}
-
-function write(next: WikiSettings): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-  } catch {
-    /* quota / private mode — non-fatal, state stays in memory */
-  }
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
-}
+const store = createPersistentStore<WikiSettings>({
+  key: "wiki:settings",
+  defaultValue: DEFAULT_WIKI_SETTINGS,
+  coerce,
+});
 
 /**
  * Flip `editorLivePreview` in the persisted settings and broadcast so every
@@ -156,9 +135,9 @@ function write(next: WikiSettings): void {
  * Returns the new value.
  */
 export function toggleLivePreviewSetting(): boolean {
-  const cur = read();
+  const cur = store.get();
   const next = { ...cur, editorLivePreview: !cur.editorLivePreview };
-  write(next);
+  store.set(next);
   return next.editorLivePreview;
 }
 
@@ -180,47 +159,21 @@ export interface UseWikiSettings {
  * `storage` event.
  */
 export function useWikiSettings(): UseWikiSettings {
-  const [settings, setSettings] = React.useState<WikiSettings>(() =>
-    typeof window === "undefined" ? DEFAULT_WIKI_SETTINGS : read(),
-  );
-
-  React.useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== null && e.key !== STORAGE_KEY) return;
-      setSettings(read());
-    };
-    const onLocalChange = () => setSettings(read());
-    window.addEventListener("storage", onStorage); // cross-tab
-    window.addEventListener(CHANGE_EVENT, onLocalChange); // same-tab
-    return () => {
-      window.removeEventListener("storage", onStorage);
-      window.removeEventListener(CHANGE_EVENT, onLocalChange);
-    };
-  }, []);
+  const settings = store.useStore();
 
   const update = React.useCallback((patch: Partial<WikiSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      write(next);
-      return next;
-    });
+    store.set({ ...store.get(), ...patch });
   }, []);
 
   const updateGraph = React.useCallback(
     <K extends keyof GraphSettings>(key: K, value: GraphSettings[K]) => {
-      setSettings((prev) => {
-        const next = { ...prev, graphDefaults: { ...prev.graphDefaults, [key]: value } };
-        write(next);
-        return next;
-      });
+      const cur = store.get();
+      store.set({ ...cur, graphDefaults: { ...cur.graphDefaults, [key]: value } });
     },
     [],
   );
 
-  const reset = React.useCallback(() => {
-    setSettings(DEFAULT_WIKI_SETTINGS);
-    write(DEFAULT_WIKI_SETTINGS);
-  }, []);
+  const reset = React.useCallback(() => store.set(DEFAULT_WIKI_SETTINGS), []);
 
   return { settings, update, updateGraph, reset };
 }

@@ -1,31 +1,23 @@
 import * as React from "react";
+import { createPersistentStore } from "@/lib/persistentStore";
 import { addTab, removeTab, renameTab, type WikiTab } from "./wikiTabs";
 
-const STORAGE_KEY = "wiki:tabs";
-const CHANGE_EVENT = "wiki:tabs:changed";
+// Session-scoped (per-tab) — sessionStorage, so the cross-tab `storage` event
+// never fires; same-tab consumers sync via the factory's subscriber set.
+const store = createPersistentStore<WikiTab[]>({
+  key: "wiki:tabs",
+  storage: "session",
+  defaultValue: [],
+  coerce: (raw) =>
+    Array.isArray(raw)
+      ? raw
+          .filter((x): x is WikiTab => !!x && typeof (x as WikiTab).id === "string" && (x as WikiTab).id.length > 0)
+          .map((x) => ({ id: x.id, title: typeof x.title === "string" ? x.title : x.id }))
+      : [],
+});
 
-function read(): WikiTab[] {
-  try {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((x): x is WikiTab => !!x && typeof (x as WikiTab).id === "string" && (x as WikiTab).id.length > 0)
-      .map((x) => ({ id: x.id, title: typeof x.title === "string" ? x.title : x.id }));
-  } catch {
-    return [];
-  }
-}
-
-function write(tabs: WikiTab[]): void {
-  try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(tabs));
-  } catch {
-    /* private mode — non-fatal */
-  }
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
-}
+const read = (): WikiTab[] => store.get();
+const write = (tabs: WikiTab[]): void => store.set(tabs);
 
 /** Update an open tab's cached title in storage + broadcast — callable from
  *  outside React (e.g. the explorer's rename success) so the strip stays fresh
@@ -50,45 +42,29 @@ export interface UseWikiTabs {
  * ./wikiTabs.
  */
 export function useWikiTabs(): UseWikiTabs {
-  const [tabs, setTabs] = React.useState<WikiTab[]>(() => (typeof window === "undefined" ? [] : read()));
-
-  React.useEffect(() => {
-    // sessionStorage is per-tab, so the cross-tab `storage` event never fires for
-    // it — same-tab consumers sync via our own CHANGE_EVENT.
-    const onChange = () => setTabs(read());
-    window.addEventListener(CHANGE_EVENT, onChange);
-    return () => window.removeEventListener(CHANGE_EVENT, onChange);
-  }, []);
+  const tabs = store.useStore();
 
   const open = React.useCallback((tab: WikiTab) => {
-    setTabs((prev) => {
-      const next = addTab(prev, tab);
-      // Only persist when something actually changed (avoid an event storm when
-      // re-opening an already-current tab with the same title).
-      if (next.length === prev.length && next.every((t, i) => t.id === prev[i].id && t.title === prev[i].title)) {
-        return prev;
-      }
-      write(next);
-      return next;
-    });
+    const prev = read();
+    const next = addTab(prev, tab);
+    // Only persist when something actually changed (avoid a notify storm when
+    // re-opening an already-current tab with the same title).
+    if (next.length === prev.length && next.every((t, i) => t.id === prev[i].id && t.title === prev[i].title)) {
+      return;
+    }
+    write(next);
   }, []);
 
   const close = React.useCallback((id: string) => {
-    setTabs((prev) => {
-      if (!prev.some((t) => t.id === id)) return prev;
-      const next = removeTab(prev, id);
-      write(next);
-      return next;
-    });
+    const prev = read();
+    if (!prev.some((t) => t.id === id)) return;
+    write(removeTab(prev, id));
   }, []);
 
   const rename = React.useCallback((id: string, title: string) => {
-    setTabs((prev) => {
-      if (!prev.some((t) => t.id === id && t.title !== title)) return prev;
-      const next = renameTab(prev, id, title);
-      write(next);
-      return next;
-    });
+    const prev = read();
+    if (!prev.some((t) => t.id === id && t.title !== title)) return;
+    write(renameTab(prev, id, title));
   }, []);
 
   return { tabs, open, close, rename };
