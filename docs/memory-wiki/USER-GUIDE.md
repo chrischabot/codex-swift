@@ -334,22 +334,27 @@ poll is the landing piece.)
 
 ## 9. Navigating the wiki in the web UI
 
-🔭/🧱 The web console is served by the daemon's WebGateway (the static server + WS
-bridge is built; the consolidated Memory-Wiki console pages are the remaining
-frontend milestone). When complete it provides:
+The web UI is served by the daemon's WebGateway (`codexd`). It provides the wiki
+browser plus a **Console** (route `/wiki/console`, reachable from the wiki header
+and the command palette):
 
-- A **wiki browser** — pages by category (concept/topic/reference/thesis), with
+- A **wiki browser** ✅ — pages by category (concept/topic/reference/thesis), with
   `[[wiki-link]]` navigation, backlinks, a graph view, and frontmatter
   (confidence/volatility/sources/compiled-from) rendered inline.
-- A **Query** console — type a question, pick a depth, see grouped hits + the
-  honest retrieval mode.
-- An **Ingest** console — add a source, watch live progress/logs, see the ledger.
-- A **Sessions** view — research runs with their round-by-round events and scores.
-- A **Reports** lane — librarian/audit reports and the daily digest.
-- A **Watch** tab — the sources table with add/pause/remove and "run now".
+- The **Console — Search tab** ✅ — type a query, get ranked hits (title / excerpt /
+  source) over `wiki/search`; click a hit to open its page.
+- The **Console — Brief tab** ✅ — a topic → a cited synthesis brief (summary, key
+  points with citation ids, sources, confidence) over `wiki/brief`.
+- The **Console — Status tab** ✅ — the dashboard / "view logs" surface over
+  `wiki/status`: raw-doc / wiki-page / flagged-stale counts + the recent ingest-job
+  ledger (status, written/skipped/failed).
+- 🧱 **Ingest / Research / Sessions / Reports / Watch tabs** — each needs its
+  `wiki/*` RPC (the `wiki/status` vertical is the template); the long-running
+  research/ingest ones additionally need async-job streaming so the UI can show live
+  progress. Today those run from the `codex-memory` CLI (§§3, 5, 7, 8).
 
-Until those pages land, every capability above is reachable from the `codex-memory`
-CLI and (for query) the `wiki/query` RPC.
+Every capability is reachable from the `codex-memory` CLI; the Console surfaces
+search, brief, and status in the browser today.
 
 ---
 
