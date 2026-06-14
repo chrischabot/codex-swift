@@ -26,7 +26,10 @@ func XCTAssertEqualAsync<T: Equatable & Sendable>(
 /// `query`. Multi-statement setup runs one `exec` per statement (or psql via
 /// `PGTestHarness.runSQL`). A dollar-quoted `CREATE FUNCTION` body is a single
 /// statement and works directly.
-final class PGRawConnection {
+// @unchecked Sendable: the two-connection isolation tests run one connection per
+// concurrent task (never the same connection from two tasks at once), so passing a
+// PGRawConnection across an `async let` is race-free in practice.
+final class PGRawConnection: @unchecked Sendable {
     let conn: PostgresConnection
     let logger = Logger(label: "pg.raw.test")
     private static let idCounter = NIOLockedValueBox<Int>(1000)
@@ -82,6 +85,15 @@ final class PGRawConnection {
         var n = 0
         for try await _ in try await query(sql) { n += 1 }
         return n
+    }
+
+    /// Run SQL; return its SQLSTATE if it errors, or "" if it SUCCEEDS — without
+    /// asserting either way (for cases where success is a valid outcome, e.g. the
+    /// non-victim of a deadlock).
+    func sqlstateOf(_ sql: String) async -> String {
+        do { try await exec(sql); return "" }
+        catch let e as PSQLError { return e.serverInfo?[.sqlState] ?? "?" }
+        catch { return "?" }
     }
 
     /// Run SQL expecting it to FAIL; returns the SQLSTATE (e.g. "23505") or "" if
