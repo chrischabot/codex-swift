@@ -19,34 +19,50 @@ import MediaDecode
 struct MediaDecodeMain {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
-        guard args.count == 2, let kind = MediaKind(rawValue: args[0]), !args[1].isEmpty else {
-            emit(.error(.internalError))
+        // 2 args = `<kind> <path>` → probe (back-compat). 3 args = `<verb> <kind> <path>`.
+        let verb: MediaVerb
+        let kindStr: String
+        let path: String
+        if args.count == 2 {
+            verb = .probe; kindStr = args[0]; path = args[1]
+        } else if args.count == 3, let v = MediaVerb(rawValue: args[0]) {
+            verb = v; kindStr = args[1]; path = args[2]
+        } else {
+            emit(.error(.internalError))   // shared {"error":...} envelope; exits 1
         }
-        let path = args[1]
+        guard let kind = MediaKind(rawValue: kindStr), !path.isEmpty else { emit(.error(.internalError)) }
         let caps = loadCaps().clamped()
 
         // FIRST, before touching the untrusted file: self-impose
-        // CPU/mem/file-size/fd limits. Best-effort (some are platform-dependent);
-        // the header-checked caps in MediaProber + the PARENT's wall-clock/RSS
-        // watchdogs are the authoritative guards, these the in-child backstop.
-        // Log any limit we couldn't set (stderr is captured/visible on direct
-        // runs; nulled by the sandboxed parent) for diagnosis.
+        // CPU/mem/file-size/fd limits. Best-effort; the header-checked caps + the
+        // PARENT's wall-clock/RSS watchdogs are authoritative, these the backstop.
         let unsetLimits = ChildResourceLimits.applySelf(caps)
         if !unsetLimits.isEmpty {
             FileHandle.standardError.write(Data(
                 "codex-mediadecode: could not set rlimits: \(unsetLimits.joined(separator: ","))\n".utf8))
         }
 
-        let response: MediaProbeResponse
-        do {
-            let result = try await MediaProber.probe(path: path, declaredKind: kind, caps: caps)
-            response = .ok(result)
-        } catch let e as MediaProbeError {
-            response = .error(e)
-        } catch {
-            response = .error(.internalError)
+        switch verb {
+        case .probe:
+            let response: MediaProbeResponse
+            do { response = .ok(try await MediaProber.probe(path: path, declaredKind: kind, caps: caps)) }
+            catch let e as MediaProbeError { response = .error(e) }
+            catch { response = .error(.internalError) }
+            emit(response)
+        case .extract:
+            let response: MediaExtractResponse
+            do { response = .ok(try MediaExtractor.extract(path: path, declaredKind: kind, caps: caps)) }
+            catch let e as MediaExtractError { response = .error(e) }
+            catch { response = .error(.internalError) }
+            emitExtract(response)
         }
-        emit(response)
+    }
+
+    static func emitExtract(_ resp: MediaExtractResponse) -> Never {
+        if let data = try? JSONEncoder().encode(resp), let json = String(data: data, encoding: .utf8) {
+            FileHandle.standardOutput.write(Data((json + "\n").utf8))
+        }
+        exit(resp.isOK ? 0 : 1)
     }
 
     static func loadCaps() -> MediaDecodeCaps {

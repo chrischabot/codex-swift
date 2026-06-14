@@ -82,10 +82,18 @@ public struct MediaDecodeCaps: Sendable, Codable, Equatable {
         maxDecompressionRatio: 5_000,
         maxPdfPages: 100_000,
         maxDurationSeconds: 72 * 3600,
-        maxOutputBytes: 1024 * 1024,
+        // 16 MiB: a probe's JSON is tiny, but the `extract` verb streams extracted
+        // markdown over the same stdout pipe — bigger than a probe, still bounded.
+        maxOutputBytes: 16 * 1024 * 1024,
         wallClockMs: 60_000,
         cpuSeconds: 120,
         addressSpaceBytes: 4 * 1024 * 1024 * 1024)
+
+    /// Defaults for the `extract` verb (text extraction is slower + larger than a
+    /// header probe). The extractor caps the *markdown* well under maxOutputBytes
+    /// so the wrapping JSON (escaping overhead) still fits the parent's drain cap.
+    public static let extractDefaults = MediaDecodeCaps(
+        maxOutputBytes: 16 * 1024 * 1024, wallClockMs: 30_000, cpuSeconds: 30)
 
     /// Clamp every field into `(0, ceiling]`, so the effective caps are always
     /// at least as strict as the ceiling regardless of caller input.

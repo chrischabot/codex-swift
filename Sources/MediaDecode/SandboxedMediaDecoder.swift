@@ -68,13 +68,46 @@ public struct SandboxedMediaDecoder: Sendable {
             // never decoded without confinement.
             return .failure(.helperUnavailable)
         }
-        return await runChild(argv: argv, caps: caps)
+        return await runChild(argv: argv, caps: caps, parse: Self.parse, killFailure: { $0 })
+    }
+
+    /// Extract text (PDF → markdown) under the SAME confinement as `probe`. Never
+    /// throws — every failure is a typed `MediaExtractError`. An image-only PDF
+    /// returns a result with `extractionStatus: .ocrNeeded`, not an error.
+    public func extract(path: String,
+                        kind: MediaKind,
+                        caps rawCaps: MediaDecodeCaps = .extractDefaults)
+    async -> Result<MediaExtractResult, MediaExtractError> {
+        let caps = rawCaps.clamped()
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue,
+              fm.isReadableFile(atPath: path) else { return .failure(.unreadable) }
+        if let size = (try? fm.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue,
+           size > caps.maxInputBytes { return .failure(.oversizeInput) }
+        guard let helper = helperPath ?? Self.resolveHelper(), fm.isExecutableFile(atPath: helper) else {
+            return .failure(.helperUnavailable)
+        }
+        let policy = SandboxPolicy(mode: .readOnly, writableRoots: [], networkAllowed: false)
+        let sandbox = WorkspaceSandbox(policy)
+        let dir = (path as NSString).deletingLastPathComponent
+        let cwd = dir.isEmpty ? "/" : dir
+        let argv: [String]
+        switch sandbox.sandboxedInvocation(argv: [helper, MediaVerb.extract.rawValue, kind.rawValue, path], cwd: cwd) {
+        case .run(let a): argv = a
+        case .deny: return .failure(.helperUnavailable)
+        }
+        return await runChild(argv: argv, caps: caps,
+                              parse: Self.parseExtract,
+                              killFailure: { MediaExtractError(probe: $0) })
     }
 
     // MARK: child process
 
-    private func runChild(argv: [String],
-                          caps: MediaDecodeCaps) async -> Result<MediaProbeResult, MediaProbeError> {
+    private func runChild<S, F: Error>(argv: [String], caps: MediaDecodeCaps,
+                                       parse: @Sendable @escaping (Data, Int, Bool) -> Result<S, F>,
+                                       killFailure: @Sendable @escaping (MediaProbeError) -> F)
+    async -> Result<S, F> {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: argv[0])
         proc.arguments = Array(argv.dropFirst())
@@ -97,7 +130,7 @@ public struct SandboxedMediaDecoder: Sendable {
             let signalled = (p.terminationReason == .uncaughtSignal)
             Task { await exit.signal(code: code, signalled: signalled) }
         }
-        do { try proc.run() } catch { return .failure(.helperUnavailable) }
+        do { try proc.run() } catch { return .failure(killFailure(.helperUnavailable)) }
         let pid = proc.processIdentifier
 
         // Drain stdout CONCURRENTLY (not after exit): a child writing past the OS
@@ -152,8 +185,8 @@ public struct SandboxedMediaDecoder: Sendable {
         // Honor a parent kill ONLY if it actually landed (the child died by
         // signal). A near-deadline clean exit, or a kill aimed at an
         // already-exited pid, is NOT signalled → fall through and trust the exit.
-        if let r = killReason, signalled { return .failure(r) }
-        return Self.parse(data: data, exitCode: code, signalled: signalled)
+        if let r = killReason, signalled { return .failure(killFailure(r)) }
+        return parse(data, code, signalled)
     }
 
     /// Read up to `cap` bytes from `fd`, then keep draining/discarding to EOF so
@@ -189,6 +222,20 @@ public struct SandboxedMediaDecoder: Sendable {
             // The child's wire contract: a successful probe exits 0, a typed
             // rejection exits 1 (Entry.swift). An `ok` payload on a NONZERO exit
             // is an inconsistent/subverted child — do not trust it as success.
+            case .ok(let r):    return exitCode == 0 ? .success(r) : .failure(.childCrashed)
+            case .error(let e): return .failure(e)
+            }
+        }
+        return .failure(exitCode == 0 ? .internalError : .childCrashed)
+    }
+
+    /// Extract-verb counterpart of `parse` (same signalled-first / nonzero-exit
+    /// distrust discipline, MediaExtractResponse wire shape).
+    static func parseExtract(_ data: Data, _ exitCode: Int, _ signalled: Bool)
+    -> Result<MediaExtractResult, MediaExtractError> {
+        if signalled { return .failure(.childCrashed) }
+        if !data.isEmpty, let resp = try? JSONDecoder().decode(MediaExtractResponse.self, from: data) {
+            switch resp {
             case .ok(let r):    return exitCode == 0 ? .success(r) : .failure(.childCrashed)
             case .error(let e): return .failure(e)
             }
