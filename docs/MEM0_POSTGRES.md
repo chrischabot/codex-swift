@@ -77,6 +77,22 @@ CODEX_MEM0_STORE_BACKEND=postgres .build/debug/codex-mem0 verify
 # stderr: "codex-mem0: embedded Postgres store ready (PGDATA …)"
 ```
 
+### Programmatic use (any target)
+Both libraries are SwiftPM products, so any macOS target can depend on `EmbeddedPG`
++ `Mem0PgStore` and get an embedded store in one call:
+
+```swift
+import Mem0PgStore
+// Spins up + provisions a cluster under $CODEX_HOME/mem0/pg and opens the store.
+let store = try await Mem0PgVectorStore.openDefault(dims: 1536)
+// `store` conforms to both Mem0VectorStore + Mem0HistoryStore — pass it as both
+// to Mem0Engine, exactly like Mem0SQLiteStore.
+```
+Need control over paths/lifecycle? Use `PGPaths` + `PostgresLifecycle` +
+`Mem0PgVectorStore.open(paths:dims:lifecycle:)` directly. The lower-level
+`EmbeddedPG` target (lifecycle + APFS snapshots) is independently reusable for any
+embedded-Postgres need, not just the mem0 store.
+
 ---
 
 ## 3. Configuration (environment knobs)
@@ -257,6 +273,11 @@ The suite (all severe / adversarial):
 | `InjectionAbuseTests` | SQL-injection round-trips as opaque data; multi-MB payloads; **least-privilege denial** (`COPY…TO PROGRAM` / `pg_read_file` / `lo_import` / DDL all rejected for `codex_app`); **no-TCP** invariant |
 | `VectorDimensionTests` | cosine-not-L2 ordering; `vector`+HNSW (EXPLAIN proves index use) vs `halfvec`; selective-filter full-top-k recall; degenerate vectors |
 | `LifecycleDurabilityTests` | 64-way concurrent inserts (FIFO gate, no lost writes); idempotent restart + `kill -9` WAL recovery; APFS cold-snapshot clone is readable |
+| `EdgeCaseTests` | keywordSearch degenerate/injection queries (→ `[]`, never throw); NUL-byte rejection + connection survival; dimension-mismatch batch rollback; `openDefault` e2e |
+
+Severe testing found and fixed **three real divergences** before they shipped: a
+`$not` absent-key bug (SQL three-valued logic), NaN scores from zero-norm vectors,
+and the scientific-notation numeric-coercion gap.
 
 ---
 
