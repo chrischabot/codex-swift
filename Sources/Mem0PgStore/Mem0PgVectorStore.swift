@@ -84,6 +84,21 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
         return store
     }
 
+    /// One-call convenience for "just give me an embedded Postgres store": resolve
+    /// the default cluster layout under `$CODEX_HOME/mem0/pg` from the environment,
+    /// spawn/provision it, and open the store. Lets any target adopt the embedded
+    /// store without hand-wiring `PGPaths`/`PostgresLifecycle`.
+    public static func openDefault(dims: Int,
+                                   env: [String: String] = ProcessInfo.processInfo.environment,
+                                   logLabel: String = "codex.mem0.pg") async throws -> Mem0PgVectorStore {
+        guard let paths = PGPaths.resolveDefault(env: env) else {
+            throw Mem0Error.configuration(
+                "embedded Postgres unavailable: no postgres server binary found (install postgresql@NN + pgvector)")
+        }
+        return try await open(paths: paths, dims: dims,
+                              lifecycle: PostgresLifecycle(paths: paths), logLabel: logLabel)
+    }
+
     private func start(lifecycle: PostgresLifecycle?) async throws {
         if let lifecycle { try await lifecycle.ensureStarted() }
         try await bootstrap()
