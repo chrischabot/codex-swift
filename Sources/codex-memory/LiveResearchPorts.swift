@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking   // URLSession/URLRequest/HTTPURLResponse on Linux
+#endif
 import WikiResearch
 import WikiIngest
 import MemoryStore
@@ -106,12 +109,16 @@ struct LiveResearchCompiler: ResearchCompiler {
                 contentFormat: .html,
                 provenance: CollectionProvenance(adapter: "research", collection: topic, canonicalURL: s.url),
                 fetched: fetchedAt, extractionStatus: "ok")
-            if let r = try? await writer.write(cand, extract: false), !r.skipped {
-                written += 1; ingestedDocs.append((s.url, r.documentID))
+            if let r = try? await writer.write(cand, extract: false) {
+                // Keep ALL resolved docs (including dedup-skipped existing ones) so a
+                // rerun / overlapping topic still gets a synthesis page + claim links;
+                // only count genuinely-new writes toward the progress score.
+                ingestedDocs.append((s.url, r.documentID))
+                if !r.skipped { written += 1 }
             }
         }
         var claimsLinked = 0
-        if written > 0 {
+        if !ingestedDocs.isEmpty {
             let synthID = try? await writeSynthesis(topic: topic, round: round,
                                                     sources: ingestedDocs.map(\.uri))
             // Extract grounded claims from each ingested source and link them to the
@@ -145,9 +152,11 @@ struct LiveResearchCompiler: ResearchCompiler {
         var body = "# \(topic)\n\n_Compiled by research round \(round)._\n\n## Sources\n"
         for s in sources { body += "- \(s)\n" }
         let dir = vaultRoot + "/wiki/synthesis"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // Let file failures throw BEFORE upserting — never register a synthesis row
+        // pointing at a body file that doesn't exist.
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let path = dir + "/\(slug).md"
-        try? body.write(toFile: path, atomically: true, encoding: .utf8)
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
         return try await store.upsertSynthesis(SynthesisRow(
             slug: slug, category: "synthesis", title: topic, bodyPath: path,
             confidence: "medium", volatility: .warm, verifiedAt: fetchedAt,

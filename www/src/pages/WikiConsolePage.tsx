@@ -114,7 +114,7 @@ export function WikiConsolePage() {
               {results?.map((r) => (
                 <button
                   key={r.id}
-                  onClick={() => navigate(`/wiki?page=${encodeURIComponent(r.id)}`)}
+                  onClick={() => navigate(`/wiki/${encodeURIComponent(r.id)}`)}
                   className="block w-full rounded-md border border-[color:var(--border)] p-3 text-left hover:bg-[color:var(--muted)]"
                 >
                   <div className="flex items-center gap-2">
