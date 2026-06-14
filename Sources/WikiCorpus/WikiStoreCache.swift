@@ -12,8 +12,13 @@ import MemoryStore
 /// stamp, so the open VALIDATES the stamp (mismatch → `MemoryStoreError.invalid`)
 /// instead of brute-forcing candidate dimensions.
 public actor WikiStoreCache {
+    /// A cached open store plus the exact stamp it was opened with, so a later
+    /// request for the same path with a DIFFERENT stamp is rejected on the cache
+    /// hit (not silently served) — otherwise a misregistered corpus could operate
+    /// with the wrong embedding config until eviction.
+    private struct Entry { let store: MemoryStore; let providerID: String?; let dimension: Int }
     private let capacity: Int
-    private var stores: [String: MemoryStore] = [:]
+    private var stores: [String: Entry] = [:]
     private var lru: [String] = []   // least-recently-used at front, MRU at end
 
     public init(capacity: Int = 8) { self.capacity = max(1, capacity) }
@@ -21,13 +26,22 @@ public actor WikiStoreCache {
     /// Open or return the cached store at `path`. `MemoryStore.init` is a
     /// synchronous throwing call, so there is no suspension between the cache
     /// miss and the insert — concurrent callers for the same path can't race
-    /// into two opens (actor isolation + no `await` gap).
+    /// into two opens (actor isolation + no `await` gap). On a cache hit the
+    /// requested stamp must match the open store's stamp (the single-embedder
+    /// invariant, enforced even when init isn't re-run).
     public func store(path: String, embeddingProviderID: String?, embeddingDimension: Int) throws -> MemoryStore {
-        if let s = stores[path] { touch(path); return s }
+        if let e = stores[path] {
+            guard e.providerID == embeddingProviderID, e.dimension == embeddingDimension else {
+                throw CorpusError.stampConflict(
+                    "store \(path) is open with provider=\(e.providerID ?? "nil") dim=\(e.dimension); " +
+                    "requested provider=\(embeddingProviderID ?? "nil") dim=\(embeddingDimension)")
+            }
+            touch(path); return e.store
+        }
         let cfg = MemoryStoreConfig(path: path, embeddingDimension: embeddingDimension,
                                     embeddingProviderID: embeddingProviderID)
         let s = try MemoryStore(cfg)
-        stores[path] = s
+        stores[path] = Entry(store: s, providerID: embeddingProviderID, dimension: embeddingDimension)
         touch(path)
         evictIfNeeded()
         return s

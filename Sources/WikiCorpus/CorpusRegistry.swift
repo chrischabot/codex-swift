@@ -25,7 +25,11 @@ public actor CorpusRegistry {
     /// `--wiki <name>` → registry lookup (auto-registering nothing); otherwise the
     /// `default` corpus, auto-registered to `MemoryStoreConfig.defaultPath()` on
     /// first use so an existing single-store install keeps working.
-    public func resolve(_ name: String?, local: Bool = false, cwd: String = ".") throws -> CorpusRecord {
+    /// `includeArchived` lets restore/peek paths resolve an archived corpus;
+    /// normal resolution refuses one (it is hidden from default context, so
+    /// silently reading/writing it would defeat archival).
+    public func resolve(_ name: String?, local: Bool = false, cwd: String = ".",
+                        includeArchived: Bool = false) throws -> CorpusRecord {
         if local {
             let db = Self.normalize(cwd) + "/.wiki/wiki.db"
             return CorpusRecord(name: "local", dbPath: db, embeddingDimension: 1536,
@@ -35,6 +39,7 @@ public actor CorpusRegistry {
             guard let r = file.corpora.first(where: { $0.name == name }) else {
                 throw CorpusError.notFound(name)
             }
+            if r.status == .archived && !includeArchived { throw CorpusError.archived(name) }
             return r
         }
         // default corpus

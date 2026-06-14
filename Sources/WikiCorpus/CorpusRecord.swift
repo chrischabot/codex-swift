@@ -46,6 +46,7 @@ public enum CorpusError: Error, Sendable, Equatable, CustomStringConvertible {
     case notFound(String)
     case alreadyExists(String)
     case archived(String)
+    case stampConflict(String)
     case io(String)
 
     public var description: String {
@@ -53,6 +54,7 @@ public enum CorpusError: Error, Sendable, Equatable, CustomStringConvertible {
         case .notFound(let n):       return "corpus not found: \(n)"
         case .alreadyExists(let n):  return "corpus already exists: \(n)"
         case .archived(let n):       return "corpus is archived: \(n)"
+        case .stampConflict(let m):  return "corpus store stamp conflict: \(m)"
         case .io(let m):             return "corpus registry io: \(m)"
         }
     }

@@ -76,9 +76,15 @@ final class CorpusRegistryTests: XCTestCase {
         XCTAssertEqual(hidden, 0)                 // hidden from default
         XCTAssertEqual(withArchived, 1)           // visible with flag
         XCTAssertEqual(status, .archived)
+        // resolve() must REFUSE an archived corpus (hidden from default context)
+        // unless include-archived is explicitly requested (restore/peek paths).
+        await XCTAssertThrowsErrorAsync(try await reg.resolve("old"))
+        let viaInclude = try await reg.resolve("old", includeArchived: true)
+        XCTAssertEqual(viaInclude.name, "old")
         try await reg.restore("old")
         let restored = await reg.list().count
         XCTAssertEqual(restored, 1)
+        _ = try await reg.resolve("old")  // resolves normally once restored
     }
 
     func testRegisterDuplicateThrows() async throws {
@@ -100,8 +106,14 @@ final class CorpusRegistryTests: XCTestCase {
         let count = await cache.count()
         XCTAssertEqual(count, 1)
 
+        // A cache HIT with a DIFFERENT requested stamp must be rejected, not
+        // silently served (otherwise a misregistered corpus operates with the
+        // wrong embedding config until eviction).
+        await XCTAssertThrowsErrorAsync(
+            try await cache.store(path: path, embeddingProviderID: "openai", embeddingDimension: 8))
+
         // Evict, then reopen with a DIFFERENT provider id → the stamp validation
-        // at open must throw (the single-embedder invariant, enforced via cache).
+        // at open must throw too (the single-embedder invariant at the store).
         await cache.evictAll()
         await XCTAssertThrowsErrorAsync(
             try await cache.store(path: path, embeddingProviderID: "openai", embeddingDimension: 8))
