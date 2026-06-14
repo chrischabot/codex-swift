@@ -5,6 +5,21 @@ Orientation lives in [`README.md`](README.md); per-module status in
 high-signal, easy-to-trip-over operational facts. **Frontend (the Memory Wiki
 UI):** see [`www/ARCHITECTURE.md`](www/ARCHITECTURE.md).
 
+## Embedded Postgres + pgvector store (opt-in, macOS)
+
+Mem0 has a second, opt-in store backend: a native PostgreSQL child process +
+pgvector, behind `CODEX_MEM0_STORE_BACKEND=postgres` (default stays sqlite-vec).
+Targets `EmbeddedPG` (reusable postmaster lifecycle: initdb/start/stop/snapshot —
+anything can depend on it) and `Mem0PgStore` (the `Mem0VectorStore` +
+`Mem0HistoryStore` conformer). Both are **macOS-only, gated at the manifest level**
+with `#if os(macOS)` (Linux/CI never see postgres-nio). Needs a local server build
+with pgvector: `brew install postgresql@18 pgvector` (discovery finds the
+`postgresql@NN` keg — the server binary is NOT on PATH, only libpq clients are).
+The postmaster is **socket-only** (`listen_addresses=''`); data plane runs as a
+non-superuser `codex_app` role. Tests are tag-gated: `CODEX_MEM0_PG_TEST=1 swift
+test --filter Mem0PgStoreTests`. Full guide: [`docs/MEM0_POSTGRES.md`](docs/MEM0_POSTGRES.md);
+design + phased plan: [`pglite.md`](pglite.md).
+
 ## On-device MLX inference lane
 
 The on-device small-model lane (`Sources/MemoryInfer/MLXLocalProvider.swift`,
