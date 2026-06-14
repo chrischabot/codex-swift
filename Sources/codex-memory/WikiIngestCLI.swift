@@ -8,8 +8,10 @@ import MemoryInfer
 
 /// `codex-memory wiki-ingest <input> [flags]` — drive the Memory-Wiki ingest
 /// pipeline end-to-end against the production store. `<input>` is a URL, a local
-/// path, an arXiv query, or a GitHub owner; the adapter auto-detects (override
-/// with `--adapter`). Writes go through the same store assembly as
+/// path, or a bare arXiv query/id (`cat:cs.AI`, `2402.17764`); the adapter
+/// auto-detects. A bare GitHub owner is ambiguous with a filename, so pass the
+/// owner URL (`https://github.com/openai`) or force `--adapter github`. Override
+/// detection any time with `--adapter`. Writes go through the same store assembly as
 /// `import-markdown`, so ingested pages join the rest of the wiki and are
 /// queryable immediately. Progress is recorded in the crash-safe ingest ledger.
 enum CodexMemoryWikiIngest {
@@ -31,7 +33,10 @@ enum CodexMemoryWikiIngest {
         var description: String { message }
     }
 
-    static func run(args: [String]) async throws -> String {
+    /// Returns the formatted output plus an explicit success flag, so the dispatcher
+    /// sets the exit code on the actual job status (not by parsing the text, which a
+    /// `--json` body would defeat).
+    static func run(args: [String]) async throws -> (output: String, ok: Bool) {
         let opt = try parse(args)
         guard !opt.input.isEmpty else {
             throw CLIError(message: "wiki-ingest requires an input (URL, path, arXiv query, or GitHub owner)")
@@ -59,7 +64,7 @@ enum CodexMemoryWikiIngest {
                                 limit: opt.limit, dryRun: opt.dryRun, fetchedAt: now)
         let jobID = opt.jobID ?? UUID().uuidString
         let summary = await orch.ingest(req, jobID: jobID, extract: opt.extract, corpus: opt.corpus)
-        return format(summary, json: opt.json)
+        return (format(summary, json: opt.json), summary.status != "failed")
     }
 
     // MARK: format

@@ -67,7 +67,22 @@ public struct WikiAdapterRegistry: Sendable {
         if lower.hasSuffix(".csv") || lower.hasSuffix(".tsv")
             || lower.hasSuffix(".jsonl") || lower.hasSuffix(".json") { return .messageArchive }
         if lower.hasSuffix(".xml.bz2") || lower.hasSuffix(".xml.gz") || lower.hasSuffix(".xml") { return .mediawikiDump }
+        // A bare arXiv query (field-prefixed: `cat:cs.AI`, `au:Karpathy`) or arXiv id
+        // (`2402.17764v2`) is unambiguous — route it to arXiv before the file fallback
+        // so the documented bare forms work without --adapter. (A bare GitHub owner
+        // like `karpathy` is ambiguous with a filename, so it still needs a URL or
+        // --adapter github.)
+        if isArxivToken(s) { return .arxiv }
         return .file
+    }
+
+    /// True for an unambiguous bare arXiv query/id (no scheme, no path separator).
+    static func isArxivToken(_ s: String) -> Bool {
+        if s.contains("/") { return false }                          // looks like a path
+        let l = s.lowercased()
+        let prefixes = ["cat:", "au:", "ti:", "abs:", "all:", "co:", "jr:", "id:", "rn:"]
+        if prefixes.contains(where: { l.hasPrefix($0) }) { return true }
+        return s.range(of: #"^\d{4}\.\d{4,5}(v\d+)?$"#, options: .regularExpression) != nil
     }
 }
 

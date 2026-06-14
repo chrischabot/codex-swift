@@ -93,9 +93,9 @@ case "wiki-lint":
 
 case "wiki-ingest":
     do {
-        let output = try await CodexMemoryWikiIngest.run(args: Array(args.dropFirst()))
-        FileHandle.standardOutput.write(Data(output.utf8))
-        exit(output.contains("status=failed") ? 1 : 0)
+        let result = try await CodexMemoryWikiIngest.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
     } catch {
         FileHandle.standardError.write(Data("wiki-ingest failed: \(error)\n".utf8))
         exit(2)
@@ -114,7 +114,7 @@ case "help", "--help", "-h":
       import-markdown Import local markdown roots into the Memory Wiki index.
       wiki-compile    Compile source/entity/claim pages and agent digests.
       wiki-lint       Lint markdown roots, compiled vault, and wiki index health.
-      wiki-ingest     Ingest a URL/file/arXiv query/GitHub owner into the wiki.
+      wiki-ingest     Ingest a URL/file/arXiv query/GitHub-owner URL into the wiki.
       run             Long-running daemon: ingest → process → score, with MCP.
 
     See docs/codex-swift-memory-wiki.md for the full design.

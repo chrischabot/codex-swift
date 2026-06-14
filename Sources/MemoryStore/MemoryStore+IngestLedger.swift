@@ -51,8 +51,10 @@ extension MemoryStore {
               rawType.map(Bind.text) ?? .null, corpus.map(Bind.text) ?? .null, .int(startedAt)])
     }
 
-    /// Record one candidate's outcome and advance the job counters atomically
-    /// (two statements under the single-writer actor — no interleaving possible).
+    /// Record one candidate's outcome and recompute the job counters from the item
+    /// rows (two statements under the single-writer actor — no interleaving). The
+    /// recompute is IDEMPOTENT: re-recording the same (job_id, seq) on a retry/resume
+    /// updates the row in place and the counts stay exact (no double-count drift).
     public func ingestRecordItem(jobID: String, seq: Int, sourceURI: String,
                                  status: IngestItemStatus, documentID: Int64?,
                                  error: String?, recordedAt: Int64) throws {
@@ -63,14 +65,14 @@ extension MemoryStore {
           document_id=excluded.document_id, error=excluded.error, recorded_at=excluded.recorded_at;
         """, [.text(jobID), .int(Int64(seq)), .text(sourceURI), .text(status.rawValue),
               documentID.map(Bind.int) ?? .null, error.map(Bind.text) ?? .null, .int(recordedAt)])
-        let col: String
-        switch status {
-        case .written:           col = "written"
-        case .deduped, .skipped: col = "skipped"
-        case .failed:            col = "failed"
-        }
-        try run("UPDATE wiki_ingest_job SET candidates=candidates+1, \(col)=\(col)+1 WHERE job_id=?;",
-                [.text(jobID)])
+        try run("""
+        UPDATE wiki_ingest_job SET
+          candidates = (SELECT COUNT(*) FROM wiki_ingest_item WHERE job_id=?1),
+          written    = (SELECT COUNT(*) FROM wiki_ingest_item WHERE job_id=?1 AND status='written'),
+          skipped    = (SELECT COUNT(*) FROM wiki_ingest_item WHERE job_id=?1 AND status IN ('deduped','skipped')),
+          failed     = (SELECT COUNT(*) FROM wiki_ingest_item WHERE job_id=?1 AND status='failed')
+        WHERE job_id=?1;
+        """, [.text(jobID)])
     }
 
     /// Close a job (done | failed | cancelled); `cursor` persists the watch position.

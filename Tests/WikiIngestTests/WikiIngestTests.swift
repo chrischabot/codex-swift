@@ -78,6 +78,14 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(d("/data/export.jsonl"), .messageArchive)
         XCTAssertEqual(d("/dumps/pages.xml"), .mediawikiDump)
         XCTAssertEqual(d("/notes/todo.md"), .file)
+        // bare arXiv query/id is unambiguous → arxiv (documented bare forms work w/o --adapter)
+        XCTAssertEqual(d("cat:cs.AI"), .arxiv)
+        XCTAssertEqual(d("au:Karpathy"), .arxiv)
+        XCTAssertEqual(d("ti:attention"), .arxiv)
+        XCTAssertEqual(d("2402.17764"), .arxiv)
+        XCTAssertEqual(d("2402.17764v2"), .arxiv)
+        XCTAssertEqual(d("karpathy"), .file)        // a bare owner stays ambiguous → file
+        XCTAssertEqual(d("notes/cat:thing"), .file) // a path with a colon is not an arXiv query
         // forced wins
         XCTAssertEqual(WikiAdapterRegistry.detectKind("/notes/todo.md", forced: .pdf), .pdf)
         XCTAssertEqual(WikiAdapterRegistry.detectKind("https://example.com", forced: .feed), .feed)
@@ -345,6 +353,29 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(recent.first?.jobID, "J1")
         let cursor = try await store.ingestLastCursor(input: "https://ex.com/feed", adapter: "feed")
         XCTAssertEqual(cursor, "a")
+    }
+
+    func testIngestLedgerRerecordIsIdempotent() async throws {
+        let (store, dir) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        try await store.ingestBegin(jobID: "R", input: "x", adapter: "feed", rawType: nil,
+                                    corpus: nil, startedAt: 0)
+        try await store.ingestRecordItem(jobID: "R", seq: 1, sourceURI: "a", status: .written,
+                                         documentID: 1, error: nil, recordedAt: 1)
+        // Re-record the SAME seq (a retry/resume) — counts must NOT double.
+        try await store.ingestRecordItem(jobID: "R", seq: 1, sourceURI: "a", status: .written,
+                                         documentID: 1, error: nil, recordedAt: 2)
+        let j1 = try await store.ingestJob("R")
+        XCTAssertEqual(j1?.candidates, 1)
+        XCTAssertEqual(j1?.written, 1)
+        // Re-record seq 1 with a DIFFERENT status — the bucket moves, total stays 1.
+        try await store.ingestRecordItem(jobID: "R", seq: 1, sourceURI: "a", status: .failed,
+                                         documentID: nil, error: "later failed", recordedAt: 3)
+        let j2 = try await store.ingestJob("R")
+        XCTAssertEqual(j2?.candidates, 1)
+        XCTAssertEqual(j2?.written, 0)
+        XCTAssertEqual(j2?.failed, 1)
+        let items = try await store.ingestItems(jobID: "R")
+        XCTAssertEqual(items.count, 1)            // still one row, not three
     }
 
     func testOrchestratorIngestsViaGitHubAdapterAndRecordsLedger() async throws {
