@@ -260,6 +260,20 @@ public struct EgressGuard: Sendable {
         return .allow(EgressApproval(host: host, pinnedIPs: ips))
     }
 
+    /// Re-vet a redirect target relative to the prior hop. Resolves a possibly
+    /// relative `Location` against `base` and runs the full connect-bound `vet`,
+    /// so an external page that 30x's toward an internal address is caught (each
+    /// redirect hop must be re-vetted + re-pinned). Returns `.deny` on a
+    /// `Location` that doesn't form a valid absolute URL.
+    public func vetRedirect(from base: URL, location: String) -> EgressResult {
+        let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .deny(reason: "empty redirect Location") }
+        guard let target = URL(string: trimmed, relativeTo: base)?.absoluteURL else {
+            return .deny(reason: "malformed redirect Location '\(trimmed)'")
+        }
+        return vet(target)
+    }
+
     /// Simple screening verdict (no pinning info).
     public func validate(_ url: URL) -> EgressDecision {
         switch vet(url) {
