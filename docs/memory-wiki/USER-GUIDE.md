@@ -204,8 +204,24 @@ tracked in a resumable session.
 decision tree (early-completion when strong + well-connected; low-yield warning when
 weak) and trajectory triggers (stalled / declining / plateau). The `--min-time`
 loop drills the **top-3 gaps** each subsequent round and never starts a round
-projected to blow >50% past its time budget. ✅ (engine + orchestrator built and
-mock-tested; the live web-swarm + frontier synthesis adapters are 🧱)
+projected to blow >50% past its time budget.
+
+✅ **built & live-verified end-to-end** — the web swarm gathers + credibility-filters,
+the survivors are fetched + ingested (queryable), atomic **claims are extracted**
+from each and linked to a synthesis page (grounding), and the session is persisted:
+
+```sh
+codex-memory wiki-research "vector database indexing algorithms"     # topic
+codex-memory wiki-research "prove that RAG beats fine-tuning"        # thesis (auto)
+codex-memory wiki-research "how do diffusion models work?" --depth deep
+codex-memory wiki-research "<topic>" --min-time 600 --max-rounds 3   # multi-round
+codex-memory wiki-research "<topic>" --sources 5 --json [--no-claims]
+```
+
+A real run (verified): *"vector database indexing algorithms"* → 3 web sources
+credibility-filtered & ingested, **12 atomic claims** extracted (e.g. "Faiss is a
+library for efficient similarity search…") and grounded to a synthesis page. The
+librarian then correctly scores that page as deep + grounded (not flagged).
 
 **Session provenance** is durable: three files at the corpus root — live state
 (`.research-session.json`), an append-only event log (`.session-events.jsonl`), and
@@ -403,6 +419,9 @@ codex-memory wiki-ingest <url|path|arxiv-query|gh-owner-url> [--adapter --raw-ty
 
 # Query the knowledge (built, live-verified vs a real 4983-doc store)
 codex-memory wiki-query "<question>" [--k N --no-rerank --json]
+
+# Research the web → credibility-filter → ingest → extract claims → synthesize
+codex-memory wiki-research "<topic>" [--mode --depth --sources --min-time --json]
 
 # Trust & status (built, live-verified)
 codex-memory wiki-librarian scan [--json --threshold T --limit N]   # staleness scan
