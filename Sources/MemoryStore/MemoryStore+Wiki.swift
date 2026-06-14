@@ -316,6 +316,44 @@ extension MemoryStore {
     public func setLastCompiledAt(_ ts: Int64) throws {
         try setMetaValue("last_compiled_at", String(ts))
     }
+
+    // MARK: - librarian Tier-1 scan
+
+    /// Librarian Tier-1 scan over the compiled wiki pages (synthesis rows): pure
+    /// DB data → LibrarianScorer (no model, no file I/O). `depthProxy` is bucketed
+    /// from the page's cited-source count; the source-freshness / source-chain
+    /// dimensions use the page's created/verified stamps as proxies. Returns the
+    /// scores stalest-first — the review queue.
+    public func librarianScan(now: Int64, tier2Threshold: Double = 50) throws -> [LibrarianPageScore] {
+        let rows = try run("""
+            SELECT s.id AS id, s.volatility AS volatility, s.verified_at AS verified_at,
+                   s.created_at AS created_at, s.updated_at AS updated_at,
+                   (SELECT COUNT(*) FROM synthesis_claim sc WHERE sc.synthesis_id = s.id) AS source_count
+            FROM synthesis s;
+            """, [])
+        let signals: [LibrarianScorer.PageSignals] = rows.map { r in
+            let vol = Volatility(rawValue: (r["volatility"] as? String) ?? "warm") ?? .warm
+            let count = Int((r["source_count"] as? Int64) ?? 0)
+            return LibrarianScorer.PageSignals(
+                documentID: (r["id"] as? Int64) ?? 0, volatility: vol,
+                sourceFetchedAt: r["created_at"] as? Int64, verifiedAt: r["verified_at"] as? Int64,
+                compiledAt: r["updated_at"] as? Int64, sourceChainValidatedAt: r["verified_at"] as? Int64,
+                sourceCount: count, avgCredibility: 0,
+                depthProxy: Self.librarianDepthBucket(sourceCount: count), hasSeeAlso: false)
+        }
+        return LibrarianScorer.scan(signals, now: now, tier2Threshold: tier2Threshold)
+    }
+
+    /// Depth proxy 1-5 from a page's cited-source count (thin → escalate).
+    static func librarianDepthBucket(sourceCount: Int) -> Int {
+        switch sourceCount {
+        case 0:    return 1
+        case 1:    return 2
+        case 2...3: return 3
+        case 4...6: return 4
+        default:    return 5
+        }
+    }
 }
 
 // MARK: - row parsers (file-private; tolerate Int64-or-Double numerics)

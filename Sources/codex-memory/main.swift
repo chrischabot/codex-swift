@@ -101,6 +101,16 @@ case "wiki-ingest":
         exit(2)
     }
 
+case "wiki-librarian":
+    do {
+        let result = try await CodexMemoryWikiLibrarian.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-librarian failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "run":
     await CodexMemoryRun.runForever()
 
@@ -115,6 +125,7 @@ case "help", "--help", "-h":
       wiki-compile    Compile source/entity/claim pages and agent digests.
       wiki-lint       Lint markdown roots, compiled vault, and wiki index health.
       wiki-ingest     Ingest a URL/file/arXiv query/GitHub-owner URL into the wiki.
+      wiki-librarian  Tier-1 staleness scan over compiled wiki pages (scan).
       run             Long-running daemon: ingest → process → score, with MCP.
 
     See docs/codex-swift-memory-wiki.md for the full design.
