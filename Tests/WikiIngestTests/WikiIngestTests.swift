@@ -4,6 +4,9 @@ import Foundation
 import PinnedFetcher
 import EgressGuard
 import MediaDecode
+import MemoryStore
+import MemoryProcess
+import MemoryInfer
 #if canImport(CoreGraphics)
 import CoreGraphics
 #endif
@@ -127,6 +130,44 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(cands[0].title, "Doc")
         XCTAssertTrue(cands[0].bodyMarkdown.contains("# Heading"))
         XCTAssertEqual(cands[0].provenance.canonicalURL, "https://example.com/x")
+    }
+
+    // MARK: WikiIngestWriter (candidate → immutable raw doc + index + source_meta)
+
+    func testWriterIngestsAndDedupes() async throws {
+        let dbDir = NSTemporaryDirectory() + "wikiwriter-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dbDir) }
+        let store = try MemoryStore(MemoryStoreConfig(path: dbDir + "/m.db", embeddingDimension: 8))
+        let processor = MemoryProcessor(store: store, inference: MockInferenceProvider(embeddingDimension: 8))
+        let writer = WikiIngestWriter(store: store, processor: processor)
+
+        let cand = WikiSourceCandidate(
+            sourceURI: "https://ex.com/a", rawType: .articles, title: "Doc A",
+            bodyMarkdown: "hello world. this is a test document with enough text to chunk into pieces.",
+            contentFormat: .html,
+            provenance: CollectionProvenance(adapter: "url", canonicalURL: "https://ex.com/a", author: "Ada"),
+            fetched: 100)
+
+        let r1 = try await writer.write(cand, extract: false)
+        XCTAssertGreaterThan(r1.documentID, 0)
+        XCTAssertGreaterThan(r1.chunksWritten, 0)
+        XCTAssertFalse(r1.skipped)
+
+        // provenance overlay written
+        let meta = try await store.sourceMeta(documentID: r1.documentID)
+        XCTAssertEqual(meta?.sourceKind, "articles")     // raw bucket
+        XCTAssertEqual(meta?.canonicalURL, "https://ex.com/a")
+        XCTAssertEqual(meta?.author, "Ada")
+        XCTAssertEqual(meta?.adapter, "url")
+
+        // re-ingesting identical content (same source_uri + content) is a no-op
+        let r2 = try await writer.write(cand, extract: false)
+        XCTAssertEqual(r2.documentID, r1.documentID)
+        XCTAssertTrue(r2.skipped)
+        XCTAssertEqual(r2.chunksWritten, 0)
+        let count = try await store.documentCount()
+        XCTAssertEqual(count, 1)   // not duplicated
     }
 
     // MARK: PDF helper
