@@ -21,6 +21,7 @@ enum CodexMemoryWikiResearch {
         var minTime: Int64?
         var maxRounds = 3
         var json = false
+        var extractClaims = true
     }
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
 
@@ -40,11 +41,18 @@ enum CodexMemoryWikiResearch {
         let writer = WikiIngestWriter(store: bundle.store, processor: bundle.processor)
         let vaultRoot = (MemoryStoreConfig.defaultPath() as NSString).deletingLastPathComponent
 
+        // Claim extraction (the producer for the trust layer) uses OpenAI directly.
+        let env = ProcessInfo.processInfo.environment
+        let claimExtractor: WikiClaimExtractor? = (opt.extractClaims ? (env["OPENAI_API_KEY"].map {
+            WikiClaimExtractor(apiKey: $0, model: env["CODEXKIT_WIKI_CLAIM_MODEL"] ?? "gpt-4o-mini")
+        }) : nil)
+
         let orch = WikiResearchOrchestrator(
             probe: LiveKnowledgeProbe(retriever: bundle.retriever),
             swarm: LiveResearchSwarm(webSearch: webSearch, perAngle: opt.perAngle),
             compiler: LiveResearchCompiler(writer: writer, store: bundle.store, fetcher: fetcher,
-                                           fetchedAt: now, vaultRoot: vaultRoot),
+                                           fetchedAt: now, vaultRoot: vaultRoot,
+                                           claimExtractor: claimExtractor),
             reflector: LiveGapReflector(webSearch: webSearch),
             now: { Int64(Date().timeIntervalSince1970) })
 
@@ -100,6 +108,7 @@ enum CodexMemoryWikiResearch {
             case "--per-angle": o.perAngle = Int(try val(a)) ?? 4
             case "--min-time": o.minTime = Int64(try val(a))
             case "--max-rounds": o.maxRounds = Int(try val(a)) ?? 3
+            case "--no-claims": o.extractClaims = false
             case "--json": o.json = true
             default:
                 if a.hasPrefix("-") { throw CLIError(message: "unknown flag \(a)") }

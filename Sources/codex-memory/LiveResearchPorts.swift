@@ -84,18 +84,20 @@ struct LiveResearchSwarm: ResearchSwarm {
 }
 
 /// Phase 4-5 — fetch each selected survivor (pinned) and ingest it (local embed,
-/// matching the store stamp) so it's queryable; then write a synthesis page for the
-/// round. Returns the wiki-size signals the progress score needs.
+/// matching the store stamp) so it's queryable; extract grounded CLAIMS from each
+/// (model) and link them to a synthesis page for the round. Returns the wiki-size
+/// signals the progress score needs.
 struct LiveResearchCompiler: ResearchCompiler {
     let writer: WikiIngestWriter
     let store: MemoryStore
     let fetcher: PinnedFetcher
     let fetchedAt: Int64
     let vaultRoot: String
+    let claimExtractor: WikiClaimExtractor?    // nil → skip claim extraction
 
     func compile(topic: String, sources: [RankedSource], round: Int) async throws -> CompileOutcome {
         var written = 0
-        var ingestedURIs: [String] = []
+        var ingestedDocs: [(uri: String, docID: Int64)] = []
         for s in sources {
             guard let u = URL(string: s.url) else { continue }
             guard case .success(let doc) = await fetcher.fetchReadable(u) else { continue }
@@ -105,20 +107,40 @@ struct LiveResearchCompiler: ResearchCompiler {
                 provenance: CollectionProvenance(adapter: "research", collection: topic, canonicalURL: s.url),
                 fetched: fetchedAt, extractionStatus: "ok")
             if let r = try? await writer.write(cand, extract: false), !r.skipped {
-                written += 1; ingestedURIs.append(s.url)
+                written += 1; ingestedDocs.append((s.url, r.documentID))
             }
         }
-        // A synthesis page for the round: the topic + the cited sources, so the wiki
-        // gains a real page (and the trust layer has something to score).
+        var claimsLinked = 0
         if written > 0 {
-            try? await writeSynthesis(topic: topic, round: round, sources: ingestedURIs)
+            let synthID = try? await writeSynthesis(topic: topic, round: round,
+                                                    sources: ingestedDocs.map(\.uri))
+            // Extract grounded claims from each ingested source and link them to the
+            // page (so it's not ungrounded, and the trust layer has real claims).
+            if let extractor = claimExtractor, let synthID {
+                for (_, docID) in ingestedDocs {
+                    let chunks = (try? await store.chunks(forDocument: docID)) ?? []
+                    let text = chunks.prefix(8).map(\.text).joined(separator: "\n")
+                    guard !text.isEmpty else { continue }
+                    let claims = await extractor.extract(text: text, maxClaims: 4)
+                    for claimText in claims {
+                        guard let cid = try? await store.upsertClaim(ClaimRow(
+                            text: claimText, status: .active, confidence: 0.7,
+                            firstSeen: fetchedAt, updatedAt: fetchedAt)) else { continue }
+                        try? await store.attachEvidence(ClaimEvidenceRow(
+                            claimID: cid, documentID: docID, chunkID: chunks.first?.id,
+                            stance: .supports, relevance: .direct, strength: 2))
+                        try? await store.linkSynthesisClaim(synthesis: synthID, claim: cid)
+                        claimsLinked += 1
+                    }
+                }
+            }
         }
         let pageCount = (try? await store.documentCount()) ?? 0
-        return CompileOutcome(articlesCreatedOrUpdated: written, crossRefsAdded: ingestedURIs.count,
-                              existingArticles: pageCount, crossRefDensity: 0.3)
+        return CompileOutcome(articlesCreatedOrUpdated: written, crossRefsAdded: claimsLinked,
+                              existingArticles: pageCount, crossRefDensity: claimsLinked > 0 ? 0.7 : 0.2)
     }
 
-    private func writeSynthesis(topic: String, round: Int, sources: [String]) async throws {
+    private func writeSynthesis(topic: String, round: Int, sources: [String]) async throws -> Int64 {
         let slug = "research-" + Self.slugify(topic) + "-r\(round)"
         var body = "# \(topic)\n\n_Compiled by research round \(round)._\n\n## Sources\n"
         for s in sources { body += "- \(s)\n" }
@@ -126,7 +148,7 @@ struct LiveResearchCompiler: ResearchCompiler {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let path = dir + "/\(slug).md"
         try? body.write(toFile: path, atomically: true, encoding: .utf8)
-        _ = try await store.upsertSynthesis(SynthesisRow(
+        return try await store.upsertSynthesis(SynthesisRow(
             slug: slug, category: "synthesis", title: topic, bodyPath: path,
             confidence: "medium", volatility: .warm, verifiedAt: fetchedAt,
             createdAt: fetchedAt, updatedAt: fetchedAt, generatedAt: fetchedAt))
@@ -137,6 +159,51 @@ struct LiveResearchCompiler: ResearchCompiler {
         return String(lowered.unicodeScalars.filter {
             CharacterSet.alphanumerics.contains($0) || $0 == "-"
         }).prefix(48).description
+    }
+}
+
+/// Extracts atomic, verifiable claims from a source's text via the OpenAI chat API
+/// (JSON mode). The missing producer for the wiki claim layer — research links each
+/// returned claim to its source (evidence) and the round's synthesis page.
+struct WikiClaimExtractor: Sendable {
+    let apiKey: String
+    let model: String
+    let endpoint = "https://api.openai.com/v1/chat/completions"
+
+    func extract(text: String, maxClaims: Int) async -> [String] {
+        let sys = """
+        You extract atomic, verifiable factual claims from the provided text. Each \
+        claim is ONE self-contained declarative sentence that could be independently \
+        fact-checked. Skip opinions, questions, hedging, and navigation/boilerplate. \
+        Respond ONLY with JSON of the form {"claims": ["claim 1", "claim 2"]} with at \
+        most \(maxClaims) claims.
+        """
+        let body: [String: Any] = [
+            "model": model, "temperature": 0,
+            "response_format": ["type": "json_object"],
+            "messages": [
+                ["role": "system", "content": sys],
+                ["role": "user", "content": String(text.prefix(8000))],
+            ],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body),
+              let url = URL(string: endpoint) else { return [] }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 60
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.httpBody = data
+        guard let (respData, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let obj = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
+              let choices = obj["choices"] as? [[String: Any]],
+              let content = (choices.first?["message"] as? [String: Any])?["content"] as? String,
+              let inner = try? JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any],
+              let claims = inner["claims"] as? [String]
+        else { return [] }
+        return claims.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count > 12 }
     }
 }
 
