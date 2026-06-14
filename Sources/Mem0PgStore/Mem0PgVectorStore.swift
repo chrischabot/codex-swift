@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import Mem0Core
 import EmbeddedPG
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
 import PostgresNIO
@@ -142,13 +143,18 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
 
     // MARK: - connection helpers (private; callers already hold the gate)
 
+    // Unique per-connection id for log correlation (was a hardcoded 1 → all
+    // instances' connections were indistinguishable in logs).
+    private static let connIDCounter = NIOLockedValueBox<Int>(0)
+
     private func openConnection(username: String) async throws -> PostgresConnection {
         let config = PostgresConnection.Configuration(
             unixSocketPath: paths.unixSocketPath,
             username: username, password: nil, database: paths.database)
+        let connID = Self.connIDCounter.withLockedValue { v -> Int in v += 1; return v }
         do {
             return try await PostgresConnection.connect(
-                on: eventLoop, configuration: config, id: 1, logger: logger).get()
+                on: eventLoop, configuration: config, id: connID, logger: logger).get()
         } catch {
             throw Mem0PgErrorMap.wrap(error, "connect(\(username))")
         }
@@ -224,19 +230,33 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     // MARK: - Mem0VectorStore
 
     public func insert(_ records: [VectorRecord]) async throws {
+        if records.isEmpty { return }
         try await acquire(); defer { release() }
         for r in records { try validateFinite(r.vector) }
+        // De-dup by id (last wins) so a single multi-row upsert can't trip
+        // "ON CONFLICT … cannot affect row a second time", then insert in chunks
+        // of 1000 (3 binds/row, well under PostgresNIO's 65535-param cap) inside
+        // one transaction — far fewer round-trips than per-record.
+        var byID: [String: VectorRecord] = [:]
+        for r in records { byID[r.id] = r }
+        let unique = Array(byID.values)
         let conn = try connection()
         do {
             try await execOn(conn, "BEGIN")
-            for r in records {
+            var i = 0
+            while i < unique.count {
+                let chunk = unique[i..<min(i + 1000, unique.count)]
                 var b = PGQueryBuilder()
-                b.raw("INSERT INTO memories (id, vector, payload) VALUES (")
-                try b.param(r.id); b.raw(", ")
-                try b.param(vectorLiteral(r.vector)); b.raw("::\(vectorType), ")
-                try b.param(JSONValue.object(r.payload).jsonString()); b.raw("::jsonb) ")
-                b.raw("ON CONFLICT (id) DO UPDATE SET vector = EXCLUDED.vector, payload = EXCLUDED.payload")
+                b.raw("INSERT INTO memories (id, vector, payload) VALUES ")
+                for (j, r) in chunk.enumerated() {
+                    if j > 0 { b.raw(", ") }
+                    b.raw("("); try b.param(r.id); b.raw(", ")
+                    try b.param(vectorLiteral(r.vector)); b.raw("::\(vectorType), ")
+                    try b.param(JSONValue.object(r.payload).jsonString()); b.raw("::jsonb)")
+                }
+                b.raw(" ON CONFLICT (id) DO UPDATE SET vector = EXCLUDED.vector, payload = EXCLUDED.payload")
                 _ = try await conn.query(b.build(), logger: logger)
+                i += 1000
             }
             try await execOn(conn, "COMMIT")
         } catch {
@@ -322,7 +342,9 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
         if PGFilterTranslator.willEmit(filters) {
             b.raw(" WHERE "); try PGFilterTranslator.appendPredicate(filters, into: &b)
         }
-        b.raw(" ORDER BY (payload ->> 'created_at') DESC NULLS LAST")
+        // COALESCE to '' (not NULLS LAST) so a record missing created_at sorts
+        // exactly like the SQLite store's `payload["created_at"]?.stringValue ?? ""`.
+        b.raw(" ORDER BY COALESCE(payload ->> 'created_at', '') DESC")
         if let n = limit { b.raw(" LIMIT "); try b.param(n) }
         do {
             let rows = try await connection().query(b.build(), logger: logger)
@@ -387,6 +409,10 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     public func batchAddHistory(_ records: [NewHistory]) async throws {
         try await acquire(); defer { release() }
         let conn = try connection()
+        // Per-record inside one transaction: history rows per mem0 op are a small,
+        // bounded set (single digits), so the round-trip cost is negligible and the
+        // straight loop stays clear. (The unbounded bulk path, `insert`, IS batched
+        // into chunked multi-row statements.)
         do {
             try await execOn(conn, "BEGIN")
             for r in records {
@@ -458,6 +484,9 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
         if messages.isEmpty { return }
         let conn = try connection()
         let now = nowUTCRFC3339()
+        // Per-message inside one transaction + an eviction sweep: messages per
+        // turn are a small bounded set, so per-record is fine (same rationale as
+        // batchAddHistory; the unbounded `insert` path is the one that's batched).
         do {
             try await execOn(conn, "BEGIN")
             for m in messages {

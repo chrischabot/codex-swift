@@ -106,20 +106,10 @@ enum PGTestHarness {
         ])
     }
 
-    /// Strict-concurrency-clean async child-process runner (off the cooperative pool).
+    /// Async child-process runner — delegates to EmbeddedPG's shared `runPGProcess`.
     static func runProc(_ launchPath: String, _ args: [String]) async throws -> (exit: Int32, out: String, err: String) {
-        try await Task.detached(priority: .utility) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: launchPath)
-            p.arguments = args
-            let out = Pipe(), err = Pipe()
-            p.standardOutput = out; p.standardError = err
-            try p.run()
-            let o = out.fileHandleForReading.readDataToEndOfFile()
-            let e = err.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            return (p.terminationStatus, String(decoding: o, as: UTF8.self), String(decoding: e, as: UTF8.self))
-        }.value
+        let r = try await runPGProcess(launchPath, args)
+        return (r.exitCode, r.stdout, r.stderr)
     }
 }
 

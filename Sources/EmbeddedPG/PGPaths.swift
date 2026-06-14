@@ -198,13 +198,13 @@ public struct PGPaths: Sendable, Equatable {
     private static func socketDirWithinLimit(_ dir: String, port: Int) -> String {
         let socketFile = "\(dir)/.s.PGSQL.\(port)"
         if socketFile.utf8.count <= 103 { return dir }
-        let tmp = ProcessInfo.processInfo.environment["TMPDIR"] ?? "/tmp"
-        // DETERMINISTIC hash (FNV-1a) — `String.hashValue` is seeded per process,
-        // so it would map the same over-long path to DIFFERENT fallback dirs across
-        // runs and spawn duplicate postmasters. FNV-1a is stable across processes.
+        // Fully DETERMINISTIC fallback so a second start finds the same socket:
+        //  - fixed `/tmp` base (NOT $TMPDIR, which can differ between runs → a
+        //    different fallback dir → a duplicate postmaster);
+        //  - FNV-1a of the requested path (NOT String.hashValue, which is
+        //    per-process seeded).
         var h: UInt64 = 1469598103934665603
         for b in dir.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
-        let key = String(h, radix: 36)
-        return "\(tmp.hasSuffix("/") ? String(tmp.dropLast()) : tmp)/codexmem0-\(key)"
+        return "/tmp/codexmem0-\(String(h, radix: 36))"
     }
 }

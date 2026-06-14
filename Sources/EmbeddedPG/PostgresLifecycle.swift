@@ -195,7 +195,9 @@ public actor PostgresLifecycle {
             let check = try await run(psql, [
                 "-h", paths.socketDir, "-p", "\(paths.port)", "-U", paths.username,
                 "-d", "postgres", "-tAc",
-                "SELECT 1 FROM pg_database WHERE datname='\(paths.database)'",
+                // safeIdentifier already strips quotes, but escape defensively so
+                // this string literal is injection-proof even if that guard changes.
+                "SELECT 1 FROM pg_database WHERE datname='\(paths.database.replacingOccurrences(of: "'", with: "''"))'",
             ])
             if check.exitCode == 0 && check.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
                 return
@@ -223,26 +225,9 @@ public actor PostgresLifecycle {
 
     // MARK: - async process runner
 
-    struct ProcResult: Sendable { let exitCode: Int32; let stdout: String; let stderr: String }
-
-    /// Run a child process off the cooperative pool (on a detached thread) so the
-    /// blocking pipe reads never stall an actor's executor. Server logs go to the
-    /// `-l` logfile, so the captured pipes stay small (no 64 KB deadlock risk).
-    private func run(_ launchPath: String, _ args: [String]) async throws -> ProcResult {
-        try await Task.detached(priority: .utility) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: launchPath)
-            p.arguments = args
-            let out = Pipe(), err = Pipe()
-            p.standardOutput = out
-            p.standardError = err
-            try p.run()
-            let o = out.fileHandleForReading.readDataToEndOfFile()
-            let e = err.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            return ProcResult(exitCode: p.terminationStatus,
-                              stdout: String(decoding: o, as: UTF8.self),
-                              stderr: String(decoding: e, as: UTF8.self))
-        }.value
+    /// Run a child process (server logs go to the `-l` logfile, so the captured
+    /// pipes stay small). Delegates to the shared `runPGProcess` helper.
+    private func run(_ launchPath: String, _ args: [String]) async throws -> PGProcessResult {
+        try await runPGProcess(launchPath, args)
     }
 }
