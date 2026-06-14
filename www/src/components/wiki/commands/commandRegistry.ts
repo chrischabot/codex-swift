@@ -209,6 +209,13 @@ const BUILTIN_WIKI_COMMANDS: ReadonlyArray<WikiCommand> = [
     run: (ctx) => ctx.navigate("/wiki/enrich"),
   },
   {
+    id: "wiki:open-console",
+    category: "View",
+    name: "Open console (search + brief)",
+    icon: Search,
+    run: (ctx) => ctx.navigate("/wiki/console"),
+  },
+  {
     id: "wiki:open-properties",
     category: "View",
     name: "Open properties",

@@ -22,6 +22,7 @@ import { AutomationEditPage } from "@/pages/AutomationEditPage";
 import { WikiPage } from "@/pages/WikiPage";
 import { WikiGraphPage } from "@/pages/WikiGraphPage";
 import { WikiPropertiesPage } from "@/pages/WikiPropertiesPage";
+import { WikiConsolePage } from "@/pages/WikiConsolePage";
 import { WikiEnrichView } from "@/components/wiki/WikiEnrichView";
 
 export function App() {
@@ -42,6 +43,7 @@ export function App() {
             <Route path="automations/:automationId" element={<AutomationEditPage />} />
             <Route path="wiki" element={<WikiPage />} />
             <Route path="wiki/graph" element={<WikiGraphPage />} />
+            <Route path="wiki/console" element={<WikiConsolePage />} />
             <Route path="wiki/properties" element={<WikiPropertiesPage />} />
             <Route path="wiki/enrich" element={<WikiEnrichView />} />
             <Route path="wiki/:pageId" element={<WikiPage />} />

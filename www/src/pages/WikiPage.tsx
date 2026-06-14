@@ -1,7 +1,7 @@
 import * as React from "react";
 import { useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
 import { resolveWikilinkNav } from "@/components/wiki/markdown/wikiRemarkPlugins";
-import { FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown, Tags } from "lucide-react";
+import { FilePlus2, Sparkles, LayoutGrid, Table2, FileStack, ChevronDown, Tags, Search } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -500,6 +500,9 @@ function WikiIndex({ onOpenSettings }: { onOpenSettings?: () => void }) {
           )}
           <Button variant="outline" size="xs" onClick={() => navigate("/wiki/enrich")}>
             <Sparkles className="mr-1 size-3" /> Enrich
+          </Button>
+          <Button variant="outline" size="xs" onClick={() => navigate("/wiki/console")}>
+            <Search className="mr-1 size-3" /> Console
           </Button>
           <button
             type="button"
