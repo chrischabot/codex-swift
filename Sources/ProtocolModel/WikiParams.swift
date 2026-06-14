@@ -46,6 +46,18 @@ public struct WikiBriefParams: Decodable, Sendable, Equatable {
     public init(topic: String, k: Int? = nil) { self.topic = topic; self.k = k }
 }
 
+public struct WikiQueryParams: Decodable, Sendable, Equatable {
+    public var query: String
+    /// 1 = quick (lexical/index only), 2 = standard, 3 = deep (hybrid + rerank).
+    /// Router clamps to 1...3 (default 2).
+    public var depth: Int?
+    /// Top-k results; router clamps to 1...100 (default 10).
+    public var k: Int?
+    public init(query: String, depth: Int? = nil, k: Int? = nil) {
+        self.query = query; self.depth = depth; self.k = k
+    }
+}
+
 public struct WikiPageUpsertParams: Decodable, Sendable, Equatable {
     /// Existing page (DocumentRow) id to overwrite; nil → create a new page.
     public var id: Int64?

@@ -412,7 +412,7 @@ let package = Package(
         .testTarget(name: "MemoryStoreTests",
                 dependencies: ["MemoryStore", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "WikiQueryKitTests",
-                dependencies: ["WikiQueryKit", "MemoryStore", "WireProtocol"], swiftSettings: strict),
+                dependencies: ["WikiQueryKit", "MemoryStore", "WireProtocol", "MemoryRetrieve", "MemoryInfer"], swiftSettings: strict),
         .testTarget(name: "WikiCorpusTests",
                 dependencies: ["WikiCorpus", "MemoryStore"], swiftSettings: strict),
         .testTarget(name: "PinnedFetcherTests",

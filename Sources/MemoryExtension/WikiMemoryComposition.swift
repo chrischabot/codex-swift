@@ -225,6 +225,38 @@ public func makeWikiMemoryProvider(wiki: WikiMemoryConfig,
     return WikiMemoryProvider(retriever: retriever, tools: toolset.tools())
 }
 
+/// Build a hybrid `MemoryRetriever` over an ALREADY-OPENED wiki `store`, but ONLY
+/// when the current inference plan's embedder produces vectors in the store's
+/// embedding space — i.e. the store's stamped `embedding_provider_id` equals the
+/// plan's. Returns nil when the embedder is mocked/unavailable or the store was
+/// built with a DIFFERENT embedder. Callers (the `wiki/query` shaper) MUST degrade
+/// to lexical-only in that case: a query vector from a different embedder is
+/// meaningless, and per D5 the embedding lane never silently mixes spaces.
+///
+/// Reuses the exact `resolveInferencePlan` + `makeInference` assembly that builds
+/// the agent-side wiki provider, so the embedder/auth/backend resolution stays in
+/// one place.
+public func makeWikiRetriever(store: MemoryStore,
+                              wiki: WikiMemoryConfig,
+                              modelClient: any ModelClient,
+                              env: [String: String] = ProcessInfo.processInfo.environment,
+                              authProvider: WikiMemoryAuthProvider? = nil) async -> MemoryRetriever? {
+    let plan = resolveInferencePlan(wiki: wiki, authProvider: authProvider, env: env)
+    // A mock embedder yields garbage vectors → lexical only.
+    if case .mock = plan.backend { return nil }
+    // The store must carry the SAME provider stamp the plan resolves to, else a
+    // query vector wouldn't share the store's embedding space.
+    guard let stamp = (try? await store.metaValue("embedding_provider_id")) ?? nil,
+          stamp == plan.providerID else { return nil }
+    let storeConfig = MemoryStoreConfig(
+        path: wiki.dbPath ?? MemoryStoreConfig.defaultPath(),
+        embeddingDimension: wiki.embeddingDimension,
+        embeddingProviderID: plan.providerID)
+    let inference = makeInference(wiki: wiki, plan: plan, modelClient: modelClient,
+                                  storeConfig: storeConfig, authProvider: authProvider)
+    return MemoryRetriever(store: store, inference: inference)
+}
+
 private enum ResolvedWikiInferenceBackend {
     case local
     case remote(url: String)

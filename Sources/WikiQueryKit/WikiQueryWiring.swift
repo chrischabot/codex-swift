@@ -6,6 +6,8 @@ import Supervisor
 import MemoryStore
 import MemoryExtension
 import MemoryMCP
+import MemoryRetrieve
+import ModelClient
 import Tools
 
 /// Builds the deny-default `WikiQueryHandle` injected into the `RequestRouter`,
@@ -22,7 +24,8 @@ public enum WikiQueryWiring {
     /// A missing/locked/corrupt DB must never crash codexd — nil ⇒ `wiki/*` RPCs
     /// reply "wiki is not enabled".
     public static func make(config: Config,
-                            env: [String: String] = ProcessInfo.processInfo.environment) -> WikiQueryHandle? {
+                            modelClient: any ModelClient,
+                            env: [String: String] = ProcessInfo.processInfo.environment) async -> WikiQueryHandle? {
         guard env["CODEXKIT_MEMORY"] == "1" else { return nil }
         let wikiCfg = WikiMemoryConfig.fromConfig(config, env: env)
         let path = wikiCfg.dbPath ?? MemoryStoreConfig.defaultPath()
@@ -50,6 +53,10 @@ public enum WikiQueryWiring {
         // One process-lifetime cache for the wiki/index shaper (incremental
         // re-parse keyed on body-file mtime). Shared by every index() call.
         let indexCache = WikiIndexCache()
+        // Best-effort hybrid retriever: built only when an embedder matching the
+        // store's stamp is available (else nil → wiki/query degrades to lexical,
+        // never mixing embedding spaces). Built once, shared across query calls.
+        let retriever = await makeWikiRetriever(store: store, wiki: wikiCfg, modelClient: modelClient, env: env)
         return WikiQueryHandle(
             list:      { try await WikiJSON.list(store, limit: $0) },
             pageGet:   { try await WikiJSON.pageGet(store, id: $0) },
@@ -62,7 +69,8 @@ public enum WikiQueryWiring {
             upsert:    { try await WikiJSON.upsert(store, bodyRoot: bodyRoot, id: $0, title: $1, body: $2) },
             delete:    { try await WikiJSON.delete(store, id: $0) },
             rename:    { try await WikiJSON.rename(store, id: $0, title: $1) },
-            brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) })
+            brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) },
+            query:     { try await WikiJSON.query(store, retriever: retriever, query: $0, depth: $1, k: $2) })
     }
 }
 
@@ -300,6 +308,51 @@ public enum WikiJSON {
                 ])
             }
         return .object(["data": .array(items)])
+    }
+
+    /// Depth-tiered retrieval (`wiki/query`). depth 1 = quick (lexical only);
+    /// depth ≥ 2 = hybrid (BM25∥cosine→RRF, rerank at depth ≥ 3) WHEN an embedder
+    /// matching the store's stamp is available (`retriever != nil`); otherwise it
+    /// falls back to lexical and reports `retrieval: "lexical-degraded"` — never
+    /// silently embedding with a mismatched model. The response always names the
+    /// mode actually used.
+    public static func query(_ store: MemoryStore, retriever: MemoryRetriever?,
+                             query: String, depth: Int, k: Int) async throws -> JSONValue {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            return .object(["query": .string(q), "depth": .int(Int64(depth)),
+                            "retrieval": .string("none"), "data": .array([])])
+        }
+        if depth >= 2, let r = retriever {
+            let hits = try await r.search(q, k: k, rerank: depth >= 3)
+            struct G { var id: Int64; var title: String; var source: String; var excerpt: String
+                       var score: Double; var fetchedAt: Int64; var bm25: Double; var vec: Double; var rerank: Double }
+            var groups: [Int64: G] = [:]
+            for h in hits where groups[h.documentId] == nil {   // hits are ranked → first per doc is best
+                guard let doc = try await store.document(id: h.documentId) else { continue }
+                groups[h.documentId] = G(id: h.documentId, title: doc.title ?? doc.sourceURI,
+                                         source: doc.source.rawValue, excerpt: String(h.snippet.prefix(240)),
+                                         score: h.score, fetchedAt: doc.fetchedAt,
+                                         bm25: h.why.bm25, vec: h.why.vec, rerank: h.why.rerank)
+            }
+            let items = groups.values.sorted { $0.score > $1.score }.map { g -> JSONValue in
+                .object([
+                    "id": .int(g.id), "title": .string(g.title), "source": .string(g.source),
+                    "excerpt": .string(g.excerpt), "updatedAt": ms(g.fetchedAt), "score": .double(g.score),
+                    "why": .object(["bm25": .double(g.bm25), "vec": .double(g.vec), "rerank": .double(g.rerank)]),
+                ])
+            }
+            return .object(["query": .string(q), "depth": .int(Int64(depth)),
+                            "retrieval": .string("hybrid"), "data": .array(items)])
+        }
+        // Quick (depth 1) OR hybrid requested but no matching embedder → lexical.
+        let lex = try await search(store, query: q, k: k)
+        let mode = depth >= 2 ? "lexical-degraded" : "lexical"
+        if case .object(var o) = lex {
+            o["query"] = .string(q); o["depth"] = .int(Int64(depth)); o["retrieval"] = .string(mode)
+            return .object(o)
+        }
+        return lex
     }
 
     /// Entity/edge graph. seed == nil → capped whole-graph; else 2-hop walk.

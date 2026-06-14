@@ -640,6 +640,7 @@ public enum ClientRequest: Sendable {
     case wikiPageDelete(RequestId, WikiPageDeleteParams)
     case wikiPageRename(RequestId, WikiPageRenameParams)
     case wikiBrief(RequestId, WikiBriefParams)
+    case wikiQuery(RequestId, WikiQueryParams)
     case turnStart(RequestId, TurnStartParams)
     case turnInterrupt(RequestId, TurnInterruptParams)
     case turnSteer(RequestId, TurnSteerParams)
@@ -701,6 +702,7 @@ public enum ClientRequest: Sendable {
              .wikiList(let i, _), .wikiPageGet(let i, _), .wikiSearch(let i, _),
              .wikiGraph(let i, _), .wikiBacklinks(let i, _), .wikiEntityBacklinks(let i, _), .wikiTags(let i), .wikiIndex(let i),
              .wikiPageUpsert(let i, _), .wikiPageDelete(let i, _), .wikiPageRename(let i, _), .wikiBrief(let i, _),
+             .wikiQuery(let i, _),
              .turnStart(let i, _), .turnInterrupt(let i, _), .turnSteer(let i, _),
              .reviewStart(let i, _), .modelList(let i, _),
              .modelProviderCapabilitiesRead(let i), .configRead(let i, _),
@@ -760,6 +762,7 @@ public enum ClientRequest: Sendable {
         case .wikiPageDelete: return "wiki/page/delete"
         case .wikiPageRename: return "wiki/page/rename"
         case .wikiBrief: return "wiki/brief"
+        case .wikiQuery: return "wiki/query"
         case .turnStart: return "turn/start"
         case .turnInterrupt: return "turn/interrupt"
         case .turnSteer: return "turn/steer"
@@ -840,6 +843,7 @@ public enum ClientRequest: Sendable {
         case "wiki/page/delete": return .wikiPageDelete(r.id, try p(WikiPageDeleteParams.self))
         case "wiki/page/rename": return .wikiPageRename(r.id, try p(WikiPageRenameParams.self))
         case "wiki/brief":      return .wikiBrief(r.id, try p(WikiBriefParams.self))
+        case "wiki/query":      return .wikiQuery(r.id, try p(WikiQueryParams.self))
         case "turn/start":      return .turnStart(r.id, try p(TurnStartParams.self))
         case "turn/interrupt":  return .turnInterrupt(r.id, try p(TurnInterruptParams.self))
         case "turn/steer":      return .turnSteer(r.id, try p(TurnSteerParams.self))

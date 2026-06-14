@@ -39,6 +39,11 @@ public struct WikiQueryHandle: Sendable {
     public var rename: @Sendable (_ id: Int64, _ title: String) async throws -> JSONValue
     /// Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface).
     public var brief: @Sendable (_ topic: String, _ k: Int) async throws -> JSONValue
+    /// Depth-tiered retrieval: depth 1=quick (lexical/index only), 2=standard,
+    /// 3=deep (hybrid BM25∥cosine→RRF→rerank when an embedder matching the store's
+    /// stamp is available; otherwise lexical, with the response noting the mode).
+    /// `k` pre-clamped by the router.
+    public var query: @Sendable (_ query: String, _ depth: Int, _ k: Int) async throws -> JSONValue
 
     public init(
         list: @escaping @Sendable (Int) async throws -> JSONValue,
@@ -52,7 +57,8 @@ public struct WikiQueryHandle: Sendable {
         upsert: @escaping @Sendable (Int64?, String?, String) async throws -> JSONValue,
         delete: @escaping @Sendable (Int64) async throws -> JSONValue,
         rename: @escaping @Sendable (Int64, String) async throws -> JSONValue,
-        brief: @escaping @Sendable (String, Int) async throws -> JSONValue
+        brief: @escaping @Sendable (String, Int) async throws -> JSONValue,
+        query: @escaping @Sendable (String, Int, Int) async throws -> JSONValue
     ) {
         self.list = list
         self.pageGet = pageGet
@@ -66,5 +72,6 @@ public struct WikiQueryHandle: Sendable {
         self.delete = delete
         self.rename = rename
         self.brief = brief
+        self.query = query
     }
 }

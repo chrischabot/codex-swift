@@ -35,7 +35,7 @@ enum MethodGate {
         // the edit surface (the wiki UI is the management/edit environment); both
         // stay deny-default behind the CODEXKIT_MEMORY-gated WikiQueryHandle.
         "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/entityBacklinks", "wiki/tags", "wiki/index",
-        "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief",
+        "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query",
         // turn lifecycle
         "turn/start", "turn/steer", "turn/interrupt", "review/start",
         // git diff-rail + automations

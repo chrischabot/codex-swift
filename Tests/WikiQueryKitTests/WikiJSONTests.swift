@@ -4,6 +4,7 @@ import Foundation
 import MemoryStore
 import WireProtocol
 import Config
+import ModelClient
 
 /// Severe coverage for the `wiki/*` JSON shapers (the read path the browser hits)
 /// against a REAL MemoryStore on a temp DB. CLAIM: each shaper maps store rows to
@@ -360,12 +361,14 @@ final class WikiJSONTests: XCTestCase {
 
     // MARK: - deny-default
 
-    func testMakeDenyDefaultWithoutEnvFlag() {
+    func testMakeDenyDefaultWithoutEnvFlag() async {
         // No CODEXKIT_MEMORY=1 → the handle is nil regardless of config (wiki off).
         let cfg = Config(layers: [])
-        XCTAssertNil(WikiQueryWiring.make(config: cfg, env: [:]),
-                     "wiki handle must be nil unless CODEXKIT_MEMORY=1")
-        XCTAssertNil(WikiQueryWiring.make(config: cfg, env: ["CODEXKIT_MEMORY": "0"]))
+        let mc = MockModelClient([])
+        let h1 = await WikiQueryWiring.make(config: cfg, modelClient: mc, env: [:])
+        XCTAssertNil(h1, "wiki handle must be nil unless CODEXKIT_MEMORY=1")
+        let h2 = await WikiQueryWiring.make(config: cfg, modelClient: mc, env: ["CODEXKIT_MEMORY": "0"])
+        XCTAssertNil(h2)
     }
 
     /// CLAIM: make() opens a store whose stamped embedding dimension differs from
@@ -387,7 +390,8 @@ final class WikiJSONTests: XCTestCase {
         // which MISMATCHES the 768 store — the fallback must still open it.
         let cfg = Config(layers: [ConfigLayer(
             name: "test", values: ["memory": .object(["db_path": .string(dbPath)])])])
-        let handle = WikiQueryWiring.make(config: cfg, env: ["CODEXKIT_MEMORY": "1"])
+        let handle = await WikiQueryWiring.make(config: cfg, modelClient: MockModelClient([]),
+                                                env: ["CODEXKIT_MEMORY": "1"])
         let h = try XCTUnwrap(handle, "wiki handle must open despite the default-dim mismatch")
         let listed = try await h.list(100)
         XCTAssertEqual(listed.obj?["data"]?.arr?.count, 1, "the seeded page is listable")

@@ -52,6 +52,9 @@ extension RequestRouter {
             await replyWiki(conn, id) { try await $0.rename(p.id, p.title) }
         case .wikiBrief(let id, let p):
             await replyWiki(conn, id) { try await $0.brief(p.topic, min(max(p.k ?? 8, 1), 20)) }
+        case .wikiQuery(let id, let p):
+            // depth clamped 1...3 (quick/standard/deep); k re-clamped router-side.
+            await replyWiki(conn, id) { try await $0.query(p.query, min(max(p.depth ?? 2, 1), 3), Self.clampWikiK(p.k)) }
         default:
             break
         }
