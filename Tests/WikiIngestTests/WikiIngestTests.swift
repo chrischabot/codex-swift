@@ -85,9 +85,9 @@ final class WikiIngestTests: XCTestCase {
 
     func testNotImplementedAdapterYieldsError() async throws {
         let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: "")))
-        let adapter = reg.resolve("https://github.com/openai")   // github-owner not implemented in M5a
+        let adapter = reg.resolve("https://dumps.wikimedia.org/enwiki-latest-pages.xml.bz2")   // mediawiki-dump: not yet implemented
         do { _ = try await collect(adapter.enumerate(IngestRequest(input: "x", fetchedAt: 1))); XCTFail("expected error") }
-        catch WikiIngestError.notImplemented(let k) { XCTAssertEqual(k, .githubOwner) }
+        catch WikiIngestError.notImplemented(let k) { XCTAssertEqual(k, .mediawikiDump) }
     }
 
     // MARK: FileAdapter
@@ -305,6 +305,60 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertTrue(cands[0].bodyMarkdown.contains("BitNet b1.58"))      // abstract is the body
         XCTAssertTrue(cands[0].bodyMarkdown.contains("# The Era of 1-bit LLMs"))
         XCTAssertEqual(cands[0].provenance.adapter, "arxiv")
+    }
+
+    // MARK: GitHub owner
+
+    func testGitHubOwnerParsing() {
+        XCTAssertEqual(GitHubAdapter.owner(from: "https://github.com/openai"), "openai")
+        XCTAssertEqual(GitHubAdapter.owner(from: "https://github.com/openai?tab=repositories"), "openai")
+        XCTAssertEqual(GitHubAdapter.owner(from: "https://github.com/orgs/openai/repositories"), "openai")
+        XCTAssertEqual(GitHubAdapter.owner(from: "karpathy"), "karpathy")
+        XCTAssertNil(GitHubAdapter.owner(from: "not a login!"))
+    }
+
+    func testGitHubReposURL() {
+        XCTAssertEqual(GitHubAdapter.reposURL(owner: "openai", org: false, perPage: 50)?.absoluteString,
+                       "https://api.github.com/users/openai/repos?sort=pushed&per_page=50")
+        XCTAssertEqual(GitHubAdapter.reposURL(owner: "openai", org: true, perPage: 200)?.absoluteString,
+                       "https://api.github.com/orgs/openai/repos?sort=pushed&per_page=100")   // clamped to 100
+    }
+
+    func testGitHubRender() {
+        let repo = GHRepo(name: "gpt-5", full_name: "openai/gpt-5", description: "The model",
+                          html_url: "https://github.com/openai/gpt-5", language: "Python",
+                          stargazers_count: 1000, forks_count: 7, pushed_at: "2026-06-01T00:00:00Z",
+                          topics: ["llm", "ai"], fork: false, archived: false,
+                          license: .init(spdx_id: "MIT"))
+        let md = GitHubAdapter.render(repo)
+        XCTAssertTrue(md.contains("# openai/gpt-5"))
+        XCTAssertTrue(md.contains("The model"))
+        XCTAssertTrue(md.contains("Language: Python"))
+        XCTAssertTrue(md.contains("Stars: 1000"))
+        XCTAssertTrue(md.contains("License: MIT"))
+        XCTAssertTrue(md.contains("`llm`"))
+    }
+
+    func testGitHubAdapterEnumeratesExcludingArchivedAndForks() async throws {
+        let json = """
+        [{"name":"gpt-5","full_name":"openai/gpt-5","description":"The model",
+          "html_url":"https://github.com/openai/gpt-5","language":"Python","stargazers_count":1000,
+          "pushed_at":"2026-06-01T00:00:00Z","topics":["llm","ai"],"license":{"spdx_id":"MIT"}},
+         {"name":"old","full_name":"openai/old","html_url":"https://github.com/openai/old","archived":true},
+         {"name":"forked","full_name":"openai/forked","html_url":"https://github.com/openai/forked","fork":true}]
+        """
+        let mock = HTMLTransport(html: json, contentType: "application/json")
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(mock))
+        let cands = try await collect(reg.resolve("https://github.com/openai").enumerate(
+            IngestRequest(input: "https://github.com/openai", fetchedAt: 9)))
+        XCTAssertEqual(cands.count, 1)                                  // archived + fork excluded
+        XCTAssertEqual(cands[0].sourceURI, "https://github.com/openai/gpt-5")
+        XCTAssertEqual(cands[0].rawType, .repos)
+        XCTAssertEqual(cands[0].title, "openai/gpt-5")
+        XCTAssertEqual(cands[0].provenance.adapter, "git")
+        XCTAssertEqual(cands[0].provenance.collection, "openai")
+        XCTAssertEqual(cands[0].provenance.upstreamID, "openai/gpt-5")
+        XCTAssertTrue(cands[0].bodyMarkdown.contains("The model"))
     }
 
     // MARK: PDF helper
