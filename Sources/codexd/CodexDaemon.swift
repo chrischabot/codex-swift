@@ -738,7 +738,8 @@ struct CodexDaemon {
         // Read-only Memory Wiki browse surface (deny-default: nil unless
         // CODEXKIT_MEMORY=1 and the SQLite store opens). Built once and shared
         // across the daemon + per-tab web routers (the store actor serializes).
-        let wikiHandle = await WikiQueryWiring.make(config: appConfig, modelClient: model)
+        let wikiHandle = await WikiQueryWiring.make(config: appConfig, modelClient: model,
+                                                    authProvider: wikiAuthProvider)
         // OWNER-TRUSTED daemon router: stdio / UDS / loopback socket. Serves
         // owner-only RPCs (outbound/send). allowsOwnerOnlyRPC defaults to true.
         let router = RequestRouter(supervisor: supervisor, store: store,

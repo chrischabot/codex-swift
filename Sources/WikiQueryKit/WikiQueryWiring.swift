@@ -25,6 +25,7 @@ public enum WikiQueryWiring {
     /// reply "wiki is not enabled".
     public static func make(config: Config,
                             modelClient: any ModelClient,
+                            authProvider: WikiMemoryAuthProvider? = nil,
                             env: [String: String] = ProcessInfo.processInfo.environment) async -> WikiQueryHandle? {
         guard env["CODEXKIT_MEMORY"] == "1" else { return nil }
         let wikiCfg = WikiMemoryConfig.fromConfig(config, env: env)
@@ -56,7 +57,8 @@ public enum WikiQueryWiring {
         // Best-effort hybrid retriever: built only when an embedder matching the
         // store's stamp is available (else nil → wiki/query degrades to lexical,
         // never mixing embedding spaces). Built once, shared across query calls.
-        let retriever = await makeWikiRetriever(store: store, wiki: wikiCfg, modelClient: modelClient, env: env)
+        let retriever = await makeWikiRetriever(store: store, wiki: wikiCfg, modelClient: modelClient,
+                                                env: env, authProvider: authProvider)
         return WikiQueryHandle(
             list:      { try await WikiJSON.list(store, limit: $0) },
             pageGet:   { try await WikiJSON.pageGet(store, id: $0) },
