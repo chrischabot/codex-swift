@@ -109,7 +109,10 @@ private final class NWDriver: @unchecked Sendable {
             guard let self else { return }
             if let data, !data.isEmpty {
                 let room = self.req.caps.maxBytes - self.received.count
-                if data.count >= room {
+                // Only > room means a byte was actually dropped. == room fills the
+                // cap exactly with no loss; keep reading so EOF (not truncation) is
+                // detected for a response whose size is exactly maxBytes.
+                if data.count > room {
                     self.received.append(data.prefix(room))
                     self.finish(.success(TransportResponse(peerIP: self.peerIP, bytes: self.received, truncated: true)))
                     return

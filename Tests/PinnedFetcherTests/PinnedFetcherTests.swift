@@ -147,6 +147,22 @@ final class PinnedFetcherTests: XCTestCase {
         guard case .deny = g.vetRedirect(from: base, location: "  ") else { return XCTFail("empty must deny") }
     }
 
+    // MARK: request building — CRLF-injection resistance
+
+    func testBuildRequestUsesEncodedTargetNoCRLFInjection() {
+        // A URL with %0d%0a in the path must NOT decode into literal CRLF in the
+        // request line (which would inject a header at the pinned host).
+        let url = URL(string: "https://example.com/a%0d%0aEvil:%20pwned/b?x=%0d%0ay")!
+        guard let bytes = PinnedFetcher.buildRequest(url: url, host: "example.com", accept: "*/*") else {
+            return XCTFail("expected a built request")
+        }
+        let s = String(decoding: bytes, as: UTF8.self)
+        let firstLine = s.split(separator: "\r\n", omittingEmptySubsequences: false).first.map(String.init) ?? ""
+        XCTAssertTrue(firstLine.hasPrefix("GET /a%0d%0aEvil:%20pwned/b?x=%0d%0ay HTTP/1.1"),
+                      "encoded target kept literal, got: \(firstLine)")
+        XCTAssertFalse(s.contains("\r\nEvil: pwned"), "no injected header")
+    }
+
     // MARK: HTTP parser (pure)
 
     func testHTTPParseContentLength() throws {

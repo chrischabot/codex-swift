@@ -35,7 +35,9 @@ public struct PinnedFetcher: Sendable {
                 let scheme = current.scheme?.lowercased() ?? "https"
                 let useTLS = scheme == "https"
                 let port = current.port ?? (useTLS ? 443 : 80)
-                let reqBytes = Self.buildRequest(url: current, host: approval.host, accept: accept)
+                guard let reqBytes = Self.buildRequest(url: current, host: approval.host, accept: accept) else {
+                    return .failure(.egressDenied(reason: "unsafe request target (control chars in path/query)"))
+                }
                 let tReq = TransportRequest(host: approval.host, pinnedIPs: approval.pinnedIPs,
                                             port: port, useTLS: useTLS, requestBytes: reqBytes, caps: c)
                 let tRes: TransportResponse
@@ -119,9 +121,17 @@ public struct PinnedFetcher: Sendable {
 
     // MARK: request building
 
-    static func buildRequest(url: URL, host: String, accept: String) -> Data {
-        var path = url.path.isEmpty ? "/" : url.path
-        if let q = url.query, !q.isEmpty { path += "?" + q }
+    /// Build the request from the PERCENT-ENCODED path/query (never the decoded
+    /// `URL.path`/`query`, which would turn a `%0d%0a` in the URL into literal
+    /// CRLF and split the request / inject headers at the pinned host). Returns
+    /// nil if the target still contains raw control characters (defense in depth).
+    static func buildRequest(url: URL, host: String, accept: String) -> Data? {
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var path = comps?.percentEncodedPath ?? "/"
+        if path.isEmpty { path = "/" }
+        if let q = comps?.percentEncodedQuery, !q.isEmpty { path += "?" + q }
+        guard !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }),
+              !host.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) else { return nil }
         let lines = [
             "GET \(path) HTTP/1.1",
             "Host: \(host)",
