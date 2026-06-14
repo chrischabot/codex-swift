@@ -131,6 +131,16 @@ case "wiki-query":
         exit(2)
     }
 
+case "wiki-watch":
+    do {
+        let result = try await CodexMemoryWikiWatch.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-watch failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "run":
     await CodexMemoryRun.runForever()
 
@@ -148,6 +158,7 @@ case "help", "--help", "-h":
       wiki-librarian  Tier-1 staleness scan over compiled wiki pages (scan).
       wiki-status     Dashboard: doc/page counts, flagged-stale, recent ingest log.
       wiki-query      Query the knowledge (hybrid retrieval) and print ranked hits.
+      wiki-watch      Register/list watched sources (add|list|pause|resume|remove|run-due).
       run             Long-running daemon: ingest → process → score, with MCP.
 
     See docs/codex-swift-memory-wiki.md for the full design.

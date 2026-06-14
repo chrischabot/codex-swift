@@ -228,6 +228,19 @@ enum MemorySchema {
       PRIMARY KEY(job_id, seq)
     );
     CREATE INDEX IF NOT EXISTS wiki_ingest_item_uri ON wiki_ingest_item(source_uri);
+    -- Watched sources (§14.6): a handle + cadence + scheduling state. The poll
+    -- loop reads `next_due_at`; WatchScheduler computes cadence/backoff.
+    CREATE TABLE IF NOT EXISTS watch_source (
+      id            TEXT PRIMARY KEY,            -- the handle/URL (dedupe key)
+      kind          TEXT NOT NULL,               -- adapter kind (github-owner|feed|arxiv|url)
+      volatility    TEXT NOT NULL DEFAULT 'warm',-- cadence tier (hot|warm|cold)
+      last_polled_at INTEGER NOT NULL DEFAULT 0,
+      error_count   INTEGER NOT NULL DEFAULT 0,
+      next_due_at   INTEGER NOT NULL DEFAULT 0,
+      status        TEXT NOT NULL DEFAULT 'active', -- active|paused|error|disabled
+      cursor        TEXT, last_change_at INTEGER, added_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS watch_source_due ON watch_source(status, next_due_at);
     """
 
     static func vec0VirtualTableSQL(dim: Int) -> String {
