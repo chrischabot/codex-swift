@@ -353,6 +353,7 @@ let package = Package(
         .executableTarget(name: "codex-memory",
                 dependencies: ["MemoryStore", "MemoryInfer", "MemoryIngest", "MemoryProcess",
                                "MemoryScore", "MemoryRetrieve", "MemoryMCP",
+                               "WikiIngest", "PinnedFetcher", "EgressGuard", "MediaDecode",
                                "Config", "Observability", "InfraPrimitives", "ModelClient",
                                "Auth"],
                 swiftSettings: strict),
