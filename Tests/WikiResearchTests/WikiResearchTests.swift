@@ -185,6 +185,73 @@ final class WikiResearchTests: XCTestCase {
 
     // MARK: round planning
 
+    // MARK: session store
+
+    private func tmpRoot() -> String {
+        NSTemporaryDirectory() + "wikiresearch-\(UUID().uuidString)"
+    }
+
+    func testSessionRoundTrip() throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let store = ResearchSessionStore(root: root)
+        let s = ResearchSession(sessionID: "S1", mode: .thesis, topic: "RAG vs FT",
+                                startTime: 1000, minTimeBudget: 7200, currentRound: 2,
+                                cumulativeSources: 14, cumulativeArticles: 9, status: "in_progress",
+                                lastProgressScore: 82,
+                                paths: [ResearchPath(id: "p1", question: "does RAG win?",
+                                                     searchAngles: ["a", "b"], status: "completed")])
+        try store.writeSession(s)
+        let back = try store.readSession()
+        XCTAssertEqual(back, s)
+        // ephemeral file removed on completion
+        try store.clearSession()
+        XCTAssertNil(try store.readSession())
+    }
+
+    func testEventLogIsAppendOnly() throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let store = ResearchSessionStore(root: root)
+        try store.appendEvent(SessionEvent(ts: 1, phase: "start", event: "research_started"))
+        try store.appendEvent(SessionEvent(ts: 2, phase: "round", event: "round_completed",
+                                           round: 1, sourcesIngested: 5, articlesCompiled: 3, progressScore: 65))
+        try store.appendEvent(SessionEvent(ts: 3, phase: "finish", event: "research_completed"))
+        let events = try store.readEvents()
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events[1].progressScore, 65)
+        XCTAssertEqual(events[1].round, 1)
+        XCTAssertEqual(events[2].event, "research_completed")
+        XCTAssertEqual(events.map(\.ts), [1, 2, 3])   // order preserved
+    }
+
+    func testCheckpointResumeRoundGranularity() throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let store = ResearchSessionStore(root: root)
+        XCTAssertNil(try store.resumeRound())   // no checkpoint yet
+        try store.writeCheckpoint(SessionCheckpoint(sessionID: "S", updatedAt: 10,
+                                                    status: "in_progress", summary: "round 2 done", round: 2))
+        XCTAssertEqual(try store.resumeRound(), 3)   // resume at last-completed + 1
+        // a completed session does not resume
+        try store.writeCheckpoint(SessionCheckpoint(sessionID: "S", updatedAt: 20,
+                                                    status: "completed", summary: "done", round: 3))
+        XCTAssertNil(try store.resumeRound())
+        let cp = try store.readCheckpoint()
+        XCTAssertEqual(cp?.round, 3)
+        XCTAssertEqual(cp?.status, "completed")
+    }
+
+    func testCheckpointAtomicReplace() throws {
+        let root = tmpRoot(); defer { try? FileManager.default.removeItem(atPath: root) }
+        let store = ResearchSessionStore(root: root)
+        for r in 1...5 {
+            try store.writeCheckpoint(SessionCheckpoint(sessionID: "S", updatedAt: Int64(r),
+                                                        status: "in_progress", summary: "r\(r)", round: r))
+        }
+        XCTAssertEqual(try store.readCheckpoint()?.round, 5)   // last write wins, no torn file
+        // no leftover temp files in the root
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: root).filter { $0.contains(".tmp-") }
+        XCTAssertTrue(leftovers.isEmpty)
+    }
+
     func testSwarmAngles() {
         XCTAssertEqual(RoundPlanner.angles(mode: .topic, depth: .standard).count, 5)
         XCTAssertEqual(RoundPlanner.angles(mode: .topic, depth: .deep).count, 8)
