@@ -281,15 +281,45 @@ and the scientific-notation numeric-coercion gap.
 
 ---
 
-## 8. Limitations & roadmap
+## 8. Shipping a signed, notarized bundle (Phase 2)
 
-- **macOS-only**, requires a local (or bundled) Postgres + pgvector.
-- **No bundled binary yet** — Phase 1 uses the Postgres you have installed. Phase 2
-  (relocatable, signed, notarized bundle) is specced in `pglite.md` but not built.
+For distribution (so the store doesn't depend on the user having Homebrew
+Postgres), build a **relocatable, Developer-ID-signed, Apple-notarized** bundle:
+
+```sh
+scripts/build-embedded-pg-bundle.sh --notarize     # build + sign + notarize + staple
+scripts/build-embedded-pg-bundle.sh --sign         # build + sign + functional test (no notary)
+scripts/build-embedded-pg-bundle.sh --no-sign      # plain relocatable bundle
+```
+
+It re-packages the Homebrew keg into `.build/embedded-pg/embedded-pg/`,
+**replicating the prefix-relative layout** so PostgreSQL's own path relocation
+finds the bundled, re-signed `pkglibdir` + `sharedir` (this is what makes `initdb`
+and `CREATE EXTENSION vector` load the *bundled* modules). Every Mach-O (≈115) is
+re-signed under one Team ID with hardened runtime + timestamp, so **library
+validation stays ON — no `disable-library-validation` entitlement**. The script
+runs a relocated functional test (`initdb` → `CREATE EXTENSION vector` → HNSW) and,
+with `--notarize`, produces a Gatekeeper-*accepted* stapled DMG.
+
+Point the store at it:
+```sh
+CODEX_MEM0_STORE_BACKEND=postgres \
+CODEX_MEM0_PG_BINDIR=.build/embedded-pg/embedded-pg/Cellar/postgresql@18/18.4/bin \
+  codex-mem0 serve
+```
+(`PGPaths` already resolves the bundle's relocated `share` dir, so pgvector is
+auto-detected.) Signing identity / notary profile are overridable via
+`CODEXKIT_SIGN_IDENTITY` / `CODEXKIT_NOTARY_PROFILE`.
+
+## 9. Limitations & roadmap
+
+- **macOS-only**, requires a local or **bundled** (§8) Postgres + pgvector.
 - **Single connection** (v1) — all ops serialized. v2: read pool + serialized write.
 - **No auto-reconnect** if the postmaster restarts under a live store.
 - **`postgresContainer`** backend (Architecture C microVM) is reserved/not wired.
-- The in-process native "libpglite" lane (Architecture A — the literal "native
-  pglite") remains the gated Phase-3 north-star.
+- **In-process native "libpglite" (Architecture A)** — **gate closed**: the
+  `postgres-pglite` fork has no native build (Emscripten-only; its "native" path is
+  w2c2 WASM-transpilation; the glue `#error`s on non-wasm). The signed bundle (§8)
+  is the responsible "as native as possible" endpoint. See `pglite.md` §9.
 
 See [`pglite.md`](../pglite.md) for the full design, risk register, and phased plan.

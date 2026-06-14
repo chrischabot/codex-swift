@@ -5,12 +5,23 @@
 > integration, leveraging Tahoe-specific capabilities. Study basis:
 > `../pglite` (Postgres-in-WASM) and our own store layer.
 >
-> **Status:** **Phase 0 + Phase 1 IMPLEMENTED** (2026-06-14) — the opt-in
-> embedded-Postgres + pgvector store backend is built, wired, and validated
-> end-to-end against a real local Postgres 18.4 + pgvector 0.8.2. Default
-> behaviour is unchanged (sqlite-vec). See the user/design guide at
-> [`docs/MEM0_POSTGRES.md`](docs/MEM0_POSTGRES.md). Phase 2 (relocatable+signed
-> bundle) and Phase 3 (in-process native libpglite) remain as specced below.
+> **Status (2026-06-14):**
+> - **Phase 0 + 1 — IMPLEMENTED & committed.** Opt-in embedded-Postgres + pgvector
+>   store, validated against real PG 18.4 + pgvector 0.8.2. Guide:
+>   [`docs/MEM0_POSTGRES.md`](docs/MEM0_POSTGRES.md).
+> - **Phase 2 — DONE.** `scripts/build-embedded-pg-bundle.sh` produces a
+>   **relocatable, Developer-ID-signed, hardened-runtime, Apple-notarized +
+>   stapled** PG+pgvector bundle (Gatekeeper: *accepted, Notarized Developer ID*;
+>   library validation stays ON — all 115 Mach-O re-signed under one Team). The
+>   `codex-mem0` store auto-uses it via `CODEX_MEM0_PG_BINDIR`.
+> - **Phase 3 — GATE CLOSED (Spike 11).** The `postgres-pglite` fork has **no
+>   native build**: `build.sh` is Emscripten-only (`CC=emcc`), its "native" path
+>   is w2c2 WASM→C transpilation, and the glue literally `#error "sigsetjmp
+>   unsupported"`s on non-Emscripten/wasi. A true native `libpglite` would mean
+>   inventing the native build (the 10–20 wk+ risk this plan flagged) and would
+>   *still* be single-user — strictly worse than the shipped Phase 2. See §9.
+>
+> Default behaviour is unchanged (sqlite-vec) throughout.
 
 ---
 
@@ -313,7 +324,31 @@ relocatability, no signing.**
 
 **Exit:** `CODEX_MEM0_STORE_BACKEND=postgres` → full add/search/get/update/delete/list passes against the spawned PG, equivalent to sqlite-vec · `EXPLAIN` shows an HNSW index scan (not seq scan) · injection + least-privilege tests green · **`Mem0Engine` unchanged** · default + Linux/CI untouched · Spike 6 (HNSW build memory + concurrent reads) run, `maintenance_work_mem` default chosen.
 
-### Phase 2 — Ship: relocatable, signed, bundled PG (~3–7 wk)
+### Phase 2 — Ship: relocatable, signed, bundled PG ✅ DONE
+**Built as [`scripts/build-embedded-pg-bundle.sh`](scripts/build-embedded-pg-bundle.sh)** —
+produces a relocatable, Developer-ID-signed, hardened-runtime, **Apple-notarized +
+stapled** PG 18.4 + pgvector 0.8.2 bundle (Gatekeeper: *accepted, Notarized
+Developer ID*).
+- **Approach taken:** rather than a from-source build, the script **re-packages
+  the Homebrew keg** and **replicates its prefix-relative layout**
+  (`Cellar/postgresql@NN/V/bin`, `lib/postgresql@NN`, `share/postgresql@NN`) so
+  PostgreSQL's own path relocation (`find_my_exec`) finds the bundled, re-signed
+  `pkglibdir` + `sharedir` — which is what makes both `initdb` (`$libdir/dict_snowball`)
+  and `CREATE EXTENSION vector` (`$libdir/vector`) load the **bundled** modules.
+- A BFS dylib collector (follows `@loader_path` siblings, names by install-name to
+  survive Homebrew's version symlinks) bundles 15 shared dylibs; all **115 Mach-O**
+  are re-signed under one Team → **library validation stays ON, no entitlement**.
+  No LLVM/JIT in the Homebrew build, so no W^X landmine. `pgxs/` (build/test infra
+  with stray unsigned exes) is dropped.
+- The script's functional test relocates the bundle and runs `initdb` →
+  `CREATE EXTENSION vector` → HNSW; the store auto-uses it via `CODEX_MEM0_PG_BINDIR`
+  (`PGPaths` already resolves the bundle's relocated share dir).
+- **Still TODO for production:** wire the signing into the repo's release gate
+  (`g6_developer_id_sign_smoke.sh`); a CVE/patch-rebuild runbook; optional
+  from-source `--without-icu` trim. The mechanism is proven end-to-end.
+
+<details><summary>Original plan (superseded by the above)</summary>
+
 **Goal:** turn the proven runtime into a redistributable bundle the app can carry.
 - From-source build: `./configure --prefix=<stage> --disable-rpath --without-llvm --with-openssl --with-lz4 --with-zstd` (`--without-llvm` drops JIT → dodges the hardened-runtime W^X landmine + shrinks CVE surface). pgvector matched to the **exact PG major**. Trim `share/` locale+tz to ~30–50 MB.
 - **`install_name_tool` `@loader_path` rewrite pass** (stock Homebrew PG hardcodes absolute `/opt/homebrew/opt/{gettext,zstd,lz4}/…` paths — verified via `otool -L`). Assert `otool -L` shows **no** `/opt/homebrew` path survives. **Order matters: rewrite *before* signing** (`install_name_tool` after signing breaks the seal).
@@ -323,7 +358,39 @@ relocatability, no signing.**
 
 **Exit:** Spikes 7–9 green (re-signed `vector.dylib` `dlopen`s under library validation · `notarytool` accepts the nested PG tree · relocated copy launches with a valid `--strict` signature) · bundle passes Gatekeeper from a quarantined location on a clean machine · footprint within target · patch pipeline scripted (not manual).
 
-### Phase 3 — Native ideal (optional north-star): in-process libpglite (~10–20 wk, GATED)
+</details>
+
+> **Outcome:** Spikes 7–9 all GREEN. The re-signed `vector.dylib` `dlopen`s under
+> library validation, `notarytool` accepted the nested 115-Mach-O tree, the
+> relocated copy launches `--strict`-valid, and the stapled DMG is Gatekeeper-
+> *accepted*. Footprint ~71 MB (untrimmed).
+
+### Phase 3 — Native ideal (optional north-star): in-process libpglite — GATE CLOSED ❌
+**Spike 11 ran and CANCELLED the phase, exactly as gated.** Cloning
+`postgres-pglite` (branch `REL_17_4_WASM-pglite`) and reading the build shows:
+- `build.sh` is **Emscripten-only** (`BUILD=emscripten`, `CC=$(which emcc)`,
+  `-sMAIN_MODULE`). There is **no** `./configure && make` that emits a native
+  `libpglite.a`.
+- The only "native" path, `native.sh`, takes the WASM output and runs it through
+  **w2c2** (a WASM→C transpiler) wrapped as a **Python** module — it still needs
+  the full Emscripten/wasi build first and carries every WASM limitation.
+- The glue (`interactive_one.c`, `pgl_os.h`, `pgl_sjlj.c`) is wasm-bound:
+  `__attribute__((export_name(...)))` exports, `chmod`/`popen` overridden for wasi,
+  and `interactive_one.c:574` literally `#error "sigsetjmp unsupported"` for the
+  non-Emscripten/wasi case — i.e. the error-recovery longjmp the re-entrant main
+  loop needs **does not exist natively**.
+
+A true native `libpglite` therefore means *inventing* the native build (replace
+the Emscripten OS/sjlj/export layer, write a native sjlj recovery path, own a
+forked PG) — the 10–20 wk+ #1 schedule risk — and it would **still** be single-user
+(no autovacuum/checkpointer/walwriter, fsync-off), i.e. strictly worse than the
+shipped Phase 2 on durability, concurrency, and maintenance. **Recommendation:
+do not pursue;** Phase 2 (real native binaries, full Postgres, notarized) is the
+responsible "as native as possible" endpoint. The original spec is kept below for
+the record.
+
+<details><summary>Original Phase 3 spec (not pursued — see Spike 11 outcome above)</summary>
+
 **Goal:** the literal "maximally native" in-process Postgres — *only after B ships*
 and *only if* the native build path is proven.
 - **Spike 11 (GATE):** clone `postgres-pglite`, read `build-with-docker.sh` + the patch series, confirm a native Mach-O target exists. **Absent → the phase is cancelled.**
@@ -332,6 +399,8 @@ and *only if* the native build path is proven.
 - Re-target the **same `Mem0PgVectorStore` actor** at the in-process transport (only lifecycle/wire change); add periodic `CHECKPOINT`/`VACUUM` timers + `atexit CHECKPOINT` to replace the missing background workers.
 
 **Exit:** native build reproducible from a clean checkout (documented re-apply recipe, like the MLX `metallib` steps in `CLAUDE.md`) · crash-recovery + `fsync` durability match/beat the sqlite-vec control · same `Mem0PgStore` tests pass against the in-process backend · single static Mach-O signs cleanly under the existing gate with library validation **on**.
+
+</details>
 
 ---
 
