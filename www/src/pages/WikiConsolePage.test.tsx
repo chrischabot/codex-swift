@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { RuntimeProvider } from "@/runtime/RuntimeProvider";
 import { makeMockConnector } from "@/runtime/connector-mock";
-import type { Connector, WikiPageSummary, WikiBrief } from "@/runtime/connector";
+import type { Connector, WikiPageSummary, WikiBrief, WikiStatus } from "@/runtime/connector";
 import { WikiConsolePage } from "./WikiConsolePage";
 
 afterEach(cleanup);
@@ -61,5 +61,24 @@ describe("WikiConsolePage", () => {
     expect(screen.getByText("RAG reduces hallucination")).toBeTruthy();
     expect(screen.getByText(/example\.com\/rag/)).toBeTruthy();
     expect(getWikiBrief).toHaveBeenCalledWith("RAG", { k: 8 });
+  });
+
+  it("loads the status dashboard when its tab opens", async () => {
+    const status: WikiStatus = {
+      documents: 4986, pages: 2, flaggedStale: 1,
+      recentJobs: [
+        { jobID: "j1", input: "https://github.com/openai", status: "done",
+          candidates: 4, written: 4, skipped: 0, failed: 0 },
+      ],
+    };
+    const getWikiStatus = vi.fn(async () => status);
+    const connector = { ...makeMockConnector(), getWikiStatus } as Connector;
+    renderWith(connector);
+
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /status/i }), { button: 0 });
+    await waitFor(() => expect(screen.getByText("4,986")).toBeTruthy());     // doc count
+    expect(screen.getByText("Raw documents")).toBeTruthy();
+    expect(screen.getByText("https://github.com/openai")).toBeTruthy();      // recent job
+    expect(getWikiStatus).toHaveBeenCalledTimes(1);
   });
 });

@@ -1037,6 +1037,30 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         return r ?? null;
       } catch { return null; }
     },
+    getWikiStatus: async () => {
+      try {
+        const r = (await rpc("wiki/status", {})) as {
+          documents?: number; pages?: number; flaggedStale?: number;
+          recentJobs?: Record<string, unknown>[];
+        };
+        return {
+          documents: r.documents ?? 0,
+          pages: r.pages ?? 0,
+          flaggedStale: r.flaggedStale ?? 0,
+          recentJobs: (r.recentJobs ?? []).map((j) => ({
+            jobID: idStr(j.jobID),
+            input: pick(j, "input") || "",
+            status: pick(j, "status") || "",
+            adapter: pick(j, "adapter") || undefined,
+            candidates: numOrU(j.candidates) ?? 0,
+            written: numOrU(j.written) ?? 0,
+            skipped: numOrU(j.skipped) ?? 0,
+            failed: numOrU(j.failed) ?? 0,
+            startedAt: numOrU(j.startedAt),
+          })),
+        };
+      } catch { return null; }
+    },
   };
 }
 

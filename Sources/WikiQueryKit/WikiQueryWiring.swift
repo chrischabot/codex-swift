@@ -72,7 +72,8 @@ public enum WikiQueryWiring {
             delete:    { try await WikiJSON.delete(store, id: $0) },
             rename:    { try await WikiJSON.rename(store, id: $0, title: $1) },
             brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) },
-            query:     { try await WikiJSON.query(store, retriever: retriever, query: $0, depth: $1, k: $2) })
+            query:     { try await WikiJSON.query(store, retriever: retriever, query: $0, depth: $1, k: $2) },
+            status:    { try await WikiJSON.status(store) })
     }
 }
 
@@ -97,6 +98,31 @@ public enum WikiJSON {
             ])
         }
         return .object(["data": .array(items)])
+    }
+
+    /// Dashboard: raw doc count, compiled wiki-page count + how many are flagged
+    /// stale (librarian Tier-1), and the recent ingest-job ledger. All reads.
+    public static func status(_ store: MemoryStore) async throws -> JSONValue {
+        let now = Int64(Date().timeIntervalSince1970)
+        let docs = try await store.documentCount()
+        let scores = try await store.librarianScan(now: now)
+        let jobs = try await store.ingestJobs(limit: 10)
+        let jobItems = jobs.map { j -> JSONValue in
+            var o: [String: JSONValue] = [
+                "jobID": .string(j.jobID), "input": .string(j.input), "status": .string(j.status),
+                "candidates": .int(Int64(j.candidates)), "written": .int(Int64(j.written)),
+                "skipped": .int(Int64(j.skipped)), "failed": .int(Int64(j.failed)),
+                "startedAt": ms(j.startedAt),
+            ]
+            if let a = j.adapter { o["adapter"] = .string(a) }
+            return .object(o)
+        }
+        return .object([
+            "documents": .int(Int64(docs)),
+            "pages": .int(Int64(scores.count)),
+            "flaggedStale": .int(Int64(scores.filter(\.needsTier2).count)),
+            "recentJobs": .array(jobItems),
+        ])
     }
 
     // MARK: link + property index (M26)

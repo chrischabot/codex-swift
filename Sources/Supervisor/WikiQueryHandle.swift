@@ -44,6 +44,8 @@ public struct WikiQueryHandle: Sendable {
     /// stamp is available; otherwise lexical, with the response noting the mode).
     /// `k` pre-clamped by the router.
     public var query: @Sendable (_ query: String, _ depth: Int, _ k: Int) async throws -> JSONValue
+    /// Dashboard: raw doc / wiki-page counts, flagged-stale count, recent ingest log.
+    public var status: @Sendable () async throws -> JSONValue
 
     public init(
         list: @escaping @Sendable (Int) async throws -> JSONValue,
@@ -58,7 +60,8 @@ public struct WikiQueryHandle: Sendable {
         delete: @escaping @Sendable (Int64) async throws -> JSONValue,
         rename: @escaping @Sendable (Int64, String) async throws -> JSONValue,
         brief: @escaping @Sendable (String, Int) async throws -> JSONValue,
-        query: @escaping @Sendable (String, Int, Int) async throws -> JSONValue
+        query: @escaping @Sendable (String, Int, Int) async throws -> JSONValue,
+        status: @escaping @Sendable () async throws -> JSONValue
     ) {
         self.list = list
         self.pageGet = pageGet
@@ -73,5 +76,6 @@ public struct WikiQueryHandle: Sendable {
         self.rename = rename
         self.brief = brief
         self.query = query
+        self.status = status
     }
 }

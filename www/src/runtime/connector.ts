@@ -223,6 +223,25 @@ export interface WikiBrief {
   limitations?: string[];
 }
 
+// ── Status: the dashboard / view-logs surface (wiki/status) ──────────────────
+export interface WikiIngestJob {
+  jobID: string;
+  input: string;
+  status: string; // running | done | failed | cancelled
+  adapter?: string;
+  candidates: number;
+  written: number;
+  skipped: number;
+  failed: number;
+  startedAt?: number; // epoch ms (connector normalizes)
+}
+export interface WikiStatus {
+  documents: number;
+  pages: number;
+  flaggedStale: number;
+  recentJobs: WikiIngestJob[];
+}
+
 export interface Connector {
   /** Lifecycle. Mock implementations may be no-ops. */
   connect(): Promise<void>;
@@ -337,4 +356,6 @@ export interface Connector {
   renameWikiPage?(pageId: string, title: string): Promise<{ renamed: boolean } | null>;
   /** Lexical, zero-spend cited synthesis brief on a topic (the "enrich" surface). */
   getWikiBrief?(topic: string, opts?: { k?: number }): Promise<WikiBrief | null>;
+  /** Dashboard: doc/page counts, flagged-stale count, recent ingest-job log. */
+  getWikiStatus?(): Promise<WikiStatus | null>;
 }

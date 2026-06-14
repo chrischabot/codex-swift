@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Search, Sparkles, FileText } from "lucide-react";
+import { ArrowLeft, Search, Sparkles, FileText, Gauge } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { useRuntime } from "@/runtime/RuntimeProvider";
-import type { WikiPageSummary, WikiBrief } from "@/runtime/connector";
+import type { WikiPageSummary, WikiBrief, WikiStatus } from "@/runtime/connector";
 
 /**
  * Wiki Console (route /wiki/console) — query the knowledge base and generate a
@@ -26,6 +26,19 @@ export function WikiConsolePage() {
   const [brief, setBrief] = useState<WikiBrief | null>(null);
   const [briefing, setBriefing] = useState(false);
   const [briefError, setBriefError] = useState<string | null>(null);
+
+  const [status, setStatus] = useState<WikiStatus | null>(null);
+  const [loadingStatus, setLoadingStatus] = useState(false);
+
+  async function loadStatus() {
+    if (!connector.getWikiStatus) return;
+    setLoadingStatus(true);
+    try {
+      setStatus(await connector.getWikiStatus());
+    } finally {
+      setLoadingStatus(false);
+    }
+  }
 
   async function runSearch() {
     const query = q.trim();
@@ -67,10 +80,15 @@ export function WikiConsolePage() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto p-4">
-        <Tabs defaultValue="search" className="mx-auto max-w-3xl">
+        <Tabs
+          defaultValue="search"
+          className="mx-auto max-w-3xl"
+          onValueChange={(v) => { if (v === "status" && !status) void loadStatus(); }}
+        >
           <TabsList>
             <TabsTrigger value="search"><Search className="mr-1 size-3.5" /> Search</TabsTrigger>
             <TabsTrigger value="brief"><Sparkles className="mr-1 size-3.5" /> Brief</TabsTrigger>
+            <TabsTrigger value="status"><Gauge className="mr-1 size-3.5" /> Status</TabsTrigger>
           </TabsList>
 
           {/* ── Search ── */}
@@ -176,8 +194,53 @@ export function WikiConsolePage() {
               </div>
             )}
           </TabsContent>
+
+          {/* ── Status ── */}
+          <TabsContent value="status" className="mt-3">
+            <div className="mb-3 flex items-center gap-2">
+              <Button variant="outline" size="xs" onClick={() => void loadStatus()} disabled={loadingStatus}>
+                {loadingStatus ? "Refreshing…" : "Refresh"}
+              </Button>
+            </div>
+            {status && (
+              <>
+                <div className="grid grid-cols-3 gap-3">
+                  <Stat label="Raw documents" value={status.documents} />
+                  <Stat label="Wiki pages" value={status.pages} />
+                  <Stat label="Flagged stale" value={status.flaggedStale} />
+                </div>
+                <h4 className="mt-4 text-[12px] font-medium text-foreground">Recent ingest jobs</h4>
+                {status.recentJobs.length === 0 ? (
+                  <p className="mt-1 text-[12px] text-[color:var(--color-text-quaternary)]">No ingest jobs yet.</p>
+                ) : (
+                  <ul className="mt-1 space-y-1">
+                    {status.recentJobs.map((j) => (
+                      <li key={j.jobID} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                        <Badge variant={j.status === "failed" ? "danger" : j.status === "done" ? "success" : "outline"}>
+                          {j.status}
+                        </Badge>
+                        <span className="truncate text-[12px] text-foreground">{j.input}</span>
+                        <span className="ml-auto shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">
+                          w{j.written}/s{j.skipped}/f{j.failed}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+          </TabsContent>
         </Tabs>
       </div>
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-md border border-[color:var(--border)] p-3">
+      <div className="text-[20px] font-semibold tabular-nums text-foreground">{value.toLocaleString()}</div>
+      <div className="text-[11px] text-[color:var(--color-text-quaternary)]">{label}</div>
     </div>
   );
 }
