@@ -1,0 +1,148 @@
+import XCTest
+import Foundation
+@testable import WikiIngest
+import PinnedFetcher
+import EgressGuard
+import MediaDecode
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+#if canImport(CoreText)
+import CoreText
+#endif
+
+final class WikiIngestTests: XCTestCase {
+    private func tmp(_ ext: String) -> String { NSTemporaryDirectory() + "wikiingest-\(UUID().uuidString).\(ext)" }
+
+    private func collect(_ s: AsyncThrowingStream<WikiSourceCandidate, any Error>) async throws -> [WikiSourceCandidate] {
+        var out: [WikiSourceCandidate] = []
+        for try await c in s { out.append(c) }
+        return out
+    }
+
+    private func publicFetcher(_ mock: any PinnedTransport) -> PinnedFetcher {
+        PinnedFetcher(guard_: EgressGuard(EgressPolicy(allowedHosts: [], allowHTTP: true,
+                                                       resolve: { _ in ["93.184.216.34"] })),
+                      transport: mock)
+    }
+
+    private actor HTMLTransport: PinnedTransport {
+        let bytes: Data
+        init(html: String, contentType: String = "text/html") {
+            bytes = Data("HTTP/1.1 200 OK\r\ncontent-type: \(contentType)\r\ncontent-length: \(html.utf8.count)\r\n\r\n\(html)".utf8)
+        }
+        func roundTrip(_ req: TransportRequest) async -> Result<TransportResponse, FetchError> {
+            .success(TransportResponse(peerIP: "93.184.216.34", bytes: bytes, truncated: false))
+        }
+    }
+
+    // MARK: detectKind (pure)
+
+    func testDetectKindExhaustive() {
+        typealias K = WikiSourceKind
+        func d(_ s: String) -> K { WikiAdapterRegistry.detectKind(s) }
+        // URL shapes
+        XCTAssertEqual(d("https://example.com/article"), .url)
+        XCTAssertEqual(d("https://arxiv.org/abs/2402.17764"), .arxiv)
+        XCTAssertEqual(d("https://export.arxiv.org/api/query?search_query=cat:cs.AI"), .arxiv)
+        XCTAssertEqual(d("https://github.com/anthropics/buffa"), .git)
+        XCTAssertEqual(d("https://github.com/anthropics"), .githubOwner)
+        XCTAssertEqual(d("https://github.com/orgs/openai/repositories"), .githubOwner)
+        XCTAssertEqual(d("https://github.com/simonw?tab=repositories"), .githubOwner)
+        XCTAssertEqual(d("https://en.wikipedia.org/w/api.php?action=query"), .mediawikiAPI)
+        XCTAssertEqual(d("https://dumps.wikimedia.org/enwiki-latest-pages.xml.bz2"), .mediawikiDump)
+        XCTAssertEqual(d("https://web.archive.org/cdx/search/cdx?url=example.com"), .waybackCDX)
+        XCTAssertEqual(d("https://simonwillison.net/atom/everything/"), .url)  // path doesn't end /atom
+        XCTAssertEqual(d("https://news.smol.ai/feed"), .feed)
+        XCTAssertEqual(d("https://lilianweng.github.io/index.xml"), .feed)
+        XCTAssertEqual(d("https://blog.example.com/rss.xml"), .feed)
+        // local paths
+        XCTAssertEqual(d("/docs/paper.pdf"), .pdf)
+        XCTAssertEqual(d("/data/messages.csv"), .messageArchive)
+        XCTAssertEqual(d("/data/export.jsonl"), .messageArchive)
+        XCTAssertEqual(d("/dumps/pages.xml"), .mediawikiDump)
+        XCTAssertEqual(d("/notes/todo.md"), .file)
+        // forced wins
+        XCTAssertEqual(WikiAdapterRegistry.detectKind("/notes/todo.md", forced: .pdf), .pdf)
+        XCTAssertEqual(WikiAdapterRegistry.detectKind("https://example.com", forced: .feed), .feed)
+    }
+
+    func testNotImplementedAdapterYieldsError() async throws {
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: "")))
+        let adapter = reg.resolve("https://github.com/openai")   // github-owner not implemented in M5a
+        do { _ = try await collect(adapter.enumerate(IngestRequest(input: "x", fetchedAt: 1))); XCTFail("expected error") }
+        catch WikiIngestError.notImplemented(let k) { XCTAssertEqual(k, .githubOwner) }
+    }
+
+    // MARK: FileAdapter
+
+    func testFileAdapterMarkdownFile() async throws {
+        let p = tmp("md"); defer { try? FileManager.default.removeItem(atPath: p) }
+        try Data("# Title\n\nbody text".utf8).write(to: URL(fileURLWithPath: p))
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: "")))
+        let cands = try await collect(reg.resolve(p).enumerate(IngestRequest(input: p, fetchedAt: 42)))
+        XCTAssertEqual(cands.count, 1)
+        XCTAssertEqual(cands[0].contentFormat, .markdown)
+        XCTAssertEqual(cands[0].rawType, .articles)
+        XCTAssertTrue(cands[0].bodyMarkdown.contains("body text"))
+        XCTAssertEqual(cands[0].sourceURI, "file://" + p)
+        XCTAssertEqual(cands[0].fetched, 42)
+    }
+
+    func testFileAdapterUnreadable() async throws {
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: "")))
+        do { _ = try await collect(reg.resolve("/no/such.md").enumerate(IngestRequest(input: "/no/such.md", fetchedAt: 1))); XCTFail("expected error") }
+        catch WikiIngestError.unreadable { /* ok */ }
+    }
+
+    func testFileAdapterPDFThroughSandbox() async throws {
+        #if canImport(PDFKit)
+        let helper = FileManager.default.currentDirectoryPath + "/.build/debug/codex-mediadecode"
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/sandbox-exec"),
+              FileManager.default.isExecutableFile(atPath: helper) else { throw XCTSkip("sandbox/helper unavailable") }
+        let p = tmp("pdf"); defer { try? FileManager.default.removeItem(atPath: p) }
+        try writeTextPDF(p, text: "INGESTPDFTEXT")
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: "")))
+        let cands = try await collect(reg.resolve(p).enumerate(IngestRequest(input: p, fetchedAt: 7)))
+        XCTAssertEqual(cands.count, 1)
+        XCTAssertEqual(cands[0].contentFormat, .pdf)
+        XCTAssertEqual(cands[0].rawType, .papers)
+        XCTAssertTrue(cands[0].bodyMarkdown.contains("INGESTPDFTEXT"))
+        XCTAssertEqual(cands[0].extractionStatus, "ok")
+        #else
+        throw XCTSkip("PDFKit unavailable")
+        #endif
+    }
+
+    // MARK: URLAdapter
+
+    func testURLAdapterHTMLToMarkdown() async throws {
+        let html = "<html><head><title>Doc</title></head><body><h1>Heading</h1><p>para text</p></body></html>"
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: html)))
+        let cands = try await collect(reg.resolve("https://example.com/x").enumerate(
+            IngestRequest(input: "https://example.com/x", fetchedAt: 9)))
+        XCTAssertEqual(cands.count, 1)
+        XCTAssertEqual(cands[0].contentFormat, .html)
+        XCTAssertEqual(cands[0].rawType, .articles)
+        XCTAssertEqual(cands[0].title, "Doc")
+        XCTAssertTrue(cands[0].bodyMarkdown.contains("# Heading"))
+        XCTAssertEqual(cands[0].provenance.canonicalURL, "https://example.com/x")
+    }
+
+    // MARK: PDF helper
+
+    private func writeTextPDF(_ path: String, text: String) throws {
+        #if canImport(CoreGraphics) && canImport(CoreText)
+        var box = CGRect(x: 0, y: 0, width: 300, height: 300)
+        guard let consumer = CGDataConsumer(url: URL(fileURLWithPath: path) as CFURL),
+              let ctx = CGContext(consumer: consumer, mediaBox: &box, nil) else { throw XCTSkip("CGContext PDF unavailable") }
+        let font = CTFontCreateWithName("Helvetica" as CFString, 20, nil)
+        let attr = NSAttributedString(string: text, attributes: [NSAttributedString.Key(kCTFontAttributeName as String): font])
+        let line = CTLineCreateWithAttributedString(attr)
+        ctx.beginPDFPage(nil); ctx.textPosition = CGPoint(x: 20, y: 150); CTLineDraw(line, ctx); ctx.endPDFPage()
+        ctx.closePDF()
+        #else
+        throw XCTSkip("CoreGraphics/CoreText unavailable")
+        #endif
+    }
+}
