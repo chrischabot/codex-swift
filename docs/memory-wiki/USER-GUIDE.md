@@ -233,7 +233,13 @@ These passes answer "is what I have still good?" without re-reading everything.
   ```
 - **Audit — output drift.** An output (report/plan) is flagged **drifted** when
   something it was compiled from changed after it was generated, recursing one hop
-  (a dependency that is itself stale). Pure timestamp/graph logic. ✅
+  (a dependency that is itself stale). Pure timestamp/graph logic. ✅ **usable
+  end-to-end:**
+
+  ```sh
+  codex-memory wiki-audit            # pages compiled from since-changed claims
+  codex-memory wiki-audit --json     # drifted pages list first
+  ```
 - **Audit — provenance.** Each output is classified **replayable** (every source's
   raw chain is intact and re-derivable), **partial**, or **missing**. ✅
 - **Lint (structural guardian).** Flags broken `[[wiki-links]]`, non-reciprocal
@@ -400,6 +406,7 @@ codex-memory wiki-query "<question>" [--k N --no-rerank --json]
 
 # Trust & status (built, live-verified)
 codex-memory wiki-librarian scan [--json --threshold T --limit N]   # staleness scan
+codex-memory wiki-audit [--json --limit N]                          # output-drift scan
 codex-memory wiki-status [--json --limit N]                         # dashboard + logs
 
 # Watch / freshness (built, live-verified — registration & scheduling)
