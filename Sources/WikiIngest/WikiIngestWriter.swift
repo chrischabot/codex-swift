@@ -29,13 +29,29 @@ public struct WikiIngestWriter: Sendable {
         // The SAME normalized content-SHA the processor stamps onto the document,
         // so the dedupe check below matches the stored value exactly.
         let sha = Normaliser.contentSHA(c.bodyMarkdown)
+        let shaHex = sha.map { String(format: "%02x", $0) }.joined()
+
+        // Exact dedupe on the canonical URI → no-op.
         if let existing = try await store.document(byURI: c.sourceURI), existing.contentSHA == sha {
             return WriteResult(documentID: existing.id, chunksWritten: 0, skipped: true)
+        }
+        // Raw immutability: a CHANGED upstream is a NEW source_uri revision, never
+        // an overwrite. Reusing the same URI would update the document row but leave
+        // the OLD chunks searchable beside the new ones (the processor only inserts).
+        // So when the canonical URI already holds different content, write under a
+        // content-addressed revision URI — a fresh document with its own chunks; the
+        // prior revision stays immutable.
+        var effectiveURI = c.sourceURI
+        if let existing = try await store.document(byURI: c.sourceURI), existing.contentSHA != sha {
+            effectiveURI = c.sourceURI + "#rev=" + String(shaHex.prefix(12))
+            if let rev = try await store.document(byURI: effectiveURI), rev.contentSHA == sha {
+                return WriteResult(documentID: rev.id, chunksWritten: 0, skipped: true)   // same revision already ingested
+            }
         }
         let doc = IngestedDocument(
             sourceName: c.provenance.adapter,
             sourceKind: Self.sourceKind(for: c),
-            sourceURI: c.sourceURI,
+            sourceURI: effectiveURI,
             title: c.title,
             publishedAt: c.provenance.publishedAt,
             fetchedAt: c.fetched,

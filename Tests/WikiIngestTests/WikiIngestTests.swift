@@ -183,6 +183,33 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(count, 1)   // not duplicated
     }
 
+    func testWriterRevisionsChangedContent() async throws {
+        let dbDir = NSTemporaryDirectory() + "wikirev-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dbDir) }
+        let store = try MemoryStore(MemoryStoreConfig(path: dbDir + "/m.db", embeddingDimension: 8))
+        let writer = WikiIngestWriter(store: store,
+            processor: MemoryProcessor(store: store, inference: MockInferenceProvider(embeddingDimension: 8)))
+        var cand = WikiSourceCandidate(sourceURI: "https://ex.com/p", rawType: .articles, title: "P",
+            bodyMarkdown: "original content here with several words to chunk", contentFormat: .html,
+            provenance: CollectionProvenance(adapter: "url"), fetched: 1)
+        let r1 = try await writer.write(cand, extract: false)
+        XCTAssertFalse(r1.skipped)
+        // Changed content under the SAME canonical URI → a NEW immutable revision.
+        cand.bodyMarkdown = "completely different replacement content with other distinct words"
+        let r2 = try await writer.write(cand, extract: false)
+        XCTAssertFalse(r2.skipped)
+        XCTAssertNotEqual(r2.documentID, r1.documentID)
+        let twoDocs = try await store.documentCount()
+        XCTAssertEqual(twoDocs, 2)   // both revisions present (old not clobbered)
+        // Re-ingesting the same changed content → revision dedupe (no duplicate).
+        let r3 = try await writer.write(cand, extract: false)
+        XCTAssertTrue(r3.skipped)
+        XCTAssertEqual(r3.documentID, r2.documentID)
+        let stillTwo = try await store.documentCount()
+        XCTAssertEqual(stillTwo, 2)
+    }
+
     // MARK: Feed parser (pure)
 
     func testFeedParserRSS() {
