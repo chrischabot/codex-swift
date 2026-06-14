@@ -1,0 +1,112 @@
+import Foundation
+import WikiResearch
+import WikiIngest
+import MemoryStore
+import EgressGuard
+import PinnedFetcher
+import Tools
+
+/// `codex-memory wiki-research "<topic>" [flags]` — run the multi-round research
+/// engine LIVE: a web-search swarm gathers sources per angle, credibility-filters
+/// them locally, ingests the survivors (queryable), compiles a synthesis page, and
+/// terminates on the progress/gap arithmetic. Mode auto-detects (topic/question/
+/// thesis); `--min-time` enables multi-round gap drilling.
+enum CodexMemoryWikiResearch {
+    struct Options {
+        var topic = ""
+        var mode: ResearchMode?
+        var depth: ResearchDepth = .standard
+        var sources = 5
+        var perAngle = 4
+        var minTime: Int64?
+        var maxRounds = 3
+        var json = false
+    }
+    struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
+
+    static func run(args: [String]) async throws -> (output: String, ok: Bool) {
+        let opt = try parse(args)
+        guard !opt.topic.isEmpty else { throw CLIError(message: "wiki-research requires a topic/question") }
+
+        // web search must be configured (OPENAI_API_KEY / PERPLEXITY_API_KEY).
+        let webSearch = ResolvedWebSearch.fromEnvironment()
+        if webSearch is UnconfiguredWebSearch {
+            throw CLIError(message: "no web-search backend configured (set OPENAI_API_KEY or PERPLEXITY_API_KEY)")
+        }
+
+        let bundle = try await CodexMemoryRun.assemble()
+        let now = Int64(Date().timeIntervalSince1970)
+        let fetcher = PinnedFetcher(guard_: EgressGuard(EgressPolicy(allowHTTP: true)))
+        let writer = WikiIngestWriter(store: bundle.store, processor: bundle.processor)
+        let vaultRoot = (MemoryStoreConfig.defaultPath() as NSString).deletingLastPathComponent
+
+        let orch = WikiResearchOrchestrator(
+            probe: LiveKnowledgeProbe(retriever: bundle.retriever),
+            swarm: LiveResearchSwarm(webSearch: webSearch, perAngle: opt.perAngle),
+            compiler: LiveResearchCompiler(writer: writer, store: bundle.store, fetcher: fetcher,
+                                           fetchedAt: now, vaultRoot: vaultRoot),
+            reflector: LiveGapReflector(webSearch: webSearch),
+            now: { Int64(Date().timeIntervalSince1970) })
+
+        let sessionStore = ResearchSessionStore(root: vaultRoot + "/research")
+        let config = ResearchConfig(depth: opt.depth, minTimeBudget: opt.minTime,
+                                    sourcesPerRound: opt.sources, maxRounds: opt.maxRounds,
+                                    sessionStore: sessionStore)
+        let sessionID = "research-\(now)"
+        let result = await orch.run(input: opt.topic, sessionID: sessionID,
+                                    forcedMode: opt.mode, config: config)
+        return (format(result, json: opt.json), result.status != "failed")
+    }
+
+    static func format(_ r: ResearchResult, json: Bool) -> String {
+        if json {
+            let obj: [String: Any] = [
+                "sessionID": r.sessionID, "mode": r.mode.rawValue, "status": r.status,
+                "rounds": r.roundsCompleted, "sources": r.cumulativeSources,
+                "pages": r.cumulativeArticles, "finalScore": r.finalScore,
+                "termination": r.termination.rawValue, "flags": r.flags.map(\.rawValue),
+                "error": r.error as Any,
+            ]
+            let d = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data("{}".utf8)
+            return String(decoding: d, as: UTF8.self) + "\n"
+        }
+        var out = "wiki-research [\(r.sessionID)] mode=\(r.mode.rawValue) status=\(r.status)\n"
+        out += "  rounds=\(r.roundsCompleted)  sources ingested=\(r.cumulativeSources)  pages=\(r.cumulativeArticles)\n"
+        out += "  final score=\(r.finalScore)  termination=\(r.termination.rawValue)\n"
+        for rd in r.rounds {
+            out += "  · round \(rd.round): \(rd.sourcesIngested) sources, score \(rd.score)\n"
+        }
+        if !r.flags.isEmpty { out += "  flags: \(r.flags.map(\.rawValue).joined(separator: ", "))\n" }
+        if let e = r.error { out += "  error: \(e)\n" }
+        return out
+    }
+
+    static func parse(_ args: [String]) throws -> Options {
+        var o = Options(); var i = 0
+        func val(_ f: String) throws -> String {
+            i += 1; guard i < args.count else { throw CLIError(message: "\(f) requires a value") }
+            return args[i]
+        }
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--mode":
+                guard let m = ResearchMode(rawValue: try val(a).lowercased()) else { throw CLIError(message: "--mode must be topic|question|thesis") }
+                o.mode = m
+            case "--depth":
+                guard let d = ResearchDepth(rawValue: try val(a).lowercased()) else { throw CLIError(message: "--depth must be standard|deep|retardmax") }
+                o.depth = d
+            case "--sources": o.sources = Int(try val(a)) ?? 5
+            case "--per-angle": o.perAngle = Int(try val(a)) ?? 4
+            case "--min-time": o.minTime = Int64(try val(a))
+            case "--max-rounds": o.maxRounds = Int(try val(a)) ?? 3
+            case "--json": o.json = true
+            default:
+                if a.hasPrefix("-") { throw CLIError(message: "unknown flag \(a)") }
+                o.topic = o.topic.isEmpty ? a : o.topic + " " + a
+            }
+            i += 1
+        }
+        return o
+    }
+}

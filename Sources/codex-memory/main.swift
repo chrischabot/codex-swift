@@ -151,6 +151,16 @@ case "wiki-audit":
         exit(2)
     }
 
+case "wiki-research":
+    do {
+        let result = try await CodexMemoryWikiResearch.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-research failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "run":
     await CodexMemoryRun.runForever()
 
@@ -170,6 +180,7 @@ case "help", "--help", "-h":
       wiki-query      Query the knowledge (hybrid retrieval) and print ranked hits.
       wiki-watch      Register/list watched sources (add|list|pause|resume|remove|run-due).
       wiki-audit      Output-drift scan: pages compiled from since-changed claims.
+      wiki-research   Multi-round web research swarm → credibility filter → ingest.
       run             Long-running daemon: ingest → process → score, with MCP.
 
     See docs/codex-swift-memory-wiki.md for the full design.
