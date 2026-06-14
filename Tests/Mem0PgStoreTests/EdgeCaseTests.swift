@@ -80,20 +80,23 @@ final class EdgeCaseTests: XCTestCase {
         let tmpHome = NSTemporaryDirectory() + "codexmem0-home-" + UUID().uuidString.prefix(8)
         var env = ProcessInfo.processInfo.environment
         env["CODEX_HOME"] = tmpHome
-        defer {
+        // AWAIT teardown on every path (a fire-and-forget Task in defer would race
+        // the temp-dir removal and leak the postmaster).
+        func teardown() async {
             if let paths = PGPaths.resolveDefault(env: env) {
-                let lc = PostgresLifecycle(paths: paths)
-                Task { try? await lc.stop() }
+                try? await PostgresLifecycle(paths: paths).stop()
             }
             try? FileManager.default.removeItem(atPath: tmpHome)
         }
-        let store = try await Mem0PgVectorStore.openDefault(dims: 4, env: env)
-        try await store.insert([VectorRecord(id: "d", vector: [1, 0, 0, 0], payload: ["user_id": .string("u")])])
-        let d = try await store.get("d")
-        XCTAssertNotNil(d)
-        await store.shutdown()
-        if let paths = PGPaths.resolveDefault(env: env) {
-            try? await PostgresLifecycle(paths: paths).stop()
+        do {
+            let store = try await Mem0PgVectorStore.openDefault(dims: 4, env: env)
+            try await store.insert([VectorRecord(id: "d", vector: [1, 0, 0, 0], payload: ["user_id": .string("u")])])
+            let d = try await store.get("d")
+            XCTAssertNotNil(d)
+            await store.shutdown()
+        } catch {
+            await teardown(); throw error
         }
+        await teardown()
     }
 }

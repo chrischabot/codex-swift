@@ -156,19 +156,16 @@ if [ "$DO_SIGN" = 1 ]; then
   step "Code-sign every Mach-O (Developer ID + hardened runtime + timestamp)"
   ids="$(security find-identity -v -p codesigning 2>/dev/null || true)"
   case "$ids" in *"$SIGN_IDENTITY"*) ;; *) fail "identity not in keychain: $SIGN_IDENTITY";; esac
-  # Sign EVERY Mach-O (detected by `file`, not extension) so no stray executable
-  # slips through — Apple notarization rejects any unsigned/un-hardened Mach-O.
+  # Sign + strict-verify EVERY Mach-O (detected by `file`, not extension) so no
+  # stray executable slips through — Apple notarization rejects any unsigned/
+  # un-hardened Mach-O. Classify once per file (sign then verify in the same pass).
   n=0
   while IFS= read -r f; do
     ft="$(file "$f" 2>/dev/null || true)"
     case "$ft" in *Mach-O*) ;; *) continue;; esac
     codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$f" >/dev/null 2>&1 || fail "codesign failed: $f"
+    codesign --verify --strict "$f" 2>/dev/null || fail "verify failed: $f"
     n=$((n+1))
-  done < <(find "$BUNDLE" -type f)
-  step "Verify signatures (strict)"
-  while IFS= read -r f; do
-    ft="$(file "$f" 2>/dev/null || true)"
-    case "$ft" in *Mach-O*) codesign --verify --strict "$f" 2>/dev/null || fail "verify failed: $f";; esac
   done < <(find "$BUNDLE" -type f)
   pdesc="$(codesign -d --verbose=2 "$BIN_DIR/postgres" 2>&1 || true)"
   case "$pdesc" in *"Authority=Developer ID Application"*) ;; *) fail "postgres not Developer-ID signed";; esac

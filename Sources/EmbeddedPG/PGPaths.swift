@@ -110,7 +110,9 @@ public struct PGPaths: Sendable, Equatable {
             for keg in pgKegs {
                 let kegDir = "\(cellar)/\(keg)"
                 guard let versions = try? fm.contentsOfDirectory(atPath: kegDir) else { continue }
-                for v in versions.sorted(by: >) {
+                // SEMANTIC descending sort — a lexicographic sort ranks "18.4"
+                // above "18.10" (string compare), picking the OLDER patch release.
+                for v in versions.sorted(by: { versionDescending($0, $1) }) {
                     let bin = "\(kegDir)/\(v)/bin"
                     if fm.isExecutableFile(atPath: bin + "/postgres") { return bin }
                 }
@@ -150,6 +152,17 @@ public struct PGPaths: Sendable, Equatable {
     }
 
     // MARK: - helpers
+
+    /// Descending numeric comparison of dotted version strings ("18.10" > "18.4").
+    private static func versionDescending(_ a: String, _ b: String) -> Bool {
+        let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+        let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0, y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
 
     private static func majorVersion(_ keg: String) -> Int {
         // "postgresql@18" → 18 ; "postgresql" → 0

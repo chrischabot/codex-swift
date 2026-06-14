@@ -149,6 +149,12 @@ public actor PostgresLifecycle {
         // (socket-only, no TCP) go LAST so a later `-c`/`-k`/`-p` always WINS over
         // anything in extraServerSettings — extraServerSettings can never re-enable
         // a TCP listener.
+        // pg_ctl `-o` joins options with spaces, so a setting value containing a
+        // space would be mis-split. Reject rather than silently corrupt the option
+        // string (extraServerSettings are key=value tuning knobs, never spaced).
+        if let bad = extraServerSettings.first(where: { $0.contains(" ") }) {
+            throw LifecycleError.startFailed("extraServerSetting with whitespace is unsupported via pg_ctl -o: '\(bad)'")
+        }
         var settings: [String] = []
         for s in extraServerSettings { settings.append(contentsOf: ["-c", s]) }
         settings.append(contentsOf: [

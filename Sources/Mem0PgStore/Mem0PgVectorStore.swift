@@ -98,6 +98,12 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     public static func open(paths: PGPaths, dims: Int,
                             lifecycle: PostgresLifecycle? = nil,
                             logLabel: String = "codex.mem0.pg") async throws -> Mem0PgVectorStore {
+        // Validate up-front so a bad dimension fails with a clear error instead of
+        // an opaque `CREATE TABLE … vector(0)` deep in bootstrap. pgvector stores
+        // up to 16000 dims.
+        guard dims > 0 && dims <= 16000 else {
+            throw Mem0Error.configuration("embedding dimension \(dims) out of range (1...16000)")
+        }
         let store = Mem0PgVectorStore(paths: paths, dims: dims, logLabel: logLabel)
         try await store.start(lifecycle: lifecycle)
         return store
@@ -286,6 +292,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func update(_ id: String, vector: [Float]?, payload: JSONObject?) async throws {
+        if vector == nil && payload == nil { return }   // nothing to change — no-op (parity with the SQLite store)
         try await acquire(); defer { release() }
         if let vector { try validateFinite(vector) }
         var b = PGQueryBuilder()
