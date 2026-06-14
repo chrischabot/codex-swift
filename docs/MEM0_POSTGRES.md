@@ -274,6 +274,9 @@ The suite (all severe / adversarial):
 | `VectorDimensionTests` | cosine-not-L2 ordering; `vector`+HNSW (EXPLAIN proves index use) vs `halfvec`; selective-filter full-top-k recall; degenerate vectors |
 | `LifecycleDurabilityTests` | 64-way concurrent inserts (FIFO gate, no lost writes); idempotent restart + `kill -9` WAL recovery; APFS cold-snapshot clone is readable |
 | `EdgeCaseTests` | keywordSearch degenerate/injection queries (→ `[]`, never throw); NUL-byte rejection + connection survival; dimension-mismatch batch rollback; `openDefault` e2e |
+| `SQLCapabilityTests` | full SQL via a raw PostgresNIO connection: CREATE/REFERENCES, INSERT/UPSERT/RETURNING, JOIN+GROUP BY/HAVING, window functions, recursive CTEs, set ops, BEGIN/SAVEPOINT/ROLLBACK, data-type round-trips, constraint→SQLSTATE, PL/pgSQL + triggers, btree/gin/hnsw + EXPLAIN |
+| `SQLAdvancedTests` | wide type matrix; identity/generated columns; materialized views; index-AM family (btree/hash/brin/gin/ivfflat); MERGE; SQLSTATE error family; two-connection deadlock (40P01) + SKIP LOCKED; pgvector `<->`/`<=>`/`<#>` + dim cap |
+| `PGBenchmarks` | (also `CODEX_MEM0_PG_BENCH=1`) insert throughput, HNSW build + search p50/p99, cold-spawn latency, and embedded-PG HNSW vs sqlite-vec brute-force (~70× faster at n=2000) |
 
 Severe testing found and fixed **three real divergences** before they shipped: a
 `$not` absent-key bug (SQL three-valued logic), NaN scores from zero-norm vectors,
