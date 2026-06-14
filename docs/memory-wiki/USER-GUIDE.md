@@ -162,9 +162,23 @@ The response tells you the `retrieval` mode actually used (`hybrid` vs
 document). So you always know whether you got semantic recall or just keyword
 matching.
 
+**From the terminal** (✅ built & **live-verified** against a real 4983-document
+store):
+
+```sh
+codex-memory wiki-query "memory architecture" --k 5        # ranked hits + provenance
+codex-memory wiki-query "vector databases" --json          # machine-readable
+codex-memory wiki-query "rag" --no-rerank                  # skip the cross-encoder
+```
+
+Each hit shows the source URI, a relevance score, a snippet, and (in `--json`) a
+`bm25 / vec / rerank` breakdown so you can see *why* it matched. The reranker is
+robust to providers that return a short result (it simply contributes nothing
+rather than failing).
+
 🧱 **The natural-language "ask the wiki" flow** (retrieve → synthesize a cited
-answer) is the research/compile path; the retrieval half is built, the frontier
-synthesis half is landing.
+answer) is the research/compile path; the retrieval half is built and verified, the
+frontier synthesis half is landing.
 
 ---
 
@@ -210,8 +224,13 @@ These passes answer "is what I have still good?" without re-reading everything.
   page's volatility (hot 30 d / warm 90 d / cold 365 d), plus quality proxies
   (source count, average credibility, depth, see-also presence). Only the
   **flagged** subset (stale, or hot, or thin) escalates to a Tier-2 model pass — so
-  cost scales with problem density, not corpus size. ✅ (Tier-1 built & tested;
-  Tier-2 + CLI/RPC are 🧱)
+  cost scales with problem density, not corpus size. ✅ (Tier-1 built, tested &
+  **usable end-to-end** — see below; the Tier-2 model pass is 🧱)
+
+  ```sh
+  codex-memory wiki-librarian scan            # stalest-first, with flagged count
+  codex-memory wiki-librarian scan --json --threshold 60 --limit 30
+  ```
 - **Audit — output drift.** An output (report/plan) is flagged **drifted** when
   something it was compiled from changed after it was generated, recursing one hop
   (a dependency that is itself stale). Pure timestamp/graph logic. ✅
@@ -267,6 +286,15 @@ codex-memory wiki-watch run-due        # poll everything currently due
   *what was ingested, when, and what failed*.
 - **Research session events** ✅ — the append-only `.session-events.jsonl` is a
   full audit trail of every research round, reflection, and completion.
+- **The `wiki-status` dashboard** ✅ — a single command surfaces the whole picture:
+
+  ```sh
+  codex-memory wiki-status            # raw docs, wiki pages (+ flagged stale),
+  codex-memory wiki-status --json     # recent ingest jobs (status, written/skipped/failed)
+  ```
+
+  Live-verified against the real store (e.g. *raw documents : 4983*). This is the
+  CLI "view logs / activity" surface today.
 - 🧱 **Live activity console** — the web UI's Sessions/Live-Activity view (and the
   Watch tab's sources table: handle, cadence, last polled, last change, status, next
   due) is part of the consolidated frontend (Section 9).
@@ -357,6 +385,13 @@ genuine judgment, on the *flagged subset only*.
 # Ingest (built, live-verified)
 codex-memory wiki-ingest <url|path|arxiv-query|gh-owner-url> [--adapter --raw-type
     --limit --corpus --dry-run --extract --json --https-only --job-id]
+
+# Query the knowledge (built, live-verified vs a real 4983-doc store)
+codex-memory wiki-query "<question>" [--k N --no-rerank --json]
+
+# Trust & status (built, live-verified)
+codex-memory wiki-librarian scan [--json --threshold T --limit N]   # staleness scan
+codex-memory wiki-status [--json --limit N]                         # dashboard + logs
 
 # Compile + lint (pre-existing)
 codex-memory wiki-compile      # source/entity/claim pages + agent digests
