@@ -307,6 +307,114 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(cands[0].provenance.adapter, "arxiv")
     }
 
+    // MARK: ingest ledger + orchestrator
+
+    private func makeStore() throws -> (MemoryStore, String) {
+        let dbDir = NSTemporaryDirectory() + "wikiorch-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dbDir, withIntermediateDirectories: true)
+        let store = try MemoryStore(MemoryStoreConfig(path: dbDir + "/m.db", embeddingDimension: 8))
+        return (store, dbDir)
+    }
+
+    func testIngestLedgerCountersAndItems() async throws {
+        let (store, dir) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        try await store.ingestBegin(jobID: "J1", input: "https://ex.com/feed", adapter: "feed",
+                                    rawType: "articles", corpus: nil, startedAt: 10)
+        try await store.ingestRecordItem(jobID: "J1", seq: 1, sourceURI: "a", status: .written,
+                                         documentID: 100, error: nil, recordedAt: 11)
+        try await store.ingestRecordItem(jobID: "J1", seq: 2, sourceURI: "b", status: .deduped,
+                                         documentID: 100, error: nil, recordedAt: 12)
+        try await store.ingestRecordItem(jobID: "J1", seq: 3, sourceURI: "c", status: .failed,
+                                         documentID: nil, error: "boom", recordedAt: 13)
+        try await store.ingestFinish(jobID: "J1", status: "done", finishedAt: 20, cursor: "a", error: nil)
+
+        let job = try await store.ingestJob("J1")
+        XCTAssertEqual(job?.candidates, 3)
+        XCTAssertEqual(job?.written, 1)
+        XCTAssertEqual(job?.skipped, 1)   // deduped counts as skipped
+        XCTAssertEqual(job?.failed, 1)
+        XCTAssertEqual(job?.status, "done")
+        XCTAssertEqual(job?.cursor, "a")
+        XCTAssertEqual(job?.finishedAt, 20)
+        let items = try await store.ingestItems(jobID: "J1")
+        XCTAssertEqual(items.count, 3)
+        XCTAssertEqual(items[2].status, "failed")
+        XCTAssertEqual(items[2].error, "boom")
+        // recent-jobs listing + watch cursor
+        let recent = try await store.ingestJobs()
+        XCTAssertEqual(recent.first?.jobID, "J1")
+        let cursor = try await store.ingestLastCursor(input: "https://ex.com/feed", adapter: "feed")
+        XCTAssertEqual(cursor, "a")
+    }
+
+    func testOrchestratorIngestsViaGitHubAdapterAndRecordsLedger() async throws {
+        let (store, dir) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let processor = MemoryProcessor(store: store, inference: MockInferenceProvider(embeddingDimension: 8))
+        let writer = WikiIngestWriter(store: store, processor: processor)
+        let json = """
+        [{"name":"r1","full_name":"o/r1","description":"first repo with enough text to chunk nicely here",
+          "html_url":"https://github.com/o/r1","language":"Swift","stargazers_count":3},
+         {"name":"r2","full_name":"o/r2","description":"second repo also with enough descriptive body text",
+          "html_url":"https://github.com/o/r2","language":"Go","stargazers_count":5}]
+        """
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: json, contentType: "application/json")))
+        let orch = WikiIngestOrchestrator(registry: reg, writer: writer, store: store, now: { 42 })
+
+        let s = await orch.ingest(IngestRequest(input: "https://github.com/o", fetchedAt: 42), jobID: "JOB")
+        XCTAssertEqual(s.status, "done")
+        XCTAssertEqual(s.candidates, 2)
+        XCTAssertEqual(s.written, 2)
+        XCTAssertEqual(s.failed, 0)
+        XCTAssertEqual(s.documentIDs.count, 2)
+        XCTAssertEqual(s.cursor, "https://github.com/o/r1")     // first (newest) candidate
+
+        // the ledger persisted the job + items, and the docs are actually in the store
+        let job = try await store.ingestJob("JOB")
+        XCTAssertEqual(job?.status, "done")
+        XCTAssertEqual(job?.written, 2)
+        let count1 = try await store.documentCount()
+        XCTAssertEqual(count1, 2)
+
+        // re-running is a clean no-op (dedup → all skipped, nothing duplicated)
+        let s2 = await orch.ingest(IngestRequest(input: "https://github.com/o", fetchedAt: 42), jobID: "JOB2")
+        XCTAssertEqual(s2.written, 0)
+        XCTAssertEqual(s2.skipped, 2)
+        let count2 = try await store.documentCount()
+        XCTAssertEqual(count2, 2)
+    }
+
+    func testOrchestratorDryRunWritesNothing() async throws {
+        let (store, dir) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let processor = MemoryProcessor(store: store, inference: MockInferenceProvider(embeddingDimension: 8))
+        let writer = WikiIngestWriter(store: store, processor: processor)
+        let json = #"[{"name":"r1","full_name":"o/r1","html_url":"https://github.com/o/r1"}]"#
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: json, contentType: "application/json")))
+        let orch = WikiIngestOrchestrator(registry: reg, writer: writer, store: store, now: { 7 })
+
+        let s = await orch.ingest(IngestRequest(input: "https://github.com/o", dryRun: true, fetchedAt: 7), jobID: "DRY")
+        XCTAssertEqual(s.candidates, 1)
+        XCTAssertTrue(s.dryRun)
+        XCTAssertEqual(s.written, 0)
+        let dryCount = try await store.documentCount()
+        XCTAssertEqual(dryCount, 0)                              // nothing written
+        let dryJob = try await store.ingestJob("DRY")
+        XCTAssertNil(dryJob)                                     // no ledger row for a dry-run
+    }
+
+    func testOrchestratorEnumerateFailureFailsJob() async throws {
+        let (store, dir) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let processor = MemoryProcessor(store: store, inference: MockInferenceProvider(embeddingDimension: 8))
+        let writer = WikiIngestWriter(store: store, processor: processor)
+        // A bare login that resolves to GitHub but the transport 404s every call.
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(RoutingTransport(routes: [:])))
+        let orch = WikiIngestOrchestrator(registry: reg, writer: writer, store: store, now: { 1 })
+        let s = await orch.ingest(IngestRequest(input: "https://github.com/ghost", fetchedAt: 1), jobID: "FAIL")
+        XCTAssertEqual(s.status, "failed")
+        XCTAssertNotNil(s.error)
+        let failJob = try await store.ingestJob("FAIL")
+        XCTAssertEqual(failJob?.status, "failed")
+    }
+
     // MARK: GitHub owner
 
     func testGitHubOwnerParsing() {

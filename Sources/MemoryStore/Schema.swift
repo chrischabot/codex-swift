@@ -209,6 +209,25 @@ enum MemorySchema {
       session_id TEXT PRIMARY KEY,
       updated_at INTEGER NOT NULL, status TEXT NOT NULL, summary TEXT NOT NULL
     );
+    -- Crash-safe ingest ledger (§ Phase 2): a job + one row per candidate item, so
+    -- an interrupted ingest is observable/queryable and the watch cursor survives.
+    CREATE TABLE IF NOT EXISTS wiki_ingest_job (
+      job_id TEXT PRIMARY KEY, input TEXT NOT NULL, adapter TEXT, raw_type TEXT,
+      corpus TEXT, started_at INTEGER NOT NULL, finished_at INTEGER,
+      status TEXT NOT NULL,                       -- running | done | failed | cancelled
+      candidates INTEGER NOT NULL DEFAULT 0, written INTEGER NOT NULL DEFAULT 0,
+      skipped INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+      cursor TEXT, error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS wiki_ingest_job_started ON wiki_ingest_job(started_at);
+    CREATE TABLE IF NOT EXISTS wiki_ingest_item (
+      job_id TEXT NOT NULL REFERENCES wiki_ingest_job(job_id) ON DELETE CASCADE,
+      seq INTEGER NOT NULL, source_uri TEXT NOT NULL,
+      status TEXT NOT NULL,                       -- written | deduped | skipped | failed
+      document_id INTEGER, error TEXT, recorded_at INTEGER NOT NULL,
+      PRIMARY KEY(job_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS wiki_ingest_item_uri ON wiki_ingest_item(source_uri);
     """
 
     static func vec0VirtualTableSQL(dim: Int) -> String {
