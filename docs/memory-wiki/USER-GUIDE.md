@@ -260,19 +260,28 @@ genuinely-new content.
 - **The digest:** a scheduled output over pages created/changed in the window,
   written to `output/digest-YYYY-MM-DD.md`. 🔭
 
-🧱 **Surface:** the cadence/backoff/gate engine is built and tested; the
-`wiki/watch/*` RPC, the `codex-memory wiki-watch add|list|run-due` CLI, the Cron
-schedule, and the dedicated **`research-round` security posture** (egress-screened
-network + wiki-write, shell/fs denied) are landing.
+**Surface:** the cadence/backoff/gate engine + the **registration/scheduling CLI**
+are ✅ built & **live-verified**; the network **poll loop** (fetch → change-gate →
+ingest), its Cron schedule, and the dedicated **`research-round` security posture**
+(egress-screened network + wiki-write, shell/fs denied) are 🧱 landing.
 
-### Setting up watching (planned surface)
+### Setting up watching (✅ built & live-verified)
 
 ```sh
-# (planned) register a source on a cadence and schedule it:
-codex-memory wiki-watch add "https://github.com/openai" --cadence hot
-codex-memory wiki-watch list
-codex-memory wiki-watch run-due        # poll everything currently due
+# register a source — the adapter kind + a sensible cadence are auto-detected
+codex-memory wiki-watch add "https://github.com/openai"            # → hot
+codex-memory wiki-watch add "https://blog.example.com/feed" --cadence warm
+codex-memory wiki-watch list                  # handle, cadence, status, due/in-Nh
+codex-memory wiki-watch run-due               # which sources are due to poll now
+codex-memory wiki-watch pause  "<handle>"     # stop scheduling it
+codex-memory wiki-watch resume "<handle>"
+codex-memory wiki-watch remove "<handle>"
 ```
+
+A new source is **due immediately**; after a successful poll it reschedules on its
+cadence; after an error it backs off (and honors `Retry-After`). `list`/`run-due`
+support `--json`. (Today `run-due` *reports* the due set; the actual fetch+ingest
+poll is the landing piece.)
 
 ---
 
@@ -392,6 +401,11 @@ codex-memory wiki-query "<question>" [--k N --no-rerank --json]
 # Trust & status (built, live-verified)
 codex-memory wiki-librarian scan [--json --threshold T --limit N]   # staleness scan
 codex-memory wiki-status [--json --limit N]                         # dashboard + logs
+
+# Watch / freshness (built, live-verified — registration & scheduling)
+codex-memory wiki-watch add <handle> [--cadence hot|warm|cold]
+codex-memory wiki-watch list|run-due [--json]
+codex-memory wiki-watch pause|resume|remove <handle>
 
 # Compile + lint (pre-existing)
 codex-memory wiki-compile      # source/entity/claim pages + agent digests
