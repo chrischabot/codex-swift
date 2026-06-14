@@ -202,7 +202,7 @@ let package = Package(
         // holds the header-only prober + the Seatbelt-spawning daemon API; the
         // `codex-mediadecode` executable below is the short-lived child.
         .target(name: "MediaDecode",
-                dependencies: ["Sandbox"], swiftSettings: strict),
+                dependencies: ["Sandbox", "InfraPrimitives"], swiftSettings: strict),
         // ADDONS.md #7 — push/outbound primitive: ntfy/webhook/native sinks over
         // the #4 durable core + #1 outbound seam, behind the #5 egress chokepoint.
         .target(name: "Push",

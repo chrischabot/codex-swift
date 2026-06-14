@@ -1,9 +1,7 @@
 import Foundation
+import InfraPrimitives
 #if canImport(PDFKit)
 import PDFKit
-#endif
-#if canImport(CryptoKit)
-import CryptoKit
 #endif
 
 /// PDF → Markdown text extraction. Runs IN the sandboxed `codex-mediadecode`
@@ -74,10 +72,8 @@ public enum MediaExtractor {
     }
 
     static func sha256Hex(_ d: Data) -> String {
-        #if canImport(CryptoKit)
-        return SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
-        #else
-        return ""   // extract is PDFKit/Darwin-only; non-Darwin never reaches a success result
-        #endif
+        // Pure-Swift sha256 (cross-platform): the result contract requires a
+        // stable provenance/dedup hash even on the non-PDFKit image path.
+        Hashing.sha256(Array(d)).map { String(format: "%02x", $0) }.joined()
     }
 }
