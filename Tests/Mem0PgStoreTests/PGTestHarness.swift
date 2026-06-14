@@ -63,6 +63,25 @@ enum PGTestHarness {
         return (s, p)
     }
 
+    /// Spin up a throwaway cluster (postmaster only — no Mem0 store), open a raw
+    /// superuser PostgresNIO connection, run `body`, then GUARANTEE teardown.
+    /// Use this for full-SQL / capability tests.
+    static func withRawConnection(_ body: (PGRawConnection, PGPaths) async throws -> Void) async throws {
+        try XCTSkipUnless(enabled, "set CODEX_MEM0_PG_TEST=1 to run")
+        let paths = try makePaths()
+        let lifecycle = PostgresLifecycle(paths: paths)
+        let root = (paths.dataDir as NSString).deletingLastPathComponent
+        try await lifecycle.ensureStarted()
+        let raw = try await PGRawConnection.open(paths)
+        let teardown: () async -> Void = {
+            await raw.close()
+            try? await lifecycle.stop()
+            try? FileManager.default.removeItem(atPath: root)
+        }
+        do { try await body(raw, paths) } catch { await teardown(); throw error }
+        await teardown()
+    }
+
     // MARK: - raw psql access (for security/abuse tests)
 
     static func psqlPath(_ paths: PGPaths) -> String? {

@@ -587,7 +587,7 @@ package.targets.append(contentsOf: [
     // Integration tests: spawn a real local postmaster, so they are tag-gated
     // (env CODEX_MEM0_PG_TEST=1) and skipped by default like the LiveTests suite.
     .testTarget(name: "Mem0PgStoreTests",
-            dependencies: ["Mem0PgStore", "EmbeddedPG", "Mem0Core", "Mem0Store"],
+            dependencies: ["Mem0PgStore", "EmbeddedPG", "Mem0Core", "Mem0Store", postgresNIO],
             swiftSettings: strict),
 ])
 // codex-mem0 selects the Postgres backend at runtime → needs the targets on macOS.
