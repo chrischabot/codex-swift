@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Search, Sparkles, FileText, Gauge } from "lucide-react";
+import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { useRuntime } from "@/runtime/RuntimeProvider";
-import type { WikiPageSummary, WikiBrief, WikiStatus } from "@/runtime/connector";
+import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource } from "@/runtime/connector";
 
 /**
  * Wiki Console (route /wiki/console) — query the knowledge base and generate a
@@ -30,6 +30,9 @@ export function WikiConsolePage() {
   const [status, setStatus] = useState<WikiStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
 
+  const [watch, setWatch] = useState<WikiWatchSource[] | null>(null);
+  const [loadingWatch, setLoadingWatch] = useState(false);
+
   async function loadStatus() {
     if (!connector.getWikiStatus) return;
     setLoadingStatus(true);
@@ -37,6 +40,16 @@ export function WikiConsolePage() {
       setStatus(await connector.getWikiStatus());
     } finally {
       setLoadingStatus(false);
+    }
+  }
+
+  async function loadWatch() {
+    if (!connector.getWikiWatch) return;
+    setLoadingWatch(true);
+    try {
+      setWatch(await connector.getWikiWatch());
+    } finally {
+      setLoadingWatch(false);
     }
   }
 
@@ -83,12 +96,16 @@ export function WikiConsolePage() {
         <Tabs
           defaultValue="search"
           className="mx-auto max-w-3xl"
-          onValueChange={(v) => { if (v === "status" && !status) void loadStatus(); }}
+          onValueChange={(v) => {
+            if (v === "status" && !status) void loadStatus();
+            if (v === "watch" && !watch) void loadWatch();
+          }}
         >
           <TabsList>
             <TabsTrigger value="search"><Search className="mr-1 size-3.5" /> Search</TabsTrigger>
             <TabsTrigger value="brief"><Sparkles className="mr-1 size-3.5" /> Brief</TabsTrigger>
             <TabsTrigger value="status"><Gauge className="mr-1 size-3.5" /> Status</TabsTrigger>
+            <TabsTrigger value="watch"><Radio className="mr-1 size-3.5" /> Watch</TabsTrigger>
           </TabsList>
 
           {/* ── Search ── */}
@@ -228,6 +245,38 @@ export function WikiConsolePage() {
                   </ul>
                 )}
               </>
+            )}
+          </TabsContent>
+
+          {/* ── Watch ── */}
+          <TabsContent value="watch" className="mt-3">
+            <div className="mb-3 flex items-center gap-2">
+              <Button variant="outline" size="xs" onClick={() => void loadWatch()} disabled={loadingWatch}>
+                {loadingWatch ? "Refreshing…" : "Refresh"}
+              </Button>
+              <span className="text-[12px] text-[color:var(--color-text-quaternary)]">
+                register sources via <code>codex-memory wiki-watch add</code>
+              </span>
+            </div>
+            {watch && (
+              watch.length === 0 ? (
+                <p className="text-[12px] text-[color:var(--color-text-quaternary)]">No watched sources.</p>
+              ) : (
+                <ul className="space-y-1">
+                  {watch.map((w) => (
+                    <li key={w.id} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                      <Badge variant={w.status === "error" ? "danger" : w.status === "active" ? "success" : "outline"}>
+                        {w.status}
+                      </Badge>
+                      <Badge variant="outline">{w.cadence}</Badge>
+                      <span className="truncate text-[12px] text-foreground">{w.id}</span>
+                      <span className="ml-auto shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">
+                        {w.due ? "due now" : "scheduled"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )
             )}
           </TabsContent>
         </Tabs>

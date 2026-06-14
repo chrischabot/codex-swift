@@ -2146,7 +2146,7 @@ public actor RequestRouter {
         // to this grouped case, and add an arm in dispatchWiki(_:_:).
         case .wikiList, .wikiPageGet, .wikiSearch, .wikiGraph, .wikiBacklinks,
              .wikiEntityBacklinks, .wikiTags, .wikiIndex, .wikiPageUpsert,
-             .wikiPageDelete, .wikiPageRename, .wikiBrief, .wikiQuery, .wikiStatus:
+             .wikiPageDelete, .wikiPageRename, .wikiBrief, .wikiQuery, .wikiStatus, .wikiWatchList:
             await dispatchWiki(parsed, conn)
 
         // MARK: turns

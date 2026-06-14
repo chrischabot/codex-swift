@@ -241,6 +241,14 @@ export interface WikiStatus {
   flaggedStale: number;
   recentJobs: WikiIngestJob[];
 }
+export interface WikiWatchSource {
+  id: string;        // the handle/URL
+  cadence: string;   // hot | warm | cold
+  status: string;    // active | paused | error | disabled
+  nextDueAt?: number; // epoch ms
+  errorCount: number;
+  due: boolean;
+}
 
 export interface Connector {
   /** Lifecycle. Mock implementations may be no-ops. */
@@ -358,4 +366,6 @@ export interface Connector {
   getWikiBrief?(topic: string, opts?: { k?: number }): Promise<WikiBrief | null>;
   /** Dashboard: doc/page counts, flagged-stale count, recent ingest-job log. */
   getWikiStatus?(): Promise<WikiStatus | null>;
+  /** Watched sources + their cadence / due status (the Watch tab). */
+  getWikiWatch?(): Promise<WikiWatchSource[]>;
 }

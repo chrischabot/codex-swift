@@ -44,6 +44,8 @@ extension RequestRouter {
             await replyWiki(conn, id) { try await $0.tags() }
         case .wikiStatus(let id):
             await replyWiki(conn, id) { try await $0.status() }
+        case .wikiWatchList(let id):
+            await replyWiki(conn, id) { try await $0.watchList() }
         case .wikiIndex(let id):
             await replyWiki(conn, id) { try await $0.index() }
         case .wikiPageUpsert(let id, let p):

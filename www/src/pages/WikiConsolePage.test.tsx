@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { RuntimeProvider } from "@/runtime/RuntimeProvider";
 import { makeMockConnector } from "@/runtime/connector-mock";
-import type { Connector, WikiPageSummary, WikiBrief, WikiStatus } from "@/runtime/connector";
+import type { Connector, WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource } from "@/runtime/connector";
 import { WikiConsolePage } from "./WikiConsolePage";
 
 afterEach(cleanup);
@@ -80,5 +80,21 @@ describe("WikiConsolePage", () => {
     expect(screen.getByText("Raw documents")).toBeTruthy();
     expect(screen.getByText("https://github.com/openai")).toBeTruthy();      // recent job
     expect(getWikiStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists watched sources when the Watch tab opens", async () => {
+    const sources: WikiWatchSource[] = [
+      { id: "https://github.com/openai", cadence: "hot", status: "active", errorCount: 0, due: true },
+      { id: "https://blog/feed", cadence: "warm", status: "paused", errorCount: 0, due: false },
+    ];
+    const getWikiWatch = vi.fn(async () => sources);
+    const connector = { ...makeMockConnector(), getWikiWatch } as Connector;
+    renderWith(connector);
+
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /watch/i }), { button: 0 });
+    await waitFor(() => expect(screen.getByText("https://github.com/openai")).toBeTruthy());
+    expect(screen.getByText("https://blog/feed")).toBeTruthy();
+    expect(screen.getByText("due now")).toBeTruthy();
+    expect(getWikiWatch).toHaveBeenCalledTimes(1);
   });
 });

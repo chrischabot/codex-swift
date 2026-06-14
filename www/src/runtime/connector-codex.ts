@@ -1061,6 +1061,19 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         };
       } catch { return null; }
     },
+    getWikiWatch: async () => {
+      try {
+        const r = (await rpc("wiki/watch/list", {})) as { watched?: Record<string, unknown>[] };
+        return (r.watched ?? []).map((w) => ({
+          id: idStr(w.id),
+          cadence: pick(w, "cadence") || "warm",
+          status: pick(w, "status") || "active",
+          nextDueAt: numOrU(w.nextDueAt),
+          errorCount: numOrU(w.errorCount) ?? 0,
+          due: w.due === true,
+        }));
+      } catch { return []; }
+    },
   };
 }
 

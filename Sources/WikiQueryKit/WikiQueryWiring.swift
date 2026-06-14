@@ -73,7 +73,8 @@ public enum WikiQueryWiring {
             rename:    { try await WikiJSON.rename(store, id: $0, title: $1) },
             brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) },
             query:     { try await WikiJSON.query(store, retriever: retriever, query: $0, depth: $1, k: $2) },
-            status:    { try await WikiJSON.status(store) })
+            status:    { try await WikiJSON.status(store) },
+            watchList:  { try await WikiJSON.watchList(store) })
     }
 }
 
@@ -123,6 +124,23 @@ public enum WikiJSON {
             "flaggedStale": .int(Int64(scores.filter(\.needsTier2).count)),
             "recentJobs": .array(jobItems),
         ])
+    }
+
+    /// Watched sources + cadence + due status (the Watch tab / §14.6 list view).
+    public static func watchList(_ store: MemoryStore) async throws -> JSONValue {
+        let now = Int64(Date().timeIntervalSince1970)
+        let sources = try await store.watchSources()
+        let items = sources.map { w -> JSONValue in
+            .object([
+                "id": .string(w.id),
+                "cadence": .string(w.volatility.rawValue),
+                "status": .string(w.status.rawValue),
+                "nextDueAt": ms(w.nextDueAt),
+                "errorCount": .int(Int64(w.errorCount)),
+                "due": .bool(WatchScheduler.isDue(w, now: now)),
+            ])
+        }
+        return .object(["watched": .array(items), "count": .int(Int64(sources.count))])
     }
 
     // MARK: link + property index (M26)
