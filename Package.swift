@@ -539,3 +539,39 @@ let package = Package(
     ],
     swiftLanguageModes: [.v6]
 )
+
+// ── Embedded Postgres + pgvector lane (pglite.md, Architecture B) ──────────────
+// macOS-only and opt-in: a supervised native PostgreSQL child process bound to a
+// UNIX socket, plus a pgvector-backed Mem0 store. Gated at the MANIFEST level with
+// `#if os(macOS)` (evaluated on the build host) so Linux/CI builds never see the
+// postgres-nio dependency or these targets — the portable default stays
+// sqlite-vec. `Package` is a class, so we splice into its arrays post-construction
+// to keep the big literal above untouched.
+#if os(macOS)
+package.dependencies.append(
+    .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.21.0"))
+let postgresNIO: Target.Dependency = .product(name: "PostgresNIO", package: "postgres-nio")
+package.products.append(.library(name: "EmbeddedPG", targets: ["EmbeddedPG"]))
+package.products.append(.library(name: "Mem0PgStore", targets: ["Mem0PgStore"]))
+package.targets.append(contentsOf: [
+    // Reusable, dependency-light lifecycle for a local native postmaster: initdb,
+    // socket-only spawn, readiness, graceful stop, and APFS-clone snapshots.
+    // Anything in the project can depend on this to get an embedded Postgres.
+    .target(name: "EmbeddedPG", swiftSettings: strict),
+    // The pgvector-backed Mem0 store — conforms to BOTH Mem0VectorStore and
+    // Mem0HistoryStore, drop-in beside Mem0SQLiteStore.
+    .target(name: "Mem0PgStore",
+            dependencies: ["Mem0Core", "EmbeddedPG", postgresNIO],
+            swiftSettings: strict),
+    // Integration tests: spawn a real local postmaster, so they are tag-gated
+    // (env CODEX_MEM0_PG_TEST=1) and skipped by default like the LiveTests suite.
+    .testTarget(name: "Mem0PgStoreTests",
+            dependencies: ["Mem0PgStore", "EmbeddedPG", "Mem0Core", "Mem0Store"],
+            swiftSettings: strict),
+])
+// codex-mem0 selects the Postgres backend at runtime → needs the targets on macOS.
+if let memExe = package.targets.first(where: { $0.name == "codex-mem0" }) {
+    memExe.dependencies.append("Mem0PgStore")
+    memExe.dependencies.append("EmbeddedPG")
+}
+#endif
