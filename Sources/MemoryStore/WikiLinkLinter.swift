@@ -50,9 +50,13 @@ public enum WikiLinkLinter {
         return out
     }
 
-    /// Link targets that appear under a "See Also" heading (to end-of-section).
+    /// Link targets that appear under a "See Also" markdown HEADING (to end-of-
+    /// section). Only a real heading (`#`…`######` then "See Also") starts the
+    /// section — prose like "See also [[b]]" is NOT a see-also edge (so write-time
+    /// enforcement doesn't reject valid pages on incidental phrasing).
     public static func seeAlsoLinks(in body: String) -> [String] {
-        guard let r = body.range(of: "See Also", options: .caseInsensitive) else { return [] }
+        guard let r = body.range(of: #"(?im)^#{1,6}[ \t]+see also\b.*$"#, options: .regularExpression)
+        else { return [] }
         var tail = String(body[r.upperBound...])
         // Stop at the next markdown heading after the See Also block.
         if let nextHeading = tail.range(of: "\n#") { tail = String(tail[tail.startIndex..<nextHeading.lowerBound]) }

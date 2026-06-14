@@ -50,6 +50,21 @@ final class WikiLinkLinterTests: XCTestCase {
         XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: body), ["b"])
     }
 
+    func testProseSeeAlsoIsNotASection() {
+        // "See also [[b]]" in a sentence (no heading) must NOT count as a see-also edge.
+        let body = "Background. See also [[b]] for context. More text."
+        XCTAssertTrue(WikiLinkLinter.seeAlsoLinks(in: body).isEmpty)
+        // and a real heading still works
+        let withHeading = "x\n### See Also\n- [[b]]\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: withHeading), ["b"])
+        // a page with only prose "see also" should not be flagged non-reciprocal
+        let pages = [
+            WikiLintPage(slug: "a", body: "See also [[b]] inline.", category: "concept"),
+            WikiLintPage(slug: "b", body: "no backlink", category: "concept"),
+        ]
+        XCTAssertTrue(WikiLinkLinter.lint(pages).filter { $0.kind == .nonReciprocalSeeAlso }.isEmpty)
+    }
+
     func testUngroundedSynthesisFlagged() {
         let pages = [
             WikiLintPage(slug: "plan1", body: "a plan that cites nothing", category: "plan", claimLinkCount: 0),
