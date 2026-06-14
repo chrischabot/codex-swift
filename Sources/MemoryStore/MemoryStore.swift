@@ -222,6 +222,10 @@ public actor MemoryStore {
                                       config: MemoryStoreConfig,
                                       vec: Bool) throws {
         try execRaw(db, MemorySchema.coreSQL)
+        // Additive Memory-Wiki knowledge model (claims/synthesis/source-meta/
+        // sessions). All `CREATE TABLE IF NOT EXISTS` — an existing DB gains the
+        // empty tables with no reindex and no embedder/provider-id change.
+        try execRaw(db, MemorySchema.wikiSQL)
         // Forward-compat ALTERs for fields added after first ship.
         try? execRaw(db, "ALTER TABLE source_cursor ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;")
         if vec {
@@ -283,19 +287,21 @@ public actor MemoryStore {
 
     // MARK: - low-level query helpers (actor-isolated)
 
-    private enum Bind: Sendable {
+    // Internal (not private) so same-actor extension files (MemoryStore+Wiki.swift)
+    // can reuse the low-level query helpers without re-implementing them.
+    enum Bind: Sendable {
         case text(String), int(Int64), real(Double), blob(Data), null
     }
 
     private func errMsg() -> String { Self.errMsg(db) }
 
-    private func execRaw(_ sql: String) throws { try Self.execRaw(db, sql) }
+    func execRaw(_ sql: String) throws { try Self.execRaw(db, sql) }
 
     /// Prepares, binds, steps, finalises. Each query returns the raw rows so
     /// the caller can shape the result; large result sets stream out via a
     /// closure variant `runStream` below.
     @discardableResult
-    private func run(_ sql: String, _ binds: [Bind] = []) throws -> [[String: Any]] {
+    func run(_ sql: String, _ binds: [Bind] = []) throws -> [[String: Any]] {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
             throw MemoryStoreError.prepare(errMsg())
@@ -312,9 +318,9 @@ public actor MemoryStore {
         return rows
     }
 
-    private func runStream(_ sql: String,
-                           _ binds: [Bind] = [],
-                           _ each: (OpaquePointer) -> Void) throws {
+    func runStream(_ sql: String,
+                   _ binds: [Bind] = [],
+                   _ each: (OpaquePointer) -> Void) throws {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
             throw MemoryStoreError.prepare(errMsg())

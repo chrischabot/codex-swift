@@ -104,6 +104,113 @@ enum MemorySchema {
     CREATE INDEX IF NOT EXISTS spend_ts ON spend(ts, bucket);
     """
 
+    /// Additive Memory-Wiki knowledge model (the §4 canonical schema): durable
+    /// claims + evidence + contradictions, synthesis/article/thesis/output pages,
+    /// per-document provenance/trust overlay, and replayable research-session
+    /// provenance. All `CREATE TABLE IF NOT EXISTS` so existing stores migrate
+    /// transparently — no reindex, no embedder change, no provider-id re-stamp.
+    /// Claim retrieval rides the existing chunk vectors via `claim_evidence.chunk_id`
+    /// (no second embedding space → the single-embedder invariant is untouched).
+    static let wikiSQL: String = """
+    -- Per-document provenance/trust overlay (1:1 with the immutable document).
+    CREATE TABLE IF NOT EXISTS source_meta (
+      document_id   INTEGER PRIMARY KEY REFERENCES document(id) ON DELETE CASCADE,
+      source_kind   TEXT NOT NULL,
+      trust_tier    TEXT NOT NULL DEFAULT 'medium',   -- high|medium|low|reject
+      credibility   INTEGER NOT NULL DEFAULT 0,        -- raw -N..+6 rubric score
+      confidence    TEXT,                              -- high|medium|low
+      volatility    TEXT NOT NULL DEFAULT 'warm',      -- hot|warm|cold
+      verified_at   INTEGER, ingested_at INTEGER NOT NULL,
+      author TEXT, published_at INTEGER, license TEXT, canonical_url TEXT, bias_flags TEXT,
+      collection TEXT, adapter TEXT, upstream_id TEXT, revision TEXT, blob_sha TEXT,
+      compiled_from TEXT NOT NULL DEFAULT 'sources',   -- sources|conversation|mixed
+      frontmatter   TEXT
+    );
+
+    -- Durable atomic claim (replaces edge-synthesized claims).
+    CREATE TABLE IF NOT EXISTS claim (
+      id            INTEGER PRIMARY KEY,
+      text          TEXT NOT NULL,
+      canonical_sha BLOB NOT NULL,                     -- sha256 of NORMALIZED text (idempotent recompile)
+      status        TEXT NOT NULL DEFAULT 'draft',     -- draft|active|stale|contradicted|archived
+      confidence    REAL NOT NULL DEFAULT 0.5,
+      volatility    TEXT NOT NULL DEFAULT 'warm',
+      category      TEXT, scope TEXT,
+      first_seen    INTEGER NOT NULL, last_reviewed INTEGER, updated_at INTEGER NOT NULL,
+      compiled_from TEXT NOT NULL DEFAULT 'sources',
+      edge_id       INTEGER REFERENCES edge(id) ON DELETE SET NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS claim_sha    ON claim(canonical_sha);
+    CREATE INDEX        IF NOT EXISTS claim_status ON claim(status, volatility, last_reviewed);
+
+    -- Evidence span: claim ⇄ chunk/document provenance (rides existing vectors).
+    -- A surrogate id + an expression-unique index keeps attach idempotent even
+    -- when chunk_id is NULL (a nullable column in a composite PK would let NULLs
+    -- duplicate, defeating dedupe).
+    CREATE TABLE IF NOT EXISTS claim_evidence (
+      id          INTEGER PRIMARY KEY,
+      claim_id    INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      document_id INTEGER NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+      chunk_id    INTEGER REFERENCES chunk(id) ON DELETE SET NULL,
+      stance      TEXT NOT NULL DEFAULT 'supports',   -- supports|opposes|nuances
+      relevance   TEXT,                                -- direct|indirect|tangential
+      strength    INTEGER NOT NULL DEFAULT 2,          -- meta>rct>cohort>case>opinion>anecdotal
+      span_start  INTEGER, span_end INTEGER
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS claim_ev_uniq  ON claim_evidence(claim_id, document_id, IFNULL(chunk_id, -1));
+    CREATE INDEX        IF NOT EXISTS claim_ev_chunk ON claim_evidence(chunk_id);
+    CREATE INDEX        IF NOT EXISTS claim_ev_doc   ON claim_evidence(document_id);
+
+    CREATE TABLE IF NOT EXISTS claim_contradiction (
+      claim_id    INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      contradicts INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      detected_at INTEGER NOT NULL,
+      PRIMARY KEY (claim_id, contradicts)
+    );
+
+    -- Synthesis / article / thesis / output page (durable; rendered to the vault).
+    CREATE TABLE IF NOT EXISTS synthesis (
+      id            INTEGER PRIMARY KEY,
+      slug          TEXT NOT NULL UNIQUE,
+      category      TEXT NOT NULL,                     -- concept|topic|reference|thesis|synthesis|plan|report|playbook|project|digest
+      title         TEXT NOT NULL,
+      body_path     TEXT NOT NULL,
+      confidence    TEXT, volatility TEXT NOT NULL DEFAULT 'warm',
+      verified_at   INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      human_block_sha BLOB,
+      thesis_status TEXT, verdict TEXT, core_claim TEXT, key_variables TEXT, falsification TEXT,
+      evidence_for  INTEGER NOT NULL DEFAULT 0, evidence_against INTEGER NOT NULL DEFAULT 0,
+      format        TEXT, generated_at INTEGER, output_type TEXT
+    );
+    CREATE INDEX IF NOT EXISTS synthesis_cat ON synthesis(category, volatility);
+
+    -- synthesis ⇄ claim (normalized link; the queryable source of truth).
+    CREATE TABLE IF NOT EXISTS synthesis_claim (
+      synthesis_id INTEGER NOT NULL REFERENCES synthesis(id) ON DELETE CASCADE,
+      claim_id     INTEGER NOT NULL REFERENCES claim(id) ON DELETE CASCADE,
+      PRIMARY KEY (synthesis_id, claim_id)
+    );
+
+    -- Durable replayable research-session provenance (mirror of the wiki-root
+    -- .session-events.jsonl / .session-checkpoint.json files).
+    CREATE TABLE IF NOT EXISTS research_session (
+      session_id TEXT PRIMARY KEY, command TEXT, mode TEXT, topic TEXT,
+      start_time INTEGER, min_time_budget INTEGER, current_round INTEGER,
+      cumulative_sources INTEGER, cumulative_articles INTEGER,
+      status TEXT, last_progress_score REAL, paths_json TEXT
+    );
+    CREATE TABLE IF NOT EXISTS session_event (
+      id INTEGER PRIMARY KEY, session_id TEXT, ts INTEGER, command TEXT,
+      phase TEXT, event TEXT, round INTEGER, sources_ingested INTEGER,
+      articles_compiled INTEGER, progress_score REAL, artifacts_json TEXT, notes TEXT
+    );
+    CREATE INDEX IF NOT EXISTS session_ev ON session_event(session_id, ts);
+    CREATE TABLE IF NOT EXISTS session_checkpoint (
+      session_id TEXT PRIMARY KEY,
+      updated_at INTEGER NOT NULL, status TEXT NOT NULL, summary TEXT NOT NULL
+    );
+    """
+
     static func vec0VirtualTableSQL(dim: Int) -> String {
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(
