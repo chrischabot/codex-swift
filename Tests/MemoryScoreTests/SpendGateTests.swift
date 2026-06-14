@@ -55,6 +55,33 @@ final class SpendGateTests: XCTestCase {
         XCTAssertEqual(bSpent, 0, accuracy: 1e-9)   // bucket b untouched
     }
 
+    func testConcurrentReservationBoundsCeiling() async throws {
+        let (store, path) = try tmpStore(); defer { try? FileManager.default.removeItem(atPath: path) }
+        // reservationUSD == ceiling → a single in-flight call reserves the whole budget,
+        // so a concurrent second call must be rate-limited even though spend=0.
+        let gate = SpendGate(store: store, config: .init(monthlyCeilingUSD: 10, bucket: "t",
+                                                         inputUSDPerMTok: 0, outputUSDPerMTok: 0,
+                                                         reservationUSD: 10))
+        let aInside = Latch()
+        let hold = Latch()
+        let aTask = Task {
+            try await gate.run(prompt: "a", model: "m") { _, _, _ in
+                await aInside.release()   // A is now inside the call → has reserved
+                await hold.wait()         // stay in-flight until released
+                return ("a", 0, 0)
+            }
+        }
+        await aInside.wait()              // ensure A reserved before B runs
+        let b = try await gate.run(prompt: "b", model: "m") { _, _, _ in ("b", 0, 0) }
+        XCTAssertTrue(b.isRateLimited, "B must be rate-limited by A's in-flight reservation")
+        await hold.release()
+        let aOut = try await aTask.value
+        XCTAssertNotNil(aOut.receipt)     // A completed and released its reservation
+        // After A finishes, a fresh call is admitted again (reservation released).
+        let c = try await gate.run(prompt: "c", model: "m") { _, _, _ in ("c", 0, 0) }
+        XCTAssertNotNil(c.receipt)
+    }
+
     func testPropagatesCallError() async throws {
         let (store, path) = try tmpStore(); defer { try? FileManager.default.removeItem(atPath: path) }
         let gate = SpendGate(store: store, config: .init(monthlyCeilingUSD: 100, bucket: "t"))
@@ -67,6 +94,14 @@ final class SpendGateTests: XCTestCase {
         let spent = try await gate.monthlySpentUSD()
         XCTAssertEqual(spent, 0, accuracy: 1e-9)
     }
+}
+
+/// One-shot latch for deterministic concurrency tests.
+private actor Latch {
+    private var released = false
+    private var conts: [CheckedContinuation<Void, Never>] = []
+    func release() { released = true; for c in conts { c.resume() }; conts.removeAll() }
+    func wait() async { if released { return }; await withCheckedContinuation { conts.append($0) } }
 }
 
 /// Sendable mutable flag for asserting a @Sendable closure did/didn't run.

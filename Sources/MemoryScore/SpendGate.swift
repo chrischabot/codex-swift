@@ -14,10 +14,16 @@ public actor SpendGate {
         public var bucket: String
         public var inputUSDPerMTok: Double
         public var outputUSDPerMTok: Double
+        /// Pessimistic per-call cost reserved while a call is in flight, so a
+        /// burst of concurrent calls can't all pass the ceiling check before any
+        /// records spend (actor reentrancy). Bounds concurrent overshoot.
+        public var reservationUSD: Double
         public init(monthlyCeilingUSD: Double = 40, bucket: String = "wiki-frontier",
-                    inputUSDPerMTok: Double = 5.0, outputUSDPerMTok: Double = 30.0) {
+                    inputUSDPerMTok: Double = 5.0, outputUSDPerMTok: Double = 30.0,
+                    reservationUSD: Double = 0.50) {
             self.monthlyCeilingUSD = monthlyCeilingUSD; self.bucket = bucket
             self.inputUSDPerMTok = inputUSDPerMTok; self.outputUSDPerMTok = outputUSDPerMTok
+            self.reservationUSD = reservationUSD
         }
     }
 
@@ -44,6 +50,8 @@ public actor SpendGate {
 
     private let store: MemoryStore
     private let config: Config
+    /// Cost reserved by in-flight calls (released when each completes).
+    private var reservedUSD: Double = 0
 
     public init(store: MemoryStore, config: Config = Config()) {
         self.store = store; self.config = config
@@ -58,9 +66,18 @@ public actor SpendGate {
                     _ call: TokenCall) async throws -> Outcome {
         let monthStart = BrainGate.monthStart(now: Int64(Date().timeIntervalSince1970))
         let spent = try await store.monthlySpend(bucket: config.bucket, monthStart: monthStart)
-        if spent >= config.monthlyCeilingUSD {
-            return .rateLimited(reason: "monthly ceiling reached", spentUSD: spent, ceilingUSD: config.monthlyCeilingUSD)
+        // Critical section: NO `await` between resuming here and reserving, so the
+        // check+reserve is atomic w.r.t. other tasks on this actor. `reservedUSD`
+        // reflects in-flight calls, so the (N+1)th concurrent call sees the
+        // accumulated reservation and is admission-controlled even though no spend
+        // has been recorded yet.
+        let projected = spent + reservedUSD
+        if projected >= config.monthlyCeilingUSD {
+            return .rateLimited(reason: "monthly ceiling reached", spentUSD: projected,
+                                ceilingUSD: config.monthlyCeilingUSD)
         }
+        reservedUSD += config.reservationUSD
+        defer { reservedUSD -= config.reservationUSD }   // release on return OR throw (actor-isolated)
         let r = try await call(prompt, model, deadline)
         let cost = Double(r.tokensIn) / 1_000_000 * config.inputUSDPerMTok
                  + Double(r.tokensOut) / 1_000_000 * config.outputUSDPerMTok
