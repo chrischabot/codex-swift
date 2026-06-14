@@ -39,6 +39,19 @@ final class WikiIngestTests: XCTestCase {
         }
     }
 
+    /// Routes a response by a substring match on the request's GET line.
+    private actor RoutingTransport: PinnedTransport {
+        let routes: [String: Data]
+        init(routes: [String: Data]) { self.routes = routes }
+        func roundTrip(_ req: TransportRequest) async -> Result<TransportResponse, FetchError> {
+            let line = String(decoding: req.requestBytes, as: UTF8.self)
+            for (k, v) in routes where line.contains(k) {
+                return .success(TransportResponse(peerIP: "93.184.216.34", bytes: v, truncated: false))
+            }
+            return .failure(.statusError(404))
+        }
+    }
+
     // MARK: detectKind (pure)
 
     func testDetectKindExhaustive() {
@@ -168,6 +181,62 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(r2.chunksWritten, 0)
         let count = try await store.documentCount()
         XCTAssertEqual(count, 1)   // not duplicated
+    }
+
+    // MARK: Feed parser (pure)
+
+    func testFeedParserRSS() {
+        let rss = """
+        <rss version="2.0"><channel><title>My Blog</title>
+        <item><title>Post One</title><link>https://b.com/1</link><guid>g1</guid><pubDate>Mon, 01 Jan 2026</pubDate></item>
+        <item><title><![CDATA[Two & Three]]></title><link>https://b.com/2</link><guid>g2</guid></item>
+        </channel></rss>
+        """
+        let p = FeedParser.parse(rss)
+        XCTAssertEqual(p.title, "My Blog")              // feed title, not an item title
+        XCTAssertEqual(p.entries.count, 2)
+        XCTAssertEqual(p.entries[0].title, "Post One")
+        XCTAssertEqual(p.entries[0].link, "https://b.com/1")
+        XCTAssertEqual(p.entries[0].id, "g1")
+        XCTAssertEqual(p.entries[1].title, "Two & Three")   // CDATA + entity
+    }
+
+    func testFeedParserAtom() {
+        let atom = """
+        <feed xmlns="http://www.w3.org/2005/Atom"><title>Lil'Log</title>
+        <entry><title>Attention</title><id>tag:x,1</id>
+        <link rel="self" href="https://x/self"/><link rel="alternate" href="https://x/post1"/>
+        <published>2026-01-01T00:00:00Z</published></entry>
+        </feed>
+        """
+        let p = FeedParser.parse(atom)
+        XCTAssertEqual(p.title, "Lil'Log")
+        XCTAssertEqual(p.entries.count, 1)
+        XCTAssertEqual(p.entries[0].title, "Attention")
+        XCTAssertEqual(p.entries[0].id, "tag:x,1")
+        XCTAssertEqual(p.entries[0].link, "https://x/post1")   // prefers rel=alternate over self
+    }
+
+    func testFeedAdapterFetchesEntryArticles() async throws {
+        func http(_ ct: String, _ body: String) -> Data {
+            Data("HTTP/1.1 200 OK\r\ncontent-type: \(ct)\r\ncontent-length: \(body.utf8.count)\r\n\r\n\(body)".utf8)
+        }
+        let rss = "<rss><channel><title>F</title>" +
+            "<item><title>A</title><link>https://example.com/a</link><guid>ga</guid></item>" +
+            "<item><title>B</title><link>https://example.com/b</link><guid>gb</guid></item></channel></rss>"
+        let routes = [
+            "GET /feed":  http("application/rss+xml", rss),
+            "GET /a ":    http("text/html", "<html><body><p>article A body</p></body></html>"),
+            "GET /b ":    http("text/html", "<html><body><p>article B body</p></body></html>"),
+        ]
+        let mock = RoutingTransport(routes: routes)
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(mock))
+        let cands = try await collect(reg.resolve("https://example.com/feed").enumerate(
+            IngestRequest(input: "https://example.com/feed", fetchedAt: 5)))
+        XCTAssertEqual(cands.count, 2)
+        XCTAssertEqual(cands.map(\.title).compactMap { $0 }.sorted(), ["A", "B"])
+        XCTAssertTrue(cands.allSatisfy { $0.provenance.adapter == "feed" })
+        XCTAssertTrue(cands.contains { $0.bodyMarkdown.contains("article A body") })
     }
 
     // MARK: PDF helper
