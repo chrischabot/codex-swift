@@ -7,8 +7,10 @@ public struct FeedEntry: Sendable, Equatable {
     public var title: String?
     public var link: String?
     public var published: String?
-    public init(id: String, title: String? = nil, link: String? = nil, published: String? = nil) {
-        self.id = id; self.title = title; self.link = link; self.published = published
+    public var summary: String?  // Atom <summary> / RSS <description> (e.g. an arXiv abstract)
+    public init(id: String, title: String? = nil, link: String? = nil,
+                published: String? = nil, summary: String? = nil) {
+        self.id = id; self.title = title; self.link = link; self.published = published; self.summary = summary
     }
 }
 
@@ -31,8 +33,11 @@ public enum FeedParser {
             let published = isAtom
                 ? (firstTagText(in: block, tag: "published") ?? firstTagText(in: block, tag: "updated"))
                 : firstTagText(in: block, tag: "pubdate")
+            let summary = isAtom
+                ? (firstTagText(in: block, tag: "summary") ?? firstTagText(in: block, tag: "content"))
+                : (firstTagText(in: block, tag: "description") ?? firstTagText(in: block, tag: "content:encoded"))
             if id.isEmpty && link == nil { continue }
-            entries.append(FeedEntry(id: id, title: title, link: link, published: published))
+            entries.append(FeedEntry(id: id, title: title, link: link, published: published, summary: summary))
         }
         return Parsed(title: feedTitle, entries: entries)
     }

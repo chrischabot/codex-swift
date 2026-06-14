@@ -266,6 +266,47 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertTrue(cands.contains { $0.bodyMarkdown.contains("article A body") })
     }
 
+    // MARK: arXiv
+
+    func testArxivAbsIDExtraction() {
+        XCTAssertEqual(ArxivAdapter.absID(from: "2402.17764"), "2402.17764")
+        XCTAssertEqual(ArxivAdapter.absID(from: "2402.17764v2"), "2402.17764v2")
+        XCTAssertEqual(ArxivAdapter.absID(from: "https://arxiv.org/abs/2402.17764"), "2402.17764")
+        XCTAssertEqual(ArxivAdapter.absID(from: "https://arxiv.org/pdf/2402.17764v1"), "2402.17764v1")
+        XCTAssertNil(ArxivAdapter.absID(from: "cat:cs.AI"))           // a query, not an id
+        XCTAssertNil(ArxivAdapter.absID(from: "au:Karpathy"))
+    }
+
+    func testArxivAPIURL() {
+        let q = ArxivAdapter.apiURL(for: "cat:cs.AI", limit: 10)!.absoluteString
+        XCTAssertTrue(q.contains("search_query=cat:cs.AI") || q.contains("search_query=cat%3Acs.AI"))
+        XCTAssertTrue(q.contains("sortBy=submittedDate"))
+        let byID = ArxivAdapter.apiURL(for: "https://arxiv.org/abs/2402.17764", limit: 10)!.absoluteString
+        XCTAssertTrue(byID.contains("id_list=2402.17764"))
+    }
+
+    func testArxivAdapterParsesAbstracts() async throws {
+        let atom = """
+        <feed xmlns="http://www.w3.org/2005/Atom"><title>ArXiv Query</title>
+        <entry><id>http://arxiv.org/abs/2402.17764v1</id><title>The Era of 1-bit LLMs</title>
+        <summary>We introduce BitNet b1.58, a 1-bit LLM variant.</summary>
+        <published>2024-02-27T00:00:00Z</published>
+        <link href="http://arxiv.org/abs/2402.17764v1" rel="alternate"/></entry></feed>
+        """
+        let mock = HTMLTransport(html: atom, contentType: "application/atom+xml")
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(mock))
+        // A bare query (not an arxiv.org URL) is forced to the arxiv adapter by the caller.
+        let cands = try await collect(reg.resolve("cat:cs.AI", forced: .arxiv).enumerate(
+            IngestRequest(input: "cat:cs.AI", adapter: .arxiv, fetchedAt: 3)))
+        XCTAssertEqual(cands.count, 1)
+        XCTAssertEqual(cands[0].rawType, .papers)
+        XCTAssertEqual(cands[0].sourceURI, "http://arxiv.org/abs/2402.17764v1")
+        XCTAssertEqual(cands[0].title, "The Era of 1-bit LLMs")
+        XCTAssertTrue(cands[0].bodyMarkdown.contains("BitNet b1.58"))      // abstract is the body
+        XCTAssertTrue(cands[0].bodyMarkdown.contains("# The Era of 1-bit LLMs"))
+        XCTAssertEqual(cands[0].provenance.adapter, "arxiv")
+    }
+
     // MARK: PDF helper
 
     private func writeTextPDF(_ path: String, text: String) throws {

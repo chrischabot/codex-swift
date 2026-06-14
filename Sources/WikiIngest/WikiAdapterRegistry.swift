@@ -21,6 +21,7 @@ public struct WikiAdapterRegistry: Sendable {
         case .file:               return FileAdapter(decoder: decoder)
         case .pdf:                return FileAdapter(decoder: decoder)   // PDF is a local-file sub-case
         case .feed:               return FeedAdapter(fetcher: fetcher)
+        case .arxiv:              return ArxivAdapter(fetcher: fetcher)
         case let other:           return NotImplementedAdapter(kind: other)
         }
     }
