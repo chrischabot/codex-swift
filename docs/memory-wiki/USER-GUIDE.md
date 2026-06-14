@@ -348,10 +348,14 @@ and the command palette):
 - The **Console — Status tab** ✅ — the dashboard / "view logs" surface over
   `wiki/status`: raw-doc / wiki-page / flagged-stale counts + the recent ingest-job
   ledger (status, written/skipped/failed).
-- 🧱 **Ingest / Research / Sessions / Reports / Watch tabs** — each needs its
-  `wiki/*` RPC (the `wiki/status` vertical is the template); the long-running
-  research/ingest ones additionally need async-job streaming so the UI can show live
-  progress. Today those run from the `codex-memory` CLI (§§3, 5, 7, 8).
+- The **Console — Watch tab** ✅ — the watched-source table over `wiki/watch/list`:
+  each source's status badge (active/paused/error), cadence, handle, and
+  due/scheduled state (register sources via `codex-memory wiki-watch add`).
+- 🧱 **Ingest / Research / Sessions / Reports tabs** — each needs its `wiki/*` RPC
+  (the read-only `wiki/status` + `wiki/watch/list` verticals are the template); the
+  long-running research/ingest *triggers* additionally need async-job streaming over
+  the WS gateway so the UI can show live progress. Today those run from the
+  `codex-memory` CLI (§§3, 5, 7, 8).
 
 Every capability is reachable from the `codex-memory` CLI; the Console surfaces
 search, brief, and status in the browser today.
