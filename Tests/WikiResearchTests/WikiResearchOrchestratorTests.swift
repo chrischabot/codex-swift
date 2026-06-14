@@ -44,6 +44,10 @@ private struct ThrowingSwarm: ResearchSwarm {
 }
 private enum ResearchTestError: Error { case boom }
 
+private struct ThrowingReflector: GapReflector {
+    func reflect(topic: String, rounds: [RoundRecord]) async throws -> [Gap] { throw ResearchTestError.boom }
+}
+
 /// File-scope so the @Sendable mock closures don't capture the (non-Sendable) test case.
 private func makeSources(_ n: Int, credibility: Int = 5) -> [RankedSource] {
     (0..<n).map { RankedSource(url: "https://s\($0).com/r", title: "s\($0)",
@@ -185,6 +189,25 @@ final class WikiResearchOrchestratorTests: XCTestCase {
         let angles = await rec.anglesForRound(1)
         XCTAssertEqual(angles?.count, 5)
         XCTAssertTrue(angles?.contains("Opposing") ?? false)   // steelman angle present
+    }
+
+    // MARK: retardmax skips reflection
+
+    func testRetardmaxSkipsReflection() async throws {
+        let rec = Recorder()
+        let swarm = CapturingSwarm(perRound: { _ in makeSources(10) }, recorder: rec)
+        let compiler = ScriptedCompiler { _, n in
+            CompileOutcome(articlesCreatedOrUpdated: n, crossRefsAdded: 0, existingArticles: 0, crossRefDensity: 0)
+        }
+        // A throwing reflector would FAIL the run if it were called — retardmax must not call it.
+        let orch = orchestrator(swarm: swarm, compiler: compiler, reflector: ThrowingReflector(),
+                                clock: FakeClock(start: 0, step: 1))
+        let r = await orch.run(input: "deep dive", sessionID: "RM",
+                               config: ResearchConfig(depth: .retardmax, minTimeBudget: 50, maxRounds: 3))
+        XCTAssertEqual(r.status, "completed")          // reflector never threw
+        // retardmax topic round 1 fires the broadest swarm (10 angles)
+        let angles = await rec.anglesForRound(1)
+        XCTAssertEqual(angles?.count, 10)
     }
 
     // MARK: session persistence

@@ -22,14 +22,14 @@ public struct ResearchConfig: Sendable {
 /// provenance — and calls the injected ports for the model/web/store work. Fully
 /// testable with mock ports.
 public struct WikiResearchOrchestrator: Sendable {
-    let probe: KnowledgeProbe
-    let swarm: ResearchSwarm
-    let compiler: ResearchCompiler
-    let reflector: GapReflector
+    let probe: any KnowledgeProbe
+    let swarm: any ResearchSwarm
+    let compiler: any ResearchCompiler
+    let reflector: any GapReflector
     let now: @Sendable () -> Int64
 
-    public init(probe: KnowledgeProbe, swarm: ResearchSwarm, compiler: ResearchCompiler,
-                reflector: GapReflector, now: @escaping @Sendable () -> Int64) {
+    public init(probe: any KnowledgeProbe, swarm: any ResearchSwarm, compiler: any ResearchCompiler,
+                reflector: any GapReflector, now: @escaping @Sendable () -> Int64) {
         self.probe = probe; self.swarm = swarm; self.compiler = compiler
         self.reflector = reflector; self.now = now
     }
@@ -120,14 +120,19 @@ public struct WikiResearchOrchestrator: Sendable {
                                                            summary: "round \(roundNum): score \(score)",
                                                            round: roundNum))
 
-                // Between-round reflection → scored gaps for the next round.
-                let newGaps = try await reflector.reflect(topic: input, rounds: rounds)
-                let newHighImpact = newGaps.contains { $0.isHighImpact && !prevGapKeys.contains($0.description) }
-                if ss != nil {
+                // Between-round reflection → scored gaps for the next round. Skipped
+                // entirely in retardmax (the planner declares it reflection-free, so a
+                // throwing/expensive reflector never runs).
+                let newGaps: [Gap]
+                if RoundPlanner.skipsPlanning(config.depth) {
+                    newGaps = []
+                } else {
+                    newGaps = try await reflector.reflect(topic: input, rounds: rounds)
                     try? ss?.appendEvent(SessionEvent(ts: now(), phase: "reflection",
                                                       event: "research_reflection_completed", round: roundNum,
                                                       notes: "gaps=\(newGaps.count)"))
                 }
+                let newHighImpact = newGaps.contains { $0.isHighImpact && !prevGapKeys.contains($0.description) }
 
                 // Termination assessment (decision tree + trajectory triggers).
                 let assessment = ProgressScorer.assess(
