@@ -344,6 +344,36 @@ extension MemoryStore {
         return LibrarianScorer.scan(signals, now: now, tier2Threshold: tier2Threshold)
     }
 
+    // MARK: - audit drift scan (Pass 2)
+
+    /// Audit output-drift over the compiled pages: a synthesis is drifted when a
+    /// claim it was compiled from changed after the page was generated (§5.D Pass 2).
+    /// Pure timestamps via AuditDriftDetector. Returns (synthesis id, status),
+    /// drifted/indirect first.
+    public func auditDriftScan() throws -> [(id: Int64, status: DriftStatus)] {
+        let claimRows = try run("SELECT id, updated_at FROM claim;", [])
+        let nodes = AuditDriftDetector.index(claimRows.map {
+            AuditNode(id: ($0["id"] as? Int64) ?? 0, updatedAt: ($0["updated_at"] as? Int64) ?? 0)
+        })
+        var deps: [Int64: [Int64]] = [:]
+        for r in try run("SELECT synthesis_id, claim_id FROM synthesis_claim;", []) {
+            let sid = (r["synthesis_id"] as? Int64) ?? 0
+            deps[sid, default: []].append((r["claim_id"] as? Int64) ?? 0)
+        }
+        let outputs = try run("SELECT id, generated_at, updated_at FROM synthesis;", []).map { r in
+            AuditOutput(id: (r["id"] as? Int64) ?? 0,
+                        generatedAt: (r["generated_at"] as? Int64) ?? (r["updated_at"] as? Int64) ?? 0,
+                        dependsOn: deps[(r["id"] as? Int64) ?? 0] ?? [])
+        }
+        let result = AuditDriftDetector.scan(outputs: outputs, nodes: nodes)
+        // drifted + indirectly-drifted first (the actionable set), then current.
+        return outputs.map { ($0.id, result[$0.id] ?? .current) }
+            .sorted { a, b in rank(a.status) < rank(b.status) }
+    }
+    private func rank(_ s: DriftStatus) -> Int {
+        switch s { case .drifted: return 0; case .indirectlyDrifted: return 1; case .current: return 2 }
+    }
+
     /// Depth proxy 1-5 from a page's cited-source count (thin → escalate).
     static func librarianDepthBucket(sourceCount: Int) -> Int {
         switch sourceCount {
