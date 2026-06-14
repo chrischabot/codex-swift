@@ -125,10 +125,11 @@ rewrite() { # $1=file  $2=relpath-from-file-dir-to-SHLIB
   done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
 }
 for b in "$BIN_DIR"/*; do rewrite "$b" "$(relpath "$SHLIB_DIR" "$BIN_DIR")"; done
-for d in "$SHLIB_DIR"/*.dylib; do
+# Cover BOTH .dylib and .so in every lib dir (a collected dep could be a .so).
+while IFS= read -r d; do
   install_name_tool -id "@loader_path/$(basename "$d")" "$d" 2>/dev/null || true
   rewrite "$d" "."
-done
+done < <(find "$SHLIB_DIR" -type f \( -name '*.dylib' -o -name '*.so' \))
 while IFS= read -r d; do
   install_name_tool -id "@loader_path/$(basename "$d")" "$d" 2>/dev/null || true
   rewrite "$d" "$PKG_TO_SHLIB"
