@@ -397,8 +397,9 @@ public actor RequestRouter {
     private let remoteControlWebSocketConnector: RemoteControlWebSocketConnector
     private let memoryResetHandler: (@Sendable () async -> Void)?
     /// Deny-default read handle into the Memory Wiki store. nil → `wiki/*` RPCs
-    /// are refused with "wiki is not enabled".
-    private let wikiQuery: WikiQueryHandle?
+    /// are refused with "wiki is not enabled". Internal (not private) so the
+    /// wiki dispatch carved into RequestRouter+Wiki.swift can reach it.
+    let wikiQuery: WikiQueryHandle?
     /// Injected live realtime voice backend (OpenAI Realtime API). When nil,
     /// `thread/realtime/*` uses the built-in echo mock. See RealtimeBackend.swift.
     private let realtimeBackendFactory: RealtimeBackendFactory?
@@ -945,33 +946,15 @@ public actor RequestRouter {
         }
     }
 
-    private func reply(_ conn: any ClientConnection, _ id: RequestId, _ result: JSONValue) async {
+    // Internal (not private) so the wiki dispatch carved into
+    // RequestRouter+Wiki.swift can reply through the same path.
+    func reply(_ conn: any ClientConnection, _ id: RequestId, _ result: JSONValue) async {
         await conn.send(.response(JSONRPCResponse(id: id, result: result)))
     }
 
-    // MARK: wiki helpers
-    private struct WikiNotFound: Error {}
-
-    /// Centralizes the deny-default gate + error mapping for the `wiki/*` arms.
-    /// A nil handle (feature off) replies internalError "wiki is not enabled"
-    /// (NOT -32601, so a known-but-disabled method is distinct from an unknown
-    /// one); WikiNotFound → invalidRequest; any other throw → internalError.
-    private func replyWiki(_ conn: any ClientConnection, _ id: RequestId,
-                           _ body: @Sendable (WikiQueryHandle) async throws -> JSONValue) async {
-        guard let wiki = wikiQuery else {
-            await conn.send(WireError.internalError(id: id, "wiki is not enabled"))
-            return
-        }
-        do { await reply(conn, id, try await body(wiki)) }
-        catch is WikiNotFound { await conn.send(WireError.invalidRequest(id: id, "wiki page not found")) }
-        catch { await conn.send(WireError.internalError(id: id, String(describing: error))) }
-    }
-
-    // All wiki bounds are RE-clamped router-side so untrusted browser input can
-    // never reach an out-of-range store query (depth>4 throws; huge limit OOMs).
-    private static func clampWikiLimit(_ v: Int?) -> Int { min(max(v ?? 100, 1), 500) }
-    private static func clampWikiK(_ v: Int?) -> Int { min(max(v ?? 10, 1), 100) }
-    private static func clampWikiDepth(_ v: Int?) -> Int { min(max(v ?? 2, 1), 4) }
+    // The wiki/* dispatch arms + their helpers (replyWiki, clampWiki*,
+    // WikiNotFound) live in RequestRouter+Wiki.swift to keep the growing wiki
+    // RPC surface out of this ~10k-line file. See dispatchWiki(_:_:).
     private func reply<T: Encodable>(_ conn: any ClientConnection, _ id: RequestId, _ v: T) async {
         await reply(conn, id, (try? JSONBridge.value(v)) ?? .object([:]))
     }
@@ -2157,34 +2140,14 @@ public actor RequestRouter {
             await memoryResetHandler?()
             await reply(conn, id, EmptyResponse())
 
-        // MARK: wiki (read-only Memory Wiki browse surface, M0)
-        case .wikiList(let id, let p):
-            await replyWiki(conn, id) { try await $0.list(Self.clampWikiLimit(p.limit)) }
-        case .wikiPageGet(let id, let p):
-            await replyWiki(conn, id) { h in
-                if let page = try await h.pageGet(p.id) { return page }
-                throw WikiNotFound()
-            }
-        case .wikiSearch(let id, let p):
-            await replyWiki(conn, id) { try await $0.search(p.query, Self.clampWikiK(p.k)) }
-        case .wikiGraph(let id, let p):
-            await replyWiki(conn, id) { try await $0.graph(p.seed, Self.clampWikiDepth(p.depth)) }
-        case .wikiBacklinks(let id, let p):
-            await replyWiki(conn, id) { try await $0.backlinks(p.entityId) }
-        case .wikiEntityBacklinks(let id, let p):
-            await replyWiki(conn, id) { try await $0.entityBacklinks(p.entityId) }
-        case .wikiTags(let id):
-            await replyWiki(conn, id) { try await $0.tags() }
-        case .wikiIndex(let id):
-            await replyWiki(conn, id) { try await $0.index() }
-        case .wikiPageUpsert(let id, let p):
-            await replyWiki(conn, id) { try await $0.upsert(p.id, p.title, p.body) }
-        case .wikiPageDelete(let id, let p):
-            await replyWiki(conn, id) { try await $0.delete(p.id) }
-        case .wikiPageRename(let id, let p):
-            await replyWiki(conn, id) { try await $0.rename(p.id, p.title) }
-        case .wikiBrief(let id, let p):
-            await replyWiki(conn, id) { try await $0.brief(p.topic, min(max(p.k ?? 8, 1), 20)) }
+        // MARK: wiki (Memory Wiki RPC surface) — per-method arms + helpers live
+        // in RequestRouter+Wiki.swift so the (growing) wiki/* surface stays out
+        // of this file. Adding a wiki method: add the ClientRequest case, add it
+        // to this grouped case, and add an arm in dispatchWiki(_:_:).
+        case .wikiList, .wikiPageGet, .wikiSearch, .wikiGraph, .wikiBacklinks,
+             .wikiEntityBacklinks, .wikiTags, .wikiIndex, .wikiPageUpsert,
+             .wikiPageDelete, .wikiPageRename, .wikiBrief:
+            await dispatchWiki(parsed, conn)
 
         // MARK: turns
         case .turnStart(let id, let p):
