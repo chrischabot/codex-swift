@@ -55,11 +55,29 @@ final class WatchStoreTests: XCTestCase {
         try await store.advanceWatch(id: "h", outcome: .failed(retryAfterSeconds: nil), now: 0, errorThreshold: 1)
         let errored = try await store.watchSources().first
         XCTAssertEqual(errored?.status, .error)        // crossed threshold 1
-        // re-adding reactivates + clears the error streak
+        // re-adding reactivates + clears the error streak + RE-ARMS the due time
         try await store.addWatch(id: "h", kind: "url", volatility: .hot, now: 10)
         let reArmed = try await store.watchSources().first
         XCTAssertEqual(reArmed?.status, .active)
         XCTAssertEqual(reArmed?.errorCount, 0)
         XCTAssertEqual(reArmed?.volatility, .hot)      // cadence updated
+        XCTAssertEqual(reArmed?.nextDueAt, 10)         // re-armed to "now" → due immediately
+        let due = try await store.dueWatchSources(now: 10)
+        XCTAssertEqual(due.map(\.id), ["h"])           // and actually appears in the due set
+    }
+
+    func testReAddReArmsAFutureBackoff() async throws {
+        let store = try makeStore()
+        // a source backed off far into the future
+        try await store.addWatch(id: "g", kind: "url", volatility: .cold, now: 0)
+        try await store.advanceWatch(id: "g", outcome: .failed(retryAfterSeconds: 10_000_000), now: 0)
+        let future = try await store.watchSources().first
+        XCTAssertGreaterThan(future?.nextDueAt ?? 0, 1_000)      // due far in the future
+        let dueBefore = try await store.dueWatchSources(now: 1_000)
+        XCTAssertTrue(dueBefore.isEmpty)
+        // re-adding makes it due NOW (the CLI's "due now" message is honest)
+        try await store.addWatch(id: "g", kind: "url", volatility: .hot, now: 1_000)
+        let dueAfter = try await store.dueWatchSources(now: 1_000)
+        XCTAssertEqual(dueAfter.map(\.id), ["g"])
     }
 }

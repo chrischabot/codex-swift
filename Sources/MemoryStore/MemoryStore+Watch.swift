@@ -13,7 +13,7 @@ extension MemoryStore {
         INSERT INTO watch_source(id,kind,volatility,last_polled_at,error_count,next_due_at,status,added_at)
         VALUES(?,?,?,0,0,?,'active',?)
         ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, volatility=excluded.volatility,
-          status='active', error_count=0;
+          status='active', error_count=0, next_due_at=excluded.next_due_at;
         """, [.text(id), .text(kind), .text(volatility.rawValue), .int(now), .int(now)])
     }
 
