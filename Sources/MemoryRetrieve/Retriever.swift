@@ -116,9 +116,15 @@ public actor MemoryRetriever {
         var rerankScores: [Float] = Array(repeating: 0, count: hydrated.count)
         if rerank {
             let candidates = hydrated.map { $0.0.text }
-            rerankScores = (try? await inference.rerank(
-                query, candidates: candidates,
-                deadline: .fromNow(config.rerankDeadline))) ?? rerankScores
+            // Only adopt the reranker's scores if it returned EXACTLY one per
+            // candidate. A short/long result (some providers truncate) would
+            // otherwise index `rerankScores[i]` out of range below — keep the
+            // all-zero array so rerank simply contributes nothing.
+            if let scores = try? await inference.rerank(
+                query, candidates: candidates, deadline: .fromNow(config.rerankDeadline)),
+               scores.count == hydrated.count {
+                rerankScores = scores
+            }
         }
 
         // Compose the final ranked list. We weight by:
