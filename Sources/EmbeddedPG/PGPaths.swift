@@ -37,8 +37,20 @@ public struct PGPaths: Sendable, Equatable {
         self.dataDir = dataDir
         self.socketDir = socketDir
         self.port = port
-        self.username = username
-        self.database = database
+        // `database`/`username` are interpolated into provisioning SQL (datname=…,
+        // GRANT … TO …), so constrain them to safe SQL identifiers; a value with
+        // anything outside [A-Za-z0-9_] (or not starting with a letter/_) falls
+        // back to the default rather than risking interpolation.
+        self.username = Self.safeIdentifier(username, fallback: "codex")
+        self.database = Self.safeIdentifier(database, fallback: "codexmem0")
+    }
+
+    /// Keep only inputs that are valid unquoted SQL identifiers; else `fallback`.
+    static func safeIdentifier(_ s: String, fallback: String) -> String {
+        let valid = !s.isEmpty
+            && s.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }
+            && (s.first.map { $0.isLetter || $0 == "_" } ?? false)
+        return valid ? s : fallback
     }
 
     // MARK: - Executables

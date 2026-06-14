@@ -53,7 +53,14 @@ public actor PostgresLifecycle {
             try await startPostmaster()
         }
         try await waitUntilReady(timeout: 30)
-        try await assertSocketOnly()
+        do {
+            try await assertSocketOnly()
+        } catch {
+            // A TCP listener slipped through — refuse to serve AND stop the
+            // postmaster so we never leave an insecure cluster running.
+            try? await stop()
+            throw error
+        }
         if !didProvisionDatabase {
             try await ensureDatabaseExists()
             didProvisionDatabase = true
@@ -138,14 +145,18 @@ public actor PostgresLifecycle {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         // All settings passed via `-o` so they cannot be overridden by a stray
-        // postgresql.auto.conf. listen_addresses='' ⇒ socket-only.
-        var settings = [
-            "-c", "listen_addresses=''",
+        // postgresql.auto.conf. Caller tuning goes FIRST; the security invariants
+        // (socket-only, no TCP) go LAST so a later `-c`/`-k`/`-p` always WINS over
+        // anything in extraServerSettings — extraServerSettings can never re-enable
+        // a TCP listener.
+        var settings: [String] = []
+        for s in extraServerSettings { settings.append(contentsOf: ["-c", s]) }
+        settings.append(contentsOf: [
             "-k", paths.socketDir,
             "-c", "unix_socket_permissions=0700",
             "-c", "port=\(paths.port)",
-        ]
-        for s in extraServerSettings { settings.append(contentsOf: ["-c", s]) }
+            "-c", "listen_addresses=''",
+        ])
         let optionString = settings.joined(separator: " ")
         let logFile = (paths.dataDir as NSString).deletingLastPathComponent + "/postmaster.log"
         let r = try await run(paths.pgCtlExecutable, [

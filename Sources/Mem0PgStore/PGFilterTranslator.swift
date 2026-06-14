@@ -104,8 +104,17 @@ enum PGFilterTranslator {
         for (i, sub) in conditions.enumerated() {
             if i > 0 { b.raw(" OR ") }
             b.raw("(")
-            let emitted = try appendPredicate(sub.objectValue ?? [:], into: &b)
-            if !emitted { b.raw("true") }
+            if let obj = sub.objectValue {
+                // an empty / all-null object matches everything (Mem0Filters:
+                // matchesFilters(payload, {}) == true), so emit `true` then.
+                let emitted = try appendPredicate(obj, into: &b)
+                if !emitted { b.raw("true") }
+            } else {
+                // a NON-object child never matches in the reference matcher
+                // (Filters.swift: `(f.objectValue).map { … } ?? false`) — emit
+                // `false`, not `true`, or $or would match-all and $not exclude-all.
+                b.raw("false")
+            }
             b.raw(")")
         }
         b.raw(negate ? "), false)" : ")")

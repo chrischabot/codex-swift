@@ -57,6 +57,8 @@ final class FilterParityTests: XCTestCase {
         ("or", ["$or": .array([.object(["category": .string("news")]),
                                .object(["score": .object(["gte": .int(20)])])])]),
         ("not", ["$not": .array([.object(["category": .string("blog")])])]),
+        ("or-nonobject-child", ["$or": .array([.object(["category": .string("news")]), .string("garbage")])]),
+        ("not-nonobject-child", ["$not": .array([.string("garbage")])]),
         ("and-two-keys", ["user_id": .string("u1"), "category": .string("news")]),
         ("absent-key-eq", ["nope": .string("x")]),
         ("absent-key-ne", ["nope": .object(["ne": .string("x")])]),

@@ -44,15 +44,34 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     // this FIFO gate for its whole duration, giving the same fully-serialized
     // single-connection semantics as `Mem0SQLiteStore`.
     private var gateLocked = false
-    private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var gateWaiters: [(id: UInt64, cont: CheckedContinuation<Void, any Error>)] = []
+    private var gateSeq: UInt64 = 0
 
-    private func acquire() async {
+    /// Acquire the gate. Cancellation-aware: a task cancelled WHILE waiting is
+    /// removed from the queue and throws `CancellationError` instead of later
+    /// waking up and running a DB op anyway. Pair with `defer { release() }` —
+    /// placed AFTER `try await acquire()` so a throwing acquire does NOT release
+    /// a lock it never held.
+    private func acquire() async throws {
         if !gateLocked { gateLocked = true; return }
-        await withCheckedContinuation { gateWaiters.append($0) }
+        let id = gateSeq; gateSeq &+= 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+                gateWaiters.append((id, cont))
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+    }
+    private func cancelWaiter(_ id: UInt64) {
+        if let i = gateWaiters.firstIndex(where: { $0.id == id }) {
+            let w = gateWaiters.remove(at: i)
+            w.cont.resume(throwing: CancellationError())
+        }
     }
     private func release() {
         if gateWaiters.isEmpty { gateLocked = false }
-        else { gateWaiters.removeFirst().resume() }
+        else { gateWaiters.removeFirst().cont.resume() }
     }
 
     // MARK: - construction
@@ -108,7 +127,10 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     /// Close the data-plane connection. Call on shutdown; the postmaster keeps
     /// running (stop it via `PostgresLifecycle.stop()` if desired).
     public func shutdown() async {
-        await acquire(); defer { release() }
+        // non-throwing: if cancelled while waiting, bail BEFORE registering the
+        // defer so we never release a gate we didn't hold.
+        do { try await acquire() } catch { return }
+        defer { release() }
         if let c = conn { try? await c.close(); conn = nil }
     }
 
@@ -196,7 +218,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     // MARK: - Mem0VectorStore
 
     public func insert(_ records: [VectorRecord]) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         for r in records { try validateFinite(r.vector) }
         let conn = try connection()
         do {
@@ -218,7 +240,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func search(_ query: String, _ vector: [Float], topK: Int, filters: JSONObject) async throws -> [SearchHit] {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         try validateFinite(vector)
         var b = PGQueryBuilder()
         b.raw("SELECT id, payload::text, (vector <=> ")
@@ -249,7 +271,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func get(_ id: String) async throws -> SearchHit? {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         var b = PGQueryBuilder()
         b.raw("SELECT payload::text FROM memories WHERE id = "); try b.param(id)
         do {
@@ -264,7 +286,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func update(_ id: String, vector: [Float]?, payload: JSONObject?) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         if let vector { try validateFinite(vector) }
         var b = PGQueryBuilder()
         b.raw("UPDATE memories SET vector = COALESCE(")
@@ -279,7 +301,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func delete(_ id: String) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         var b = PGQueryBuilder()
         b.raw("DELETE FROM memories WHERE id = "); try b.param(id)
         do { _ = try await connection().query(b.build(), logger: logger) }
@@ -287,7 +309,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func list(_ filters: JSONObject, limit: Int?) async throws -> [SearchHit] {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         var b = PGQueryBuilder()
         b.raw("SELECT id, payload::text FROM memories")
         if PGFilterTranslator.willEmit(filters) {
@@ -308,13 +330,13 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func deleteCol() async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         do { try await execOn(connection(), "DELETE FROM memories") }
         catch { throw Mem0PgErrorMap.wrap(error, "deleteCol") }
     }
 
     public func keywordSearch(_ query: String, topK: Int, filters: JSONObject) async throws -> [SearchHit]? {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         var b = PGQueryBuilder()
         b.raw("SELECT id, payload::text, ts_rank(to_tsvector('simple', coalesce(payload ->> 'text_lemmatized', '')), plainto_tsquery('simple', ")
         try b.param(query)
@@ -345,7 +367,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
                            createdAt: String?, updatedAt: String?, isDeleted: Int,
                            actorID: String?, role: String?, userID: String?,
                            agentID: String?, runID: String?) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         do {
             try await insertHistory(try connection(),
                                     memoryID: memoryID, oldMemory: oldMemory, newMemory: newMemory,
@@ -356,7 +378,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func batchAddHistory(_ records: [NewHistory]) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         let conn = try connection()
         do {
             try await execOn(conn, "BEGIN")
@@ -399,7 +421,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func getHistory(_ memoryID: String) async throws -> [HistoryRecord] {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         var b = PGQueryBuilder()
         b.raw("""
         SELECT id, memory_id, old_memory, new_memory, event, created_at, updated_at,
@@ -425,7 +447,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func saveMessages(_ messages: [Message], scope: String) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         if messages.isEmpty { return }
         let conn = try connection()
         let now = nowUTCRFC3339()
@@ -456,7 +478,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     public func getLastMessages(_ scope: String, limit: Int) async throws -> [StoredMessage] {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         var b = PGQueryBuilder()
         b.raw("SELECT role, content, name, created_at FROM (SELECT role, content, name, created_at FROM messages WHERE session_scope = ")
         try b.param(scope)
@@ -477,7 +499,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
 
     /// Full reset — satisfies both protocols' `reset()`.
     public func reset() async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         let conn = try connection()
         do {
             try await execOn(conn, "BEGIN")
@@ -499,7 +521,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     /// cold snapshot (stop the postmaster, clone, restart) — see pglite.md.
     /// `destination` must not already exist.
     public func snapshot(to destination: String) async throws {
-        await acquire(); defer { release() }
+        try await acquire(); defer { release() }
         do {
             try await execOn(connection(), "CHECKPOINT")
             try PGSnapshot.cloneQuiesced(from: paths.dataDir, to: destination)

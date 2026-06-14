@@ -95,7 +95,8 @@ resolve_dep() { local dep="$1" srcdir="$2" p=""
     /*) p="$dep";;
     *) return 0;;
   esac
-  readlink -f "$p" 2>/dev/null || true
+  # `readlink -f` is unavailable on older macOS — use python realpath (portable).
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null || true
 }
 while [ ${#WORK[@]} -gt 0 ]; do
   src="${WORK[0]}"; WORK=("${WORK[@]:1}")
