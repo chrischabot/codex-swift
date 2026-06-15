@@ -153,21 +153,53 @@ public enum WikiJSON {
     public static func librarianReport(_ store: MemoryStore, limit: Int = 50) async throws -> JSONValue {
         let now = Int64(Date().timeIntervalSince1970)
         let scores = try await store.librarianScan(now: now)
+        // Read back the Tier-2 model verdicts the CLI persisted to <vaultRoot>/.librarian/
+        // scan-results.json (vaultRoot == parent of the db path). Best-effort: a missing/
+        // corrupt artifact → no tier2 fields (still Tier-1-flagged). Stays a Tier-A read —
+        // no spend/egress (we re-READ the durable verdict, never re-invoke the model).
+        let (verdicts, scoredCount) = tier2VerdictsByDocID(databasePath: store.databasePath)
         let pages = scores.prefix(limit).map { s -> JSONValue in
-            .object([
+            var o: [String: JSONValue] = [
                 "documentID": .int(s.documentID),
                 "volatility": .string(s.volatility.rawValue),
                 "staleness": .double((s.staleness.score * 100).rounded() / 100),
                 "needsTier2": .bool(s.needsTier2),
                 "sourceCount": .int(Int64(s.quality.sourceCount)),
                 "depthProxy": .int(Int64(s.quality.depthProxy)),
-            ])
+            ]
+            if let v = verdicts[s.documentID] {
+                o["coherence"] = .int(Int64(v.coherence))
+                o["utility"] = .int(Int64(v.utility))
+                o["rationale"] = .string(v.rationale)
+            }
+            return .object(o)
         }
         return .object([
             "pages": .int(Int64(scores.count)),
             "flagged": .int(Int64(scores.filter(\.needsTier2).count)),
+            "tier2Scored": .int(Int64(scoredCount)),
             "stalest": .array(pages),
         ])
+    }
+
+    /// Read the Tier-2 coherence/utility verdicts the librarian CLI persisted to
+    /// `<vaultRoot>/.librarian/scan-results.json`. Returns (docID → verdict, scoredCount).
+    static func tier2VerdictsByDocID(databasePath: String)
+    -> (map: [Int64: (coherence: Int, utility: Int, rationale: String)], scored: Int) {
+        let vaultRoot = (databasePath as NSString).deletingLastPathComponent
+        let path = (vaultRoot as NSString).appendingPathComponent(".librarian/scan-results.json")
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return ([:], 0) }
+        var map: [Int64: (Int, Int, String)] = [:]
+        if let tier2 = obj["tier2"] as? [[String: Any]] {
+            for t in tier2 {
+                guard let id = (t["documentID"] as? NSNumber)?.int64Value,
+                      let c = (t["coherence"] as? NSNumber)?.intValue,
+                      let u = (t["utility"] as? NSNumber)?.intValue else { continue }
+                map[id] = (c, u, (t["rationale"] as? String) ?? "")
+            }
+        }
+        return (map, (obj["tier2_scored"] as? NSNumber)?.intValue ?? map.count)
     }
 
     /// Audit Pass-2 output-drift report (§5.D): compiled pages built from a claim that

@@ -485,6 +485,38 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(byCat["memes"], 2); XCTAssertEqual(byCat["tools"], 1)
     }
 
+    func testTier2VerdictsReadBackFromScanResults() throws {
+        // The librarian CLI persists Tier-2 verdicts here; the report reads them back
+        // (no model re-invocation → stays a Tier-A read).
+        let libDir = dir + "/.librarian"
+        try FileManager.default.createDirectory(atPath: libDir, withIntermediateDirectories: true)
+        let json: [String: Any] = [
+            "tier2_scored": 2,
+            "tier2": [
+                ["documentID": 12, "coherence": 2, "utility": 3, "rationale": "thin"],
+                ["documentID": 7, "coherence": 4, "utility": 5, "rationale": "solid"],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: json).write(to: URL(fileURLWithPath: libDir + "/scan-results.json"))
+        let (map, scored) = WikiJSON.tier2VerdictsByDocID(databasePath: dir + "/m.db")
+        XCTAssertEqual(scored, 2)
+        XCTAssertEqual(map[12]?.coherence, 2)
+        XCTAssertEqual(map[12]?.utility, 3)
+        XCTAssertEqual(map[7]?.rationale, "solid")
+        XCTAssertNil(map[99], "unscored doc has no verdict")
+    }
+
+    func testTier2MissingArtifactYieldsEmpty() {
+        let (map, scored) = WikiJSON.tier2VerdictsByDocID(databasePath: "/nonexistent/x.db")
+        XCTAssertTrue(map.isEmpty)
+        XCTAssertEqual(scored, 0, "a missing artifact → no verdicts (page stays Tier-1-flagged only)")
+    }
+
+    func testLibrarianReportExposesTier2ScoredCount() async throws {
+        let r = try await WikiJSON.librarianReport(store)
+        XCTAssertNotNil(r.obj?["tier2Scored"], "the report exposes the model-scored count distinctly from flagged")
+    }
+
     func testStatusFlaggedCountFromCycleMarkersNotLiveScan() async throws {
         // No cycle has run → flaggedStale falls back to the live scan, source "live".
         let empty = try await WikiJSON.status(store)

@@ -44,6 +44,7 @@ import type {
   WikiCollectCatalog,
   WikiDatasetManifest,
   WikiInventoryRecord,
+  WikiLibrarianPage,
   WikiLibrarianReport,
   WikiPage,
   WikiPageSummary,
@@ -1235,14 +1236,22 @@ export function mapLibrarianReport(r: Record<string, unknown>): WikiLibrarianRep
   return {
     pages: numOrU(r.pages) ?? 0,
     flagged: numOrU(r.flagged) ?? 0,
-    stalest: stalest.map((p) => ({
-      documentID: numOrU(p.documentID) ?? 0,
-      volatility: pick(p, "volatility") || "warm",
-      staleness: numOrU(p.staleness) ?? 0,
-      needsTier2: p.needsTier2 === true,
-      sourceCount: numOrU(p.sourceCount) ?? 0,
-      depthProxy: numOrU(p.depthProxy) ?? 0,
-    })),
+    tier2Scored: numOrU(r.tier2Scored) ?? 0,
+    stalest: stalest.map((p) => {
+      const page: WikiLibrarianPage = {
+        documentID: numOrU(p.documentID) ?? 0,
+        volatility: pick(p, "volatility") || "warm",
+        staleness: numOrU(p.staleness) ?? 0,
+        needsTier2: p.needsTier2 === true,
+        sourceCount: numOrU(p.sourceCount) ?? 0,
+        depthProxy: numOrU(p.depthProxy) ?? 0,
+      };
+      // Tier-2 verdict only when the model scored this doc (sparse stays sparse).
+      const coh = numOrU(p.coherence); if (coh !== undefined) page.coherence = coh;
+      const util = numOrU(p.utility); if (util !== undefined) page.utility = util;
+      if (typeof p.rationale === "string") page.rationale = p.rationale;
+      return page;
+    }),
   };
 }
 

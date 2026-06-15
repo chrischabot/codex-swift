@@ -506,9 +506,10 @@ export function WikiConsolePage() {
             {librarian && (
               <>
                 <h4 className="text-[12px] font-medium text-foreground">Librarian — staleness</h4>
-                <div className="mt-1 grid grid-cols-2 gap-3">
+                <div className="mt-1 grid grid-cols-3 gap-3">
                   <Stat label="Pages scanned" value={librarian.pages} />
                   <Stat label="Flagged for review" value={librarian.flagged} />
+                  <Stat label="Tier-2 scored" value={librarian.tier2Scored ?? 0} />
                 </div>
                 {librarian.stalest.length === 0 ? (
                   <p className="mt-1 text-[12px] text-[color:var(--color-text-quaternary)]">No stale pages.</p>
@@ -517,6 +518,14 @@ export function WikiConsolePage() {
                     {librarian.stalest.slice(0, 10).map((p) => (
                       <li key={p.documentID} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
                         {p.needsTier2 && <Badge variant="danger">flagged</Badge>}
+                        {p.coherence !== undefined && p.utility !== undefined && (
+                          <Badge
+                            variant={Math.min(p.coherence, p.utility) <= 2 ? "danger" : Math.min(p.coherence, p.utility) === 3 ? "warning" : "success"}
+                            title={p.rationale}
+                          >
+                            coh {p.coherence} · util {p.utility}
+                          </Badge>
+                        )}
                         <Badge variant="outline">{p.volatility}</Badge>
                         <span className="text-[12px] text-foreground">page #{p.documentID}</span>
                         <span className="ml-auto shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">

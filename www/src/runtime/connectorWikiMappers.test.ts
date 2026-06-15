@@ -103,12 +103,29 @@ describe("mapLibrarianReport", () => {
   });
   it("defaults missing/empty fields (a Swift rename → zeros here, not silently in the UI)", () => {
     const r = mapLibrarianReport({});
-    expect(r).toEqual({ pages: 0, flagged: 0, stalest: [] });
+    expect(r).toEqual({ pages: 0, flagged: 0, tier2Scored: 0, stalest: [] });
     // a row missing documentID + a non-boolean needsTier2 default safely
     const r2 = mapLibrarianReport({ stalest: [{ staleness: 50 }] });
     expect(r2.stalest[0].documentID).toBe(0);
     expect(r2.stalest[0].volatility).toBe("warm");
     expect(r2.stalest[0].needsTier2).toBe(false);
+  });
+  it("surfaces the Tier-2 verdict (coherence/utility/rationale + tier2Scored) distinctly from the flag", () => {
+    const r = mapLibrarianReport({
+      pages: 3, flagged: 2, tier2Scored: 1,
+      stalest: [
+        { documentID: 12, volatility: "hot", staleness: 18, needsTier2: true, sourceCount: 1, depthProxy: 2,
+          coherence: 2, utility: 3, rationale: "thin" },
+        { documentID: 7, volatility: "warm", staleness: 41, needsTier2: true, sourceCount: 3, depthProxy: 3 },
+      ],
+    });
+    expect(r.tier2Scored).toBe(1);
+    expect(r.stalest[0].coherence).toBe(2);
+    expect(r.stalest[0].utility).toBe(3);
+    expect(r.stalest[0].rationale).toBe("thin");
+    // a flagged-but-unscored row stays sparse — no verdict fields (flag ≠ verdict).
+    expect(r.stalest[1].coherence).toBeUndefined();
+    expect(r.stalest[1].utility).toBeUndefined();
   });
 });
 

@@ -100,9 +100,10 @@ describe("WikiConsolePage", () => {
 
   it("loads the trust reports (librarian + audit) when the Reports tab opens", async () => {
     const librarian: WikiLibrarianReport = {
-      pages: 2, flagged: 1,
+      pages: 2, flagged: 1, tier2Scored: 1,
       stalest: [
-        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2 },
+        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2,
+          coherence: 2, utility: 3, rationale: "thin" },
         { documentID: 99, volatility: "cold", staleness: 92, needsTier2: false, sourceCount: 6, depthProxy: 4 },
       ],
     };

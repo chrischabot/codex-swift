@@ -401,8 +401,12 @@ export function makeMockConnector(): Connector {
     getLibrarianReport: async () => ({
       pages: 3,
       flagged: 2,
+      tier2Scored: 1,
       stalest: [
-        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2 },
+        // row 12: flagged AND model-scored (the verdict chip renders, distinct from the flag).
+        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2,
+          coherence: 2, utility: 3, rationale: "thin and partly contradictory" },
+        // row 7: flagged but NOT yet scored (flag without a verdict).
         { documentID: 7, volatility: "warm", staleness: 41.2, needsTier2: true, sourceCount: 3, depthProxy: 3 },
         { documentID: 3, volatility: "cold", staleness: 92.0, needsTier2: false, sourceCount: 6, depthProxy: 4 },
       ],

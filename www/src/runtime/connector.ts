@@ -255,13 +255,17 @@ export interface WikiLibrarianPage {
   documentID: number;
   volatility: string;  // hot | warm | cold
   staleness: number;   // 0–100 composite (LOW = stale)
-  needsTier2: boolean; // flagged for a model coherence/utility review
+  needsTier2: boolean; // Tier-1 FLAG: queued for a model review (NOT a verdict)
   sourceCount: number;
   depthProxy: number;  // 1–5 (1–2 = thin)
+  coherence?: number;  // Tier-2 VERDICT 1–5 (present only when model-scored)
+  utility?: number;    // Tier-2 VERDICT 1–5 (present only when model-scored)
+  rationale?: string;  // Tier-2 one-line rationale
 }
 export interface WikiLibrarianReport {
   pages: number;
-  flagged: number;
+  flagged: number;       // Tier-1 flagged count
+  tier2Scored: number;   // Tier-2 model-scored count (distinct from flagged)
   stalest: WikiLibrarianPage[]; // stalest-first review queue
 }
 export interface WikiAuditPage {
