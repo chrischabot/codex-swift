@@ -60,6 +60,8 @@ public struct WikiQueryHandle: Sendable {
     public var datasetList: @Sendable () async throws -> JSONValue
     /// Collect catalogs with item counts. Tier-A read.
     public var collectList: @Sendable () async throws -> JSONValue
+    /// Research-session history (topic/mode/status/rounds/score). Tier-A read.
+    public var sessionsList: @Sendable () async throws -> JSONValue
 
     public init(
         list: @escaping @Sendable (Int) async throws -> JSONValue,
@@ -81,7 +83,8 @@ public struct WikiQueryHandle: Sendable {
         auditReport: @escaping @Sendable () async throws -> JSONValue,
         inventoryList: @escaping @Sendable () async throws -> JSONValue,
         datasetList: @escaping @Sendable () async throws -> JSONValue,
-        collectList: @escaping @Sendable () async throws -> JSONValue
+        collectList: @escaping @Sendable () async throws -> JSONValue,
+        sessionsList: @escaping @Sendable () async throws -> JSONValue
     ) {
         self.list = list
         self.pageGet = pageGet
@@ -103,5 +106,6 @@ public struct WikiQueryHandle: Sendable {
         self.inventoryList = inventoryList
         self.datasetList = datasetList
         self.collectList = collectList
+        self.sessionsList = sessionsList
     }
 }

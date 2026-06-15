@@ -2264,7 +2264,7 @@ public actor RequestRouter {
              .wikiEntityBacklinks, .wikiTags, .wikiIndex, .wikiPageUpsert,
              .wikiPageDelete, .wikiPageRename, .wikiBrief, .wikiQuery, .wikiStatus, .wikiWatchList,
              .wikiLibrarianReport, .wikiAuditReport,
-             .wikiInventoryList, .wikiDatasetList, .wikiCollectList,
+             .wikiInventoryList, .wikiDatasetList, .wikiCollectList, .wikiSessionsList,
              .wikiResearchStart, .wikiIngestStart:
             await dispatchWiki(parsed, conn)
 

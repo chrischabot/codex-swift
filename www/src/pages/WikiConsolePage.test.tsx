@@ -152,4 +152,43 @@ describe("WikiConsolePage", () => {
     expect(getWikiDatasets).toHaveBeenCalledTimes(1);
     expect(getWikiCollect).toHaveBeenCalledTimes(1);
   });
+
+  it("runs a depth-tiered query and renders ranked hits with the retrieval mode", async () => {
+    const queryWiki = vi.fn(async (_q: string, _opts?: { depth?: number; k?: number }) => ({
+      query: "rope", depth: 3, retrieval: "hybrid",
+      hits: [
+        { id: "h1", title: "Rope Memory", excerpt: "core rope…", source: "web", score: 0.88,
+          why: { bm25: 0.7, vec: 0.9, rerank: 0.95 } },
+      ],
+    }));
+    const connector = { ...makeMockConnector(), queryWiki } as Connector;
+    renderWith(connector);
+
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /query/i }), { button: 0 });
+    // pick the Deep depth tier, then query.
+    fireEvent.click(await screen.findByRole("button", { name: "Deep" }));
+    const input = await screen.findByLabelText("Knowledge query");
+    fireEvent.change(input, { target: { value: "rope" } });
+    fireEvent.submit(input.closest("form")!);
+
+    await waitFor(() => expect(screen.getByText("Rope Memory")).toBeTruthy());
+    expect(screen.getByText("hybrid")).toBeTruthy();   // retrieval-mode badge
+    expect(screen.getByText("0.88")).toBeTruthy();      // per-hit score
+    expect(queryWiki).toHaveBeenCalledWith("rope", { depth: 3, k: 25 });
+  });
+
+  it("lists research sessions when the Sessions tab opens", async () => {
+    const getWikiSessions = vi.fn(async () => [
+      { sessionID: "s1", topic: "Rope Research", mode: "deep", status: "complete",
+        rounds: 4, sources: 18, articles: 6, score: 0.91, startedAt: 1_700_000_000_000 },
+    ]);
+    const connector = { ...makeMockConnector(), getWikiSessions } as Connector;
+    renderWith(connector);
+
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /sessions/i }), { button: 0 });
+    await waitFor(() => expect(screen.getByText("Rope Research")).toBeTruthy());
+    expect(screen.getByText("complete")).toBeTruthy();
+    expect(screen.getByText("4 round(s)")).toBeTruthy();
+    expect(getWikiSessions).toHaveBeenCalledTimes(1);
+  });
 });

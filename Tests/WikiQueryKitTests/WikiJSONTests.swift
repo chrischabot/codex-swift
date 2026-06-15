@@ -489,9 +489,42 @@ final class WikiJSONTests: XCTestCase {
         let inv = try await WikiJSON.inventoryList(store)
         let ds = try await WikiJSON.datasetList(store)
         let col = try await WikiJSON.collectList(store)
+        let ses = try await WikiJSON.sessionsList(store)
         XCTAssertEqual(inv.obj?["count"]?.int, 0)
         XCTAssertEqual(ds.obj?["count"]?.int, 0)
         XCTAssertEqual(col.obj?["count"]?.int, 0)
+        XCTAssertEqual(ses.obj?["count"]?.int, 0)
+        XCTAssertEqual(ses.obj?["sessions"]?.arr?.count, 0)
+    }
+
+    func testSessionsListShaper() async throws {
+        try await store.upsertResearchSession(ResearchSessionRow(
+            sessionID: "s1", mode: "standard", topic: "rope memory", startTime: 1_700_000_000,
+            currentRound: 3, cumulativeSources: 12, cumulativeArticles: 4, status: "complete",
+            lastProgressScore: 0.876_54))
+        try await store.upsertResearchSession(ResearchSessionRow(
+            sessionID: "s2", topic: "no-score session"))   // sparse: optional fields omitted
+        let r = try await WikiJSON.sessionsList(store)
+        XCTAssertEqual(r.obj?["count"]?.int, 2)
+        let byID = Dictionary(uniqueKeysWithValues: (r.obj?["sessions"]?.arr ?? []).compactMap { v -> (String, JSONValue)? in
+            guard let id = v.obj?["sessionID"]?.str else { return nil }
+            return (id, v)
+        })
+        let s1 = byID["s1"]?.obj
+        XCTAssertEqual(s1?["topic"]?.str, "rope memory")
+        XCTAssertEqual(s1?["mode"]?.str, "standard")
+        XCTAssertEqual(s1?["status"]?.str, "complete")
+        XCTAssertEqual(s1?["rounds"]?.int, 3)
+        XCTAssertEqual(s1?["sources"]?.int, 12)
+        XCTAssertEqual(s1?["articles"]?.int, 4)
+        XCTAssertEqual(s1?["score"]?.dbl, 0.88, "score rounded to 2dp")
+        XCTAssertEqual(s1?["startedAt"]?.int, 1_700_000_000 * 1000, "epoch→ms")
+        // Sparse session: only sessionID + topic present; no nulls leaked for absent fields.
+        let s2 = byID["s2"]?.obj
+        XCTAssertEqual(s2?["topic"]?.str, "no-score session")
+        XCTAssertNil(s2?["score"], "absent score is omitted, not null")
+        XCTAssertNil(s2?["rounds"], "absent rounds is omitted, not null")
+        XCTAssertNil(s2?["startedAt"], "absent startTime is omitted, not null")
     }
 }
 
@@ -501,5 +534,6 @@ private extension JSONValue {
     var arr: [JSONValue]? { if case .array(let a) = self { return a }; return nil }
     var str: String? { if case .string(let s) = self { return s }; return nil }
     var int: Int64? { if case .int(let i) = self { return i }; return nil }
+    var dbl: Double? { if case .double(let d) = self { return d }; return nil }
     var bool: Bool? { if case .bool(let b) = self { return b }; return nil }
 }

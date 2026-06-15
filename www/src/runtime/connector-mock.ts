@@ -430,6 +430,20 @@ export function makeMockConnector(): Connector {
       { slug: "memes", count: 24 },
       { slug: "agent-tools", count: 8 },
     ],
+    getWikiSessions: async () => [
+      { sessionID: "s-2026-06-12-rope", topic: "rope memory", mode: "deep", status: "complete",
+        rounds: 4, sources: 18, articles: 6, score: 0.91, startedAt: 1_749_700_000_000 },
+      { sessionID: "s-2026-06-13-hnsw", topic: "HNSW recall tuning", mode: "standard", status: "running",
+        rounds: 2, sources: 7, articles: 1, score: 0.42, startedAt: 1_749_800_000_000 },
+    ],
+    queryWiki: async (query, opts) => ({
+      query, depth: opts?.depth ?? 2, retrieval: (opts?.depth ?? 2) >= 2 ? "hybrid" : "lexical",
+      hits: [
+        { id: "1", title: `Hybrid hit for “${query}”`, excerpt: "Top-ranked passage about " + query,
+          source: "web", score: 0.88, why: { bm25: 0.7, vec: 0.9, rerank: 0.95 } },
+        { id: "2", title: "Vector Databases", excerpt: "FAISS, HNSW, IVF…", source: "arxiv", score: 0.61 },
+      ],
+    }),
     startWikiResearch: async (params, onEvent) => {
       const seq: Array<[WikiJobLine, boolean]> = [
         [{ type: "event", kind: "started", mode: params.mode || "topic" }, false],

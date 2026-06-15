@@ -47,6 +47,9 @@ import type {
   WikiLibrarianReport,
   WikiPage,
   WikiPageSummary,
+  WikiQueryHit,
+  WikiQueryResult,
+  WikiResearchSession,
   WikiTag,
 } from "./connector";
 import { toast } from "@/components/ui/sonner";
@@ -1131,6 +1134,23 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         return (r.catalogs ?? []).map(mapCollectCatalog);
       } catch { return []; }
     },
+    getWikiSessions: async () => {
+      try {
+        const r = (await rpc("wiki/sessions/list", {})) as { sessions?: Record<string, unknown>[] };
+        return (r.sessions ?? []).map(mapResearchSession);
+      } catch { return []; }
+    },
+    queryWiki: async (query, opts) => {
+      try {
+        const params: Record<string, unknown> = { query };
+        if (opts?.depth != null) params.depth = opts.depth;
+        if (opts?.k != null) params.k = opts.k;
+        const r = (await rpc("wiki/query", params)) as {
+          query?: unknown; depth?: unknown; retrieval?: unknown; data?: Record<string, unknown>[];
+        };
+        return mapQueryResult(r, query, opts?.depth ?? 2);
+      } catch { return null; }
+    },
     startWikiResearch: async (params, onEvent) => {
       const r = (await rpc("wiki/research/start", params as unknown as Json)) as { jobId?: string };
       const jobId = r.jobId;
@@ -1248,6 +1268,41 @@ export function mapDatasetManifest(o: Record<string, unknown>): WikiDatasetManif
 }
 export function mapCollectCatalog(o: Record<string, unknown>): WikiCollectCatalog {
   return { slug: pick(o, "slug"), count: numOrU(o.count) ?? 0 };
+}
+/// Map one wiki/sessions/list row → WikiResearchSession. Optional fields stay
+/// undefined when the shaper omits them (a sparse session must not surface as 0s).
+export function mapResearchSession(o: Record<string, unknown>): WikiResearchSession {
+  const s: WikiResearchSession = { sessionID: pick(o, "sessionID") };
+  if (typeof o.topic === "string") s.topic = o.topic;
+  if (typeof o.mode === "string") s.mode = o.mode;
+  if (typeof o.status === "string") s.status = o.status;
+  const rounds = numOrU(o.rounds); if (rounds !== undefined) s.rounds = rounds;
+  const sources = numOrU(o.sources); if (sources !== undefined) s.sources = sources;
+  const articles = numOrU(o.articles); if (articles !== undefined) s.articles = articles;
+  const score = numOrU(o.score); if (score !== undefined) s.score = score;
+  const startedAt = normalizeEpochMs(o.startedAt); if (startedAt !== undefined) s.startedAt = startedAt;
+  return s;
+}
+/// Map the wiki/query envelope → WikiQueryResult. `query`/`depth` fall back to the
+/// request values when the server echo is absent; `retrieval` defaults to "lexical".
+export function mapQueryResult(r: { query?: unknown; depth?: unknown; retrieval?: unknown; data?: Record<string, unknown>[] },
+                              reqQuery: string, reqDepth: number): WikiQueryResult {
+  const data = Array.isArray(r.data) ? r.data : [];
+  return {
+    query: typeof r.query === "string" ? r.query : reqQuery,
+    depth: numOrU(r.depth) ?? reqDepth,
+    retrieval: typeof r.retrieval === "string" ? r.retrieval : "lexical",
+    hits: data.map((o) => {
+      const hit: WikiQueryHit = mapWikiSummary(o);
+      const sc = numOrU(o.score); if (sc !== undefined) hit.score = sc;
+      const why = o.why;
+      if (why && typeof why === "object") {
+        const w = why as Record<string, unknown>;
+        hit.why = { bm25: numOrU(w.bm25) ?? 0, vec: numOrU(w.vec) ?? 0, rerank: numOrU(w.rerank) ?? 0 };
+      }
+      return hit;
+    }),
+  };
 }
 
 /// Map the wiki/audit/report wire shape → WikiAuditReport (see mapLibrarianReport).

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { idStr, mapWikiSummary, mapWikiPage, mapWikiIndexEntry, mapLibrarianReport, mapAuditReport, mapInventoryRecord, mapDatasetManifest, mapCollectCatalog } from "./connector-codex";
+import { idStr, mapWikiSummary, mapWikiPage, mapWikiIndexEntry, mapLibrarianReport, mapAuditReport, mapInventoryRecord, mapDatasetManifest, mapCollectCatalog, mapResearchSession, mapQueryResult } from "./connector-codex";
 
 // Characterization tests: lock the wire contract between the Swift wiki/* RPCs
 // (ids arrive as integers; fields like data/props/links may be missing) and the
@@ -156,5 +156,62 @@ describe("mapCollectCatalog", () => {
   it("maps slug + count, defaulting count to 0", () => {
     expect(mapCollectCatalog({ slug: "memes", count: 24 })).toEqual({ slug: "memes", count: 24 });
     expect(mapCollectCatalog({ slug: "empty" })).toEqual({ slug: "empty", count: 0 });
+  });
+});
+
+describe("mapResearchSession", () => {
+  it("maps a full session row", () => {
+    const s = mapResearchSession({
+      sessionID: "s1", topic: "rope", mode: "deep", status: "complete",
+      rounds: 4, sources: 18, articles: 6, score: 0.91, startedAt: 1_700_000_000_000,
+    });
+    expect(s).toEqual({
+      sessionID: "s1", topic: "rope", mode: "deep", status: "complete",
+      rounds: 4, sources: 18, articles: 6, score: 0.91, startedAt: 1_700_000_000_000,
+    });
+  });
+  it("omits absent optional fields (sparse session never surfaces as zeros)", () => {
+    const s = mapResearchSession({ sessionID: "s2", topic: "bare" });
+    expect(s).toEqual({ sessionID: "s2", topic: "bare" });
+    expect(s.rounds).toBeUndefined();
+    expect(s.score).toBeUndefined();
+    expect(s.startedAt).toBeUndefined();
+  });
+  it("normalizes an epoch-seconds startedAt to ms", () => {
+    // shaper sends ms, but the normalizer also rescales bare-seconds for safety.
+    expect(mapResearchSession({ sessionID: "s3", startedAt: 1_700_000_000 }).startedAt).toBe(1_700_000_000_000);
+  });
+  it("empties a missing sessionID rather than throwing", () => {
+    expect(mapResearchSession({}).sessionID).toBe("");
+  });
+});
+
+describe("mapQueryResult", () => {
+  it("maps the hybrid envelope incl. per-hit score + why", () => {
+    const r = mapQueryResult({
+      query: "rope", depth: 3, retrieval: "hybrid",
+      data: [{ id: 7, title: "Rope", excerpt: "…", source: "web", score: 0.88, why: { bm25: 0.7, vec: 0.9, rerank: 0.95 } }],
+    }, "rope", 3);
+    expect(r.query).toBe("rope");
+    expect(r.depth).toBe(3);
+    expect(r.retrieval).toBe("hybrid");
+    expect(r.hits).toHaveLength(1);
+    expect(r.hits[0].id).toBe("7");          // integer id → string
+    expect(r.hits[0].score).toBe(0.88);
+    expect(r.hits[0].why).toEqual({ bm25: 0.7, vec: 0.9, rerank: 0.95 });
+  });
+  it("falls back to request query/depth + 'lexical' when the server omits the echo", () => {
+    const r = mapQueryResult({ data: [] }, "fallback", 1);
+    expect(r.query).toBe("fallback");
+    expect(r.depth).toBe(1);
+    expect(r.retrieval).toBe("lexical");
+    expect(r.hits).toEqual([]);
+  });
+  it("tolerates missing data + scoreless hits (no why block)", () => {
+    const r = mapQueryResult({ query: "q", depth: 1, retrieval: "lexical", data: [{ id: 1, title: "A" }] }, "q", 1);
+    expect(r.hits[0].score).toBeUndefined();
+    expect(r.hits[0].why).toBeUndefined();
+    const empty = mapQueryResult({}, "q", 2);
+    expect(empty.hits).toEqual([]);
   });
 });

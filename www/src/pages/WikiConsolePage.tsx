@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download, ShieldAlert, Boxes, Database, Images } from "lucide-react";
+import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download, ShieldAlert, Boxes, Database, Images, Layers, History } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { WikiJobTab } from "./WikiJobTab";
 import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource, WikiLibrarianReport, WikiAuditReport,
-  WikiInventoryRecord, WikiDatasetManifest, WikiCollectCatalog } from "@/runtime/connector";
+  WikiInventoryRecord, WikiDatasetManifest, WikiCollectCatalog, WikiQueryResult, WikiResearchSession } from "@/runtime/connector";
 
 /**
  * Wiki Console (route /wiki/console) — query the knowledge base and generate a
@@ -69,6 +69,41 @@ export function WikiConsolePage() {
     if (ds.status === "fulfilled") setDatasets(ds.value);
     if (col.status === "fulfilled") setCatalogs(col.value);
     setCurationLoaded(true);
+  }
+
+  // Query (depth-tiered wiki/query) — quick(1) / standard(2) / deep(3).
+  const [qq, setQq] = useState("");
+  const [depth, setDepth] = useState(2);
+  const [queryResult, setQueryResult] = useState<WikiQueryResult | null>(null);
+  const [querying, setQuerying] = useState(false);
+
+  async function runQuery() {
+    const query = qq.trim();
+    if (!query || !connector.queryWiki) return;
+    setQuerying(true);
+    try {
+      setQueryResult(await connector.queryWiki(query, { depth, k: 25 }));
+    } catch {
+      setQueryResult(null);
+    } finally {
+      setQuerying(false);
+    }
+  }
+
+  // Sessions (research_session history) — lazy on first tab open.
+  const [sessions, setSessions] = useState<WikiResearchSession[]>([]);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+
+  async function loadSessions() {
+    if (!connector.getWikiSessions) { setSessionsLoaded(true); return; }
+    setLoadingSessions(true);
+    try {
+      setSessions(await connector.getWikiSessions());
+    } finally {
+      setSessionsLoaded(true);
+      setLoadingSessions(false);
+    }
   }
 
   async function loadStatus() {
@@ -139,12 +174,15 @@ export function WikiConsolePage() {
             if (v === "watch" && !watch) void loadWatch();
             if (v === "reports" && !reportsLoaded) void loadReports();
             if ((v === "inventory" || v === "datasets" || v === "collect") && !curationLoaded) void loadCuration();
+            if (v === "sessions" && !sessionsLoaded) void loadSessions();
           }}
         >
           <TabsList>
             <TabsTrigger value="search"><Search className="mr-1 size-3.5" /> Search</TabsTrigger>
+            <TabsTrigger value="query"><Layers className="mr-1 size-3.5" /> Query</TabsTrigger>
             <TabsTrigger value="brief"><Sparkles className="mr-1 size-3.5" /> Brief</TabsTrigger>
             <TabsTrigger value="research"><Telescope className="mr-1 size-3.5" /> Research</TabsTrigger>
+            <TabsTrigger value="sessions"><History className="mr-1 size-3.5" /> Sessions</TabsTrigger>
             <TabsTrigger value="ingest"><Download className="mr-1 size-3.5" /> Ingest</TabsTrigger>
             <TabsTrigger value="status"><Gauge className="mr-1 size-3.5" /> Status</TabsTrigger>
             <TabsTrigger value="watch"><Radio className="mr-1 size-3.5" /> Watch</TabsTrigger>
@@ -193,6 +231,78 @@ export function WikiConsolePage() {
                 </button>
               ))}
             </div>
+          </TabsContent>
+
+          {/* ── Query (depth-tiered wiki/query) ── */}
+          <TabsContent value="query" className="mt-3">
+            <form
+              className="flex flex-wrap gap-2"
+              onSubmit={(e) => { e.preventDefault(); void runQuery(); }}
+            >
+              <Input
+                value={qq}
+                onChange={(e) => setQq(e.target.value)}
+                placeholder="Depth-tiered hybrid retrieval…"
+                aria-label="Knowledge query"
+                className="min-w-[16rem] flex-1"
+              />
+              <div className="flex overflow-hidden rounded-md border border-[color:var(--border)]" role="group" aria-label="Retrieval depth">
+                {[{ d: 1, l: "Quick" }, { d: 2, l: "Standard" }, { d: 3, l: "Deep" }].map(({ d, l }) => (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() => setDepth(d)}
+                    aria-pressed={depth === d}
+                    className={`px-2.5 py-1 text-[12px] ${depth === d ? "bg-[color:var(--primary)] text-[color:var(--primary-foreground)]" : "text-[color:var(--color-text-secondary)] hover:bg-[color:var(--muted)]"}`}
+                  >
+                    {l}
+                  </button>
+                ))}
+              </div>
+              <Button type="submit" disabled={querying || !qq.trim()}>
+                {querying ? "Querying…" : "Query"}
+              </Button>
+            </form>
+            {queryResult && (
+              <div className="mt-3">
+                <div className="mb-2 flex items-center gap-2 text-[11px] text-[color:var(--color-text-quaternary)]">
+                  <Badge variant="outline">depth {queryResult.depth}</Badge>
+                  <Badge variant={queryResult.retrieval === "hybrid" ? "success" : "outline"}>{queryResult.retrieval}</Badge>
+                  <span>{queryResult.hits.length} hit(s)</span>
+                </div>
+                {queryResult.hits.length === 0 ? (
+                  <p className="text-[13px] text-[color:var(--color-text-quaternary)]">No matches.</p>
+                ) : (
+                  <div className="space-y-2">
+                    {queryResult.hits.map((h) => (
+                      <button
+                        key={h.id}
+                        onClick={() => navigate(`/wiki/${encodeURIComponent(h.id)}`)}
+                        className="block w-full rounded-md border border-[color:var(--border)] p-3 text-left hover:bg-[color:var(--muted)]"
+                      >
+                        <div className="flex items-center gap-2">
+                          <FileText className="size-3.5 shrink-0 text-[color:var(--color-text-quaternary)]" />
+                          <span className="truncate text-[13px] font-medium text-foreground">{h.title}</span>
+                          {h.score != null && (
+                            <span className="ml-auto shrink-0 font-mono text-[11px] tabular-nums text-[color:var(--color-text-quaternary)]">
+                              {h.score.toFixed(2)}
+                            </span>
+                          )}
+                        </div>
+                        {h.excerpt && (
+                          <p className="mt-1 line-clamp-2 text-[12px] text-[color:var(--color-text-secondary)]">{h.excerpt}</p>
+                        )}
+                        {h.why && (
+                          <p className="mt-1 font-mono text-[10px] text-[color:var(--color-text-quaternary)]">
+                            bm25 {h.why.bm25.toFixed(2)} · vec {h.why.vec.toFixed(2)} · rerank {h.why.rerank.toFixed(2)}
+                          </p>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </TabsContent>
 
           {/* ── Brief ── */}
@@ -261,6 +371,48 @@ export function WikiConsolePage() {
           {/* ── Research (live job) ── */}
           <TabsContent value="research">
             <WikiJobTab kind="research" />
+          </TabsContent>
+
+          {/* ── Sessions (research_session history) ── */}
+          <TabsContent value="sessions" className="mt-3">
+            <div className="mb-2 flex items-center gap-2">
+              <p className="text-[12px] text-[color:var(--color-text-quaternary)]">
+                deep-research runs — topic / progress / coverage
+              </p>
+              <Button variant="outline" size="xs" className="ml-auto" onClick={() => void loadSessions()} disabled={loadingSessions}>
+                {loadingSessions ? "Refreshing…" : "Refresh"}
+              </Button>
+            </div>
+            {sessionsLoaded && sessions.length === 0 ? (
+              <p className="text-[12px] text-[color:var(--color-text-quaternary)]">No research sessions yet.</p>
+            ) : (
+              <ul className="space-y-1">
+                {sessions.map((s) => (
+                  <li key={s.sessionID} className="rounded-md border border-[color:var(--border)] px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      {s.mode && <Badge variant="outline">{s.mode}</Badge>}
+                      {s.status && (
+                        <Badge variant={s.status === "complete" ? "success" : s.status === "failed" ? "danger" : "outline"}>
+                          {s.status}
+                        </Badge>
+                      )}
+                      <span className="truncate text-[12px] font-medium text-foreground">{s.topic ?? s.sessionID}</span>
+                      {s.score != null && (
+                        <span className="ml-auto shrink-0 font-mono text-[11px] tabular-nums text-[color:var(--color-text-quaternary)]">
+                          {s.score.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-1 flex items-center gap-3 text-[11px] text-[color:var(--color-text-quaternary)]">
+                      {s.rounds != null && <span>{s.rounds} round(s)</span>}
+                      {s.sources != null && <span>{s.sources} source(s)</span>}
+                      {s.articles != null && <span>{s.articles} article(s)</span>}
+                      {s.startedAt != null && <span className="ml-auto">{new Date(s.startedAt).toLocaleDateString()}</span>}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
           </TabsContent>
 
           {/* ── Ingest (live job) ── */}

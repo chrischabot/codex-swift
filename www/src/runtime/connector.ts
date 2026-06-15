@@ -297,6 +297,31 @@ export interface WikiCollectCatalog {
   slug: string;
   count: number;
 }
+/** One research-session run (wiki/sessions/list): the §14 deep-research timeline. */
+export interface WikiResearchSession {
+  sessionID: string;
+  topic?: string;
+  mode?: string;     // quick | standard | deep
+  status?: string;   // running | complete | failed | …
+  rounds?: number;
+  sources?: number;
+  articles?: number;
+  score?: number;    // last progress score, 0..1 (2dp)
+  startedAt?: number; // epoch ms
+}
+/** One ranked hit from depth-tiered retrieval (wiki/query). */
+export interface WikiQueryHit extends WikiPageSummary {
+  score?: number;
+  why?: { bm25: number; vec: number; rerank: number };
+}
+/** Depth-tiered retrieval result (wiki/query). `retrieval` names the mode actually
+ *  used: hybrid | lexical | lexical-degraded (hybrid asked, no matching embedder) | none. */
+export interface WikiQueryResult {
+  query: string;
+  depth: number;
+  retrieval: string;
+  hits: WikiQueryHit[];
+}
 
 // ── Live jobs: streamed ingest/research (wiki/research/start, wiki/ingest/start) ──
 /** One streamed NDJSON line from a wiki job. `type` is "event" during the run and
@@ -469,6 +494,11 @@ export interface Connector {
   getWikiDatasets?(): Promise<WikiDatasetManifest[]>;
   /** Collect catalogs with item counts (Collect tab) — read. */
   getWikiCollect?(): Promise<WikiCollectCatalog[]>;
+  /** Research-session history (Sessions tab) — read. */
+  getWikiSessions?(): Promise<WikiResearchSession[]>;
+  /** Depth-tiered hybrid retrieval (Query tab): depth 1=quick lexical, 2=standard,
+   *  3=deep (hybrid BM25∥cosine→RRF→rerank when a matching embedder exists). */
+  queryWiki?(query: string, opts?: { depth?: number; k?: number }): Promise<WikiQueryResult | null>;
   /** Start a streamed research job; `onEvent` fires for each progress line until
    *  the terminal (`done=true`) result. Returns the jobId + a local unsubscribe. */
   startWikiResearch?(params: WikiResearchStartInput,

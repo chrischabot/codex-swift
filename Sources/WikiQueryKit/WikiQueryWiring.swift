@@ -79,7 +79,8 @@ public enum WikiQueryWiring {
             auditReport:     { try await WikiJSON.auditReport(store) },
             inventoryList:   { try await WikiJSON.inventoryList(store) },
             datasetList:     { try await WikiJSON.datasetList(store) },
-            collectList:     { try await WikiJSON.collectList(store) })
+            collectList:     { try await WikiJSON.collectList(store) },
+            sessionsList:    { try await WikiJSON.sessionsList(store) })
     }
 }
 
@@ -204,6 +205,25 @@ public enum WikiJSON {
         let cats = try await store.collectCatalogs()
         let rows = cats.map { c -> JSONValue in .object(["slug": .string(c.slug), "count": .int(Int64(c.count))]) }
         return .object(["count": .int(Int64(cats.count)), "catalogs": .array(rows)])
+    }
+
+    /// Research-session history (the Sessions tab): topic/mode/status/rounds/sources/
+    /// articles/score per session, newest-first. Tier-A read.
+    public static func sessionsList(_ store: MemoryStore, limit: Int = 100) async throws -> JSONValue {
+        let sessions = try await store.researchSessions(limit: limit)
+        let rows = sessions.map { s -> JSONValue in
+            var o: [String: JSONValue] = ["sessionID": .string(s.sessionID)]
+            if let t = s.topic { o["topic"] = .string(t) }
+            if let m = s.mode { o["mode"] = .string(m) }
+            if let st = s.status { o["status"] = .string(st) }
+            if let r = s.currentRound { o["rounds"] = .int(Int64(r)) }
+            if let src = s.cumulativeSources { o["sources"] = .int(Int64(src)) }
+            if let a = s.cumulativeArticles { o["articles"] = .int(Int64(a)) }
+            if let sc = s.lastProgressScore { o["score"] = .double((sc * 100).rounded() / 100) }
+            if let stt = s.startTime { o["startedAt"] = ms(stt) }
+            return .object(o)
+        }
+        return .object(["count": .int(Int64(sessions.count)), "sessions": .array(rows)])
     }
 
     /// Watched sources + cadence + due status (the Watch tab / §14.6 list view).

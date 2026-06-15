@@ -40,6 +40,8 @@ enum MethodGate {
         "wiki/librarian/report", "wiki/audit/report",
         // Curation reads — compact-table projections (inventory/datasets/collect), no spend/egress.
         "wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list",
+        // Research-session history — read-only projection of research_session rows.
+        "wiki/sessions/list",
         "wiki/research/start", "wiki/ingest/start",
         // turn lifecycle
         "turn/start", "turn/steer", "turn/interrupt", "review/start",

@@ -56,6 +56,8 @@ extension RequestRouter {
             await replyWiki(conn, id) { try await $0.datasetList() }
         case .wikiCollectList(let id):
             await replyWiki(conn, id) { try await $0.collectList() }
+        case .wikiSessionsList(let id):
+            await replyWiki(conn, id) { try await $0.sessionsList() }
         case .wikiIndex(let id):
             await replyWiki(conn, id) { try await $0.index() }
         case .wikiPageUpsert(let id, let p):

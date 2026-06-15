@@ -2273,4 +2273,11 @@ final class ProtocolModelTests: XCTestCase {
             XCTAssertTrue(ClientRequest.typedMethods.contains(m), m)
         }
     }
+
+    /// Research-session history read parses + round-trips to its wire name.
+    func testWikiSessionsListMethodParsesAndRoundTrips() throws {
+        guard case .wikiSessionsList = try ClientRequest.parse(req("wiki/sessions/list", nil)) else { return XCTFail("sessions/list") }
+        XCTAssertEqual(ClientRequest.wikiSessionsList(.int(1)).method, "wiki/sessions/list")
+        XCTAssertTrue(ClientRequest.typedMethods.contains("wiki/sessions/list"))
+    }
 }

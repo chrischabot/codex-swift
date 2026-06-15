@@ -652,6 +652,7 @@ public enum ClientRequest: Sendable {
     case wikiInventoryList(RequestId)
     case wikiDatasetList(RequestId)
     case wikiCollectList(RequestId)
+    case wikiSessionsList(RequestId)
     case wikiResearchStart(RequestId, WikiResearchStartParams)
     case wikiIngestStart(RequestId, WikiIngestStartParams)
     case wikiPageUpsert(RequestId, WikiPageUpsertParams)
@@ -700,7 +701,7 @@ public enum ClientRequest: Sendable {
         "thread/memoryMode/set", "memory/reset",
         "skills/extraRoots/set", "permissionProfile/list", "account/usage/read",
         "wiki/list", "wiki/page/get", "wiki/search",
-        "wiki/graph", "wiki/backlinks", "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/status", "wiki/watch/list", "wiki/librarian/report", "wiki/audit/report", "wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list", "wiki/research/start", "wiki/ingest/start",
+        "wiki/graph", "wiki/backlinks", "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/status", "wiki/watch/list", "wiki/librarian/report", "wiki/audit/report", "wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list", "wiki/sessions/list", "wiki/research/start", "wiki/ingest/start",
         "turn/start", "turn/interrupt", "turn/steer", "review/start",
         "model/list", "modelProvider/capabilities/read", "config/read",
         "account/read", "account/rateLimits/read", "skills/list",
@@ -728,6 +729,7 @@ public enum ClientRequest: Sendable {
              .wikiQuery(let i, _), .wikiStatus(let i), .wikiWatchList(let i),
              .wikiLibrarianReport(let i), .wikiAuditReport(let i),
              .wikiInventoryList(let i), .wikiDatasetList(let i), .wikiCollectList(let i),
+             .wikiSessionsList(let i),
              .wikiResearchStart(let i, _), .wikiIngestStart(let i, _),
              .turnStart(let i, _), .turnInterrupt(let i, _), .turnSteer(let i, _),
              .reviewStart(let i, _), .modelList(let i, _),
@@ -794,6 +796,7 @@ public enum ClientRequest: Sendable {
         case .wikiInventoryList: return "wiki/inventory/list"
         case .wikiDatasetList: return "wiki/dataset/list"
         case .wikiCollectList: return "wiki/collect/list"
+        case .wikiSessionsList: return "wiki/sessions/list"
         case .wikiResearchStart: return "wiki/research/start"
         case .wikiIngestStart: return "wiki/ingest/start"
         case .wikiPageUpsert: return "wiki/page/upsert"
@@ -888,6 +891,7 @@ public enum ClientRequest: Sendable {
         case "wiki/inventory/list":   return .wikiInventoryList(r.id)
         case "wiki/dataset/list":     return .wikiDatasetList(r.id)
         case "wiki/collect/list":     return .wikiCollectList(r.id)
+        case "wiki/sessions/list":    return .wikiSessionsList(r.id)
         case "wiki/research/start": return .wikiResearchStart(r.id, try p(WikiResearchStartParams.self))
         case "wiki/ingest/start":   return .wikiIngestStart(r.id, try p(WikiIngestStartParams.self))
         case "wiki/page/upsert": return .wikiPageUpsert(r.id, try p(WikiPageUpsertParams.self))
