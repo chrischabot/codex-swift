@@ -584,11 +584,13 @@ struct CodexDaemon {
                                                          authProvider: mem0AuthProvider) {
                         memoryCandidates.append(mem0)
                     }
+                    var wikiVolunteerSource: (any MemoryProvider)? = nil
                     if configuredMemoryProvider == "wiki",
                        let wiki = makeWikiMemoryProvider(config: addonConfig,
                                                          modelClient: model,
                                                          authProvider: wikiAuthProvider) {
                         memoryCandidates.append(wiki)
+                        wikiVolunteerSource = wiki   // resolver attached in makeWikiMemoryProvider
                     }
                     let memoryProvider = selectMemoryProvider(
                         config: addonConfig, candidates: memoryCandidates)
@@ -622,8 +624,10 @@ struct CodexDaemon {
                     // tool just reads it. nil holder (media off) → self-prunes.
                     toolPacks.append(MediaToolPack(ledger: MediaLedgerHolder.shared.current()))
                     await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
+                    let volunteerSource = (memoryProvider?.id == "wiki") ? wikiVolunteerSource : nil
                     let extRegistry = installAddons(
-                        config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
+                        config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider,
+                        volunteerSource: volunteerSource)
                     let engine = SessionEngine(config: c, model: model, store: store,
                                          router: router, limits: limits,
                                          autoCompactTokens: autoCompact,

@@ -222,7 +222,13 @@ public func makeWikiMemoryProvider(wiki: WikiMemoryConfig,
     let toolset = MemoryToolset(store: store, retriever: retriever,
                                 inference: inference, personas: personas,
                                 gate: gate)
+    // Push-context (gbrain.md Wave 4): equip the provider with a PointerResolver over the
+    // SAME already-opened store, so volunteer() can resolve confidence-gated page pointers.
+    // .volunteering(with:) only sets a property (no init change); the opt-in is completed
+    // at the composition root by passing this provider as installAddons' volunteerSource.
+    let resolver = PointerResolver(store: store)
     return WikiMemoryProvider(retriever: retriever, tools: toolset.tools())
+        .volunteering(with: resolver)
 }
 
 /// Build a hybrid `MemoryRetriever` over an ALREADY-OPENED wiki `store`, but ONLY

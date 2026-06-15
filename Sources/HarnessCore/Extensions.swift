@@ -140,7 +140,8 @@ public func parseExtensionManifests(from config: Config) -> [ExtensionManifest] 
 /// (lesson 9b).
 public func installAddons(config: Config,
                           sessionConfig: SessionConfig,
-                          memoryProvider: (any MemoryProvider)? = nil) -> ExtensionRegistry<SessionConfig>? {
+                          memoryProvider: (any MemoryProvider)? = nil,
+                          volunteerSource: (any MemoryProvider)? = nil) -> ExtensionRegistry<SessionConfig>? {
     // General extension manifests are opt-in behind the `extensions` feature
     // (`CODEX_FEATURE_EXTENSIONS` env or `[features].extensions` in config.toml),
     // defaulting to off. The selected memory provider is the exception: personal
@@ -157,7 +158,10 @@ public func installAddons(config: Config,
     // Phase 1: wire the selected Memory slot provider (recall → fenced
     // contextContributor; capture → turnLifecycle onStop). The composition root
     // selects the provider (`selectMemoryProvider`) and passes it here.
-    if let memoryProvider { registerMemory(memoryProvider, into: builder) }
+    // Phase 1 + push-context (gbrain.md Wave 4): wire recall/capture, and — when a
+    // volunteer source is supplied (the resolver-equipped Wiki) — the proactive
+    // push-context contributor. volunteerSource defaults nil ⇒ zero behavior change.
+    if let memoryProvider { registerMemory(memoryProvider, volunteerSource: volunteerSource, into: builder) }
 
     // Future phases register more contributors against `builder` here, keyed on
     // each manifest's id / capabilities.

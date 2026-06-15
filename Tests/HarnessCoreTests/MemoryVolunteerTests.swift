@@ -4,6 +4,7 @@ import Foundation
 @testable import ExtensionAPI
 @testable import Tools
 @testable import ProtocolModel
+@testable import Config
 
 /// Deterministic coverage for the push-context wiring (gbrain.md Wave 4): the
 /// opt-in volunteer contributor in `registerMemory`, the volunteered-pages fence,
@@ -33,6 +34,34 @@ final class MemoryVolunteerTests: XCTestCase {
         _ = thread.insert(ConversationWindow(turns: [.init(role: "user", text: "tell me about Alice Smith")]))
         let frags = await registry.promptFragments(sessionStore: session, threadStore: thread)
         XCTAssertFalse(fragsContainPages(frags), "no volunteerSource ⇒ no push context (zero behavior change)")
+    }
+
+    // PROVES THE PRODUCTION SEAM the audit found open: installAddons now forwards
+    // volunteerSource → the push contributor (was hard-nil at the only callsite).
+    func testInstallAddonsForwardsVolunteerSourceToPushContributor() async {
+        let stub = StubProvider(pointers: [MemorySnippet(text: "Alice — person", score: 0.9, citation: "alice-smith")])
+        guard let registry = installAddons(config: Config(layers: []),
+                                           sessionConfig: SessionConfig(threadId: .generate(), cwd: "/w"),
+                                           memoryProvider: stub, volunteerSource: stub) else {
+            return XCTFail("installAddons should build a registry when a memory provider is set")
+        }
+        let (session, thread) = (ExtensionData(levelId: "session"), ExtensionData(levelId: "thread"))
+        _ = thread.insert(ConversationWindow(turns: [.init(role: "user", text: "tell me about Alice Smith")]))
+        let frags = await registry.promptFragments(sessionStore: session, threadStore: thread)
+        XCTAssertTrue(fragsContainPages(frags), "installAddons forwards volunteerSource → the push contributor runs")
+    }
+
+    func testInstallAddonsOmittingVolunteerSourceInjectsNoPages() async {
+        let stub = StubProvider(pointers: [MemorySnippet(text: "Alice — person", score: 0.9, citation: "alice-smith")])
+        guard let registry = installAddons(config: Config(layers: []),
+                                           sessionConfig: SessionConfig(threadId: .generate(), cwd: "/w"),
+                                           memoryProvider: stub) else {       // no volunteerSource
+            return XCTFail("registry expected")
+        }
+        let (session, thread) = (ExtensionData(levelId: "session"), ExtensionData(levelId: "thread"))
+        _ = thread.insert(ConversationWindow(turns: [.init(role: "user", text: "tell me about Alice Smith")]))
+        let frags = await registry.promptFragments(sessionStore: session, threadStore: thread)
+        XCTAssertFalse(fragsContainPages(frags), "default-nil volunteerSource ⇒ zero behavior change")
     }
 
     func testEmptyWindowVolunteersNothing() async {

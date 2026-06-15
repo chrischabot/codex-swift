@@ -427,11 +427,13 @@ struct SessionWorkerMain {
                                                  authProvider: mem0AuthProvider) {
                 memoryCandidates.append(mem0)
             }
+            var wikiVolunteerSource: (any MemoryProvider)? = nil
             if configuredMemoryProvider == "wiki",
                let wiki = makeWikiMemoryProvider(config: addonConfig,
                                                  modelClient: model,
                                                  authProvider: wikiAuthProvider) {
                 memoryCandidates.append(wiki)
+                wikiVolunteerSource = wiki   // resolver attached in makeWikiMemoryProvider
             }
             let memoryProvider = selectMemoryProvider(
                 config: addonConfig, candidates: memoryCandidates)
@@ -474,8 +476,12 @@ struct SessionWorkerMain {
             }
             toolPacks.append(MediaToolPack(ledger: MediaLedgerHolder.shared.current()))
             await ToolPackRegistry(toolPacks).install(on: router, config: addonConfig)
+            // Only volunteer when the SELECTED provider is the wiki (selectMemoryProvider
+            // may pick mem0/core even if wiki was built) — gate on identity.
+            let volunteerSource = (memoryProvider?.id == "wiki") ? wikiVolunteerSource : nil
             let extRegistry = installAddons(
-                config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider)
+                config: addonConfig, sessionConfig: c, memoryProvider: memoryProvider,
+                volunteerSource: volunteerSource)
             let engine = SessionEngine(config: c, model: model, store: store,
                                        router: router, limits: limits,
                                        autoCompactTokens: autoCompact,
