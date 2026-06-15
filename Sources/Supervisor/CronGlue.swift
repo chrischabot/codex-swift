@@ -37,6 +37,35 @@ public enum CronGlue {
             networkAccess: false)
     }
 
+    /// The locked-down SessionConfig for an unattended **wiki research round** (§14.5 —
+    /// the design's flagged "real security task"). Unlike a cron turn, a research round
+    /// MUST reach the network (to fetch sources) and MUST write (to persist findings into
+    /// the wiki vault) — which is exactly why its confinement is the load-bearing part:
+    ///
+    /// - `sandboxMode: .workspaceWrite` + `writableRoots: [vaultRoot]` — writes are
+    ///   confined to the WIKI VAULT ONLY. No project tree, no home, no arbitrary fs; a
+    ///   prompt-injected source can't make the round scribble outside the knowledge base.
+    /// - `networkAccess: true` — egress is REQUIRED, but it is *screened*: every fetch
+    ///   still flows through PinnedFetcher + EgressGuard (HTTPS-only, public-host, IP-pin,
+    ///   per-redirect re-vet) at the fetch layer. The sandbox flag only permits the
+    ///   syscalls; the EgressGuard chokepoint is the actual screen (NOT re-opened here).
+    /// - `approvalPolicy: .never` — unattended, so it can't block on an unanswerable gate
+    ///   (the engine denies an approval-required tool inline instead of hanging).
+    /// - `ephemeral: skipMemory` — an unattended round must not silently rewrite the user
+    ///   model; memory consolidation is off when skipMemory is set.
+    ///
+    /// Pure + public so a test pins these security properties directly (no full engine).
+    public static func researchRoundSessionConfig(vaultRoot: String, defaultModel: String,
+                                                  skipMemory: Bool = true) -> SessionConfig {
+        SessionConfig(
+            threadId: .generate(), cwd: vaultRoot, model: defaultModel,
+            ephemeral: skipMemory,
+            approvalPolicy: .never,
+            sandboxMode: .workspaceWrite,
+            writableRoots: [vaultRoot],          // the wiki vault — and nothing else
+            networkAccess: true)                 // screened at PinnedFetcher/EgressGuard
+    }
+
     public static func makeCronRunner(supervisor: SessionSupervisor,
                                       defaultCwd: String,
                                       defaultModel: String,

@@ -271,6 +271,27 @@ final class CronRpcTests: XCTestCase {
         XCTAssertFalse(cfg2.ephemeral)
     }
 
+    func testResearchRoundSessionConfigIsScreenedAndWriteConfined() {
+        // The §14.5 "real security task": a research round MAY reach the network
+        // (fetch sources) + write (persist findings), but writes are confined to the
+        // WIKI VAULT ONLY, approval is .never (unattended), and egress is screened at
+        // the PinnedFetcher/EgressGuard layer (the sandbox flag just permits syscalls).
+        let vault = "/Users/x/.codex/wiki-vault"
+        let cfg = CronGlue.researchRoundSessionConfig(vaultRoot: vault, defaultModel: "m")
+        XCTAssertEqual(cfg.approvalPolicy, .never, "unattended → never prompt")
+        XCTAssertEqual(cfg.sandboxMode, .workspaceWrite, "write allowed but confined")
+        XCTAssertEqual(cfg.writableRoots, [vault], "writes confined to the wiki vault — NOT the whole fs")
+        XCTAssertTrue(cfg.networkAccess, "research must reach the network (screened at EgressGuard)")
+        XCTAssertEqual(cfg.cwd, vault)
+        XCTAssertTrue(cfg.ephemeral, "skipMemory default true → no silent memory rewrite")
+        // skipMemory=false → memory allowed (not ephemeral).
+        let cfg2 = CronGlue.researchRoundSessionConfig(vaultRoot: vault, defaultModel: "m", skipMemory: false)
+        XCTAssertFalse(cfg2.ephemeral)
+        // The vault is the ONLY writable root — never the home dir or a project tree.
+        XCTAssertFalse(cfg.writableRoots.contains("/"), "no root write")
+        XCTAssertEqual(cfg.writableRoots.count, 1, "exactly one writable root")
+    }
+
     // MARK: migration
 
     func testMigrationIsLossyCorrectAndIdempotent() throws {
