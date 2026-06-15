@@ -9,6 +9,15 @@ import MemoryStore
 /// existing `memory_graph_walk` then answers callers/callees:
 ///   callers of X = edges WHERE dst = X AND relation = 'calls'
 ///   callees of X = edges WHERE src = X AND relation = 'calls'
+///
+/// CONTRACT (codeintel-recall): code-intel entities use `EntityKind.codeIntel`
+/// (.symbol/.module). They are WRITTEN only here (CLI `codex-memory code-index`) and READ
+/// only via `memory_graph_walk` with an explicit seed + `relation:"calls"`. They are
+/// deliberately EXCLUDED from every memory/wiki entity-LIST surface (WikiJSON.graph nodes,
+/// PointerResolver, GraphWalkTool name-seed) via `EntityKind.isMemoryEntity` /
+/// `entities(excludingKinds:)`, and never enter chunk/vec recall (symbols are never chunks
+/// or documents). So the call graph is a queryable island — populated from the CLI, walked
+/// by an explicit seed, invisible to conversational recall.
 public struct CodeIndexer: Sendable {
     let store: MemoryStore
     public init(store: MemoryStore) { self.store = store }

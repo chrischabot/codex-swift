@@ -132,9 +132,15 @@ public struct GraphWalkTool: Tool {
         case .id(let id): entityId = id
         case .name(let name):
             var found: Int64?
-            for kind in EntityKind.allCases {
-                if let row = try await store.entity(kind: kind, canonical: name) {
-                    found = row.id; break
+            // Prefer a memory entity (a recall-originated plain name resolves to the memory
+            // entity, not a colliding symbol stub), then fall back to code-intel kinds so a
+            // qualified-name graph-walk seed can still reach the code graph.
+            for kind in EntityKind.allCases where kind.isMemoryEntity {
+                if let row = try await store.entity(kind: kind, canonical: name) { found = row.id; break }
+            }
+            if found == nil {
+                for kind in EntityKind.codeIntel.sorted(by: { $0.rawValue < $1.rawValue }) {
+                    if let row = try await store.entity(kind: kind, canonical: name) { found = row.id; break }
                 }
             }
             guard let f = found else {

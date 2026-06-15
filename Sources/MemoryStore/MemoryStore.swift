@@ -824,6 +824,20 @@ public actor MemoryStore {
         """, [.int(Int64(limit))]).map(Self.rowToEntity)
     }
 
+    /// Memory/wiki entity listing that EXCLUDES code-intel stub kinds (.symbol/.module).
+    /// The exclusion is in SQL so a large symbol population can't starve the LIMIT.
+    public func entities(limit: Int = 10_000, excludingKinds: Set<EntityKind>) throws -> [EntityRow] {
+        guard !excludingKinds.isEmpty else { return try entities(limit: limit) }
+        let placeholders = excludingKinds.map { _ in "?" }.joined(separator: ",")
+        let binds = excludingKinds.map { Bind.text($0.rawValue) } + [Bind.int(Int64(limit))]
+        return try run("""
+        SELECT * FROM entity
+         WHERE kind NOT IN (\(placeholders))
+         ORDER BY kind, canonical, id
+         LIMIT ?;
+        """, binds).map(Self.rowToEntity)
+    }
+
     /// Entities of a single `kind`, ordered by `degree` DESC (most-connected
     /// first). The WHERE filter is applied in SQL so the LIMIT can't starve the
     /// result (e.g. a tag cloud isn't crowded out by thousands of non-tag rows).

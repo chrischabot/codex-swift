@@ -25,6 +25,31 @@ final class CodeIndexerTests: XCTestCase {
         return try MemoryStore(MemoryStoreConfig(path: db, embeddingDimension: 8))
     }
 
+    // codeintel-recall: symbol/module stubs must not pollute memory/wiki entity-LIST surfaces.
+
+    func testEntityKindMembership() {
+        XCTAssertFalse(EntityKind.symbol.isMemoryEntity)
+        XCTAssertFalse(EntityKind.module.isMemoryEntity)
+        XCTAssertTrue(EntityKind.person.isMemoryEntity)
+        XCTAssertTrue(EntityKind.concept.isMemoryEntity)
+        XCTAssertEqual(EntityKind.codeIntel, [.symbol, .module])
+    }
+
+    func testCodeIntelEntitiesExcludedFromMemoryEntityList() async throws {
+        let store = try makeStore()
+        _ = try await CodeIndexer(store: store).index(source: src, path: "Widget.swift", now: 1)  // writes .symbol rows
+        _ = try await store.upsertEntity(EntityRow(kind: .person, canonical: "Ada Lovelace",
+                                                   aliases: [], firstSeen: 1, lastSeen: 1, degree: 0))
+        // The filtered listing returns ONLY memory entities — no symbol stubs.
+        let memOnly = try await store.entities(limit: 1000, excludingKinds: EntityKind.codeIntel)
+        XCTAssertTrue(memOnly.allSatisfy { $0.kind.isMemoryEntity }, "no code-intel kinds leak into the memory list")
+        XCTAssertTrue(memOnly.contains { $0.canonical == "Ada Lovelace" })
+        XCTAssertFalse(memOnly.contains { $0.kind == .symbol })
+        // The raw all-kinds listing still includes the symbols (the CLI/graph-walk island).
+        let all = try await store.entities(limit: 1000)
+        XCTAssertTrue(all.contains { $0.kind == .symbol }, "symbols remain queryable by an explicit consumer")
+    }
+
     func testIndexesSymbolsAsEntities() async throws {
         let store = try makeStore()
         let report = try await CodeIndexer(store: store).index(source: src, path: "Widget.swift", now: 1)

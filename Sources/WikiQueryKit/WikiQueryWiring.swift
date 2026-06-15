@@ -523,7 +523,7 @@ public enum WikiJSON {
             let walked = try await store.twoHopNeighbours(seed: seed, depth: depth)
             nodeIds = Array(Set(walked.map { $0.0 } + [seed]))
         } else {
-            nodeIds = try await store.entities(limit: 2000).map { $0.id }
+            nodeIds = try await store.entities(limit: 2000, excludingKinds: EntityKind.codeIntel).map { $0.id }
         }
         let nodeSet = Set(nodeIds)
         var nodes: [JSONValue] = []

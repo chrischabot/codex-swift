@@ -62,6 +62,14 @@ public enum EntityKind: String, Sendable, Codable, CaseIterable {
     case person, org, product, paper, repo, concept, tag
     // Code-intelligence graph (gbrain.md Wave 5.30): source symbols + modules.
     case symbol, module
+
+    /// Code-intelligence kinds: written ONLY by the CLI CodeIndexer, read ONLY by
+    /// memory_graph_walk with an explicit seed. EXCLUDED from memory/wiki entity-LIST
+    /// surfaces (whole-graph nodes, pointer resolution, name-seed) so symbol stubs don't
+    /// pollute recall/backlinks.
+    public static let codeIntel: Set<EntityKind> = [.symbol, .module]
+    /// True for a normal memory/wiki entity (NOT a code-intel stub).
+    public var isMemoryEntity: Bool { !EntityKind.codeIntel.contains(self) }
 }
 
 public struct EntityRow: Sendable, Equatable {

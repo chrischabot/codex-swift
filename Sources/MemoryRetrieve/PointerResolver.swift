@@ -57,7 +57,9 @@ public struct PointerResolver: Sendable {
 
     /// First exact entity match across kinds (deterministic kind order).
     private func exactEntity(canonical: String) async throws -> (EntityRow, EntityKind)? {
-        for kind in EntityKind.allCases {
+        // Skip code-intel kinds so a conversational surface form is never volunteered as
+        // a pointer to a code symbol/module stub.
+        for kind in EntityKind.allCases where kind.isMemoryEntity {
             if let e = try await store.entity(kind: kind, canonical: canonical) { return (e, kind) }
         }
         return nil
