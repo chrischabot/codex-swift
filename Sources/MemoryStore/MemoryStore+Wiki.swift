@@ -307,6 +307,30 @@ extension MemoryStore {
                 [.text(key), .text(value)])
     }
 
+    /// Prefix scan over the durable `meta` queue. Returns every (key,value) whose key
+    /// begins with `prefix`, ordered by key. The maintenance/dream cycle writes review
+    /// markers here (`synthesis_review:<id>`, `librarian_tier2:<id>`); this is the READER
+    /// the audit found missing — consuming the cycle's committed transitions instead of
+    /// recomputing the scanners live. The prefix is escaped (`%` `_` `\` → ESCAPE clause)
+    /// so a caller-supplied prefix can never wildcard.
+    public func metaEntries(prefix: String) throws -> [(key: String, value: String)] {
+        let escaped = prefix
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let rows = try run("SELECT key, value FROM meta WHERE key LIKE ? ESCAPE '\\' ORDER BY key;",
+                           [.text(escaped + "%")])
+        return rows.compactMap { r in
+            guard let k = r["key"] as? String, let v = r["value"] as? String else { return nil }
+            return (k, v)
+        }
+    }
+
+    /// Count of durable `meta` keys with `prefix` (the cycle's review-marker queue size).
+    public func metaCount(prefix: String) throws -> Int {
+        try metaEntries(prefix: prefix).count
+    }
+
     /// Incremental-compile cutoff (mirrors llm-wiki's "Last compiled"): only
     /// documents fetched after this stamp are recompiled by default.
     public func lastCompiledAt() throws -> Int64? {

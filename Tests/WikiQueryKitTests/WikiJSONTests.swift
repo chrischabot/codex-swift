@@ -485,6 +485,19 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(byCat["memes"], 2); XCTAssertEqual(byCat["tools"], 1)
     }
 
+    func testStatusFlaggedCountFromCycleMarkersNotLiveScan() async throws {
+        // No cycle has run → flaggedStale falls back to the live scan, source "live".
+        let empty = try await WikiJSON.status(store)
+        XCTAssertEqual(empty.obj?["flaggedSource"]?.str, "live")
+        // The dream cycle commits two librarian_tier2 markers → status now reports THOSE
+        // (what was durably decided), not a live recompute.
+        try await store.setMetaValue("librarian_tier2:1", "1")
+        try await store.setMetaValue("librarian_tier2:2", "1")
+        let after = try await WikiJSON.status(store)
+        XCTAssertEqual(after.obj?["flaggedSource"]?.str, "cycle")
+        XCTAssertEqual(after.obj?["flaggedStale"]?.int, 2, "status reads the marker queue, not the scanner")
+    }
+
     func testCurationReadsEmptyStore() async throws {
         let inv = try await WikiJSON.inventoryList(store)
         let ds = try await WikiJSON.datasetList(store)

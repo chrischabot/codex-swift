@@ -16,7 +16,11 @@ enum CodexMemoryWikiStatus {
         let docs = try await bundle.store.documentCount()
         let scores = try await bundle.store.librarianScan(now: now)
         let jobs = try await bundle.store.ingestJobs(limit: opt.limit)
-        return (format(docs: docs, pages: scores.count, flagged: scores.filter(\.needsTier2).count,
+        // Agree with the RPC dashboard: report what the maintenance/dream cycle committed
+        // (durable librarian_tier2: markers), falling back to the live scan only if none.
+        let persistedFlagged = try await bundle.store.metaCount(prefix: "librarian_tier2:")
+        let flagged = persistedFlagged > 0 ? persistedFlagged : scores.filter(\.needsTier2).count
+        return (format(docs: docs, pages: scores.count, flagged: flagged,
                        jobs: jobs, opt: opt), true)
     }
 

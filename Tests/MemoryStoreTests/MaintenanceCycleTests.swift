@@ -81,6 +81,47 @@ final class MaintenanceCycleTests: XCTestCase {
         XCTAssertNotNil(marker, "a durable review marker must be written")
     }
 
+    // MARK: marker queue is now READABLE (the dream-cycle source-of-truth seam)
+
+    func testMetaEntriesPrefixScanAndCount() async throws {
+        let store = try makeStore()
+        try await store.setMetaValue("librarian_tier2:42", "1")
+        try await store.setMetaValue("librarian_tier2:7", "1")
+        try await store.setMetaValue("synthesis_review:3", "drifted")
+        try await store.setMetaValue("librarian_tier2", "x")       // no colon → different key
+        try await store.setMetaValue("librarian_tier2x:9", "x")    // different family
+        let lib = try await store.metaEntries(prefix: "librarian_tier2:")
+        XCTAssertEqual(lib.map(\.key), ["librarian_tier2:42", "librarian_tier2:7"], "only the exact prefix family, ordered")
+        let libCount = try await store.metaCount(prefix: "librarian_tier2:")
+        let revCount = try await store.metaCount(prefix: "synthesis_review:")
+        XCTAssertEqual(libCount, 2)
+        XCTAssertEqual(revCount, 1)
+    }
+
+    func testMetaEntriesEscapesLikeWildcards() async throws {
+        let store = try makeStore()
+        try await store.setMetaValue("50%_off\\promoA", "1")   // literal % _ \ in the key
+        try await store.setMetaValue("500XoffYpromoB", "2")    // would match if % _ were wildcards
+        let hits = try await store.metaEntries(prefix: "50%_off\\promo")
+        XCTAssertEqual(hits.map(\.key), ["50%_off\\promoA"], "LIKE metacharacters in the prefix are escaped, not wildcarded")
+    }
+
+    func testCycleMarkerIsReadableAsQueueEntryWithVerdict() async throws {
+        let store = try makeStore()
+        let now: Int64 = 1_800_000_000
+        let cid = try await seedClaim(store, text: "c", status: .active, firstSeen: now, lastReviewed: now, updatedAt: now)
+        let sid = try await store.upsertSynthesis(SynthesisRow(
+            slug: "s", category: "synthesis", title: "S", bodyPath: "/tmp/x.md",
+            createdAt: now - 1000 * day, updatedAt: now - 1000 * day, generatedAt: now - 1000 * day))
+        try await store.linkSynthesisClaim(synthesis: sid, claim: cid)
+        _ = await MaintenanceCycle(store: store).run(now: now)
+        // The marker the cycle committed is now ENUMERABLE (was write-only) and carries the verdict.
+        let entries = try await store.metaEntries(prefix: "synthesis_review:")
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?.key, "synthesis_review:\(sid)")
+        XCTAssertEqual(entries.first?.value, "drifted", "the marker carries the DriftStatus the scan produced")
+    }
+
     func testAbortStopsBeforeAnyPhase() async throws {
         let store = try makeStore()
         let now: Int64 = 1_800_000_000

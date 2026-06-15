@@ -114,6 +114,12 @@ public enum WikiJSON {
         let docs = try await store.documentCount()
         let scores = try await store.librarianScan(now: now)
         let jobs = try await store.ingestJobs(limit: 10)
+        // Source of truth for the flagged-stale count = the maintenance/dream cycle's
+        // durable librarian_tier2:<id> markers (what was actually committed). Fall back
+        // to the live scan count ONLY if no cycle has ever run (no markers) so a fresh
+        // DB still shows something. Monotone: never worse than the old live recompute.
+        let persistedFlagged = try await store.metaCount(prefix: "librarian_tier2:")
+        let flaggedStale = persistedFlagged > 0 ? persistedFlagged : scores.filter(\.needsTier2).count
         let jobItems = jobs.map { j -> JSONValue in
             var o: [String: JSONValue] = [
                 "jobID": .string(j.jobID), "input": .string(j.input), "status": .string(j.status),
@@ -127,7 +133,8 @@ public enum WikiJSON {
         return .object([
             "documents": .int(Int64(docs)),
             "pages": .int(Int64(scores.count)),
-            "flaggedStale": .int(Int64(scores.filter(\.needsTier2).count)),
+            "flaggedStale": .int(Int64(flaggedStale)),
+            "flaggedSource": .string(persistedFlagged > 0 ? "cycle" : "live"),
             "recentJobs": .array(jobItems),
         ])
     }
