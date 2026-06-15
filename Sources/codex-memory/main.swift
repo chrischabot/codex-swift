@@ -223,6 +223,16 @@ case "wiki-dataset":
         exit(2)
     }
 
+case "wiki-collect":
+    do {
+        let result = try await CodexMemoryWikiCollect.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-collect failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "code-index":
     do {
         let result = try await CodexMemoryCodeIndex.run(args: Array(args.dropFirst()))
@@ -265,6 +275,7 @@ case "help", "--help", "-h":
       wiki-refresh    Re-fetch + re-verify due (stale) sources (--due); bump verified_at.
       wiki-inventory  Durable inventory CRUD (list|add|show|save-view|views) — compact table.
       wiki-dataset    Dataset manifests + notes (list|add|show|profile|note); bounded local profile.
+      wiki-collect    Discovery catalog (list|add|download); HTTPS-only IP-pinned media downloader.
       wiki-research   Multi-round web research swarm → credibility filter → ingest.
       run             Long-running daemon: ingest → process → score, with MCP.
 

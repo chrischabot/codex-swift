@@ -167,6 +167,32 @@ extension MemoryStore {
         return (rows.first?["id"] as? Int64) ?? 0
     }
 
+    /// Update a collect item IN PLACE by id — used to persist a download result
+    /// (sha256/local_media_path/status). `upsertCollectItem` must NOT be used for this:
+    /// it is insert-or-return-existing and would discard the new fields on a dedupe hit
+    /// (or insert a duplicate once the sha is set). Throws on a sha/url UNIQUE collision
+    /// (the caller treats that as "another row already owns this content").
+    public func updateCollectItem(_ c: CollectItemRow) throws {
+        try run("""
+        UPDATE wiki_collect_item SET
+          title=?, aliases=?, collect_kind=?, canonical_url=?, media_url=?, source_url=?, origin_platform=?,
+          creator=?, first_seen=?, description=?, evidence=?, found_in_context=?, provenance_confidence=?,
+          rights_or_license=?, media_format=?, local_media_path=?, media_bytes=?, sha256=?, perceptual_hash=?,
+          download_status=?, downloaded_at=?, next_action=?
+        WHERE id=?;
+        """, [
+            .text(c.title), c.aliases.map(Bind.text) ?? .null, c.collectKind.map(Bind.text) ?? .null,
+            c.canonicalURL.map(Bind.text) ?? .null, c.mediaURL.map(Bind.text) ?? .null, c.sourceURL.map(Bind.text) ?? .null,
+            c.originPlatform.map(Bind.text) ?? .null, c.creator.map(Bind.text) ?? .null, c.firstSeen.map(Bind.text) ?? .null,
+            c.description.map(Bind.text) ?? .null, c.evidence.map(Bind.text) ?? .null, c.foundInContext.map(Bind.text) ?? .null,
+            c.provenanceConfidence.map(Bind.text) ?? .null, c.rightsOrLicense.map(Bind.text) ?? .null,
+            c.mediaFormat.map(Bind.text) ?? .null, c.localMediaPath.map(Bind.text) ?? .null,
+            c.mediaBytes.map(Bind.int) ?? .null, c.sha256.map(Bind.text) ?? .null, c.perceptualHash.map(Bind.text) ?? .null,
+            c.downloadStatus.map(Bind.text) ?? .null, c.downloadedAt.map(Bind.int) ?? .null, c.nextAction.map(Bind.text) ?? .null,
+            .int(c.id),
+        ])
+    }
+
     public func collectItems(catalogSlug: String, limit: Int = 10_000) throws -> [CollectItemRow] {
         try run("SELECT * FROM wiki_collect_item WHERE catalog_slug=? ORDER BY row_number, id LIMIT ?;",
                 [.text(catalogSlug), .int(Int64(limit))]).map(curParseCollect)
