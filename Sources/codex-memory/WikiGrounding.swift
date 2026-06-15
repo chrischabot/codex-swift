@@ -144,7 +144,14 @@ enum CodexMemoryWikiArtifact {
             if (try? await store.claim(id: cid)) != nil { validClaims.insert(cid); citedClaimIDs.append(cid) }
         }
         if enforceGrounding {
-            let violations = WikiGroundingLint.lint(body: body, validSlugs: validSlugs, validClaims: validClaims)
+            var violations = WikiGroundingLint.lint(body: body, validSlugs: validSlugs, validClaims: validClaims)
+            // A body with NO `## ` decision sections is vacuously "grounded" by the
+            // per-section lint (it has nothing to check) — but an enforced plan with
+            // zero decision sections is degenerate. Guard it, so a model that drifts to
+            // heading-less prose (or only h1/h3) can't slip a strict plan past grounding.
+            if WikiGroundingLint.sections(WikiGroundingLint.stripFences(body)).isEmpty {
+                violations.append(GroundingViolation(kind: .ungroundedSection, detail: "(no decision sections)"))
+            }
             if !violations.isEmpty {
                 let summary = violations.map { "\($0.kind.rawValue): \($0.detail)" }.joined(separator: "; ")
                 if strict {
@@ -202,37 +209,61 @@ enum CodexMemoryWikiArtifact {
     // MARK: - CLI entry points
 
     static func runPlan(args: [String]) async throws -> (output: String, ok: Bool) {
-        guard args.first == "file" else { throw CLIError(message: "wiki-plan requires the 'file' verb") }
-        let o = try parse(Array(args.dropFirst()), formats: planFormats, formatFlag: "--format")
+        let verb = args.first ?? ""
+        guard verb == "file" || verb == "generate" else { throw CLIError(message: "wiki-plan requires the 'file' or 'generate' verb") }
+        let o = try parse(Array(args.dropFirst()), formats: planFormats, formatFlag: "--format", needsBody: verb == "file")
         guard let format = o.format, planFormats.contains(format) else {
             throw CLIError(message: "wiki-plan requires --format (\(planFormats.sorted().joined(separator: "|")))")
         }
         let bundle = try await CodexMemoryRun.assemble()
         let vaultRoot = (MemoryStoreConfig.defaultPath() as NSString).deletingLastPathComponent
-        return try await file(store: bundle.store, vaultRoot: vaultRoot, now: Int64(Date().timeIntervalSince1970),
+        let now = Int64(Date().timeIntervalSince1970)
+        if verb == "generate" {
+            guard let gen = liveGenerator(store: bundle.store) else {
+                return ("wiki-plan: generation needs OPENAI_API_KEY (or use `file` with a pre-written --body)\n", false)
+            }
+            return try await generateAndFile(store: bundle.store, vaultRoot: vaultRoot, now: now,
+                                             kind: "plan", category: "plan", format: format, outputType: nil,
+                                             slug: o.slug, title: o.title, topic: o.topic,
+                                             generator: gen, strict: o.strict, enforceGrounding: true, project: o.project)
+        }
+        return try await file(store: bundle.store, vaultRoot: vaultRoot, now: now,
                               slug: o.slug, title: o.title, category: "plan", format: format, outputType: nil,
                               body: o.body, strict: o.strict, enforceGrounding: true, project: o.project)
     }
 
     static func runOutput(args: [String]) async throws -> (output: String, ok: Bool) {
-        guard args.first == "file" else { throw CLIError(message: "wiki-output requires the 'file' verb") }
-        let o = try parse(Array(args.dropFirst()), formats: outputTypes, formatFlag: "--type")
+        let verb = args.first ?? ""
+        guard verb == "file" || verb == "generate" else { throw CLIError(message: "wiki-output requires the 'file' or 'generate' verb") }
+        let o = try parse(Array(args.dropFirst()), formats: outputTypes, formatFlag: "--type", needsBody: verb == "file")
         let type = o.format ?? "report"
         guard outputTypes.contains(type) else {
             throw CLIError(message: "wiki-output --type must be one of: \(outputTypes.sorted().joined(separator: "|"))")
         }
         let bundle = try await CodexMemoryRun.assemble()
         let vaultRoot = (MemoryStoreConfig.defaultPath() as NSString).deletingLastPathComponent
+        let now = Int64(Date().timeIntervalSince1970)
         // Outputs are filed under category=report with output_type=<type>; grounding is
         // surfaced but not enforced (outputs aren't decisions).
-        return try await file(store: bundle.store, vaultRoot: vaultRoot, now: Int64(Date().timeIntervalSince1970),
+        if verb == "generate" {
+            guard let gen = liveGenerator(store: bundle.store) else {
+                return ("wiki-output: generation needs OPENAI_API_KEY (or use `file` with a pre-written --body)\n", false)
+            }
+            return try await generateAndFile(store: bundle.store, vaultRoot: vaultRoot, now: now,
+                                             kind: "output", category: "report", format: nil, outputType: type,
+                                             slug: o.slug, title: o.title, topic: o.topic,
+                                             generator: gen, strict: false, enforceGrounding: false, project: o.project)
+        }
+        return try await file(store: bundle.store, vaultRoot: vaultRoot, now: now,
                               slug: o.slug, title: o.title, category: "report", format: nil, outputType: type,
                               body: o.body, strict: false, enforceGrounding: false, project: o.project)
     }
 
-    struct Options { var slug = "", title = "", body = "", strict = false; var format: String?; var project: String? }
+    struct Options { var slug = "", title = "", body = "", topic = "", strict = false; var format: String?; var project: String? }
 
-    static func parse(_ args: [String], formats: Set<String>, formatFlag: String) throws -> Options {
+    /// `needsBody` = the `file` verb (a pre-written --body is required); `generate`
+    /// instead requires --topic (the KB query the body is grounded against).
+    static func parse(_ args: [String], formats: Set<String>, formatFlag: String, needsBody: Bool = true) throws -> Options {
         var o = Options(); var i = 0
         func val(_ f: String) throws -> String { i += 1; guard i < args.count else { throw CLIError(message: "\(f) requires a value") }; return args[i] }
         while i < args.count {
@@ -244,6 +275,7 @@ enum CodexMemoryWikiArtifact {
                 let p = try val("--body-file")
                 guard let s = try? String(contentsOfFile: p, encoding: .utf8) else { throw CLIError(message: "could not read --body-file \(p)") }
                 o.body = s
+            case "--topic": o.topic = try val("--topic")
             case "--strict": o.strict = true
             case "--project": o.project = try val("--project")
             case formatFlag: o.format = try val(formatFlag)
@@ -251,10 +283,16 @@ enum CodexMemoryWikiArtifact {
             }
             i += 1
         }
-        guard !o.slug.isEmpty else { throw CLIError(message: "file requires --slug") }
+        guard !o.slug.isEmpty else { throw CLIError(message: "requires --slug") }
         guard isSafeSlug(o.slug) else { throw CLIError(message: "--slug must be [a-z0-9-_] (no slashes/dots/uppercase)") }
-        guard !o.title.isEmpty else { throw CLIError(message: "file requires --title") }
-        guard !o.body.isEmpty else { throw CLIError(message: "file requires --body or --body-file") }
+        guard !o.title.isEmpty else { throw CLIError(message: "requires --title") }
+        if needsBody {
+            guard !o.body.isEmpty else { throw CLIError(message: "file requires --body or --body-file") }
+        } else {
+            guard !o.topic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw CLIError(message: "generate requires --topic (the KB query to ground against)")
+            }
+        }
         return o
     }
 }

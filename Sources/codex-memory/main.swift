@@ -316,8 +316,8 @@ case "help", "--help", "-h":
       wiki-inventory  Durable inventory CRUD (list|add|show|save-view|views) — compact table.
       wiki-dataset    Dataset manifests + notes (list|add|show|profile|note); bounded local profile.
       wiki-collect    Discovery catalog (list|add|download); HTTPS-only IP-pinned media downloader.
-      wiki-plan       File a wiki-grounded plan (file --format rfc|adr|spec|roadmap; --strict; --project <slug>).
-      wiki-output     File an output artifact (file --type report|glossary|… ; --project <slug>) as a synthesis row.
+      wiki-plan       Wiki-grounded plan (file --body | generate --topic; --format rfc|adr|spec|roadmap; --strict; --project).
+      wiki-output     Output artifact (file --body | generate --topic; --type report|glossary|… ; --project) as a synthesis row.
       wiki-project    Project scope (list|create|show); WHY.md pre-flight gate for --project routing.
       wiki-digest     Render a digest of pages updated in a window (--days N --file); category=digest.
       wiki-research   Multi-round web research swarm → credibility filter → ingest.

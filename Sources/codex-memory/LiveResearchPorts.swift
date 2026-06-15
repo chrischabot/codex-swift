@@ -354,16 +354,18 @@ struct WikiClaimExtractor: Sendable {
     /// failure. Returns the message content plus token usage (from the response
     /// `usage` block, falling back to a 4-chars/token estimate).
     static func chatCall(endpoint: String, apiKey: String, model: String,
-                         sys: String, user: String) async throws
+                         sys: String, user: String, jsonMode: Bool = true) async throws
         -> (text: String, tokensIn: Int, tokensOut: Int) {
-        let body: [String: Any] = [
+        // jsonMode forces `response_format: json_object` (extraction/scoring/adjudication).
+        // Prose generation (plan/output bodies) turns it OFF to get markdown.
+        var body: [String: Any] = [
             "model": model, "temperature": 0,
-            "response_format": ["type": "json_object"],
             "messages": [
                 ["role": "system", "content": sys],
                 ["role": "user", "content": user],
             ],
         ]
+        if jsonMode { body["response_format"] = ["type": "json_object"] }
         guard let data = try? JSONSerialization.data(withJSONObject: body),
               let url = URL(string: endpoint) else {
             throw ExtractorError(message: "could not encode request")
