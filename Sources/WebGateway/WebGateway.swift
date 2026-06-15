@@ -62,6 +62,10 @@ public struct WebGatewayConfig: Sendable {
     /// bind host. nil → derive from host:port (only safe for a concrete host;
     /// a wildcard bind with no override DISABLES URL minting → path delivery).
     public var publicBaseURL: String?
+    /// Owner/write-tier credential (a SEPARATE secret from `bearerToken`). nil disables
+    /// the owner tier (fail-closed on Tier-B). codexd sets it = bearerToken for a loopback
+    /// bind (current UX) and mints a DISTINCT token for an auth-required/exposed bind.
+    public var ownerToken: String? = nil
 
     public init(host: String = "127.0.0.1",
                 port: Int = 8443,
@@ -79,7 +83,8 @@ public struct WebGatewayConfig: Sendable {
                 maxUploadBytes: Int = 50 * 1024 * 1024,
                 uploadQuotaBytes: Int = 500 * 1024 * 1024,
                 persistMediaSignerKey: Bool = false,
-                publicBaseURL: String? = nil) {
+                publicBaseURL: String? = nil,
+                ownerToken: String? = nil) {
         self.host = host
         self.port = port
         self.wwwRoot = wwwRoot
@@ -97,6 +102,7 @@ public struct WebGatewayConfig: Sendable {
         self.uploadQuotaBytes = uploadQuotaBytes
         self.persistMediaSignerKey = persistMediaSignerKey
         self.publicBaseURL = publicBaseURL
+        self.ownerToken = ownerToken
     }
 
     /// Resolve the browser-reachable origin for minting signed `/media` URLs, or
@@ -181,11 +187,18 @@ public final class WebGateway: Sendable {
         var logger = Logger(label: "codex-web-gateway")
         logger.logLevel = .notice
 
-        let security = SecurityPolicy(
-            enforceMethodAllowlist: true,
-            requireAuth: config.requireAuth,
-            bearerToken: config.bearerToken,
-            allowedOrigins: Set(config.allowedOrigins))
+        let security: SecurityPolicy = {
+            var s = SecurityPolicy(
+                enforceMethodAllowlist: true,
+                requireAuth: config.requireAuth,
+                bearerToken: config.bearerToken,
+                allowedOrigins: Set(config.allowedOrigins))
+            s.ownerToken = config.ownerToken
+            // Fail-closed only when an owner token exists; a plain loopback dev bind with no
+            // owner token leaves the tier off (current single-operator UX, unchanged).
+            s.enforceOwnerTier = config.ownerToken != nil
+            return s
+        }()
 
         // HTTP routes. Security headers are outermost so they apply to every
         // response (static files, SPA fallback, health). Static middlewares
@@ -288,13 +301,23 @@ public final class WebGateway: Sendable {
                 }
                 return .upgrade([:])
             },
-            onUpgrade: { inbound, outbound, _ in
+            onUpgrade: { inbound, outbound, context in
+                // Detect the OWNER credential at upgrade (distinct from the read bearer):
+                // an `owner.<token>` WS subprotocol or an `X-Codex-Owner: Bearer <token>`
+                // header. Connection-scoped — re-checked here so a forged later message
+                // can't elevate. Same header-extraction shape as shouldUpgrade.
+                let req = context.request
+                let oh: (String) -> String? = { name in HTTPField.Name(name).flatMap { req.headers[$0] } }
+                let oProtos = (oh("Sec-WebSocket-Protocol") ?? "")
+                    .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                let ownerAuthorized = security.ownerAccepted(subprotocols: oProtos, authorization: oh("X-Codex-Owner"))
                 await WebGateway.serve(inbound: inbound,
                                        outbound: outbound,
                                        routerFactory: factory,
                                        maxMessageBytes: maxMsg,
                                        idleTimeoutSeconds: idleTimeout,
                                        security: security,
+                                       ownerAuthorized: ownerAuthorized,
                                        limiter: limiter,
                                        log: gatewayLog)
             })
@@ -350,6 +373,7 @@ public final class WebGateway: Sendable {
                       maxMessageBytes: Int,
                       idleTimeoutSeconds: Int,
                       security: SecurityPolicy,
+                      ownerAuthorized: Bool = false,
                       limiter: ConnectionLimiter,
                       log: Log) async {
         guard await limiter.acquire() else {
@@ -376,6 +400,18 @@ public final class WebGateway: Sendable {
                         error: JSONRPCErrorObject(
                             code: -32601,
                             message: "method '\(req.method)' is not permitted via the web gateway"))))
+                    return
+                }
+                // Tier-B: a mutating/effectful method needs an owner credential, not just
+                // the shared read bearer. A leaked read bearer can browse but not write/spend.
+                if security.enforceMethodAllowlist, security.enforceOwnerTier,
+                   MethodGate.requiresOwner(req.method), !ownerAuthorized {
+                    log.error("web gateway: owner-tier method '\(req.method)' blocked (no owner credential)")
+                    await conn.send(.error(JSONRPCError(
+                        id: req.id,
+                        error: JSONRPCErrorObject(
+                            code: -32601,
+                            message: "method '\(req.method)' requires an owner credential (X-Codex-Owner / owner.<token>)"))))
                     return
                 }
             case .notification(let note):

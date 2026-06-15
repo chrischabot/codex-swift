@@ -125,4 +125,41 @@ final class MethodGateTests: XCTestCase {
             XCTAssertTrue(MethodGate.isAllowed(m), "expected \(m) allowed for full UI")
         }
     }
+
+    // MARK: owner/write tier (audit — a flat single bearer let any token holder write/spend)
+
+    func testEffectfulMethodsAreOwnerTierAndStillAllowed() {
+        for m in ["wiki/page/upsert", "wiki/page/delete", "wiki/page/rename",
+                  "wiki/research/start", "wiki/ingest/start", "config/value/write",
+                  "config/batchWrite", "remoteControl/enable", "remoteControl/disable",
+                  "environment/add", "plugin/install", "plugin/uninstall"] {
+            XCTAssertTrue(MethodGate.requiresOwner(m), "\(m) must be owner-tier")
+            XCTAssertTrue(MethodGate.isAllowed(m), "owner-tier is a strict subset of Tier-A allowed")
+        }
+    }
+
+    func testPureReadsAreNotOwnerTier() {
+        for m in ["wiki/list", "wiki/page/get", "wiki/search", "wiki/graph",
+                  "wiki/librarian/report", "wiki/sessions/list", "thread/list", "account/read"] {
+            XCTAssertFalse(MethodGate.requiresOwner(m), "\(m) is a read — stays Tier-A only")
+        }
+    }
+
+    func testOwnerCredentialIsADistinctSecretFromReadBearer() {
+        var p = SecurityPolicy(requireAuth: true, bearerToken: "read-bearer")
+        p.ownerToken = "owner-secret"
+        // THE seam: the READ bearer must NOT unlock the owner tier.
+        XCTAssertFalse(p.ownerAccepted(subprotocols: ["bearer.read-bearer"], authorization: "Bearer read-bearer"),
+                       "a leaked read bearer can browse but not write/spend")
+        // The owner secret is accepted via header AND via the owner.<token> subprotocol.
+        XCTAssertTrue(p.ownerAccepted(subprotocols: [], authorization: "Bearer owner-secret"))
+        XCTAssertTrue(p.ownerAccepted(subprotocols: ["owner.owner-secret"], authorization: nil))
+        XCTAssertFalse(p.ownerAccepted(subprotocols: ["owner.wrong"], authorization: "Bearer wrong"))
+    }
+
+    func testOwnerTierFailsClosedWithoutAToken() {
+        let p = SecurityPolicy(requireAuth: true, bearerToken: "read-bearer")   // no ownerToken set
+        XCTAssertFalse(p.ownerAccepted(subprotocols: ["owner.anything"], authorization: "Bearer anything"),
+                       "no configured owner token ⇒ the tier is unreachable (fail-closed)")
+    }
 }

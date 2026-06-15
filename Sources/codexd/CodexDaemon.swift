@@ -227,6 +227,22 @@ struct CodexDaemon {
             FileHandle.standardError.write(
                 Data("codexd web gateway auth token: \(token!)\n".utf8))
         }
+        // Owner/write-tier credential. Loopback dev keeps the single-token UX (owner ==
+        // bearer → bearer unlocks everything, byte-identical to before, and nil for plain
+        // loopback dev → owner tier off, same as today). An auth-required / non-loopback
+        // bind gets a DISTINCT owner secret so a shared read bearer can NOT reach the
+        // mutating/paid lane.
+        var ownerToken: String? = env["CODEXKIT_WEB_OWNER_TOKEN"]
+        if ownerToken?.isEmpty == true { ownerToken = nil }
+        if ownerToken == nil {
+            if loopback {
+                ownerToken = token            // == bearer (or nil → owner tier off)
+            } else if requireAuth {
+                ownerToken = Self.generateToken()
+                FileHandle.standardError.write(
+                    Data("codexd web gateway OWNER token: \(ownerToken!)\n".utf8))
+            }
+        }
         let origins = (env["CODEXKIT_WEB_ORIGINS"] ?? "")
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -253,7 +269,8 @@ struct CodexDaemon {
                                 allowedOrigins: origins,
                                 mediaRoot: mediaRoot,
                                 persistMediaSignerKey: persistSigner,
-                                publicBaseURL: publicBase)
+                                publicBaseURL: publicBase,
+                                ownerToken: ownerToken)
     }
 
     /// A URL-safe random bearer token for the web gateway.

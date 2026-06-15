@@ -67,6 +67,21 @@ enum MethodGate {
         "environment/add",
     ]
 
+    /// Tier-B: strongly-mutating / effectful RPCs that need MORE than the shared read
+    /// bearer — an owner-identity credential. Every entry is ALSO in `allowed` (Tier-B is a
+    /// strict gate layered on Tier-A); `requiresOwner` is consulted only AFTER `isAllowed`
+    /// passes. wiki/research|ingest start a live PAID extraction lane; config writes mutate
+    /// config.toml; remoteControl/environment/plugin reshape the control plane. Keep in
+    /// sync deliberately — never relax to a prefix.
+    static let ownerTier: Set<String> = [
+        "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename",
+        "wiki/research/start", "wiki/ingest/start",
+        "config/value/write", "config/batchWrite", "config/mcpServer/reload",
+        "remoteControl/enable", "remoteControl/disable",
+        "environment/add", "plugin/install", "plugin/uninstall",
+    ]
+    static func requiresOwner(_ method: String) -> Bool { ownerTier.contains(method) }
+
     static func isAllowed(_ method: String) -> Bool { allowed.contains(method) }
 }
 
@@ -81,6 +96,12 @@ public struct SecurityPolicy: Sendable {
     public var bearerToken: String?
     /// Exact-match allowed `Origin` values. Empty = loopback origins only.
     public var allowedOrigins: Set<String>
+    /// Owner/write-tier credential — a SEPARATE secret from the read bearer. nil → the
+    /// owner tier is unreachable (fail-closed). Set via property assignment after
+    /// construction (no init param — ABI-safe under concurrent incremental builds).
+    public var ownerToken: String? = nil
+    /// When true (default), Tier-B (mutating/effectful) methods require `ownerAccepted`.
+    public var enforceOwnerTier: Bool = true
 
     public init(enforceMethodAllowlist: Bool = true,
                 requireAuth: Bool = false,
@@ -155,6 +176,17 @@ public struct SecurityPolicy: Sendable {
     /// the token in `Authorization: Bearer <token>` (no WS subprotocol).
     public func httpBearerAccepted(_ authorization: String?) -> Bool {
         bearerAccepted(subprotocols: [], authorization: authorization)
+    }
+
+    /// Accept an OWNER credential offered as a WS subprotocol (`owner.<token>`) or an
+    /// `X-Codex-Owner: Bearer <token>` header. Constant-time. Fail-CLOSED: with no
+    /// configured `ownerToken` this returns false (the owner tier is unreachable).
+    /// Independent of the read bearer — a leaked read bearer can NOT unlock the write tier.
+    public func ownerAccepted(subprotocols: [String], authorization: String?) -> Bool {
+        guard let token = ownerToken, !token.isEmpty else { return false }
+        if let authorization, Self.constantTimeEqual(authorization, "Bearer \(token)") { return true }
+        for proto in subprotocols where Self.constantTimeEqual(proto, "owner.\(token)") { return true }
+        return false
     }
 
     /// Length-independent constant-time string compare over UTF-8 bytes. The
