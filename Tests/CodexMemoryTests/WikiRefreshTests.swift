@@ -179,4 +179,67 @@ final class WikiRefreshTests: XCTestCase {
         let results = await WikiRefresh.run(store: store, fetcher: fetcher, now: now, limit: 50)
         XCTAssertTrue(results.isEmpty)
     }
+
+    // MARK: changed source → drift seam (refresh now feeds AuditDriftDetector)
+
+    /// Build a claim→evidence→synthesis chain over `uri`; the synthesis starts CURRENT.
+    /// Returns (docID, claimID, synthID).
+    @discardableResult
+    private func driftChain(_ store: MemoryStore, uri: String, body: String) async throws -> (Int64, Int64, Int64) {
+        let docID = try await source(store, uri: uri, markdown: body, volatility: .hot, verifiedAt: now - 100 * day)
+        let claimID = try await store.upsertClaim(ClaimRow(text: "claim for \(uri)", status: .active,
+                                                           firstSeen: now - 200 * day, updatedAt: now - 200 * day))
+        try await store.attachEvidence(ClaimEvidenceRow(claimID: claimID, documentID: docID, stance: .supports, strength: 3))
+        let synthID = try await store.upsertSynthesis(SynthesisRow(
+            slug: "s-\(abs(uri.hashValue))", category: "synthesis", title: "S", bodyPath: "inline:s",
+            createdAt: now - 150 * day, updatedAt: now - 150 * day, generatedAt: now - 150 * day))
+        try await store.linkSynthesisClaim(synthesis: synthID, claim: claimID)
+        return (docID, claimID, synthID)
+    }
+
+    func testChangedSourceDriftsDependentSynthesis() async throws {
+        let store = try makeStore()
+        let (docID, claimID, synthID) = try await driftChain(store, uri: "https://ex.com/a", body: "original body")
+        // PRE: the page is CURRENT (claim updated 200d ago < synthesis generated 150d ago).
+        let pre = try await store.auditDriftScan()
+        XCTAssertEqual(pre.first { $0.id == synthID }?.status, .current, "starts current — nothing changed yet")
+
+        let fetcher = MockFetcher(["https://ex.com/a": "DIFFERENT body now"])   // SHA differs → .changed
+        let results = await WikiRefresh.run(store: store, fetcher: fetcher, now: now, limit: 50)
+        XCTAssertEqual(results.first { $0.documentID == docID }?.outcome, .changed)
+        // the dependent claim's updated_at is pushed to now…
+        let bumped = try await store.claim(id: claimID)
+        XCTAssertEqual(bumped?.updatedAt, now)
+        // …so the synthesis compiled from it now DRIFTS (the seam the audit found broken).
+        let post = try await store.auditDriftScan()
+        XCTAssertEqual(post.first { $0.id == synthID }?.status, .drifted)
+    }
+
+    func testUnchangedSourceDoesNotDrift() async throws {
+        let store = try makeStore()
+        let (docID, claimID, synthID) = try await driftChain(store, uri: "https://ex.com/a", body: "original body")
+        let fetcher = MockFetcher(["https://ex.com/a": "original body"])   // identical → .unchanged
+        let results = await WikiRefresh.run(store: store, fetcher: fetcher, now: now, limit: 50)
+        XCTAssertEqual(results.first { $0.documentID == docID }?.outcome, .unchanged)
+        let claim = try await store.claim(id: claimID)
+        XCTAssertEqual(claim?.updatedAt, now - 200 * day, "an unchanged source must NOT bump claim updated_at")
+        let scan = try await store.auditDriftScan()
+        XCTAssertEqual(scan.first { $0.id == synthID }?.status, .current)
+    }
+
+    func testTouchScopedToChangedDocOnly() async throws {
+        let store = try makeStore()
+        let (_, changedClaim, changedSynth) = try await driftChain(store, uri: "https://ex.com/changed", body: "v1")
+        let (_, otherClaim, otherSynth) = try await driftChain(store, uri: "https://ex.com/other", body: "stable")
+        let fetcher = MockFetcher(["https://ex.com/changed": "v2 different",
+                                   "https://ex.com/other": "stable"])   // other unchanged
+        _ = await WikiRefresh.run(store: store, fetcher: fetcher, now: now, limit: 50)
+        let changedUpdated = try await store.claim(id: changedClaim)?.updatedAt
+        let otherUpdated = try await store.claim(id: otherClaim)?.updatedAt
+        XCTAssertEqual(changedUpdated, now)
+        XCTAssertEqual(otherUpdated, now - 200 * day, "unrelated claim untouched")
+        let scan = try await store.auditDriftScan()
+        XCTAssertEqual(scan.first { $0.id == changedSynth }?.status, .drifted)
+        XCTAssertEqual(scan.first { $0.id == otherSynth }?.status, .current, "only the changed doc's syntheses drift")
+    }
 }

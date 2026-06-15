@@ -50,4 +50,20 @@ extension MemoryStore {
     public func markSourceVerified(documentID: Int64, at ts: Int64) throws {
         try run("UPDATE source_meta SET verified_at=? WHERE document_id=?;", [.int(ts), .int(documentID)])
     }
+
+    /// Mark every claim evidenced by `documentID` as changed at `ts` by bumping its
+    /// `updated_at`. Used by the refresh pass when a source's upstream SHA changed:
+    /// pushing the dependent claims' `updated_at` past their syntheses' `generated_at`
+    /// makes `auditDriftScan` flag those compiled pages as `.drifted` (§5.D Pass 2) —
+    /// the precise drift trigger. Does NOT touch `last_reviewed` (the claim was not
+    /// re-reviewed, only its source moved) nor `verified_at`. Returns rows bumped.
+    @discardableResult
+    public func touchClaimsForChangedSource(documentID: Int64, at ts: Int64) throws -> Int {
+        let rows = try run("""
+        UPDATE claim SET updated_at=?
+         WHERE id IN (SELECT DISTINCT claim_id FROM claim_evidence WHERE document_id=?)
+        RETURNING id;
+        """, [.int(ts), .int(documentID)])
+        return rows.count
+    }
 }

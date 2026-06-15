@@ -81,6 +81,12 @@ enum WikiRefresh {
                 try? await store.markSourceVerified(documentID: c.documentID, at: now)
                 out.append(Result(documentID: c.documentID, sourceURI: c.sourceURI, outcome: .unchanged))
             } else {
+                // The upstream content moved. We do NOT re-verify (verified_at stays old →
+                // the page still surfaces as out-of-date) and we push the updated_at of every
+                // claim evidenced by this document forward, so AuditDriftDetector flags the
+                // syntheses compiled from it as drifted. (Full re-ingest of the new revision
+                // is separate Watch/Phase-6 work — this candidate carries no body to rebuild.)
+                try? await store.touchClaimsForChangedSource(documentID: c.documentID, at: now)
                 out.append(Result(documentID: c.documentID, sourceURI: c.sourceURI, outcome: .changed))
             }
         }
