@@ -241,6 +241,60 @@ enum MemorySchema {
       cursor        TEXT, last_change_at INTEGER, added_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS watch_source_due ON watch_source(status, next_due_at);
+
+    -- ── Curation (§4/§5: Inventory, Datasets, Collect). NO vectors → the store's
+    -- embedding stamp is untouched; these are durable record tables projected to
+    -- compact-table views, never read as bodies. ───────────────────────────────
+    CREATE TABLE IF NOT EXISTS wiki_inventory_record (
+      id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
+      kind TEXT NOT NULL,        -- item|ingest-candidate|entity|corpus|question|task|artifact|watch
+      status TEXT NOT NULL,      -- proposed|active|blocked|ingested|superseded|archived
+      priority TEXT NOT NULL,    -- p0..p4
+      title TEXT NOT NULL, summary TEXT, next_action TEXT,
+      tags TEXT, sources TEXT, origin TEXT, confidence TEXT, body_md TEXT,
+      quantity INTEGER, unit TEXT, item_state TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_checked INTEGER,
+      lifecycle_status TEXT NOT NULL DEFAULT 'active'
+    );
+    CREATE INDEX IF NOT EXISTS inv_kind ON wiki_inventory_record(kind, status, priority);
+
+    CREATE TABLE IF NOT EXISTS wiki_inventory_view (
+      id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+      filters TEXT, updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS wiki_dataset_manifest (
+      id INTEGER PRIMARY KEY, dataset_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+      status TEXT NOT NULL, storage TEXT NOT NULL,  -- proposed|active|external|archived|unavailable / local|remote|external|hybrid
+      locations TEXT, formats TEXT, schema_status TEXT,  -- unknown|inferred|declared|validated
+      size_bytes INTEGER, record_count INTEGER,
+      inventory_links TEXT, raw_sources TEXT, license TEXT, access TEXT, checksum TEXT,
+      refresh_cadence TEXT, summary TEXT, body_md TEXT, origin TEXT,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      lifecycle_status TEXT NOT NULL DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS wiki_dataset_note (
+      id INTEGER PRIMARY KEY,
+      manifest_id INTEGER NOT NULL REFERENCES wiki_dataset_manifest(id) ON DELETE CASCADE,
+      note_kind TEXT NOT NULL,  -- sample|profile|query
+      title TEXT NOT NULL, body_md TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS dataset_note_manifest ON wiki_dataset_note(manifest_id);
+
+    CREATE TABLE IF NOT EXISTS wiki_collect_item (
+      id INTEGER PRIMARY KEY, catalog_slug TEXT NOT NULL, row_number INTEGER NOT NULL,
+      title TEXT NOT NULL, aliases TEXT, collect_kind TEXT,
+      canonical_url TEXT, media_url TEXT, source_url TEXT,
+      origin_platform TEXT, creator TEXT, first_seen TEXT, description TEXT, evidence TEXT,
+      found_in_context TEXT,    -- JSON array of sightings (first-class provenance)
+      provenance_confidence TEXT, rights_or_license TEXT,
+      media_format TEXT, local_media_path TEXT, media_bytes INTEGER,
+      sha256 TEXT, perceptual_hash TEXT, download_status TEXT, downloaded_at INTEGER,
+      next_action TEXT, created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS collect_dedup ON wiki_collect_item(catalog_slug, sha256, canonical_url);
+    CREATE INDEX IF NOT EXISTS collect_catalog ON wiki_collect_item(catalog_slug, row_number);
     """
 
     static func vec0VirtualTableSQL(dim: Int) -> String {
