@@ -482,6 +482,9 @@ public struct ListMcpServerStatusParams: Sendable, Codable, Equatable {
     public var cursor: String?
     public var limit: Int?
     public var detail: String?
+    /// Optional thread scope. Upstream made MCP server contributions
+    /// thread-scoped (#27670): `mcpServerStatus/list.threadId` (`string | null`).
+    public var threadId: String?
 }
 public struct McpServerStatusInfo: Sendable, Codable, Equatable {
     public var name: String

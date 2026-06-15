@@ -174,6 +174,15 @@ public enum CodexMemoryRun {
             config: .init())
     }
 
+    /// Run the nightly knowledge-maintenance cycle once (gbrain.md Wave 1.7) —
+    /// the `codex-memory cycle` CLI entry, also reusable in tests.
+    public static func cycleOnce(now: Int64? = nil, dryRun: Bool = false) async throws
+        -> MaintenanceCycleReport {
+        let bundle = try await assemble()
+        let n = now ?? Int64(Date().timeIntervalSince1970)
+        return await MaintenanceCycle(store: bundle.store).run(now: n, dryRun: dryRun)
+    }
+
     static func assemble() async throws -> AssembledMemory {
         let env = ProcessInfo.processInfo.environment
         let codexHome = env["CODEX_HOME"] ?? (NSHomeDirectory() + "/.codex")

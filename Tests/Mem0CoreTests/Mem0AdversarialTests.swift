@@ -189,12 +189,16 @@ final class Mem0MockEmbedderTests: XCTestCase {
 }
 
 final class Mem0SearchValidationTests: XCTestCase {
+    private func engine() -> Mem0Engine {
+        Mem0Engine(config: Mem0Config(historyDbPath: ":memory:"),
+                   embedder: MockEmbedder(dims: 16),
+                   llm: MockLLM(),
+                   vectorStore: InMemoryVectorStore(),
+                   historyStore: InMemoryHistoryStore())
+    }
+
     func testSearchRejectsHugeTopKBeforeInternalLimitOverflow() async throws {
-        let mem = Mem0Engine(config: Mem0Config(historyDbPath: ":memory:"),
-                             embedder: MockEmbedder(dims: 16),
-                             llm: MockLLM(),
-                             vectorStore: InMemoryVectorStore(),
-                             historyStore: InMemoryHistoryStore())
+        let mem = engine()
         do {
             _ = try await mem.search("agent memory",
                                      ["user_id": .string("u1")],
@@ -204,5 +208,60 @@ final class Mem0SearchValidationTests: XCTestCase {
             XCTAssertEqual(error.code, "VALIDATION_004")
             XCTAssertTrue(error.message.contains("top_k"))
         }
+    }
+
+    func testAdvancedFiltersCannotOverwriteAuthoritativeSearchScope() async throws {
+        let mem = engine()
+        _ = try await mem.add("u1 hiking public", AddOptions(userID: "u1", infer: false))
+        _ = try await mem.add("u2 hiking secret", AddOptions(userID: "u2", infer: false))
+
+        let response = try await mem.search(
+            "hiking",
+            [
+                "user_id": .string("u1"),
+                "AND": .array([.object(["user_id": .string("u2")])]),
+            ],
+            SearchOptions(topK: 10))
+
+        let results = response.objectValue?["results"]?.arrayValue ?? []
+        XCTAssertFalse(results.isEmpty)
+        XCTAssertTrue(results.allSatisfy { $0.objectValue?["user_id"]?.stringValue == "u1" },
+                      "advanced filters must not overwrite the exact session scope")
+        XCTAssertFalse(results.contains { $0.objectValue?["memory"]?.stringValue?.contains("u2") == true })
+    }
+
+    func testSearchRejectsNonStringScopeValues() async throws {
+        let mem = engine()
+        do {
+            _ = try await mem.search("hiking",
+                                     ["user_id": .object(["eq": .string("u1")])],
+                                     SearchOptions(topK: 10))
+            XCTFail("object-valued user_id is not an authoritative session scope")
+        } catch let error as Mem0Error {
+            XCTAssertEqual(error.code, "VALIDATION_001")
+        }
+    }
+}
+
+final class Mem0BackendResolutionTests: XCTestCase {
+    func testExplicitLocalNeverFallsThroughToRemoteWhenUnavailable() {
+        let resolved = Mem0BackendResolver.resolve(.local,
+                                                   localAvailable: false,
+                                                   remoteAvailable: true)
+        XCTAssertEqual(resolved, .mock)
+    }
+
+    func testAutoMayUseRemoteWhenLocalUnavailable() {
+        let resolved = Mem0BackendResolver.resolve(.auto,
+                                                   localAvailable: false,
+                                                   remoteAvailable: true)
+        XCTAssertEqual(resolved, .remote)
+    }
+
+    func testExplicitRemoteCanFallBackLocalButNotMockWhenLocalAvailable() {
+        let resolved = Mem0BackendResolver.resolve(.remote,
+                                                   localAvailable: true,
+                                                   remoteAvailable: false)
+        XCTAssertEqual(resolved, .local)
     }
 }

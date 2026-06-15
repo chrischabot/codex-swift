@@ -217,7 +217,7 @@ final class AuthGatingAdversarialTests: XCTestCase {
             ("thread/resume", .object(["threadId": .string(evil)])),
             ("thread/read", .object(["threadId": .string(evil)])),
             ("thread/rollback", .object(["threadId": .string(evil), "numTurns": .int(1)])),
-            ("thread/goal/get", .object(["threadId": .string(evil)])),
+            ("thread/turns/list", .object(["threadId": .string(evil)])),
             ("turn/start", .object(["threadId": .string(evil),
                                     "input": .array([])])),
         ]
@@ -229,7 +229,7 @@ final class AuthGatingAdversarialTests: XCTestCase {
             // The probe must be rejected at the dispatch boundary (code -32600,
             // no worker spawn, no file). For non-experimental methods this is
             // the upstream "invalid thread id: <error>" message; for an
-            // experimental-gated method (thread/goal/get) called by a
+            // experimental-gated method (thread/turns/list) called by a
             // non-experimental connection the experimental-capability error
             // wins, because upstream gates experimental BEFORE any thread-id
             // parsing (audit app-server-registry/finding-3). Both are -32600

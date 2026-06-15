@@ -60,6 +60,8 @@ public struct ChunkRow: Sendable, Equatable {
 
 public enum EntityKind: String, Sendable, Codable, CaseIterable {
     case person, org, product, paper, repo, concept, tag
+    // Code-intelligence graph (gbrain.md Wave 5.30): source symbols + modules.
+    case symbol, module
 }
 
 public struct EntityRow: Sendable, Equatable {

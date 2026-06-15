@@ -1,4 +1,5 @@
 import Foundation
+import Auth   // LocalSecretsBackend — encrypted MCP OAuth store (#27541)
 
 public struct StoredOAuthTokens: Sendable, Codable, Equatable {
     public var accessToken: String
@@ -22,19 +23,44 @@ public struct StoredOAuthTokens: Sendable, Codable, Equatable {
 
 public struct McpOAuthStore: Sendable {
     public let codexHome: String
+
+    #if canImport(CryptoKit)
+    /// When set, OAuth tokens are persisted in the encrypted secrets file
+    /// (`mcpOAuth` namespace, Keychain-held key, #27541) instead of plaintext
+    /// per-server JSON. `nil` keeps the legacy plaintext store (default).
+    let secrets: LocalSecretsBackend?
+    public init(codexHome: String, secrets: LocalSecretsBackend? = nil) {
+        self.codexHome = codexHome
+        self.secrets = secrets
+    }
+    /// Production encrypted-secrets-backed MCP OAuth store.
+    public static func encrypted(codexHome: String) -> McpOAuthStore {
+        McpOAuthStore(codexHome: codexHome,
+                      secrets: LocalSecretsBackend.mcpOAuth(codexHome: codexHome))
+    }
+    #else
     public init(codexHome: String) { self.codexHome = codexHome }
+    #endif
 
     private var dir: String { codexHome + "/.mcp-oauth" }
 
-    private func path(_ server: String) -> String {
-        let safe = String(server.map { c -> Character in
+    /// Filesystem-/secret-name-safe server label.
+    private func sanitize(_ server: String) -> String {
+        String(server.map { c -> Character in
             if c.isLetter || c.isNumber || c == "." || c == "_" || c == "-" { return c }
             return "_"
         })
-        return dir + "/" + safe + ".json"
     }
+    private func path(_ server: String) -> String { dir + "/" + sanitize(server) + ".json" }
 
     public func save(_ t: StoredOAuthTokens, server: String) throws {
+        #if canImport(CryptoKit)
+        if let secrets {
+            let json = String(decoding: try JSONEncoder().encode(t), as: UTF8.self)
+            try secrets.set(.global, sanitize(server), json)
+            return
+        }
+        #endif
         try? FileManager.default.createDirectory(
             atPath: dir, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
@@ -55,6 +81,12 @@ public struct McpOAuthStore: Sendable {
     }
 
     public func load(server: String) -> StoredOAuthTokens? {
+        #if canImport(CryptoKit)
+        if let secrets {
+            guard let json = try? secrets.get(.global, sanitize(server)) else { return nil }
+            return try? JSONDecoder().decode(StoredOAuthTokens.self, from: Data(json.utf8))
+        }
+        #endif
         guard let data = FileManager.default.contents(atPath: path(server)) else {
             return nil
         }
@@ -62,6 +94,9 @@ public struct McpOAuthStore: Sendable {
     }
 
     public func delete(server: String) {
+        #if canImport(CryptoKit)
+        if let secrets { _ = try? secrets.delete(.global, sanitize(server)); return }
+        #endif
         try? FileManager.default.removeItem(atPath: path(server))
     }
 }

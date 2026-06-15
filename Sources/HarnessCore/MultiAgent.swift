@@ -468,7 +468,10 @@ public enum SessionEngineAgentRunner {
                             model: any ModelClient,
                             router: @escaping @Sendable (AgentSpawnSpec) async -> ToolRouter,
                             cwd: String,
-                            collectTimeout: Duration = .seconds(120))
+                            collectTimeout: Duration = .seconds(120),
+                            hooks: HookEngine? = nil,
+                            parentSessionId: String? = nil,
+                            parentTurnId: String? = nil)
     -> @Sendable (AgentSpawnSpec) async -> AgentRunResult {
         return { spec in
             let sanitized = String(spec.path.raw.map { c -> Character in
@@ -476,14 +479,30 @@ public enum SessionEngineAgentRunner {
                 return "_"
             })
             let tid = ThreadId("thr_agent_" + sanitized)
+            let subModel = spec.model ?? "gpt-5.5"
             let cfg = SessionConfig(threadId: tid, cwd: cwd,
-                                    model: spec.model ?? "gpt-5.5",
+                                    model: subModel,
                                     ephemeral: true,
                                     subagentSourceLabel: "collab_spawn")
             _ = try? await store.create(cfg)
             let r = await router(spec)
             let engine = SessionEngine(config: cfg, model: model, store: store,
                                        router: r, limits: limits)
+
+            // SubagentStart fires at the spawned subagent's start instead of the
+            // root session-start (upstream `HookEventName::SubagentStart`). The
+            // subagent's own SessionEngine is intentionally hookless so it does
+            // not ALSO fire session-start/stop — upstream replaces those with the
+            // subagent variants for thread-spawned child turns.
+            let subagentExtra = ["agent_id": spec.path.raw, "agent_type": spec.role]
+            if let hooks {
+                _ = await hooks.fire(.subagentStart, HookRequest(
+                    eventName: .subagentStart,
+                    sessionId: parentSessionId ?? tid.raw, cwd: cwd,
+                    turnId: parentTurnId, model: subModel,
+                    extra: subagentExtra))
+            }
+
             await engine.start()
             let stream = await engine.events()
 
@@ -516,6 +535,21 @@ public enum SessionEngineAgentRunner {
             let (out, st) = await collector.value
             timeoutTask.cancel()
             await engine.quiesce()
+
+            // SubagentStop fires when the child turn ends — upstream runs this
+            // INSTEAD OF Stop for thread-spawned child turns. Carries the final
+            // assistant message + the subagent-only agent_* fields.
+            if let hooks {
+                var stopExtra = subagentExtra
+                stopExtra["agent_transcript_path"] = ""
+                _ = await hooks.fire(.subagentStop, HookRequest(
+                    eventName: .subagentStop,
+                    sessionId: parentSessionId ?? tid.raw, cwd: cwd,
+                    turnId: parentTurnId, model: subModel,
+                    stopHookActive: false,
+                    lastAssistantMessage: out.isEmpty ? nil : out,
+                    extra: stopExtra))
+            }
 
             let ok = (st == .completed)
             return AgentRunResult(status: ok ? .completed : .failed,

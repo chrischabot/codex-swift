@@ -10,6 +10,9 @@ public actor SnapshotScheduler {
         public var intervalSeconds: Double
         public var retentionDays: Int
         public var clock: @Sendable () -> Date
+        /// Run the nightly knowledge-maintenance cycle (gbrain.md Wave 1.7) before
+        /// DB hygiene. Property-level default keeps the init signature stable.
+        public var runMaintenanceCycle: Bool = true
         public init(intervalSeconds: Double = 24 * 60 * 60,
                     retentionDays: Int = 30,
                     clock: @escaping @Sendable () -> Date = { Date() }) {
@@ -65,6 +68,14 @@ public actor SnapshotScheduler {
         formatter.timeZone = TimeZone(identifier: "UTC")!
         formatter.dateFormat = "yyyy-MM-dd"
         let stamp = formatter.string(from: date)
+        // Knowledge maintenance settles BEFORE DB hygiene (gbrain.md Wave 1.7):
+        // freshness/drift/librarian transitions, then VACUUM the result.
+        if config.runMaintenanceCycle {
+            let report = await MaintenanceCycle(store: store)
+                .run(now: Int64(date.timeIntervalSince1970))
+            let summary = report.phases.map { "\($0.name)=\($0.touched)" }.joined(separator: " ")
+            FileHandle.standardOutput.write(Data("maintenance cycle: \(summary)\n".utf8))
+        }
         let snapshotPath = archive.root + "/snapshots/memory.db.\(stamp).bak"
         try await store.vacuumInto(snapshotPath)
         await archive.snapshotIntoGit(

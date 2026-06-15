@@ -91,9 +91,13 @@ public struct ExperimentalGate: Sendable {
         // app-server-protocol/src/protocol/common.rs:497-1052. Upstream rejects
         // these with `<method> requires experimentalApi capability` (-32600)
         // when the connection did not negotiate `experimentalApi`.
-        "thread/goal/set",
-        "thread/goal/get",
-        "thread/goal/clear",
+        //
+        // NOTE: `thread/goal/{set,get,clear}` were REMOVED here for the 2026-06
+        // sync — upstream #23732 promoted the Goals feature to `Stage::Stable`
+        // (`default_enabled: true`) and dropped the `#[experimental(...)]` markers
+        // from the ThreadGoal* request variants (common.rs:533-546 at dfd03ea01b
+        // carry no experimental attribute). Goals are now reachable without the
+        // experimentalApi capability, matching upstream.
         "thread/realtime/start",
         "thread/realtime/appendAudio",
         "thread/realtime/appendText",

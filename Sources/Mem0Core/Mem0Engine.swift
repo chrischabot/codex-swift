@@ -318,7 +318,8 @@ public struct Mem0Engine: Sendable {
         try Mem0Filters.validateSearchParams(threshold: options.threshold, topK: options.topK)
 
         var effective = filters
-        if !["user_id", "agent_id", "run_id"].contains(where: { effective[$0] != nil }) {
+        let sessionScope = Mem0Filters.sessionFilters(effective)
+        if sessionScope.isEmpty {
             throw Mem0Error.validationCode("VALIDATION_001",
                                            "filters must contain at least one of: user_id, agent_id, run_id.",
                                            "Example: filters={\"user_id\": \"u1\"}")
@@ -334,6 +335,7 @@ public struct Mem0Engine: Sendable {
                 }
             }
             for (k, v) in processed { effective[k] = v }
+            for (k, v) in sessionScope { effective[k] = v }
         }
 
         let results = try await searchVectorStore(query, effective, limit: options.topK, threshold: options.threshold)

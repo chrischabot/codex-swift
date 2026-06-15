@@ -171,6 +171,11 @@ swift build -c release --product codex-mem0
 # Verify store + provider wiring (no server)
 codex-mem0 verify
 
+# Import extracted memory JSONL into the native mem0 store
+CODEX_MEM0_DB=/var/lib/codex/mem0.db \
+OPENAI_API_KEY=sk-... \
+codex-mem0 import-jsonl /path/to/mem0_ingest.jsonl --user-id alex
+
 # Serve (defaults to 127.0.0.1:8080)
 CODEX_MEM0_DB=/var/lib/codex/mem0.db \
 OPENAI_API_KEY=sk-... \
@@ -188,6 +193,23 @@ codex-mem0 serve
 | `CODEX_MEM0_API_KEY` / `OPENAI_API_KEY` | — | Explicit remote bearer override. |
 | `CODEX_MEM0_EMBEDDING_MODEL` / `_LLM_MODEL` / `_EMBEDDING_DIM` | see config | Model selection. |
 | `CODEX_MEM0_EMBEDDING_BACKEND` / `CODEX_MEM0_LLM_BACKEND` | `auto` | `auto`, `local`, `remote`, or `mock`. |
+
+### Importing extracted memories
+
+`codex-mem0 import-jsonl <path>` imports newline-delimited memory rows shaped
+like:
+
+```json
+{"memory":"User prefers ...","memory_id":"mem_...","metadata":{"source":"claude_export"},"user_id":"alex"}
+```
+
+The importer writes directly to the native mem0 SQLite schema, preserving
+`memory_id` as the mem0 id. Re-running the same file is idempotent: unchanged
+rows are skipped, changed rows update the existing id, and new rows are added.
+Claude `source_uri` links are stripped from imported metadata so memory views
+stay readable. Use `--user-id`, `--agent-id`, or `--run-id` to override row
+scope; `--dry-run` checks parsing and reports what would change without
+embedding or writing.
 
 ### REST endpoints (parity with `mem0-rs`)
 

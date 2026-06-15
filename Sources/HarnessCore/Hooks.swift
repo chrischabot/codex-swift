@@ -20,6 +20,8 @@ public enum HookEventName: String, Sendable, Codable, Equatable, CaseIterable {
     case sessionStart
     case userPromptSubmit
     case stop
+    case subagentStart
+    case subagentStop
 
     /// codex kebab-case wire string.
     public var wire: String {
@@ -32,6 +34,8 @@ public enum HookEventName: String, Sendable, Codable, Equatable, CaseIterable {
         case .sessionStart:      return "session-start"
         case .userPromptSubmit:  return "user-prompt-submit"
         case .stop:              return "stop"
+        case .subagentStart:     return "subagent-start"
+        case .subagentStop:      return "subagent-stop"
         }
     }
 
@@ -53,6 +57,8 @@ public enum HookEventName: String, Sendable, Codable, Equatable, CaseIterable {
         case .sessionStart:      return "SessionStart"
         case .userPromptSubmit:  return "UserPromptSubmit"
         case .stop:              return "Stop"
+        case .subagentStart:     return "SubagentStart"
+        case .subagentStop:      return "SubagentStop"
         }
     }
 
@@ -69,6 +75,8 @@ public enum HookEventName: String, Sendable, Codable, Equatable, CaseIterable {
         case .sessionStart:      return "hook returned invalid session start JSON output"
         case .userPromptSubmit:  return "hook returned invalid user prompt submit JSON output"
         case .stop:              return "hook returned invalid stop hook JSON output"
+        case .subagentStart:     return "hook returned invalid subagent-start JSON output"
+        case .subagentStop:      return "hook returned invalid subagent-stop JSON output"
         }
     }
 
@@ -442,7 +450,7 @@ public struct HookRequest: Sendable, Equatable {
             // Upstream `run_id_suffix` is a non-optional `String`; always append.
             return runIdSuffix ?? ""
         case .preCompact, .postCompact, .sessionStart,
-             .userPromptSubmit, .stop:
+             .userPromptSubmit, .stop, .subagentStart, .subagentStop:
             return nil
         }
     }
@@ -472,7 +480,9 @@ public struct HookRequest: Sendable, Equatable {
             return source ?? ""
         case .preCompact, .postCompact:
             return extra["trigger"] ?? ""
-        case .userPromptSubmit, .stop:
+        case .userPromptSubmit, .stop, .subagentStart, .subagentStop:
+            // Subagent hooks carry no matcher input — the dispatcher fires them
+            // for every subagent lifecycle event (like Stop/UserPromptSubmit).
             return nil
         }
     }
@@ -559,7 +569,11 @@ public struct HookRequest: Sendable, Equatable {
         if eventName == .sessionStart {
             o["source"] = source ?? "startup"
         }
-        if eventName == .stop {
+        // Stop AND SubagentStop carry stop_hook_active + last_assistant_message
+        // (upstream `StopCommandInput` / `SubagentStopCommandInput`). The
+        // subagent-only fields agent_id / agent_type / agent_transcript_path are
+        // threaded through `extra` and merged below.
+        if eventName == .stop || eventName == .subagentStop {
             o["stop_hook_active"] = stopHookActive ?? false
             if let lastAssistantMessage {
                 o["last_assistant_message"] = lastAssistantMessage
@@ -1541,7 +1555,7 @@ public actor HookEngine {
         case .postToolUse, .sessionStart, .userPromptSubmit:
             out.additionalContext = (hso["additionalContext"] as? String)
                 ?? (hso["additional_context"] as? String)
-        case .preCompact, .postCompact, .stop:
+        case .preCompact, .postCompact, .stop, .subagentStart, .subagentStop:
             // Upstream wire types intentionally have no event-specific output
             // for these. We still allow callers to read `additionalContext`
             // if a hook author sends one (forward-compat / no-op today).
@@ -1685,7 +1699,8 @@ public actor HookEngine {
             var blockReasonGate: String?
             if let cont = obj["continue"] as? Bool, cont == false {
                 switch req.eventName {
-                case .stop, .preCompact, .postCompact, .sessionStart:
+                case .stop, .preCompact, .postCompact, .sessionStart,
+                     .subagentStart, .subagentStop:
                     shouldStop = true
                     stopReason = (obj["stopReason"] as? String)
                         ?? (obj["stop_reason"] as? String)
@@ -1758,7 +1773,7 @@ public actor HookEngine {
                         ?? "PostToolUse hook returned unsupported suppressOutput"
                 }
             case .preCompact, .postCompact, .sessionStart,
-                 .userPromptSubmit, .stop:
+                 .userPromptSubmit, .stop, .subagentStart, .subagentStop:
                 break
             }
             if let blk = obj["block"] as? Bool, blk == true { decision = .block }
@@ -1992,9 +2007,11 @@ public actor HookEngine {
                     outputSchemaError:
                         "UserPromptSubmit hook exited with code 2 but did not write a blocking reason to stderr",
                     raw: raw)
-            case .sessionStart:
+            case .sessionStart, .subagentStart, .subagentStop:
                 // session_start.rs:208-214 — NO exit-2 arm: exit 2 is just a
-                // generic nonzero exit → Failed, no block, no context.
+                // generic nonzero exit → Failed, no block, no context. The
+                // subagent events share this: the one-shot subagent runner can
+                // honor neither a Stop-style continuation nor a block.
                 return HookOutcome(decision: .allow, reason: nil,
                     outputSchemaError: "hook exited with code 2", raw: raw)
             case .preCompact, .postCompact:

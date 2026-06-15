@@ -120,6 +120,7 @@ The deep design docs and the addon thesis:
 | [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) | Building, testing, release gates, CI |
 | [`ADDONS.md`](ADDONS.md) | The "reverse the pyramid" addon portfolio and its design |
 | [`CRATE_DISPOSITIONS.md`](CRATE_DISPOSITIONS.md) | Every `codex-rs` crate → Swift target mapping |
+| [`UPSTREAM_SYNC_LOG.md`](UPSTREAM_SYNC_LOG.md) | Which upstream `codex-rs` commit we've caught up to, by date, and what was folded in |
 | [`STATUS.md`](STATUS.md) | Per-module completion vs. plan, macOS punch list — single source of truth |
 
 ---

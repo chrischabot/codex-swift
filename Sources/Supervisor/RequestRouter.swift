@@ -2558,13 +2558,23 @@ public actor RequestRouter {
             await reply(conn, id, EmptyResponse())
         case .threadDelete(let id, let p):
             do {
-                let wasActive = ((try? await store.list(archived: false, limit: 1000)) ?? [])
-                    .contains { $0.id == p.threadId }
-                try await store.delete(p.threadId)
-                await reply(conn, id, EmptyResponse())
-                if wasActive {
-                    await supervisor.broadcast(p.threadId, .threadDeleted(threadId: p.threadId))
+                // Stop the worker + tear down supervisor state BEFORE removing the
+                // row/file, so a mid-flight turn cannot revive the rollout
+                // (write-after-free). evictDeletedThread emits `thread/deleted` to
+                // any current subscribers and is a no-op for an unloaded thread.
+                await supervisor.evictDeletedThread(p.threadId)
+                let existed = try await store.delete(p.threadId)
+                // Drop router-side subscription + skills-change watch state so no
+                // residue points at a tombstoned thread.
+                if let sinkId = subscriptions.removeValue(forKey: p.threadId) {
+                    await supervisor.unsubscribe(p.threadId, sinkId)
                 }
+                await skillsChangeWatchManager.unwatch(conn: conn, threadId: p.threadId)
+                await reply(conn, id, EmptyResponse())
+                // Belt-and-suspenders: if a peer connection is subscribed (the
+                // eviction sweep already delivered to current subscribers; this
+                // re-broadcast is a no-op when none remain), still signal them.
+                if existed { await supervisor.broadcast(p.threadId, .threadDeleted(threadId: p.threadId)) }
             } catch {
                 await conn.send(WireError.internalError(
                     id: id, "failed to delete thread \(p.threadId.raw): \(error.localizedDescription)"))

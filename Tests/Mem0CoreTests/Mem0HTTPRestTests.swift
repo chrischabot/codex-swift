@@ -240,4 +240,24 @@ final class Mem0RestHandlerTests: XCTestCase {
         XCTAssertFalse(results.isEmpty)
         XCTAssertTrue(results.allSatisfy { $0.objectValue?["user_id"]?.stringValue == "u1" })
     }
+
+    func testSearchAdvancedFiltersCannotOverrideTopLevelScope() async {
+        let mem = engine()
+        _ = await Mem0RestHandler.handle(method: "POST", path: "/v1/memories", query: [:],
+                                         body: Data(#"{"messages":"u1 hiking public","user_id":"u1","infer":false}"#.utf8),
+                                         engine: mem)
+        _ = await Mem0RestHandler.handle(method: "POST", path: "/v1/memories", query: [:],
+                                         body: Data(#"{"messages":"u2 hiking secret","user_id":"u2","infer":false}"#.utf8),
+                                         engine: mem)
+
+        let body = Data(#"{"query":"hiking","user_id":"u1","filters":{"AND":[{"user_id":"u2"}]},"top_k":10}"#.utf8)
+        let search = await Mem0RestHandler.handle(method: "POST", path: "/v1/memories/search",
+                                                  query: [:], body: body, engine: mem)
+
+        XCTAssertEqual(search.status, 200)
+        let results = parse(search)?.objectValue?["results"]?.arrayValue ?? []
+        XCTAssertFalse(results.isEmpty)
+        XCTAssertTrue(results.allSatisfy { $0.objectValue?["user_id"]?.stringValue == "u1" })
+        XCTAssertFalse(results.contains { $0.objectValue?["memory"]?.stringValue?.contains("u2") == true })
+    }
 }

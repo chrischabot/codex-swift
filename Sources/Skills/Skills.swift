@@ -61,7 +61,8 @@ public struct SkillsDiscovery: Sendable {
     public func discover(codexHome: String,
                          cwds: [String],
                          home: String? = nil,
-                         projectRootMarkers: [String]? = nil) -> [SkillRecord] {
+                         projectRootMarkers: [String]? = nil,
+                         extraRoots: [String] = []) -> [SkillRecord] {
         let markers = projectRootMarkers ?? [".git"]
         let homeDir = home ?? ProcessInfo.processInfo.environment["HOME"]
 
@@ -81,6 +82,11 @@ public struct SkillsDiscovery: Sendable {
         }
         for c in cwds {
             roots.append((c + "/.codex/skills", .repo))
+        }
+        // Runtime-registered extra roots (`skills/extraRoots/set`) are scanned
+        // last so canonical user/repo skills keep first-write-wins precedence.
+        for r in extraRoots {
+            roots.append((r, .user))
         }
         var seen = Set<String>()
         var seenRoots = Set<String>()

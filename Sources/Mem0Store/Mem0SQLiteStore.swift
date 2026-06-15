@@ -44,6 +44,34 @@ public actor Mem0SQLiteStore: Mem0VectorStore, Mem0HistoryStore {
     private nonisolated(unsafe) let db: OpaquePointer
     private var cache: [String: VectorRecord] = [:]
 
+    /// Enforce tenant scope at the STORE (defense in depth, gbrain.md Wave 0.6).
+    /// A scope-less filter fails CLOSED (returns nothing) rather than matching
+    /// every tenant's records — closing the cross-tenant leak a filter-construction
+    /// bug could open (an empty filter matches ALL records). The engine always
+    /// scopes (`buildFiltersAndMetadata` throws without a scope), so this never
+    /// triggers in legitimate flow. Disable for admin/global tools with
+    /// `CODEX_MEM0_ALLOW_UNSCOPED=1`, or toggle directly in tests.
+    public var enforceTenantScope: Bool =
+        ProcessInfo.processInfo.environment["CODEX_MEM0_ALLOW_UNSCOPED"] != "1"
+
+    /// Tenant-scope keys: at least one must be present for a scoped read.
+    static let tenantScopeKeys: Set<String> = ["user_id", "agent_id", "run_id"]
+
+    /// True when `filters` carries a tenant scope — a direct scope key with a
+    /// non-null value, or an `$or` whose every branch is itself scoped.
+    static func hasTenantScope(_ filters: JSONObject) -> Bool {
+        for k in tenantScopeKeys {
+            if let v = filters[k], !v.isNull { return true }
+        }
+        if let branches = filters["$or"]?.arrayValue, !branches.isEmpty {
+            return branches.allSatisfy { ($0.objectValue).map(hasTenantScope) ?? false }
+        }
+        return false
+    }
+
+    /// Admin/test hook to toggle store-level scope enforcement.
+    public func setEnforceTenantScope(_ enabled: Bool) { enforceTenantScope = enabled }
+
     /// Open (or create) the database at `path` (`":memory:"` for ephemeral),
     /// create the schema, and load the memory cache.
     public init(path: String) throws {
@@ -317,7 +345,9 @@ public actor Mem0SQLiteStore: Mem0VectorStore, Mem0HistoryStore {
     }
 
     private func candidates(_ filters: JSONObject) -> [VectorRecord] {
-        cache.values.filter { Mem0Filters.matchesFilters($0.payload, filters) }
+        // Fail closed: a scope-less read must never return cross-tenant data.
+        if enforceTenantScope && !Self.hasTenantScope(filters) { return [] }
+        return cache.values.filter { Mem0Filters.matchesFilters($0.payload, filters) }
     }
 
     public func search(_ query: String, _ vector: [Float], topK: Int, filters: JSONObject) async throws -> [SearchHit] {

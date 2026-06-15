@@ -43,6 +43,11 @@ public actor MemoryRetriever {
         public var rrfK: Double
         public var embedDeadline: Duration
         public var rerankDeadline: Duration
+        /// Post-fusion boosts (recency, …) apply only to candidates whose base
+        /// score is ≥ floorRatio·topBaseScore — the gbrain floor-ratio gate that
+        /// stops weak pages leapfrogging strong hits. `nil` disables the gate.
+        /// Defaulted at the property level so the init signature stays stable.
+        public var floorRatio: Double? = 0.85
         public init(bm25TopK: Int = 200, vecTopK: Int = 200,
                     fuseTopK: Int = 50, finalTopK: Int = 10,
                     rrfK: Double = 60,
@@ -90,6 +95,10 @@ public actor MemoryRetriever {
         // to FTS5 (which would crash with a parse error).
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return [] }
+        // Zero-LLM intent classification reshapes the final blend (gbrain.md
+        // Wave 2.16). `.general` reproduces the historical 0.7/0.2/0.1 weights, so
+        // an ordinary query is byte-for-byte unchanged.
+        let weights = QueryIntentClassifier.resolve(trimmed).weights
         let topK = Self.clampedPositive(k ?? config.finalTopK, defaultValue: 10, max: 100)
         let fuseTopK = Self.clampedPositive(config.fuseTopK, defaultValue: 50, max: 1_000)
         async let bm25Task = bm25TopHits(query)
@@ -130,19 +139,41 @@ public actor MemoryRetriever {
         // Compose the final ranked list. We weight by:
         //   final = 0.7 * rerank + 0.2 * (1 - vec_dist) + 0.1 * bm25
         // When rerank is disabled (or all-zero) the second/third terms remain.
-        var ranked: [RetrievedHit] = []
+        // Pass 1: intent-weighted base score per candidate.
+        var base: [(chunk: ChunkRow, doc: DocumentRow,
+                    bm25: Double, vec: Double, rerank: Double, score: Double)] = []
+        base.reserveCapacity(hydrated.count)
         for (i, pair) in hydrated.enumerated() {
             let (chunk, doc) = pair
             let bm25Score = bm25Scores[chunk.id] ?? 0
             let vecScore  = vecScores[chunk.id]  ?? 0
             let rerankScore = Double(rerankScores[i])
-            let total = 0.7 * rerankScore + 0.2 * vecScore + 0.1 * bm25Score
+            let s = weights.rerank * rerankScore
+                  + weights.vec * vecScore
+                  + weights.bm25 * bm25Score
+            base.append((chunk, doc, bm25Score, vecScore, rerankScore, s))
+        }
+        // Floor-ratio gate: one threshold computed on the BASE scores before any
+        // boost (gbrain.md Wave 2.17). Candidates below it are not boosted.
+        let topBase = base.map(\.score).max() ?? 0
+        let floor = config.floorRatio.map { $0 * topBase } ?? -.infinity
+        let now = Int64(Date().timeIntervalSince1970)
+        // Pass 2: recency boost — temporal intent only, above the floor. For a
+        // general query (recencyOn == false) total == base, i.e. unchanged.
+        var ranked: [RetrievedHit] = []
+        ranked.reserveCapacity(base.count)
+        for b in base {
+            var total = b.score
+            if weights.recencyOn, b.score >= floor {
+                total *= RecencyDecay.factor(source: b.doc.source, publishedAt: b.doc.publishedAt,
+                                             fetchedAt: b.doc.fetchedAt, now: now)
+            }
             ranked.append(RetrievedHit(
-                chunkId: chunk.id, documentId: doc.id,
-                documentURI: doc.sourceURI,
-                snippet: Self.snippet(from: chunk.text, query: query),
+                chunkId: b.chunk.id, documentId: b.doc.id,
+                documentURI: b.doc.sourceURI,
+                snippet: Self.snippet(from: b.chunk.text, query: query),
                 score: total,
-                why: .init(bm25: bm25Score, vec: vecScore, rerank: rerankScore)))
+                why: .init(bm25: b.bm25, vec: b.vec, rerank: b.rerank)))
         }
         ranked.sort { $0.score > $1.score }
         return Array(ranked.prefix(topK))

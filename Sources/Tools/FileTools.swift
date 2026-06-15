@@ -846,6 +846,9 @@ public struct WebSearchTool: Tool {
     public var jsonSchema: String {
         #"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#
     }
+    /// Opt out of large-schema compaction (#24660): the web-search schema is
+    /// already minimal and must reach the model verbatim.
+    public let compactInputSchema = false
     private let backend: any WebSearchBackend
     private let sandbox: (any Sandbox)?
     public init(backend: any WebSearchBackend = DisabledWebSearch(),

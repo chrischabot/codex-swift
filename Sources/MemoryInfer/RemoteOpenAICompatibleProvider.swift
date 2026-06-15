@@ -138,12 +138,15 @@ enum ExtractionPrompt {
         lines.append("    \"edges\": [ { \"src\": <canonical>, \"dst\": <canonical>,")
         lines.append("       \"relation\": <one of \(schema.allowedRelations)> } ] } ] }")
         lines.append("")
-        lines.append("Title: \(batch.documentTitle ?? "(untitled)")")
-        lines.append("URI: \(batch.documentURI)")
+        lines.append(ContextSanitizer.dataPreamble)
+        lines.append("")
+        // Title/URI/chunk text all originate from untrusted fetched content.
+        lines.append("Title: \(ContextSanitizer.sanitize(batch.documentTitle ?? "(untitled)"))")
+        lines.append("URI: \(ContextSanitizer.sanitize(batch.documentURI))")
         lines.append("")
         for c in batch.chunks {
             lines.append("--- chunk \(c.localId) ---")
-            lines.append(c.contextualised)
+            lines.append(ContextSanitizer.sanitize(c.contextualised))
         }
         lines.append("")
         lines.append("Return JSON only, no prose.")
@@ -223,13 +226,14 @@ enum ContextualisePrompt {
         """
         Produce a single sentence (≤30 words) that situates the following chunk
         inside its source document. Do not summarise the chunk; orient it.
+        \(ContextSanitizer.dataPreamble)
 
-        Source title: \(document.title ?? "(none)")
-        Source URI:   \(document.uri)
-        Source summary: \(document.summary)
+        Source title: \(ContextSanitizer.sanitize(document.title ?? "(none)"))
+        Source URI:   \(ContextSanitizer.sanitize(document.uri))
+        Source summary: \(ContextSanitizer.sanitize(document.summary))
 
         Chunk \(chunk.idx) text:
-        \(chunk.rawText)
+        \(ContextSanitizer.sanitize(chunk.rawText))
 
         Return the situating sentence with no quotes, no preamble.
         """

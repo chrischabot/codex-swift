@@ -4,6 +4,7 @@ account/logout
 account/rateLimits/read
 account/read
 account/sendAddCreditsNudgeEmail
+account/usage/read
 app/list
 command/exec
 command/exec/resize
@@ -40,6 +41,7 @@ mcpServer/tool/call
 mcpServerStatus/list
 model/list
 modelProvider/capabilities/read
+permissionProfile/list
 plugin/install
 plugin/installed
 plugin/list
@@ -53,11 +55,16 @@ plugin/skill/read
 plugin/uninstall
 review/start
 skills/config/write
+skills/extraRoots/set
 skills/list
 thread/approveGuardianDeniedAction
 thread/archive
 thread/compact/start
+thread/delete
 thread/fork
+thread/goal/clear
+thread/goal/get
+thread/goal/set
 thread/inject_items
 thread/list
 thread/loaded/list

@@ -331,6 +331,38 @@ public actor SessionSupervisor {
         for s in subscribers[threadId] ?? [] { s.deliver(notification) }
     }
 
+    /// Terminal teardown for `thread/delete`: stop any running worker FIRST (so
+    /// no further `record()` can revive the rollout file the store is about to
+    /// remove), resolve outstanding requests, emit `thread/deleted` to current
+    /// subscribers, then drop ALL in-memory state for the thread. Unlike
+    /// idle-unload this is non-recoverable, so it emits `thread/deleted` rather
+    /// than `thread/closed`. Safe to call for an unknown/unloaded thread (no-op
+    /// beyond a harmless generation bump and the subscriber sweep).
+    public func evictDeletedThread(_ tid: ThreadId) {
+        if let h = workers[tid] { h.terminate(); h.link.finish() }
+        relays[tid]?.cancel()
+        relays[tid] = nil
+        // Invalidate the cancelled relay's generation so its eventual drain into
+        // clearThread no-ops instead of double-emitting a terminal event.
+        _ = nextRelayGen(tid)
+        workers[tid] = nil
+        boundConfigs[tid] = nil
+        ledgers[tid] = nil
+        governorStates[tid] = nil
+        resourceControls[tid] = nil
+        lastHeartbeats[tid] = nil
+        idleUnloadTasks.removeValue(forKey: tid)?.cancel()
+        quiescingWorkers.remove(tid)
+        resolveAllServerRequests(for: tid)
+        removeStatusFacts(tid)
+        let recipients = subscribers[tid] ?? formerSubscribers[tid] ?? []
+        for s in recipients { s.deliver(.threadDeleted(threadId: tid)) }
+        subscribers[tid] = nil
+        formerSubscribers[tid] = nil
+        pendingServerRequests = pendingServerRequests.filter { $0.value != tid }
+        resolveMcpResponsesForClosedThread(tid)
+    }
+
     // MARK: - thread/status/changed tracking (upstream ThreadWatchManager)
 
     /// Mutate a thread's runtime facts and, if the derived `ThreadStatus`

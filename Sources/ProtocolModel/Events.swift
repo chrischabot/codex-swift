@@ -507,6 +507,20 @@ public enum ServerNotification: Sendable, Equatable {
                            modelContextWindow: Int?)
     case threadGoalUpdated(threadId: ThreadId, turnId: TurnId?, goal: ThreadGoal)
     case threadGoalCleared(threadId: ThreadId)
+    /// `thread/deleted` — emitted after a permanent `thread/delete`.
+    case threadDeleted(threadId: ThreadId)
+    /// `turn/moderationMetadata` — forwards opaque per-turn moderation metadata.
+    /// FORWARD-DECLARED: no producer in this port yet (the model/backend does not
+    /// surface moderation metadata through the engine event stream). Declared for
+    /// wire-shape parity so a client can register for it; wire an emission site
+    /// when the backend starts emitting it.
+    case turnModerationMetadata(threadId: ThreadId, turnId: TurnId, metadata: JSONValue)
+    /// `thread/settings/updated` — emitted when a thread's settings change.
+    /// FORWARD-DECLARED: there is no `thread/settings/update` request method in
+    /// the pinned surface to drive it, so the port has no producer yet. Declared
+    /// for wire-shape parity (see [[ThreadSettingsUpdatedBody]]); wire an emission
+    /// site once a settings-mutation path exists.
+    case threadSettingsUpdated(threadId: ThreadId, settings: JSONValue)
     /// Parity P3.4 / H-18: `update_plan` tool emits this. Wire shape mirrors
     /// upstream `EventMsg::PlanUpdate(UpdatePlanArgs)` plus the
     /// `threadId`/`turnId` envelope used by the rest of the v2 surface.
@@ -618,6 +632,9 @@ public enum ServerNotification: Sendable, Equatable {
         case .tokenUsageUpdated: return "thread/tokenUsage/updated"
         case .threadGoalUpdated: return "thread/goal/updated"
         case .threadGoalCleared: return "thread/goal/cleared"
+        case .threadDeleted: return "thread/deleted"
+        case .turnModerationMetadata: return "turn/moderationMetadata"
+        case .threadSettingsUpdated: return "thread/settings/updated"
         case .planUpdate: return "turn/plan/updated"
         case .planDelta: return "item/plan/delta"
         case .rawResponseItemCompleted: return "rawResponseItem/completed"
@@ -731,6 +748,14 @@ public enum ServerNotification: Sendable, Equatable {
                     turnId: turnId?.raw, goal: goal))
             case .threadGoalCleared(let tid):
                 params = try JSONBridge.value(["threadId": tid])
+            case .threadDeleted(let tid):
+                params = try JSONBridge.value(ThreadDeletedBody(threadId: tid))
+            case .turnModerationMetadata(let tid, let turnId, let metadata):
+                params = try JSONBridge.value(TurnModerationMetadataBody(
+                    threadId: tid, turnId: turnId, metadata: metadata))
+            case .threadSettingsUpdated(let tid, let settings):
+                params = try JSONBridge.value(ThreadSettingsUpdatedBody(
+                    threadId: tid, threadSettings: settings))
             case .planUpdate(let tid, let turnId, let explanation, let plan):
                 params = try JSONBridge.value(PlanUpdated(
                     threadId: tid, turnId: turnId,

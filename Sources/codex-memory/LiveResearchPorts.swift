@@ -6,6 +6,8 @@ import WikiResearch
 import WikiIngest
 import MemoryStore
 import MemoryRetrieve
+import MemoryInfer
+import MemoryScore
 import PinnedFetcher
 import Tools
 
@@ -101,7 +103,9 @@ struct LiveResearchCompiler: ResearchCompiler {
     func compile(topic: String, sources: [RankedSource], round: Int) async throws -> CompileOutcome {
         var written = 0
         var ingestedDocs: [(uri: String, docID: Int64)] = []
+        var uriCredibility: [String: Int] = [:]   // source URL → CredibilityResult.points
         for s in sources {
+            uriCredibility[s.url] = s.credibility
             guard let u = URL(string: s.url) else { continue }
             guard case .success(let doc) = await fetcher.fetchReadable(u) else { continue }
             let cand = WikiSourceCandidate(
@@ -119,26 +123,62 @@ struct LiveResearchCompiler: ResearchCompiler {
         }
         var claimsLinked = 0
         if !ingestedDocs.isEmpty {
-            let synthID = try? await writeSynthesis(topic: topic, round: round,
-                                                    sources: ingestedDocs.map(\.uri))
-            // Extract grounded claims from each ingested source and link them to the
-            // page (so it's not ungrounded, and the trust layer has real claims).
-            if let extractor = claimExtractor, let synthID {
-                for (_, docID) in ingestedDocs {
+            // Phase 1: extract + persist claims from each source FIRST (claims are
+            // independent knowledge — they attach to their source doc, not the page),
+            // collecting the ids to link. Counting before the page is written lets the
+            // write gate REFUSE an ungrounded page up front, with no post-hoc rollback.
+            var linkableClaims: [Int64] = []
+            if let extractor = claimExtractor {
+                for (uri, docID) in ingestedDocs {
                     let chunks = (try? await store.chunks(forDocument: docID)) ?? []
                     let text = chunks.prefix(8).map(\.text).joined(separator: "\n")
                     guard !text.isEmpty else { continue }
+                    // Per-claim confidence comes from the SOURCE's credibility tier
+                    // (the extractor emits verifiable claims but no per-claim score),
+                    // then routes through the three-bucket write policy: high→active,
+                    // mid→draft (review queue), low→skip+log. No more hardcoded 0.7.
+                    // (gbrain.md Wave 0.3.)
+                    let conf = ClaimWritePolicy.confidence(forCredibilityPoints: uriCredibility[uri] ?? 0)
+                    let bucket = ClaimWritePolicy.bucket(forConfidence: conf)
                     let claims = await extractor.extract(text: text, maxClaims: 4)
                     for claimText in claims {
+                        guard let status = bucket.claimStatus else {
+                            ClaimWritePolicy.logSkipped(vaultRoot: vaultRoot, claim: claimText,
+                                                        url: uri, confidence: conf, at: fetchedAt)
+                            continue
+                        }
                         guard let cid = try? await store.upsertClaim(ClaimRow(
-                            text: claimText, status: .active, confidence: 0.7,
+                            text: claimText, status: status, confidence: conf,
                             firstSeen: fetchedAt, updatedAt: fetchedAt)) else { continue }
                         try? await store.attachEvidence(ClaimEvidenceRow(
                             claimID: cid, documentID: docID, chunkID: chunks.first?.id,
                             stance: .supports, relevance: .direct, strength: 2))
-                        try? await store.linkSynthesisClaim(synthesis: synthID, claim: cid)
-                        claimsLinked += 1
+                        if status == .draft {
+                            ClaimWritePolicy.logReview(vaultRoot: vaultRoot, claim: claimText,
+                                                       url: uri, confidence: conf, at: fetchedAt)
+                        }
+                        linkableClaims.append(cid)
                     }
+                }
+            }
+            // Phase 2: write gate (gbrain.md Wave 0.2). Validate BEFORE writing — an
+            // ungrounded synthesis (zero linked claims) is logged in lint mode and
+            // BLOCKED in strict mode. A blocked page is simply never written (claims
+            // already persisted stand on their own evidence), so strict mode actually
+            // refuses the write instead of leaving the bad page behind.
+            let synthSlug = "research-" + Self.slugify(topic) + "-r\(round)"
+            let gate = WikiWriteGate(mode: await WikiWriteGate.resolveMode(store: store),
+                                     vaultRoot: vaultRoot)
+            let verdict = gate.validate(WikiLintPage(slug: synthSlug, body: "", category: "synthesis",
+                                                     claimLinkCount: linkableClaims.count),
+                                        validSlugs: [synthSlug])
+            // Phase 3: write the page + link its claims, only when not blocked.
+            if !verdict.block,
+               let synthID = try? await writeSynthesis(topic: topic, round: round,
+                                                       sources: ingestedDocs.map(\.uri)) {
+                for cid in linkableClaims {
+                    try? await store.linkSynthesisClaim(synthesis: synthID, claim: cid)
+                    claimsLinked += 1
                 }
             }
         }
@@ -171,13 +211,101 @@ struct LiveResearchCompiler: ResearchCompiler {
     }
 }
 
+/// Three-bucket confidence write policy for LLM-extracted claims (gbrain.md
+/// Wave 0.3). Replaces the old hardcoded `confidence: 0.7, status: .active`:
+/// a claim's confidence is derived from its SOURCE's credibility tier, then
+/// routed — high-confidence claims become ground-truth (`.active`), mid become a
+/// reviewable `.draft`, and low are skipped (logged, never written). Pure +
+/// testable.
+enum ClaimWritePolicy {
+    /// Confidence ≥ this → `.active`.
+    static let autoThreshold = 0.8
+    /// Confidence in `[draftThreshold, autoThreshold)` → `.draft`; below → skip.
+    static let draftThreshold = 0.5
+
+    /// Map a source's `CredibilityResult.points` to a claim confidence in [0,1]
+    /// via its trust tier.
+    static func confidence(forCredibilityPoints points: Int) -> Double {
+        switch CredibilityScorer.tier(points: points) {
+        case .high:   return 0.85
+        case .medium: return 0.65
+        case .low:    return 0.55
+        case .reject: return 0.30
+        }
+    }
+
+    enum Bucket: Equatable {
+        case active, draft, skip
+        /// `nil` for `.skip` (the claim is not written).
+        var claimStatus: ClaimStatus? {
+            switch self {
+            case .active: return .active
+            case .draft:  return .draft
+            case .skip:   return nil
+            }
+        }
+    }
+
+    static func bucket(forConfidence c: Double) -> Bucket {
+        if c >= autoThreshold { return .active }
+        if c >= draftThreshold { return .draft }
+        return .skip
+    }
+
+    static func logSkipped(vaultRoot: String, claim: String, url: String,
+                           confidence: Double, at ts: Int64) {
+        appendJSONL(path: vaultRoot + "/research/low-confidence-claims.jsonl",
+                    obj: ["claim": claim, "url": url, "confidence": confidence,
+                          "ts": ts, "disposition": "skipped"])
+    }
+
+    static func logReview(vaultRoot: String, claim: String, url: String,
+                          confidence: Double, at ts: Int64) {
+        appendJSONL(path: vaultRoot + "/research/draft-claims-review.jsonl",
+                    obj: ["claim": claim, "url": url, "confidence": confidence,
+                          "ts": ts, "disposition": "draft"])
+    }
+
+    /// Best-effort append of one JSON line. Creates the parent dir + file if absent.
+    static func appendJSONL(path: String, obj: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return }
+        var line = data
+        line.append(0x0A)   // '\n'
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: path), let fh = FileHandle(forWritingAtPath: path) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: line)
+        } else {
+            try? line.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
+
 /// Extracts atomic, verifiable claims from a source's text via the OpenAI chat API
 /// (JSON mode). The missing producer for the wiki claim layer — research links each
 /// returned claim to its source (evidence) and the round's synthesis page.
 struct WikiClaimExtractor: Sendable {
     let apiKey: String
     let model: String
+    /// Budget admission control. When present, every claim-extraction call is
+    /// reserved+recorded against a monthly USD ceiling (the documented
+    /// "remote extraction has real dollar cost with no ceiling" hole, gbrain.md
+    /// Wave 0.1). When `nil`, the call runs ungated (back-compat for tests).
+    let spendGate: SpendGate?
     let endpoint = "https://api.openai.com/v1/chat/completions"
+
+    init(apiKey: String, model: String, spendGate: SpendGate? = nil) {
+        self.apiKey = apiKey
+        self.model = model
+        self.spendGate = spendGate
+    }
+
+    struct ExtractorError: Error, CustomStringConvertible {
+        let message: String
+        var description: String { message }
+    }
 
     func extract(text: String, maxClaims: Int) async -> [String] {
         let sys = """
@@ -185,30 +313,74 @@ struct WikiClaimExtractor: Sendable {
         claim is ONE self-contained declarative sentence that could be independently \
         fact-checked. Skip opinions, questions, hedging, and navigation/boilerplate. \
         Respond ONLY with JSON of the form {"claims": ["claim 1", "claim 2"]} with at \
-        most \(maxClaims) claims.
+        most \(maxClaims) claims. \(ContextSanitizer.dataPreamble)
         """
+        // The text is arbitrary fetched web content — neutralize injection vectors
+        // before it enters the prompt.
+        let userContent = ContextSanitizer.sanitize(String(text.prefix(8000)))
+        let key = apiKey, ep = endpoint
+        // The raw chat call returns (content, tokensIn, tokensOut) and THROWS on
+        // transport/HTTP failure so a no-op never records spend.
+        let call: SpendGate.TokenCall = { prompt, model, _ in
+            try await Self.chatCall(endpoint: ep, apiKey: key, model: model,
+                                    sys: sys, user: prompt)
+        }
+        let content: String
+        if let gate = spendGate {
+            // .rateLimited (ceiling reached) or any error → no claims this round.
+            guard let outcome = try? await gate.run(prompt: userContent, model: model, call),
+                  case let .ran(receipt) = outcome
+            else { return [] }
+            content = receipt.text
+        } else {
+            guard let r = try? await call(userContent, model, .distantFuture) else { return [] }
+            content = r.text
+        }
+        return Self.parseClaims(content)
+    }
+
+    /// One OpenAI chat-completions call. Throws on transport/non-2xx/parse
+    /// failure. Returns the message content plus token usage (from the response
+    /// `usage` block, falling back to a 4-chars/token estimate).
+    static func chatCall(endpoint: String, apiKey: String, model: String,
+                         sys: String, user: String) async throws
+        -> (text: String, tokensIn: Int, tokensOut: Int) {
         let body: [String: Any] = [
             "model": model, "temperature": 0,
             "response_format": ["type": "json_object"],
             "messages": [
                 ["role": "system", "content": sys],
-                ["role": "user", "content": String(text.prefix(8000))],
+                ["role": "user", "content": user],
             ],
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: body),
-              let url = URL(string: endpoint) else { return [] }
+              let url = URL(string: endpoint) else {
+            throw ExtractorError(message: "could not encode request")
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 60
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.httpBody = data
-        guard let (respData, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let obj = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
+        let (respData, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw ExtractorError(message: "non-2xx claim-extraction response")
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
               let choices = obj["choices"] as? [[String: Any]],
-              let content = (choices.first?["message"] as? [String: Any])?["content"] as? String,
-              let inner = try? JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any],
+              let content = (choices.first?["message"] as? [String: Any])?["content"] as? String
+        else { throw ExtractorError(message: "malformed claim-extraction response") }
+        let usage = obj["usage"] as? [String: Any]
+        let tokensIn = (usage?["prompt_tokens"] as? Int)
+            ?? max(1, (sys.utf8.count + user.utf8.count) / 4)
+        let tokensOut = (usage?["completion_tokens"] as? Int)
+            ?? max(1, content.utf8.count / 4)
+        return (content, tokensIn, tokensOut)
+    }
+
+    static func parseClaims(_ content: String) -> [String] {
+        guard let inner = try? JSONSerialization.jsonObject(with: Data(content.utf8)) as? [String: Any],
               let claims = inner["claims"] as? [String]
         else { return [] }
         return claims.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }

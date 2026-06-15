@@ -150,8 +150,11 @@ final class WireProtocolTests: XCTestCase {
         let g = ExperimentalGate()
         let noCaps = ClientCapabilities(experimentalApi: false)
         let caps = ClientCapabilities(experimentalApi: true)
+        // NOTE: thread/goal/{set,get,clear} are intentionally NOT here — upstream
+        // #23732 promoted Goals to Stage::Stable (default-on) and dropped the
+        // `#[experimental(...)]` markers, so they are reachable without the
+        // experimentalApi capability (see ExperimentalGate.defaultMethods).
         let gatedMethods = [
-            "thread/goal/set", "thread/goal/get", "thread/goal/clear",
             "thread/realtime/start", "thread/realtime/appendAudio",
             "thread/realtime/appendText", "thread/realtime/stop",
             "thread/realtime/listVoices",

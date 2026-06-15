@@ -88,6 +88,32 @@ public enum AuthCredentialsStoreMode: String, Sendable, CaseIterable {
     }
 }
 
+/// How the keyring-backed auth path stores the payload. Port of upstream
+/// `AuthKeyringBackendKind` (#27504, config/src/types.rs): either the serialized
+/// auth payload goes **directly** in the OS keyring (`.keyring`), or it goes in
+/// the local **encrypted secrets file** with the file key in the keyring
+/// (`.secrets`).
+///
+/// Upstream's `#[default]` is `Secrets`. The port defaults to `.keyring`
+/// (the existing, well-tested + CLI-interop-stable path) and exposes `.secrets`
+/// as an opt-in via config `auth_keyring_backend` or env
+/// `CODEXKIT_AUTH_KEYRING_BACKEND=secrets`. When `.secrets` is selected the
+/// store reads-fall-back from (and migrates) a legacy direct-keychain entry, so
+/// existing credentials are never stranded.
+public enum AuthKeyringBackendKind: String, Sendable, CaseIterable {
+    case keyring
+    case secrets
+
+    public static let `default`: AuthKeyringBackendKind = .keyring
+
+    public static func resolve(config: String?, env: [String: String]) -> AuthKeyringBackendKind {
+        if let e = env["CODEXKIT_AUTH_KEYRING_BACKEND"],
+           let m = AuthKeyringBackendKind(rawValue: e.lowercased()) { return m }
+        if let c = config, let m = AuthKeyringBackendKind(rawValue: c.lowercased()) { return m }
+        return .default
+    }
+}
+
 /// `Auto` storage: keyring-primary with a file fallback. Mirrors upstream
 /// `AutoAuthStorage` (login/src/auth/storage.rs:265-291): reads prefer the
 /// keyring and fall back to the file; writes prefer the keyring and fall back
@@ -337,13 +363,29 @@ public enum TokenStoreFactory {
         if envOverride == "keyring-migrate" {
             return MigratingTokenStore(primary: keychain(), legacy: fileStore)
         }
+        // The keyring TIER (keyring/auto modes) can store the payload directly in
+        // the keychain (.keyring) or in the encrypted secrets file (.secrets,
+        // upstream #27504). When .secrets, reads fall back to + migrate from the
+        // legacy direct-keychain entry.
+        let keyringBackend = AuthKeyringBackendKind.resolve(
+            config: nil, env: environment)
+        func keyringTier() -> any TokenStore {
+            #if canImport(CryptoKit)
+            if keyringBackend == .secrets {
+                return MigratingTokenStore(
+                    primary: EncryptedSecretsTokenStore(codexHome: codexHome),
+                    legacy: keychain())
+            }
+            #endif
+            return keychain()
+        }
         switch mode {
         case .file:
             return fileStore
         case .keyring:
-            return keychain()
+            return keyringTier()
         case .auto:
-            return AutoTokenStore(keyring: keychain(), file: fileStore)
+            return AutoTokenStore(keyring: keyringTier(), file: fileStore)
         case .ephemeral:
             return InMemoryTokenStore()
         }

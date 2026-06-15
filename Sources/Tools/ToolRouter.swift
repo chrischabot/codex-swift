@@ -47,6 +47,11 @@ public protocol Tool: Sendable {
     /// Model-visible JSON-Schema object for the tool arguments. Default: a
     /// permissive object.
     var jsonSchema: String { get }
+    /// Whether `specs()` runs best-effort large-schema compaction on this tool's
+    /// input schema (upstream `parse_tool_input_schema`). Default `true`; the
+    /// standalone `web_search` tool opts OUT (#24660) so its minimal schema is
+    /// sent verbatim. Unreachable-definition pruning runs regardless.
+    var compactInputSchema: Bool { get }
     /// Optional model-visible JSON-Schema for the structured output the tool
     /// returns. Emitted as `output_schema` next to `parameters` in the
     /// Responses API tool definition (mirrors `output_schema` on upstream
@@ -85,6 +90,7 @@ public enum ToolApprovalRequirement: Sendable, Equatable {
 public extension Tool {
     var toolDescription: String { "" }
     var jsonSchema: String { #"{"type":"object","additionalProperties":true}"# }
+    var compactInputSchema: Bool { true }
     var outputSchemaJSON: String? { nil }
     var freeformToolFormat: FreeformToolFormat? { nil }
     func approvalRequirement(_ call: ToolCall) -> ToolApprovalRequirement { .none }
@@ -262,10 +268,15 @@ public actor ToolRouter {
             if let t = deferred[name] { all.append(t) }
         }
         return all.map {
-            ToolSpec(name: $0.name, description: $0.toolDescription,
-                     parametersJSON: $0.jsonSchema,
-                     outputSchemaJSON: $0.outputSchemaJSON,
-                     freeformFormat: $0.freeformToolFormat)
+            // Freeform tools are serialized as `{"type":"custom","format":…}` and
+            // never read `parametersJSON`, so skip compaction work for them.
+            let params = $0.freeformToolFormat == nil
+                ? ToolSchemaCompaction.prepare($0.jsonSchema, compact: $0.compactInputSchema)
+                : $0.jsonSchema
+            return ToolSpec(name: $0.name, description: $0.toolDescription,
+                            parametersJSON: params,
+                            outputSchemaJSON: $0.outputSchemaJSON,
+                            freeformFormat: $0.freeformToolFormat)
         }
     }
 

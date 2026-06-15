@@ -314,6 +314,14 @@ public actor StateDB {
         ])
     }
 
+    /// Permanently remove a thread and its dependent rows (`goals`). The rollout
+    /// file on disk is removed separately by `ThreadStore.delete`. Mirrors
+    /// upstream `thread/delete` (delete_thread): the row is gone, not archived.
+    public func deleteThread(_ id: String) throws {
+        try run("DELETE FROM goals WHERE thread_id=?;", [.text(id)])
+        try run("DELETE FROM threads WHERE id=?;", [.text(id)])
+    }
+
     public func getGoal(_ threadId: String) throws -> GoalRow? {
         try run("SELECT * FROM goals WHERE thread_id=?;", [.text(threadId)]).first.map(Self.rowToGoal)
     }

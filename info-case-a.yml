@@ -1,0 +1,203 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - button "Hide sidebar" [ref=e8]:
+        - img
+      - generic [ref=e9]:
+        - button "New chat" [ref=e10]:
+          - img [ref=e12]
+          - generic [ref=e14]: New chat
+        - button "Search ⌘K" [ref=e15]:
+          - img [ref=e17]
+          - generic [ref=e20]: Search
+          - generic [ref=e21]: ⌘K
+        - button "Plugins" [ref=e22]:
+          - img [ref=e24]
+          - generic [ref=e27]: Plugins
+        - button "Automations" [ref=e28]:
+          - img [ref=e30]
+          - generic [ref=e33]: Automations
+        - button "Wiki" [ref=e34]:
+          - img [ref=e36]
+          - generic [ref=e38]: Wiki
+      - generic [ref=e43]:
+        - generic [ref=e44]:
+          - img
+          - searchbox "Filter wiki pages" [ref=e45]
+        - navigation "Wiki file explorer" [ref=e49]:
+          - generic [ref=e89]:
+            - button "claude 16" [expanded] [ref=e90]:
+              - img [ref=e91]
+              - img [ref=e93]
+              - generic [ref=e95]: claude
+              - generic [ref=e96]: "16"
+            - generic [ref=e97]:
+              - 'button "Claude Memory Export: anti_preference" [ref=e98]':
+                - img [ref=e99]
+                - generic [ref=e102]: "Claude Memory Export: anti_preference"
+              - 'button "Claude Memory Export: communication" [ref=e103]':
+                - img [ref=e104]
+                - generic [ref=e107]: "Claude Memory Export: communication"
+              - 'button "Claude Memory Export: constraint" [ref=e108]':
+                - img [ref=e109]
+                - generic [ref=e112]: "Claude Memory Export: constraint"
+              - 'button "Claude Memory Export: decision" [ref=e113]':
+                - img [ref=e114]
+                - generic [ref=e117]: "Claude Memory Export: decision"
+              - 'button "Claude Memory Export: event" [ref=e118]':
+                - img [ref=e119]
+                - generic [ref=e122]: "Claude Memory Export: event"
+              - 'button "Claude Memory Export: goal" [ref=e123]':
+                - img [ref=e124]
+                - generic [ref=e127]: "Claude Memory Export: goal"
+              - 'button "Claude Memory Export: health" [ref=e128]':
+                - img [ref=e129]
+                - generic [ref=e132]: "Claude Memory Export: health"
+              - 'button "Claude Memory Export: inventory" [ref=e133]':
+                - img [ref=e134]
+                - generic [ref=e137]: "Claude Memory Export: inventory"
+              - 'button "Claude Memory Export: other" [ref=e138]':
+                - img [ref=e139]
+                - generic [ref=e142]: "Claude Memory Export: other"
+              - 'button "Claude Memory Export: preference" [ref=e143]':
+                - img [ref=e144]
+                - generic [ref=e147]: "Claude Memory Export: preference"
+              - 'button "Claude Memory Export: profile" [ref=e148]':
+                - img [ref=e149]
+                - generic [ref=e152]: "Claude Memory Export: profile"
+              - 'button "Claude Memory Export: project" [ref=e153]':
+                - img [ref=e154]
+                - generic [ref=e157]: "Claude Memory Export: project"
+              - 'button "Claude Memory Export: relationship" [ref=e158]':
+                - img [ref=e159]
+                - generic [ref=e162]: "Claude Memory Export: relationship"
+              - 'button "Claude Memory Export: technical" [ref=e163]':
+                - img [ref=e164]
+                - generic [ref=e167]: "Claude Memory Export: technical"
+              - 'button "Claude Memory Export: wardrobe" [ref=e168]':
+                - img [ref=e169]
+                - generic [ref=e172]: "Claude Memory Export: wardrobe"
+              - 'button "Claude Memory Export: work" [ref=e173]':
+                - img [ref=e174]
+                - generic [ref=e177]: "Claude Memory Export: work"
+          - generic [ref=e178]:
+            - button "manual 5" [expanded] [ref=e179]:
+              - img [ref=e180]
+              - img [ref=e182]
+              - generic [ref=e185]: manual
+              - generic [ref=e186]: "5"
+            - generic [ref=e187]:
+              - button "Adversarial RT" [ref=e188]:
+                - img [ref=e189]
+                - generic [ref=e192]: Adversarial RT
+              - button "CaseA dots" [ref=e193]:
+                - img [ref=e194]
+                - generic [ref=e197]: CaseA dots
+              - button "M4 Editor Smoke Test" [ref=e198]:
+                - img [ref=e199]
+                - generic [ref=e202]: M4 Editor Smoke Test
+              - button "Untitled base" [ref=e203]:
+                - img [ref=e204]
+                - generic [ref=e207]: Untitled base
+              - button "Untitled canvas" [ref=e208]:
+                - img [ref=e209]
+                - generic [ref=e212]: Untitled canvas
+      - generic [ref=e51]:
+        - generic [ref=e56]: codex
+        - generic [ref=e57]:
+          - button "Settings" [ref=e59]:
+            - img [ref=e61]
+            - generic [ref=e64]: Settings
+          - button "Connect a device" [ref=e65]:
+            - img [ref=e66]
+    - separator [ref=e68]
+  - main [ref=e69]:
+    - generic [ref=e70]:
+      - generic [ref=e71]:
+        - button "Hide sidebar" [ref=e72]:
+          - img
+        - button "Back" [disabled] [ref=e73]:
+          - img
+        - button "Forward" [ref=e74]:
+          - img
+      - generic [ref=e75]:
+        - button "Connections" [ref=e77]:
+          - img
+          - img
+        - button "Switch layout" [ref=e79]:
+          - img
+        - button "Toggle side panel" [pressed] [ref=e80]:
+          - img
+    - generic [ref=e82]:
+      - generic [ref=e88]:
+        - generic [ref=e214]:
+          - button "Add bookmark" [ref=e215]:
+            - img [ref=e216]
+          - button "Edit" [ref=e218]:
+            - img
+            - text: Edit
+          - button "Wiki settings" [ref=e219]:
+            - img
+        - article [ref=e220]:
+          - heading "CaseA dots" [level=1] [ref=e221]
+          - generic [ref=e222]:
+            - separator [ref=e223]
+            - paragraph [ref=e224]: "title: CaseA note: | block one block two keep: original ..."
+            - generic [ref=e225]:
+              - generic [ref=e226]:
+                - generic [ref=e227]: text
+                - generic [ref=e228]:
+                  - button "Enable word wrap" [ref=e229]:
+                    - img [ref=e230]
+                  - button "Copy code" [ref=e233]:
+                    - img [ref=e234]
+              - code [ref=e239]: indented code line
+            - paragraph [ref=e240]: plain win end
+      - complementary [ref=e241]:
+        - generic [ref=e242]:
+          - tablist [ref=e243]:
+            - tab "Links" [ref=e244] [cursor=pointer]
+            - tab "Graph" [ref=e245] [cursor=pointer]
+            - tab "Tags" [ref=e246] [cursor=pointer]
+            - tab "Outline" [ref=e247] [cursor=pointer]
+            - tab "Saved" [ref=e248] [cursor=pointer]
+            - tab "Info" [active] [selected] [ref=e249] [cursor=pointer]
+          - tabpanel "Info" [ref=e254]:
+            - generic [ref=e255]:
+              - generic [ref=e256]:
+                - generic [ref=e257]:
+                  - generic [ref=e258]:
+                    - 'button "Type: Text" [ref=e260]':
+                      - img [ref=e261]
+                    - textbox "Property name" [ref=e262]:
+                      - /placeholder: property
+                      - text: title
+                  - textbox "Value" [ref=e264]:
+                    - /placeholder: empty
+                    - text: CaseA
+                  - button "Remove title" [ref=e265]:
+                    - img [ref=e266]
+                - generic [ref=e269]:
+                  - generic [ref=e270]:
+                    - 'button "Type: Text" [ref=e272]':
+                      - img [ref=e273]
+                    - textbox "Property name" [ref=e274]:
+                      - /placeholder: property
+                      - text: keep
+                  - textbox "Value" [ref=e276]:
+                    - /placeholder: empty
+                    - text: original
+                  - button "Remove keep" [ref=e277]:
+                    - img [ref=e278]
+              - button "Add property" [ref=e282]:
+                - img
+                - text: Add property
+              - generic [ref=e283]:
+                - generic [ref=e284]: Metadata
+                - generic [ref=e285]:
+                  - generic [ref=e286]: Source
+                  - generic [ref=e287]: manual
+                - generic [ref=e288]:
+                  - generic [ref=e289]: Updated
+                  - generic [ref=e290]: 9 Jun 2026, 04:03
+  - region "Notifications alt+T"

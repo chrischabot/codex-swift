@@ -68,6 +68,11 @@ public actor ThreadStore {
     private let limits: Limits
     private var writers: [String: RolloutWriter] = [:]
     private var ephemeralIds: Set<String> = []
+    /// Threads removed by `thread/delete`. A still-running worker can have a
+    /// `record()` already queued in this actor's mailbox when the row + rollout
+    /// file are removed; without this tombstone, `writer(for:)` would lazily
+    /// RE-CREATE the deleted file (write-after-free). Tombstoned ids drop writes.
+    private var deletedIds: Set<String> = []
     private var ephemeralRecords: [String: [RolloutRecord]] = [:]
     private var ephemeralConfig: [String: SessionConfig] = [:]
     private var ephemeralGoals: [String: GoalState] = [:]
@@ -248,6 +253,9 @@ public actor ThreadStore {
     }
 
     public func record(_ id: ThreadId, _ rec: RolloutRecord) async throws {
+        // A worker terminated by thread/delete may still have a queued record();
+        // drop it rather than resurrect the removed rollout file.
+        if deletedIds.contains(id.raw) { return }
         if ephemeralIds.contains(id.raw) {
             ephemeralRecords[id.raw, default: []].append(rec)
             return
@@ -766,6 +774,39 @@ public actor ThreadStore {
             try fm.moveItem(atPath: archivedPath, toPath: restoredPath)
         }
         try await db.markUnarchived(id.raw, rolloutPath: restoredPath, updatedAt: now())
+    }
+
+    /// Permanently delete a thread: close any active writer, remove the rollout
+    /// file from disk (active **or** archived location), and delete the DB row +
+    /// dependents. Mirrors upstream `thread/delete` — unlike `archive`, nothing
+    /// is recoverable afterward. Idempotent: a missing thread is a no-op.
+    /// Returns `true` when a durable/ephemeral thread actually existed and was
+    /// removed (so the caller can gate the `thread/deleted` notification on real
+    /// existence rather than a truncated listing).
+    @discardableResult
+    public func delete(_ id: ThreadId) async throws -> Bool {
+        try ensureSafe(id)
+        // Tombstone first so any record() still queued from a terminating worker
+        // is dropped (no write-after-free file revival).
+        deletedIds.insert(id.raw)
+        if ephemeralIds.contains(id.raw) {
+            ephemeralIds.remove(id.raw)
+            ephemeralRecords[id.raw] = nil
+            ephemeralConfig[id.raw] = nil
+            if let w = writers[id.raw] { await w.close(); writers[id.raw] = nil }
+            return true
+        }
+        guard let row = try await db.getThread(id.raw) else { return false }
+        if let w = writers[id.raw] { await w.close(); writers[id.raw] = nil }
+        let fm = FileManager.default
+        // Remove the transcript BEFORE the DB row, and PROPAGATE a failure: a delete is
+        // documented + signaled as permanent, so we must not drop the row (and report
+        // success) while leaving an orphaned rollout file on disk.
+        if fm.fileExists(atPath: row.rolloutPath) {
+            try fm.removeItem(atPath: row.rolloutPath)
+        }
+        try await db.deleteThread(id.raw)
+        return true
     }
 
     /// Extract `(year, month, day)` from a rollout filename of the form

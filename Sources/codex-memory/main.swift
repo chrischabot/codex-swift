@@ -51,6 +51,38 @@ case "snapshot":
         exit(2)
     }
 
+case "cycle":
+    do {
+        let cliArgs = Array(args.dropFirst())
+        let dryRun = cliArgs.contains("--dry-run")
+        let json = cliArgs.contains("--json")
+        let report = try await CodexMemoryRun.cycleOnce(dryRun: dryRun)
+        let out: String
+        if json {
+            let obj: [String: Any] = [
+                "aborted": report.aborted,
+                "total_touched": report.totalTouched,
+                "phases": report.phases.map {
+                    ["name": $0.name, "status": $0.status.rawValue,
+                     "touched": $0.touched, "duration_ms": $0.durationMs]
+                },
+            ]
+            let d = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]))
+                ?? Data("{}".utf8)
+            out = String(decoding: d, as: UTF8.self) + "\n"
+        } else {
+            let body = report.phases
+                .map { "\($0.name)=\($0.touched)(\($0.status.rawValue))" }
+                .joined(separator: " ")
+            out = "maintenance cycle: \(body)\(dryRun ? " [dry-run]" : "")\n"
+        }
+        FileHandle.standardOutput.write(Data(out.utf8))
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("cycle failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "import-claude":
     do {
         let report = try await CodexMemoryClaudeImport.run(args: Array(args.dropFirst()))
@@ -148,6 +180,26 @@ case "wiki-audit":
         exit(result.ok ? 0 : 1)
     } catch {
         FileHandle.standardError.write(Data("wiki-audit failed: \(error)\n".utf8))
+        exit(2)
+    }
+
+case "wiki-contradictions":
+    do {
+        let result = try await CodexMemoryWikiContradictions.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-contradictions failed: \(error)\n".utf8))
+        exit(2)
+    }
+
+case "code-index":
+    do {
+        let result = try await CodexMemoryCodeIndex.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("code-index failed: \(error)\n".utf8))
         exit(2)
     }
 

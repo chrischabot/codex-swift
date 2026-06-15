@@ -1902,4 +1902,41 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(payload["cli_version"] as? String, "9.9.9")
     }
 
+    // MARK: thread/delete — permanence + write-after-free tombstone (P1)
+
+    /// Severe test for the adversarial-review finding: a still-terminating worker
+    /// can have a `record()` queued AFTER `thread/delete` removes the row + file.
+    /// Without the tombstone, `writer(for:)` lazily re-creates the rollout file,
+    /// leaking a permanently-orphaned file. Asserts delete is permanent and a
+    /// late write does NOT resurrect it.
+    func testDeleteIsPermanentAndTombstonesLateWrites() async throws {
+        let home = NSTemporaryDirectory() + "del-waf-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let store = try ThreadStore(codexHome: home, limits: smallLimits())
+        let thread = ThreadId("thr_waf")
+        _ = try await store.create(SessionConfig(threadId: thread, cwd: "/w"))
+        let turn = TurnId("t1")
+        try await store.record(thread, .turnBoundary(turnId: turn, status: .inProgress))
+        try await store.durabilityBarrier(thread)
+
+        func rolloutFiles() -> [String] {
+            guard let en = FileManager.default.enumerator(atPath: home + "/sessions") else { return [] }
+            var out: [String] = []
+            while let p = en.nextObject() as? String { if p.hasSuffix(".jsonl") { out.append(p) } }
+            return out
+        }
+        XCTAssertEqual(rolloutFiles().count, 1, "rollout file exists before delete")
+
+        let existed = try await store.delete(thread)
+        XCTAssertTrue(existed, "delete reports the thread existed")
+        XCTAssertEqual(rolloutFiles().count, 0, "delete removed the rollout file")
+
+        // Late write from a worker that hadn't yet observed termination.
+        try await store.record(thread, .userInput(turnId: turn, input: [TurnInput(text: "late write")]))
+        XCTAssertEqual(rolloutFiles().count, 0, "tombstone prevents write-after-free revival")
+
+        let again = try await store.delete(thread)
+        XCTAssertFalse(again, "second delete → already gone (idempotent, reports non-existence)")
+    }
+
 }

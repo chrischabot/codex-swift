@@ -355,6 +355,10 @@ public struct TurnStartParams: Sendable, Codable, Equatable {
     }
     public var threadId: ThreadId
     public var input: [TurnInput]
+    /// Optional client-supplied id correlating the user message that started
+    /// this turn. Upstream wire field `turn/start.clientUserMessageId`
+    /// (v2/turn.rs), serialized as `string | null`.
+    public var clientUserMessageId: String?
     public var environments: [EnvironmentParams]?
     public var model: String?
     public var personality: String?
@@ -388,7 +392,7 @@ public struct TurnStartParams: Sendable, Codable, Equatable {
     /// a raw JSON value for round-tripping.
     public var collaborationMode: JSONValue?
     enum CodingKeys: String, CodingKey {
-        case threadId, input, environments, model, personality, approvalPolicy,
+        case threadId, input, clientUserMessageId, environments, model, personality, approvalPolicy,
              approvalsReviewer, cwd, effort, outputSchema, sandboxPolicy,
              serviceTier, summary, responsesapiClientMetadata,
              runtimeWorkspaceRoots, permissions, collaborationMode
@@ -397,6 +401,7 @@ public struct TurnStartParams: Sendable, Codable, Equatable {
         let c = try d.container(keyedBy: CodingKeys.self)
         threadId = try c.decode(ThreadId.self, forKey: .threadId)
         input = try c.decode([TurnInput].self, forKey: .input)
+        clientUserMessageId = try c.decodeIfPresent(String.self, forKey: .clientUserMessageId)
         environments = try c.decodeIfPresent([EnvironmentParams].self, forKey: .environments)
         model = try c.decodeIfPresent(String.self, forKey: .model)
         personality = try c.decodeIfPresent(String.self, forKey: .personality)
@@ -419,6 +424,7 @@ public struct TurnStartParams: Sendable, Codable, Equatable {
         var c = e.container(keyedBy: CodingKeys.self)
         try c.encode(threadId, forKey: .threadId)
         try c.encode(input, forKey: .input)
+        try c.encodeIfPresent(clientUserMessageId, forKey: .clientUserMessageId)
         try c.encodeIfPresent(environments, forKey: .environments)
         try c.encodeIfPresent(model, forKey: .model)
         try c.encodeIfPresent(personality, forKey: .personality)
@@ -443,6 +449,9 @@ public struct TurnInterruptParams: Sendable, Codable, Equatable {
 public struct TurnSteerParams: Sendable, Codable, Equatable {
     public var threadId: ThreadId
     public var input: [TurnInput]
+    /// Optional client-supplied id correlating the steered user message.
+    /// Upstream wire field `turn/steer.clientUserMessageId` (`string | null`).
+    public var clientUserMessageId: String?
     /// Optional turn-scoped Responses API client metadata. Experimental wire
     /// field `turn/steer.responsesapiClientMetadata` (gated when the connection
     /// did not negotiate `experimentalApi`). Omitted from the wire when nil.
