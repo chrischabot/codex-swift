@@ -233,6 +233,26 @@ case "wiki-collect":
         exit(2)
     }
 
+case "wiki-plan":
+    do {
+        let result = try await CodexMemoryWikiArtifact.runPlan(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-plan failed: \(error)\n".utf8))
+        exit(2)
+    }
+
+case "wiki-output":
+    do {
+        let result = try await CodexMemoryWikiArtifact.runOutput(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-output failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "code-index":
     do {
         let result = try await CodexMemoryCodeIndex.run(args: Array(args.dropFirst()))
@@ -276,6 +296,8 @@ case "help", "--help", "-h":
       wiki-inventory  Durable inventory CRUD (list|add|show|save-view|views) — compact table.
       wiki-dataset    Dataset manifests + notes (list|add|show|profile|note); bounded local profile.
       wiki-collect    Discovery catalog (list|add|download); HTTPS-only IP-pinned media downloader.
+      wiki-plan       File a wiki-grounded plan (file --format rfc|adr|spec|roadmap; --strict enforces grounding).
+      wiki-output     File an output artifact (file --type report|glossary|timeline|… ) as a synthesis row.
       wiki-research   Multi-round web research swarm → credibility filter → ingest.
       run             Long-running daemon: ingest → process → score, with MCP.
 
