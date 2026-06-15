@@ -371,6 +371,7 @@ public actor RequestRouter {
     }
 
     public typealias AccountRateLimitsFetcher = @Sendable (_ tokens: AuthTokens, _ baseURL: String) async throws -> JSONValue
+    public typealias AccountTokenUsageFetcher = @Sendable (_ tokens: AuthTokens, _ baseURL: String) async throws -> GetAccountTokenUsageResponse
     public typealias AccountNudgeEmailSender = @Sendable (_ tokens: AuthTokens, _ baseURL: String, _ creditType: String) async throws -> String
     public typealias RemoteControlEnroller = @Sendable (_ tokens: AuthTokens, _ baseURL: String, _ installationId: String, _ serverName: String) async throws -> RemoteControlEnrollment
     public typealias RemoteControlWebSocketConnector = @Sendable (_ request: RemoteControlWebSocketRequest) async throws -> RemoteControlWebSocketConnection
@@ -392,6 +393,13 @@ public actor RequestRouter {
     private let config: Config?
     private let requirementsLoader: ConfigRequirementsLoader
     private let accountRateLimitsFetcher: AccountRateLimitsFetcher
+    /// Best-effort token-usage profile fetcher (`account/usage/read`). Backend
+    /// HTTP by default; the auth-gate precondition runs in the handler. Stored as
+    /// a property so tests can substitute a deterministic projection.
+    private let accountTokenUsageFetcher: AccountTokenUsageFetcher = RequestRouter.fetchAccountTokenUsage
+    /// Runtime-registered extra skill roots (`skills/extraRoots/set`). Appended
+    /// to the canonical discovery roots on every `skills/list`.
+    private var extraSkillRoots: [String] = []
     private let accountNudgeEmailSender: AccountNudgeEmailSender
     private let remoteControlEnroller: RemoteControlEnroller
     private let remoteControlWebSocketConnector: RemoteControlWebSocketConnector
@@ -1012,6 +1020,114 @@ public actor RequestRouter {
             throw SimpleError("malformed rate-limit response")
         }
         return rateLimitResponse(from: body)
+    }
+
+    /// Invalid-cursor / cursor-out-of-range conditions for `permissionProfile/list`,
+    /// mapped to `invalid_request` to mirror upstream (catalog_processor.rs:472-481).
+    struct PermissionProfileListError: Error { let message: String }
+
+    /// Build the `permissionProfile/list` response: three built-in profiles
+    /// (`:read-only`, `:workspace`, `:danger-full-access`) followed by configured
+    /// `[permissions.<id>]` profiles sorted by id, then offset/limit pagination.
+    /// Faithful port of `permission_profile_list_response`.
+    static func permissionProfileListResponse(
+        params: PermissionProfileListParams, codexHome: String
+    ) throws -> PermissionProfileListResponse {
+        let effectiveConfig = ConfigLoader(codexHome: codexHome,
+                                           cwdOverride: params.cwd).load()
+        if let loadError = effectiveConfig.loadError {
+            throw SimpleError(loadError)
+        }
+        var profiles: [PermissionProfileSummary] = BuiltInPermissionProfile.ordered
+            .map { PermissionProfileSummary(id: $0, description: nil) }
+        let configured = (effectiveConfig.value("permissions")?.objectValue ?? [:])
+            .map { (id, value) in
+                PermissionProfileSummary(
+                    id: id,
+                    description: value.objectValue?["description"]?.stringValue)
+            }
+            .sorted { $0.id < $1.id }
+        profiles.append(contentsOf: configured)
+
+        let total = profiles.count
+        let limit = Int(params.limit ?? UInt32(total))
+        let effectiveLimit = max(1, min(limit, total))
+        let start: Int
+        if let cursor = params.cursor {
+            guard let parsed = Int(cursor), parsed >= 0 else {
+                throw PermissionProfileListError(message: "invalid cursor: \(cursor)")
+            }
+            start = parsed
+        } else {
+            start = 0
+        }
+        if start > total {
+            throw PermissionProfileListError(
+                message: "cursor \(start) exceeds total permission profiles \(total)")
+        }
+        let end = min(start + effectiveLimit, total)
+        let data = Array(profiles[start..<end])
+        let nextCursor = end < total ? String(end) : nil
+        return PermissionProfileListResponse(data: data, nextCursor: nextCursor)
+    }
+
+    /// Fetch the backend token-usage profile and project it onto
+    /// `GetAccountTokenUsageResponse`. Mirrors `account_token_usage_response`
+    /// (`/wham/profiles/me` on ChatGPT, `/api/codex/profiles/me` on codex-api).
+    private static func fetchAccountTokenUsage(
+        tokens: AuthTokens, baseURL: String
+    ) async throws -> GetAccountTokenUsageResponse {
+        var normalizedBase = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if (normalizedBase == "https://chatgpt.com"
+            || normalizedBase == "https://chat.openai.com")
+            && !normalizedBase.contains("/backend-api") {
+            normalizedBase += "/backend-api"
+        }
+        guard var components = URLComponents(string: normalizedBase) else {
+            throw SimpleError("invalid ChatGPT base URL")
+        }
+        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let suffix = normalizedBase.contains("/backend-api")
+            ? "/wham/profiles/me" : "/api/codex/profiles/me"
+        components.path = (basePath.isEmpty ? "" : "/" + basePath) + suffix
+        guard let url = components.url else { throw SimpleError("invalid token-usage URL") }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+        if let accountId = tokens.accountId {
+            request.setValue(accountId, forHTTPHeaderField: "chatgpt-account-id")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SimpleError("missing HTTP response")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw SimpleError("HTTP \(http.statusCode)")
+        }
+        return try projectTokenUsageProfile(data)
+    }
+
+    /// Project the backend `TokenUsageProfile` JSON (`{ stats: {...} }`,
+    /// snake_case) onto the wire response. Pure + total so it is unit-testable
+    /// without a network round-trip.
+    static func projectTokenUsageProfile(_ data: Data) throws -> GetAccountTokenUsageResponse {
+        let any = try JSONSerialization.jsonObject(with: data)
+        let stats = (jsonAnyToValue(any).objectValue?["stats"])?.objectValue ?? [:]
+        let buckets = stats["daily_usage_buckets"]?.arrayValue?.compactMap { v -> AccountTokenUsageDailyBucket? in
+            guard let o = v.objectValue,
+                  let startDate = o["start_date"]?.stringValue,
+                  let tokens = o["tokens"]?.intValue else { return nil }
+            return AccountTokenUsageDailyBucket(startDate: startDate, tokens: tokens)
+        }
+        return GetAccountTokenUsageResponse(
+            summary: AccountTokenUsageSummary(
+                lifetimeTokens: stats["lifetime_tokens"]?.intValue,
+                peakDailyTokens: stats["peak_daily_tokens"]?.intValue,
+                longestRunningTurnSec: stats["longest_running_turn_sec"]?.intValue,
+                currentStreakDays: stats["current_streak_days"]?.intValue,
+                longestStreakDays: stats["longest_streak_days"]?.intValue),
+            dailyUsageBuckets: buckets)
     }
 
     private static func sendAddCreditsNudgeEmail(tokens: AuthTokens,
@@ -2146,7 +2262,8 @@ public actor RequestRouter {
         // to this grouped case, and add an arm in dispatchWiki(_:_:).
         case .wikiList, .wikiPageGet, .wikiSearch, .wikiGraph, .wikiBacklinks,
              .wikiEntityBacklinks, .wikiTags, .wikiIndex, .wikiPageUpsert,
-             .wikiPageDelete, .wikiPageRename, .wikiBrief, .wikiQuery, .wikiStatus, .wikiWatchList:
+             .wikiPageDelete, .wikiPageRename, .wikiBrief, .wikiQuery, .wikiStatus, .wikiWatchList,
+             .wikiResearchStart, .wikiIngestStart:
             await dispatchWiki(parsed, conn)
 
         // MARK: turns
@@ -2423,10 +2540,64 @@ public actor RequestRouter {
         case .skillsList(let id, let p):
             let recs = SkillsDiscovery().discover(
                 codexHome: codexHome,
-                cwds: p.cwds ?? [FileManager.default.currentDirectoryPath])
+                cwds: p.cwds ?? [FileManager.default.currentDirectoryPath],
+                extraRoots: extraSkillRoots)
             await reply(conn, id, SkillsListResponse(data: recs.map {
                 SkillSummary(name: $0.name, description: $0.description, path: $0.path)
             }))
+        case .skillsExtraRootsSet(let id, let p):
+            // Upstream models each entry as an `AbsolutePathBuf`; reject relative
+            // entries rather than silently resolving against an ambiguous cwd.
+            let nonAbsolute = p.extraRoots.filter { !$0.hasPrefix("/") }
+            guard nonAbsolute.isEmpty else {
+                await conn.send(WireError.invalidRequest(id: id,
+                    "skills extra roots must be absolute paths: \(nonAbsolute.joined(separator: ", "))"))
+                return
+            }
+            extraSkillRoots = p.extraRoots
+            await reply(conn, id, EmptyResponse())
+        case .threadDelete(let id, let p):
+            do {
+                let wasActive = ((try? await store.list(archived: false, limit: 1000)) ?? [])
+                    .contains { $0.id == p.threadId }
+                try await store.delete(p.threadId)
+                await reply(conn, id, EmptyResponse())
+                if wasActive {
+                    await supervisor.broadcast(p.threadId, .threadDeleted(threadId: p.threadId))
+                }
+            } catch {
+                await conn.send(WireError.internalError(
+                    id: id, "failed to delete thread \(p.threadId.raw): \(error.localizedDescription)"))
+            }
+        case .permissionProfileList(let id, let p):
+            do {
+                await reply(conn, id, try Self.permissionProfileListResponse(
+                    params: p, codexHome: codexHome))
+            } catch let e as PermissionProfileListError {
+                await conn.send(WireError.invalidRequest(id: id, e.message))
+            } catch {
+                await conn.send(WireError.internalError(
+                    id: id, "failed to reload config: \(error.localizedDescription)"))
+            }
+        case .getAccountTokenUsage(let id):
+            guard let auth, let tokens = await auth.storedTokens() else {
+                await conn.send(WireError.invalidRequest(
+                    id: id, "codex account authentication required to read token usage"))
+                return
+            }
+            guard tokens.tokenType != "APIKey" else {
+                await conn.send(WireError.invalidRequest(
+                    id: id, "chatgpt authentication required to read token usage"))
+                return
+            }
+            do {
+                let result = try await accountTokenUsageFetcher(
+                    tokens, Self.chatGPTBaseURL(codexHome: codexHome))
+                await reply(conn, id, result)
+            } catch {
+                await conn.send(WireError.internalError(
+                    id: id, "failed to fetch token usage profile: \(error.localizedDescription)"))
+            }
         case .mcpServerStatusList(let id, _):
             await ensureMcpServersStarted(conn: conn)
             await reply(conn, id, await mcpStatusListResponse())

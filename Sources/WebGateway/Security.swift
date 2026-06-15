@@ -36,6 +36,7 @@ enum MethodGate {
         // stay deny-default behind the CODEXKIT_MEMORY-gated WikiQueryHandle.
         "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/entityBacklinks", "wiki/tags", "wiki/index",
         "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query", "wiki/status", "wiki/watch/list",
+        "wiki/research/start", "wiki/ingest/start",
         // turn lifecycle
         "turn/start", "turn/steer", "turn/interrupt", "review/start",
         // git diff-rail + automations

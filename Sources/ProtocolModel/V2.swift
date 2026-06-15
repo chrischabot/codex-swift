@@ -14,16 +14,16 @@ public enum Method {
         "thread/start", "thread/resume", "thread/fork", "thread/archive",
         "thread/unsubscribe", "thread/increment_elicitation",
         "thread/decrement_elicitation", "thread/name/set", "thread/goal/set",
-        "thread/goal/get", "thread/goal/clear", "thread/metadata/update",
+        "thread/goal/get", "thread/goal/clear", "thread/delete", "thread/metadata/update",
         "thread/memoryMode/set", "memory/reset", "thread/unarchive", "thread/pin/set", "git/action", "automation/action",
         // memory wiki (browse + edit surface)
-        "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/tags", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query", "wiki/status", "wiki/watch/list",
+        "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/tags", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query", "wiki/status", "wiki/watch/list", "wiki/research/start", "wiki/ingest/start",
         "thread/compact/start", "thread/shellCommand",
         "thread/approveGuardianDeniedAction", "thread/backgroundTerminals/clean",
         "thread/rollback", "thread/list", "thread/loaded/list", "thread/read",
         "thread/turns/list", "thread/turns/items/list", "thread/inject_items",
         // skills / hooks / marketplace / plugins / apps
-        "skills/list", "skills/config/write", "hooks/list",
+        "skills/list", "skills/config/write", "skills/extraRoots/set", "hooks/list",
         "marketplace/add", "marketplace/remove", "marketplace/upgrade",
         // `plugin/installed` is a deliberate port marketplace extension (real
         // handler in RequestRouter + GenericResponses); it must stay in the
@@ -56,7 +56,8 @@ public enum Method {
         // account
         "account/login/start", "account/login/cancel", "account/logout",
         "account/rateLimits/read", "account/sendAddCreditsNudgeEmail",
-        "account/read", "feedback/upload",
+        "account/read", "account/usage/read", "feedback/upload",
+        "permissionProfile/list",
         // command/process exec
         "command/exec", "command/exec/write", "command/exec/terminate",
         "command/exec/resize", "process/spawn", "process/writeStdin",

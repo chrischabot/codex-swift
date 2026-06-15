@@ -82,3 +82,32 @@ public struct WikiPageRenameParams: Decodable, Sendable, Equatable {
     public var title: String
     public init(id: Int64, title: String) { self.id = id; self.title = title }
 }
+
+/// Start a long-running research job; progress streams over wiki/job/* notifications.
+public struct WikiResearchStartParams: Decodable, Sendable, Equatable {
+    public var topic: String
+    public var mode: String?       // topic | question | thesis (auto if nil)
+    public var depth: String?      // standard | deep | retardmax
+    public var sources: Int?
+    public var minTime: Int?       // seconds → multi-round
+    public var maxRounds: Int?
+    public init(topic: String, mode: String? = nil, depth: String? = nil, sources: Int? = nil,
+                minTime: Int? = nil, maxRounds: Int? = nil) {
+        self.topic = topic; self.mode = mode; self.depth = depth
+        self.sources = sources; self.minTime = minTime; self.maxRounds = maxRounds
+    }
+}
+
+/// Start a long-running ingest job; progress streams over wiki/job/* notifications.
+public struct WikiIngestStartParams: Decodable, Sendable, Equatable {
+    public var input: String
+    public var adapter: String?
+    public var rawType: String?
+    public var limit: Int?
+    public var extract: Bool?
+    public init(input: String, adapter: String? = nil, rawType: String? = nil,
+                limit: Int? = nil, extract: Bool? = nil) {
+        self.input = input; self.adapter = adapter; self.rawType = rawType
+        self.limit = limit; self.extract = extract
+    }
+}

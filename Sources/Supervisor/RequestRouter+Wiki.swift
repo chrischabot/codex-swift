@@ -59,9 +59,62 @@ extension RequestRouter {
         case .wikiQuery(let id, let p):
             // depth clamped 1...3 (quick/standard/deep); k re-clamped router-side.
             await replyWiki(conn, id) { try await $0.query(p.query, min(max(p.depth ?? 2, 1), 3), Self.clampWikiK(p.k)) }
+        case .wikiResearchStart(let id, let p):
+            await startWikiJob(conn, id, args: Self.researchArgs(p))
+        case .wikiIngestStart(let id, let p):
+            await startWikiJob(conn, id, args: Self.ingestArgs(p))
         default:
             break
         }
+    }
+
+    /// Start a long-running wiki job: ack with `{ jobId }`, then spawn the
+    /// codex-memory subprocess and forward its `--progress` NDJSON lines as
+    /// `wiki/job/event` (during) / `wiki/job/done` (final) notifications on this
+    /// connection. Gated behind the same CODEXKIT_MEMORY flag as the read handle.
+    func startWikiJob(_ conn: any ClientConnection, _ id: RequestId, args: [String]) async {
+        guard wikiQuery != nil else {
+            await conn.send(WireError.internalError(id: id, "wiki is not enabled")); return
+        }
+        let jobId = UUID().uuidString
+        await reply(conn, id, .object(["jobId": .string(jobId)]))   // immediate ack
+        let flag = WikiJobFlag()
+        Task { [conn] in
+            let exit = await WikiJobRunner.stream(args: args) { line in
+                guard let jv = try? JSONDecoder().decode(JSONValue.self, from: Data(line.utf8)) else { return }
+                let isResult = (jv.objectValue?["type"]?.stringValue == "result")
+                if isResult { await flag.mark() }
+                await conn.send(.notification(JSONRPCNotification(
+                    method: isResult ? "wiki/job/done" : "wiki/job/event",
+                    params: .object(["jobId": .string(jobId), "data": jv]))))
+            }
+            // A crash / spawn failure (no result line) still needs a terminal signal.
+            if await !flag.value {
+                await conn.send(.notification(JSONRPCNotification(
+                    method: "wiki/job/done",
+                    params: .object(["jobId": .string(jobId),
+                        "data": .object(["type": .string("result"), "status": .string("failed"),
+                            "error": .string("job ended without a result (exit \(exit.map(String.init) ?? "spawn-failed"))")])]))))
+            }
+        }
+    }
+
+    static func researchArgs(_ p: WikiResearchStartParams) -> [String] {
+        var a = ["wiki-research", p.topic, "--progress"]
+        if let m = p.mode { a += ["--mode", m] }
+        if let d = p.depth { a += ["--depth", d] }
+        if let s = p.sources { a += ["--sources", String(min(max(s, 1), 12))] }
+        if let t = p.minTime { a += ["--min-time", String(max(0, t))] }
+        if let r = p.maxRounds { a += ["--max-rounds", String(min(max(r, 1), 5))] }
+        return a
+    }
+    static func ingestArgs(_ p: WikiIngestStartParams) -> [String] {
+        var a = ["wiki-ingest", p.input, "--progress"]
+        if let ad = p.adapter { a += ["--adapter", ad] }
+        if let rt = p.rawType { a += ["--raw-type", rt] }
+        if let l = p.limit { a += ["--limit", String(min(max(l, 1), 500))] }
+        if p.extract == true { a += ["--extract"] }
+        return a
     }
 
     /// Centralizes the deny-default gate + error mapping for the `wiki/*` arms.
