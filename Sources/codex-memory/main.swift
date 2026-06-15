@@ -253,6 +253,16 @@ case "wiki-output":
         exit(2)
     }
 
+case "wiki-digest":
+    do {
+        let result = try await CodexMemoryWikiDigest.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-digest failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "code-index":
     do {
         let result = try await CodexMemoryCodeIndex.run(args: Array(args.dropFirst()))
@@ -298,6 +308,7 @@ case "help", "--help", "-h":
       wiki-collect    Discovery catalog (list|add|download); HTTPS-only IP-pinned media downloader.
       wiki-plan       File a wiki-grounded plan (file --format rfc|adr|spec|roadmap; --strict enforces grounding).
       wiki-output     File an output artifact (file --type report|glossary|timeline|… ) as a synthesis row.
+      wiki-digest     Render a digest of pages updated in a window (--days N --file); category=digest.
       wiki-research   Multi-round web research swarm → credibility filter → ingest.
       run             Long-running daemon: ingest → process → score, with MCP.
 
