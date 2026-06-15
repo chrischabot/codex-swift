@@ -287,16 +287,47 @@ public enum CodeModeRuntime {
                 globalThis.text=function(s){ __codex_output.push({type:'text', text:String(s)}); };
                 globalThis.store=function(k,v){ __codex_store[String(k)]=v; };
                 globalThis.load=function(k){ var v=__codex_store[String(k)]; return v===undefined?null:v; };
+                // notify(): upstream streams these mid-run; the synchronous JSC
+                // runtime collects them and appends a [notify] section instead.
+                globalThis.__codex_notify=[];
+                globalThis.notify=function(s){ var t=String(s); if(t.trim().length===0) throw new Error('notify expects non-empty text'); __codex_notify.push(t); };
+                // exit(value): early, clean termination. Records an optional final
+                // message, then unwinds via a sentinel error the host recognizes
+                // by message identity (so a real error can't be laundered clean).
+                globalThis.exit=function(v){ if(v!==undefined&&v!==null){ text(v); } throw new Error('__CODEX_EXIT__'); };
+                // tools.<name>(args) + ALL_TOOLS: ergonomic per-tool surface that
+                // forwards to the same authoritative callTool bridge. Interop keys
+                // (then/constructor/toJSON/…) return undefined so the proxy is not
+                // mistaken for a thenable (which would hang under sync eval).
+                globalThis.tools=new Proxy({}, { get:function(_,name){
+                  if(typeof name!=='string') return undefined;
+                  if(name==='then'||name==='catch'||name==='finally'||name==='constructor'||name==='toJSON'||name==='toString'||name==='valueOf'||name==='inspect') return undefined;
+                  return function(args){ return callTool(name, args); };
+                } });
+                globalThis.ALL_TOOLS=globalThis.ALL_TOOLS||[];
+                // Sandbox parity (upstream deletes these from the global scope).
+                try{ delete globalThis.Atomics; }catch(e){}
+                try{ delete globalThis.SharedArrayBuffer; }catch(e){}
+                try{ delete globalThis.WebAssembly; }catch(e){}
                 """
                 context.evaluateScript(prelude)
 
                 let wrapped = "(function(){\n" + source + "\n})()"
                 let value = context.evaluateScript(wrapped)
 
-                if let exc = context.exception {
+                // An exception that is NOT the exit() sentinel is a real error.
+                // We detect a clean exit by the sentinel's exception IDENTITY
+                // (its message), NOT a script-writable flag — otherwise a script
+                // could set such a flag and then throw a genuine error to launder
+                // a real failure into a reported success.
+                let exitedCleanly = context.exception?.toString()?.contains("__CODEX_EXIT__") == true
+                if let exc = context.exception, !exitedCleanly {
                     cont.resume(returning: ("code-mode error: \(exc)", false))
                     return
                 }
+                // Clear the exit() sentinel so it can't poison the JSON.stringify
+                // host calls used below to serialize the composed output.
+                if exitedCleanly { context.exception = nil }
 
                 var output = ""
                 if let value = value, !value.isUndefined, !value.isNull {
@@ -317,6 +348,16 @@ public enum CodeModeRuntime {
                    let arr = logsValue.toArray(), !arr.isEmpty {
                     let joined = arr.map { "\($0)" }.joined(separator: "\n")
                     output += "\n[console]\n" + joined
+                }
+
+                if let notifyValue = context.objectForKeyedSubscript("__codex_notify"),
+                   let arr = notifyValue.toArray(), !arr.isEmpty {
+                    // Bound output flooding from a runaway script: keep the first
+                    // 50 notifications and note any overflow.
+                    let cap = 50
+                    var lines = arr.prefix(cap).map { "\($0)" }
+                    if arr.count > cap { lines.append("… (\(arr.count - cap) more notifications truncated)") }
+                    output += (output.isEmpty ? "" : "\n") + "[notify]\n" + lines.joined(separator: "\n")
                 }
 
                 // Collect the code-mode OUTPUT items the script composed. We

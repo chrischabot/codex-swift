@@ -97,6 +97,68 @@ final class CodeModeOutputTests: XCTestCase {
         XCTAssertTrue(out.contains("remote image URLs are not supported"), out)
     }
 
+    // --- P5b wave 2: exit() / notify() / tools.<name>() surface parity ---
+
+    func testExitTerminatesCleanlyWithFinalMessage() async {
+        let (out, ok) = await run("""
+        text('first');
+        exit('done-early');
+        text('SHOULD-NOT-RUN');
+        """)
+        XCTAssertTrue(ok, "exit() must terminate cleanly, not as an error: \(out)")
+        XCTAssertTrue(out.contains("first"), out)
+        XCTAssertTrue(out.contains("done-early"), out)
+        XCTAssertFalse(out.contains("SHOULD-NOT-RUN"), "code after exit() must not run: \(out)")
+    }
+
+    func testExitWithNoArgStillCleanAndNotAnError() async {
+        let (out, ok) = await run(#"text('kept'); exit();"#)
+        XCTAssertTrue(ok, "bare exit() is a clean termination: \(out)")
+        XCTAssertFalse(out.contains("code-mode error"), out)
+        XCTAssertTrue(out.contains("kept"), out)
+    }
+
+    func testRealErrorCannotBeLaunderedAsCleanExit() async {
+        // #1 (MAJOR review fix): a script must NOT be able to fake a clean exit
+        // and then throw a genuine error to launder a real failure into success.
+        // Clean-exit is decided by the sentinel's exception identity, not a
+        // script-writable flag.
+        let (out, ok) = await run("""
+        globalThis.__codex_exited = true;   // attempt to spoof the old flag
+        null.foo;                           // genuine TypeError
+        """)
+        XCTAssertFalse(ok, "a real error must be reported, not laundered: \(out)")
+        XCTAssertTrue(out.contains("code-mode error"), out)
+    }
+
+    func testToolsProxyIsNotMistakenForThenable() async {
+        // #3 (review fix): tools.then must be undefined so awaiting/returning the
+        // proxy doesn't trigger thenable resolution (which would hang sync eval).
+        let (out, ok) = await run(#"text(typeof tools.then);"#)
+        XCTAssertTrue(ok, out)
+        XCTAssertTrue(out.contains("undefined"), out)
+    }
+
+    func testNotifyCollectedAndEmptyRejected() async {
+        let (out, ok) = await run(#"notify('working on it'); text('ok');"#)
+        XCTAssertTrue(ok, out)
+        XCTAssertTrue(out.contains("[notify]") && out.contains("working on it"), out)
+        // Empty notify must throw (matches upstream "non-empty text" rule).
+        let (bad, badOk) = await run(#"notify('   ');"#)
+        XCTAssertFalse(badOk, "empty notify must fail: \(bad)")
+    }
+
+    func testToolsProxyForwardsToCallTool() async {
+        // tools.<name>(args) must forward to the same dispatch bridge as
+        // callTool; the noop dispatch returns "{}", so the call resolves.
+        let (out, ok) = await run("""
+        var r = tools.echo({a: 1});
+        text('called:' + (r !== undefined));
+        """)
+        XCTAssertTrue(ok, out)
+        XCTAssertTrue(out.contains("called:true"), out)
+    }
+
     func testNoHelpersUsedLeavesOutputUnchanged() async {
         // Regression: a script that uses no output helpers behaves exactly as
         // before (return value + console only; no "[code-mode output]" block).

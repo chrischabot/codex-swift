@@ -52,3 +52,45 @@ boundary. Revisit only if the port grows a remote control plane.
 The three PORTED items (encrypted local secrets, multi-agent v2, code mode) are
 tracked as their own sub-phases in `tools/catchup-backlog.md` and the task list,
 each driven through implement → adversarial review → severe test → live validation.
+
+---
+
+## Code mode — runtime-model divergence (JavaScriptCore vs. V8)
+
+Upstream `code-mode` (`codex-rs/code-mode`, ~4.3 kLOC) is a **V8** runtime with a
+custom event loop, module loader, and *durable continuations*. The Swift port
+(`Sources/Tools/CodeMode.swift`) runs model-authored JS in **JavaScriptCore** as a
+**single-shot, synchronous, deadline-bounded** evaluation. The JS-facing helper
+surface is ported for parity; the pieces that depend on V8-specific machinery are
+documented divergences because they are not expressible in the JSC model.
+
+**Ported (parity):**
+- Output helpers `text()` / `image()` / `generatedImage()`, with the **#27732**
+  reject-remote-image rule enforced as a **positive `data:`-only allow-list**,
+  authoritative **host-side** (re-validated after the run, not trusting the JS
+  helper) — see `CodeModeOutputTests`.
+- Per-run KV via `store()` / `load()`.
+- `exit(value)` — clean early termination with an optional final message.
+- `notify(text)` — collected and appended as a `[notify]` section (see below).
+- `tools.<name>(args)` + `ALL_TOOLS` ergonomic surface forwarding to the same
+  authoritative `callTool` dispatch bridge.
+- Sandbox global-deletion parity (`Atomics`, `SharedArrayBuffer`, `WebAssembly`).
+
+**Divergences (V8-only, not portable to single-shot JSC):**
+- **Durable session / `yield_control` (#24180).** Upstream snapshots the V8 heap to
+  suspend a script across tool turns and resume the *same* continuation. JSC has no
+  heap-snapshot/continuation API; the port's runtime is one synchronous evaluation
+  per call. Cross-call durability is therefore **not** ported — scripts are
+  stateless across invocations (use `store()`/`load()` for explicit per-run state).
+- **`setTimeout` / `clearTimeout` + event loop.** The port evaluates synchronously
+  under a wall-clock deadline; there is no run loop to schedule timers onto. Omitted.
+- **Live-streamed `notify`.** Upstream emits notifications mid-run over an event
+  channel; the synchronous port has no mid-run channel into the engine, so it
+  **collects** them and appends a `[notify]` section to the final output instead.
+- **Module loader / imports.** No `import`/module graph; scripts are a single body.
+
+Rationale: the port chose JSC (in-tree on macOS, no V8 build/vendoring) as a
+deliberate, contained runtime. The user-visible authoring surface matches upstream;
+only the execution *model* (synchronous vs. durable-async) differs, and that
+difference is the source of every omission above. Revisit only if the port adopts a
+V8/event-loop runtime.
