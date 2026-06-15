@@ -2263,6 +2263,7 @@ public actor RequestRouter {
         case .wikiList, .wikiPageGet, .wikiSearch, .wikiGraph, .wikiBacklinks,
              .wikiEntityBacklinks, .wikiTags, .wikiIndex, .wikiPageUpsert,
              .wikiPageDelete, .wikiPageRename, .wikiBrief, .wikiQuery, .wikiStatus, .wikiWatchList,
+             .wikiLibrarianReport, .wikiAuditReport,
              .wikiResearchStart, .wikiIngestStart:
             await dispatchWiki(parsed, conn)
 

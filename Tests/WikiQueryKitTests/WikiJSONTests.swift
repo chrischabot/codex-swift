@@ -396,6 +396,56 @@ final class WikiJSONTests: XCTestCase {
         let listed = try await h.list(100)
         XCTAssertEqual(listed.obj?["data"]?.arr?.count, 1, "the seeded page is listable")
     }
+
+    // MARK: - trust reports (librarian Tier-1 + audit Pass-2) — Tier-A read RPCs
+
+    func testLibrarianReportShapesStalenessScan() async throws {
+        let now = Int64(Date().timeIntervalSince1970)
+        let day: Int64 = 86_400
+        // fresh+deep (not flagged) and stale+thin (flagged) synthesis pages.
+        _ = try await store.upsertSynthesis(SynthesisRow(
+            slug: "fresh", category: "topic", title: "fresh", bodyPath: "inline:fresh",
+            volatility: .cold, verifiedAt: now, createdAt: now, updatedAt: now))
+        let staleID = try await store.upsertSynthesis(SynthesisRow(
+            slug: "stale", category: "topic", title: "stale", bodyPath: "inline:stale",
+            volatility: .warm, verifiedAt: now - 800 * day, createdAt: now - 800 * day, updatedAt: now - 800 * day))
+
+        let r = try await WikiJSON.librarianReport(store, limit: 50)
+        XCTAssertEqual(r.obj?["pages"]?.int, 2)
+        XCTAssertGreaterThanOrEqual(r.obj?["flagged"]?.int ?? 0, 1, "the stale/thin page is flagged")
+        let stalest = try XCTUnwrap(r.obj?["stalest"]?.arr)
+        // stalest-first → the stale page leads.
+        XCTAssertEqual(stalest.first?.obj?["documentID"]?.int, staleID)
+        XCTAssertEqual(stalest.first?.obj?["needsTier2"]?.bool, true)
+    }
+
+    func testAuditReportShapesDriftScan() async throws {
+        let now = Int64(Date().timeIntervalSince1970)
+        // A page generated at T, compiled from a claim updated at T+100 → drifted.
+        let sid = try await store.upsertSynthesis(SynthesisRow(
+            slug: "drifted", category: "synthesis", title: "drifted", bodyPath: "inline:drifted",
+            createdAt: now, updatedAt: now, generatedAt: now))
+        let cid = try await store.upsertClaim(ClaimRow(text: "a claim that later changed",
+                                                       firstSeen: now, updatedAt: now + 100))
+        try await store.linkSynthesisClaim(synthesis: sid, claim: cid)
+
+        let r = try await WikiJSON.auditReport(store, limit: 50)
+        XCTAssertEqual(r.obj?["pages"]?.int, 1)
+        XCTAssertEqual(r.obj?["drifted"]?.int, 1, "the page whose claim changed after generation is drifted")
+        let detail = try XCTUnwrap(r.obj?["pagesDetail"]?.arr)
+        XCTAssertEqual(detail.first?.obj?["id"]?.int, sid)
+        XCTAssertEqual(detail.first?.obj?["status"]?.str, "drifted")
+    }
+
+    func testTrustReportsEmptyStore() async throws {
+        // setUp seeds documents but NO synthesis rows → both reports are well-formed + empty.
+        let lib = try await WikiJSON.librarianReport(store, limit: 50)
+        XCTAssertEqual(lib.obj?["pages"]?.int, 0)
+        XCTAssertEqual(lib.obj?["stalest"]?.arr?.count, 0)
+        let aud = try await WikiJSON.auditReport(store, limit: 50)
+        XCTAssertEqual(aud.obj?["pages"]?.int, 0)
+        XCTAssertEqual(aud.obj?["drifted"]?.int, 0)
+    }
 }
 
 // Minimal JSONValue accessors for assertions.

@@ -48,6 +48,12 @@ public struct WikiQueryHandle: Sendable {
     public var status: @Sendable () async throws -> JSONValue
     /// Watched sources + their cadence / due status (the Watch tab).
     public var watchList: @Sendable () async throws -> JSONValue
+    /// Librarian Tier-1 staleness report (pure date arithmetic, no spend/egress): the
+    /// stalest pages + which are flagged for a Tier-2 model review. A Tier-A read.
+    public var librarianReport: @Sendable () async throws -> JSONValue
+    /// Audit Pass-2 output-drift report (pure timestamps, no spend/egress): which
+    /// compiled pages were built from a since-changed claim. A Tier-A read.
+    public var auditReport: @Sendable () async throws -> JSONValue
 
     public init(
         list: @escaping @Sendable (Int) async throws -> JSONValue,
@@ -64,7 +70,9 @@ public struct WikiQueryHandle: Sendable {
         brief: @escaping @Sendable (String, Int) async throws -> JSONValue,
         query: @escaping @Sendable (String, Int, Int) async throws -> JSONValue,
         status: @escaping @Sendable () async throws -> JSONValue,
-        watchList: @escaping @Sendable () async throws -> JSONValue
+        watchList: @escaping @Sendable () async throws -> JSONValue,
+        librarianReport: @escaping @Sendable () async throws -> JSONValue,
+        auditReport: @escaping @Sendable () async throws -> JSONValue
     ) {
         self.list = list
         self.pageGet = pageGet
@@ -81,5 +89,7 @@ public struct WikiQueryHandle: Sendable {
         self.query = query
         self.status = status
         self.watchList = watchList
+        self.librarianReport = librarianReport
+        self.auditReport = auditReport
     }
 }

@@ -74,7 +74,9 @@ public enum WikiQueryWiring {
             brief:     { try await WikiJSON.brief(store, topic: $0, k: $1) },
             query:     { try await WikiJSON.query(store, retriever: retriever, query: $0, depth: $1, k: $2) },
             status:    { try await WikiJSON.status(store) },
-            watchList:  { try await WikiJSON.watchList(store) })
+            watchList:  { try await WikiJSON.watchList(store) },
+            librarianReport: { try await WikiJSON.librarianReport(store) },
+            auditReport:     { try await WikiJSON.auditReport(store) })
     }
 }
 
@@ -123,6 +125,47 @@ public enum WikiJSON {
             "pages": .int(Int64(scores.count)),
             "flaggedStale": .int(Int64(scores.filter(\.needsTier2).count)),
             "recentJobs": .array(jobItems),
+        ])
+    }
+
+    /// Librarian Tier-1 staleness report (§5.D): the stalest pages first + which are
+    /// flagged for a Tier-2 model review. Pure date arithmetic over SQL rows — no spend,
+    /// no egress — so it is a safe Tier-A browser read (powers the Reports console).
+    public static func librarianReport(_ store: MemoryStore, limit: Int = 50) async throws -> JSONValue {
+        let now = Int64(Date().timeIntervalSince1970)
+        let scores = try await store.librarianScan(now: now)
+        let pages = scores.prefix(limit).map { s -> JSONValue in
+            .object([
+                "documentID": .int(s.documentID),
+                "volatility": .string(s.volatility.rawValue),
+                "staleness": .double((s.staleness.score * 100).rounded() / 100),
+                "needsTier2": .bool(s.needsTier2),
+                "sourceCount": .int(Int64(s.quality.sourceCount)),
+                "depthProxy": .int(Int64(s.quality.depthProxy)),
+            ])
+        }
+        return .object([
+            "pages": .int(Int64(scores.count)),
+            "flagged": .int(Int64(scores.filter(\.needsTier2).count)),
+            "stalest": .array(pages),
+        ])
+    }
+
+    /// Audit Pass-2 output-drift report (§5.D): compiled pages built from a claim that
+    /// has since changed (drifted), drifted-first. Pure timestamps — no spend, no egress
+    /// — so it is a safe Tier-A browser read.
+    public static func auditReport(_ store: MemoryStore, limit: Int = 50) async throws -> JSONValue {
+        let scan = try await store.auditDriftScan()
+        let drifted = scan.filter { $0.status == .drifted }.count
+        let indirect = scan.filter { $0.status == .indirectlyDrifted }.count
+        let rows = scan.prefix(limit).map { row -> JSONValue in
+            .object(["id": .int(row.id), "status": .string(row.status.rawValue)])
+        }
+        return .object([
+            "pages": .int(Int64(scan.count)),
+            "drifted": .int(Int64(drifted)),
+            "indirectlyDrifted": .int(Int64(indirect)),
+            "pagesDetail": .array(rows),
         ])
     }
 

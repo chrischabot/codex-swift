@@ -17,7 +17,7 @@ public enum Method {
         "thread/goal/get", "thread/goal/clear", "thread/delete", "thread/metadata/update",
         "thread/memoryMode/set", "memory/reset", "thread/unarchive", "thread/pin/set", "git/action", "automation/action",
         // memory wiki (browse + edit surface)
-        "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/tags", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query", "wiki/status", "wiki/watch/list", "wiki/research/start", "wiki/ingest/start",
+        "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks", "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query", "wiki/status", "wiki/watch/list", "wiki/librarian/report", "wiki/audit/report", "wiki/research/start", "wiki/ingest/start",
         "thread/compact/start", "thread/shellCommand",
         "thread/approveGuardianDeniedAction", "thread/backgroundTerminals/clean",
         "thread/rollback", "thread/list", "thread/loaded/list", "thread/read",

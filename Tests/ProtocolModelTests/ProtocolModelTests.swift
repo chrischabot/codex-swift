@@ -2245,4 +2245,19 @@ final class ProtocolModelTests: XCTestCase {
         XCTAssertTrue(usage["modelContextWindow"] is NSNull,
                       "modelContextWindow emitted as null when nil")
     }
+
+    /// Phase 4e: the trust-report read methods parse to their cases (parameterless,
+    /// like wiki/status) and round-trip back to their wire names.
+    func testWikiTrustReportMethodsParseAndRoundTrip() throws {
+        guard case .wikiLibrarianReport = try ClientRequest.parse(req("wiki/librarian/report", nil)) else {
+            return XCTFail("wiki/librarian/report should parse to .wikiLibrarianReport")
+        }
+        guard case .wikiAuditReport = try ClientRequest.parse(req("wiki/audit/report", nil)) else {
+            return XCTFail("wiki/audit/report should parse to .wikiAuditReport")
+        }
+        XCTAssertEqual(ClientRequest.wikiLibrarianReport(.int(1)).method, "wiki/librarian/report")
+        XCTAssertEqual(ClientRequest.wikiAuditReport(.int(1)).method, "wiki/audit/report")
+        XCTAssertTrue(ClientRequest.typedMethods.contains("wiki/librarian/report"))
+        XCTAssertTrue(ClientRequest.typedMethods.contains("wiki/audit/report"))
+    }
 }
