@@ -110,6 +110,18 @@ code mode = **PORT** (own gated sub-phases).
     the same as the CLI-auth live test (shared `KeychainSecretsKeyProvider`,
     namespace-isolated).
   - **P5a COMPLETE** (both #27539 CLI auth + #27541 MCP OAuth).
+## P6 persistence parity
+
+- **P6.3 SQLite robustness — DONE + reviewed + pushed (d375fe9).** `StateDB`
+  auto-recovers from a corrupted on-disk DB (upstream #26859): result-code-based
+  corruption detection (SQLITE_CORRUPT/NOTADB, never text-matching), authoritative
+  back-up (UUID name, throws `recoveryFailed` on move failure), fresh rebuild,
+  surfaced via `ThreadStore.recoveryNotice`. Healthy DB never discarded;
+  non-corruption errors rethrow. 4 severe tests + 4-finding adversarial review (all
+  fixed). REMAINING P6: 6.1 rollout `response_item` fidelity (audit-v10 #449, the
+  long-standing divergence), 6.2 persistence-policy into ThreadStore (#27318),
+  6.4 cold-resume no-reread (#27031) / case-insensitive thread search (#23921).
+
 - **P5b code mode — SCOPE CORRECTED (not started).** The port's `CodeMode.swift`
   runtime is *intentionally minimal* (301 lines, `MACOS-COMPLETION`): it binds only
   `globalThis.callTool(name,args)` via `__codex_call_tool` + a `console.log` shim.
