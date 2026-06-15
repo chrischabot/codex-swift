@@ -250,6 +250,49 @@ export interface WikiWatchSource {
   due: boolean;
 }
 
+// ── Live jobs: streamed ingest/research (wiki/research/start, wiki/ingest/start) ──
+/** One streamed NDJSON line from a wiki job. `type` is "event" during the run and
+ *  "result" at the end; the rest of the fields depend on `kind`. */
+export interface WikiJobLine {
+  type?: string;     // event | result
+  kind?: string;     // started | round_started | sources | compiled | round_completed | finished | candidate
+  round?: number;
+  count?: number;
+  written?: number;
+  claims?: number;
+  skipped?: number;
+  failed?: number;
+  score?: number;
+  status?: string;
+  mode?: string;
+  seq?: number;
+  uri?: string;
+  rounds?: number;
+  finalScore?: number;
+  pages?: number;
+  sources?: number;
+  error?: string;
+}
+export interface WikiResearchStartInput {
+  topic: string;
+  mode?: string;     // topic | question | thesis
+  depth?: string;    // standard | deep | retardmax
+  sources?: number;
+  minTime?: number;  // seconds
+  maxRounds?: number;
+}
+export interface WikiIngestStartInput {
+  input: string;
+  adapter?: string;
+  rawType?: string;
+  limit?: number;
+  extract?: boolean;
+}
+export interface WikiJobHandle {
+  jobId: string;
+  cancel: () => void;  // stop receiving further events (does not kill the backend job)
+}
+
 export interface Connector {
   /** Lifecycle. Mock implementations may be no-ops. */
   connect(): Promise<void>;
@@ -368,4 +411,11 @@ export interface Connector {
   getWikiStatus?(): Promise<WikiStatus | null>;
   /** Watched sources + their cadence / due status (the Watch tab). */
   getWikiWatch?(): Promise<WikiWatchSource[]>;
+  /** Start a streamed research job; `onEvent` fires for each progress line until
+   *  the terminal (`done=true`) result. Returns the jobId + a local unsubscribe. */
+  startWikiResearch?(params: WikiResearchStartInput,
+                     onEvent: (line: WikiJobLine, done: boolean) => void): Promise<WikiJobHandle>;
+  /** Start a streamed ingest job (same streaming contract as research). */
+  startWikiIngest?(params: WikiIngestStartInput,
+                   onEvent: (line: WikiJobLine, done: boolean) => void): Promise<WikiJobHandle>;
 }

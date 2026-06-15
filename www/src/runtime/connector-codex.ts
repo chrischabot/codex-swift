@@ -39,12 +39,17 @@ import type {
   UploadedAttachment,
   WikiBrief,
   WikiGraph,
+  WikiJobLine,
   WikiPage,
   WikiPageSummary,
   WikiTag,
 } from "./connector";
 import { toast } from "@/components/ui/sonner";
 import { parseUnifiedDiff, countDiff } from "@/lib/diff";
+// partysocket's WebSocket is a drop-in for the browser WebSocket that AUTO-
+// RECONNECTS with exponential backoff — so a dropped daemon socket (and any
+// in-flight live job stream) recovers without a page reload.
+import { WebSocket as ReconnectingWebSocket } from "partysocket";
 
 export interface CodexConnectorOptions {
   url?: string;
@@ -81,7 +86,7 @@ const uid = (p: string) => `${p}-${Date.now().toString(36)}-${(seq++).toString(3
 export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector {
   const url = opts.url ?? defaultUrl();
 
-  let ws: WebSocket | null = null;
+  let ws: ReconnectingWebSocket | null = null;
   let nextId = 1;
   const pending = new Map<number, { resolve: (v: Json) => void; reject: (e: unknown) => void }>();
   // RPCs issued before the socket is OPEN (e.g. a settings panel reading config
@@ -111,6 +116,9 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
   // user bubble + streamed assistant message).
   const createdThisSession = new Set<string>();
   const activeTurn = new Map<string, string>();
+  // Live wiki-job (ingest/research) progress subscribers, keyed by jobId. Fed by
+  // the wiki/job/event + wiki/job/done notifications; the done line removes the sub.
+  const wikiJobSubs = new Map<string, (line: WikiJobLine, done: boolean) => void>();
   // Uploaded-but-not-yet-sent attachments, keyed by threadId ("shared" for the
   // home composer where no thread exists yet). Drained on the next sendMessage.
   const pendingUploads = new Map<string, UploadedAttachment[]>();
@@ -366,6 +374,17 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
 
   // ── server→client notifications → snapshot message mutations ──────────────
   function handleNotification(method: string, p: Record<string, Json>) {
+    // Wiki job stream (ingest/research) → the registered per-job subscriber.
+    if (method === "wiki/job/event" || method === "wiki/job/done") {
+      const jobId = p.jobId as string;
+      const done = method === "wiki/job/done";
+      const line = (p.data as WikiJobLine) ?? {};
+      const cb = wikiJobSubs.get(jobId);
+      if (cb) cb(line, done);
+      if (done) wikiJobSubs.delete(jobId);
+      return;
+    }
+
     const threadId = (p.threadId as string) ?? "";
     const turnId = (p.turnId as string) ?? "";
     const itemId = (p.itemId as string) ?? "";
@@ -651,7 +670,14 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       if (ws && ws.readyState === WebSocket.OPEN) return;
       setStatus({ kind: "connecting" });
       await new Promise<void>((resolve, reject) => {
-        ws = new WebSocket(url, opts.token ? [`bearer.${opts.token}`] : undefined);
+        ws = new ReconnectingWebSocket(url, opts.token ? [`bearer.${opts.token}`] : undefined, {
+          // Auto-reconnect with backoff; the connector's own readyState guard +
+          // preOpenQueue control send ordering, so disable partysocket's buffer.
+          maxRetries: Infinity,
+          minReconnectionDelay: 500,
+          maxReconnectionDelay: 8000,
+          maxEnqueuedMessages: 0,
+        });
         ws.onmessage = (ev) => onWireMessage(typeof ev.data === "string" ? ev.data : "");
         ws.onclose = () => { setStatus({ kind: "offline" }); pending.forEach((e) => e.reject(new Error("socket closed"))); pending.clear(); bound.clear(); historyLoaded.clear(); preOpenQueue = []; };
         ws.onerror = () => setStatus({ kind: "error", message: "websocket error" });
@@ -1073,6 +1099,20 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
           due: w.due === true,
         }));
       } catch { return []; }
+    },
+    startWikiResearch: async (params, onEvent) => {
+      const r = (await rpc("wiki/research/start", params as unknown as Json)) as { jobId?: string };
+      const jobId = r.jobId;
+      if (!jobId) throw new Error("wiki/research/start: no jobId");
+      wikiJobSubs.set(jobId, onEvent);
+      return { jobId, cancel: () => wikiJobSubs.delete(jobId) };
+    },
+    startWikiIngest: async (params, onEvent) => {
+      const r = (await rpc("wiki/ingest/start", params as unknown as Json)) as { jobId?: string };
+      const jobId = r.jobId;
+      if (!jobId) throw new Error("wiki/ingest/start: no jobId");
+      wikiJobSubs.set(jobId, onEvent);
+      return { jobId, cancel: () => wikiJobSubs.delete(jobId) };
     },
   };
 }
