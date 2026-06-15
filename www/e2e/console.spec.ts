@@ -59,3 +59,21 @@ test("Reports tab shows librarian + audit trust scans", async ({ page }) => {
   // the drifted page surfaces; the mock has one drifted + one indirectly-drifted.
   await expect(page.getByText("drifted", { exact: true })).toBeVisible();
 });
+
+test("Inventory tab lists curation records", async ({ page }) => {
+  await page.getByRole("tab", { name: "Inventory", exact: true }).click();
+  await expect(page.getByText("RAG", { exact: true })).toBeVisible();
+  await expect(page.getByText("arXiv cs.AI feed")).toBeVisible();
+});
+
+test("Datasets tab lists manifests", async ({ page }) => {
+  await page.getByRole("tab", { name: "Datasets", exact: true }).click();
+  await expect(page.getByText("ImageNet", { exact: true })).toBeVisible();
+  await expect(page.getByText("Local notes")).toBeVisible();
+});
+
+test("Collect tab lists catalogs with counts", async ({ page }) => {
+  await page.getByRole("tab", { name: "Collect", exact: true }).click();
+  await expect(page.getByText("memes")).toBeVisible();
+  await expect(page.getByText("24 item(s)")).toBeVisible();
+});

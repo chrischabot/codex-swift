@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { idStr, mapWikiSummary, mapWikiPage, mapWikiIndexEntry, mapLibrarianReport, mapAuditReport } from "./connector-codex";
+import { idStr, mapWikiSummary, mapWikiPage, mapWikiIndexEntry, mapLibrarianReport, mapAuditReport, mapInventoryRecord, mapDatasetManifest, mapCollectCatalog } from "./connector-codex";
 
 // Characterization tests: lock the wire contract between the Swift wiki/* RPCs
 // (ids arrive as integers; fields like data/props/links may be missing) and the
@@ -126,5 +126,35 @@ describe("mapAuditReport", () => {
   it("defaults missing fields", () => {
     expect(mapAuditReport({})).toEqual({ pages: 0, drifted: 0, indirectlyDrifted: 0, pagesDetail: [] });
     expect(mapAuditReport({ pagesDetail: [{}] }).pagesDetail[0]).toEqual({ id: 0, status: "current" });
+  });
+});
+
+describe("mapInventoryRecord", () => {
+  it("maps wire keys + omits absent optionals", () => {
+    const r = mapInventoryRecord({ slug: "rag", kind: "item", status: "active", priority: "p0", title: "RAG", summary: "s" });
+    expect(r).toEqual({ slug: "rag", kind: "item", status: "active", priority: "p0", title: "RAG", summary: "s" });
+    const bare = mapInventoryRecord({ slug: "x", kind: "item", status: "active", priority: "p2", title: "X" });
+    expect(bare.summary).toBeUndefined();
+    expect(bare.nextAction).toBeUndefined();
+  });
+  it("defaults missing string fields to empty", () => {
+    expect(mapInventoryRecord({}).slug).toBe("");
+  });
+});
+
+describe("mapDatasetManifest", () => {
+  it("maps wire keys incl. optional numbers", () => {
+    const d = mapDatasetManifest({ datasetID: "d1", title: "D1", status: "active", storage: "local", sizeBytes: 99, recordCount: 3 });
+    expect(d).toEqual({ datasetID: "d1", title: "D1", status: "active", storage: "local", sizeBytes: 99, recordCount: 3 });
+    const noNums = mapDatasetManifest({ datasetID: "d2", title: "D2", status: "external", storage: "remote" });
+    expect(noNums.sizeBytes).toBeUndefined();
+    expect(noNums.recordCount).toBeUndefined();
+  });
+});
+
+describe("mapCollectCatalog", () => {
+  it("maps slug + count, defaulting count to 0", () => {
+    expect(mapCollectCatalog({ slug: "memes", count: 24 })).toEqual({ slug: "memes", count: 24 });
+    expect(mapCollectCatalog({ slug: "empty" })).toEqual({ slug: "empty", count: 0 });
   });
 });

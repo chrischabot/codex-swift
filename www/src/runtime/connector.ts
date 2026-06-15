@@ -275,6 +275,29 @@ export interface WikiAuditReport {
   pagesDetail: WikiAuditPage[];
 }
 
+// ── Curation: Inventory / Datasets / Collect (compact-table read projections) ──
+export interface WikiInventoryRecord {
+  slug: string;
+  kind: string;     // item|ingest-candidate|entity|corpus|question|task|artifact|watch
+  status: string;   // proposed|active|blocked|ingested|superseded|archived
+  priority: string; // p0..p4
+  title: string;
+  summary?: string;
+  nextAction?: string;
+}
+export interface WikiDatasetManifest {
+  datasetID: string;
+  title: string;
+  status: string;   // proposed|active|external|archived|unavailable
+  storage: string;  // local|remote|external|hybrid
+  sizeBytes?: number;
+  recordCount?: number;
+}
+export interface WikiCollectCatalog {
+  slug: string;
+  count: number;
+}
+
 // ── Live jobs: streamed ingest/research (wiki/research/start, wiki/ingest/start) ──
 /** One streamed NDJSON line from a wiki job. `type` is "event" during the run and
  *  "result" at the end; the rest of the fields depend on `kind`. */
@@ -440,6 +463,12 @@ export interface Connector {
   getLibrarianReport?(): Promise<WikiLibrarianReport | null>;
   /** Audit Pass-2 output-drift report (Reports tab) — pure-local read. */
   getAuditReport?(): Promise<WikiAuditReport | null>;
+  /** Inventory records (Inventory tab) — compact-table read. */
+  getWikiInventory?(): Promise<WikiInventoryRecord[]>;
+  /** Dataset manifests (Datasets tab) — read. */
+  getWikiDatasets?(): Promise<WikiDatasetManifest[]>;
+  /** Collect catalogs with item counts (Collect tab) — read. */
+  getWikiCollect?(): Promise<WikiCollectCatalog[]>;
   /** Start a streamed research job; `onEvent` fires for each progress line until
    *  the terminal (`done=true`) result. Returns the jobId + a local unsubscribe. */
   startWikiResearch?(params: WikiResearchStartInput,

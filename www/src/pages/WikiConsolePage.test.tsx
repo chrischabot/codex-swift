@@ -127,4 +127,29 @@ describe("WikiConsolePage", () => {
     expect(getLibrarianReport).toHaveBeenCalledTimes(1);
     expect(getAuditReport).toHaveBeenCalledTimes(1);
   });
+
+  it("loads the curation tabs (inventory/datasets/collect)", async () => {
+    const getWikiInventory = vi.fn(async () => [
+      { slug: "rag", kind: "item", status: "active", priority: "p0", title: "RAG Inventory Item" },
+    ]);
+    const getWikiDatasets = vi.fn(async () => [
+      { datasetID: "imagenet", title: "ImageNet DS", status: "external", storage: "remote", recordCount: 1281167 },
+    ]);
+    const getWikiCollect = vi.fn(async () => [{ slug: "memes", count: 24 }]);
+    const connector = { ...makeMockConnector(), getWikiInventory, getWikiDatasets, getWikiCollect } as Connector;
+    renderWith(connector);
+
+    // opening any curation tab loads all three (one allSettled batch).
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /inventory/i }), { button: 0 });
+    await waitFor(() => expect(screen.getByText("RAG Inventory Item")).toBeTruthy());
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /datasets/i }), { button: 0 });
+    await waitFor(() => expect(screen.getByText("ImageNet DS")).toBeTruthy());
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /collect/i }), { button: 0 });
+    await waitFor(() => expect(screen.getByText("memes")).toBeTruthy());
+    expect(screen.getByText("24 item(s)")).toBeTruthy();
+    // loaded once (the batch loader is gated on curationLoaded).
+    expect(getWikiInventory).toHaveBeenCalledTimes(1);
+    expect(getWikiDatasets).toHaveBeenCalledTimes(1);
+    expect(getWikiCollect).toHaveBeenCalledTimes(1);
+  });
 });

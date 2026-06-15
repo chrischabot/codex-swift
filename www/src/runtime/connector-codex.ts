@@ -41,6 +41,9 @@ import type {
   WikiGraph,
   WikiJobLine,
   WikiAuditReport,
+  WikiCollectCatalog,
+  WikiDatasetManifest,
+  WikiInventoryRecord,
   WikiLibrarianReport,
   WikiPage,
   WikiPageSummary,
@@ -1110,6 +1113,24 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       try { return mapAuditReport((await rpc("wiki/audit/report", {})) as Record<string, unknown>); }
       catch { return null; }
     },
+    getWikiInventory: async () => {
+      try {
+        const r = (await rpc("wiki/inventory/list", {})) as { records?: Record<string, unknown>[] };
+        return (r.records ?? []).map(mapInventoryRecord);
+      } catch { return []; }
+    },
+    getWikiDatasets: async () => {
+      try {
+        const r = (await rpc("wiki/dataset/list", {})) as { datasets?: Record<string, unknown>[] };
+        return (r.datasets ?? []).map(mapDatasetManifest);
+      } catch { return []; }
+    },
+    getWikiCollect: async () => {
+      try {
+        const r = (await rpc("wiki/collect/list", {})) as { catalogs?: Record<string, unknown>[] };
+        return (r.catalogs ?? []).map(mapCollectCatalog);
+      } catch { return []; }
+    },
     startWikiResearch: async (params, onEvent) => {
       const r = (await rpc("wiki/research/start", params as unknown as Json)) as { jobId?: string };
       const jobId = r.jobId;
@@ -1203,6 +1224,30 @@ export function mapLibrarianReport(r: Record<string, unknown>): WikiLibrarianRep
       depthProxy: numOrU(p.depthProxy) ?? 0,
     })),
   };
+}
+
+/// Curation wire mappers — exported so the wire contract (field names + defensive
+/// defaults) is locked by characterization tests, not just code reading.
+export function mapInventoryRecord(o: Record<string, unknown>): WikiInventoryRecord {
+  const r: WikiInventoryRecord = {
+    slug: pick(o, "slug"), kind: pick(o, "kind"), status: pick(o, "status"),
+    priority: pick(o, "priority"), title: pick(o, "title"),
+  };
+  if (typeof o.summary === "string") r.summary = o.summary;
+  if (typeof o.nextAction === "string") r.nextAction = o.nextAction;
+  return r;
+}
+export function mapDatasetManifest(o: Record<string, unknown>): WikiDatasetManifest {
+  const d: WikiDatasetManifest = {
+    datasetID: pick(o, "datasetID"), title: pick(o, "title"),
+    status: pick(o, "status"), storage: pick(o, "storage"),
+  };
+  const sz = numOrU(o.sizeBytes); if (sz !== undefined) d.sizeBytes = sz;
+  const rc = numOrU(o.recordCount); if (rc !== undefined) d.recordCount = rc;
+  return d;
+}
+export function mapCollectCatalog(o: Record<string, unknown>): WikiCollectCatalog {
+  return { slug: pick(o, "slug"), count: numOrU(o.count) ?? 0 };
 }
 
 /// Map the wiki/audit/report wire shape → WikiAuditReport (see mapLibrarianReport).

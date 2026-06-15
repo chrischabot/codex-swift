@@ -1,13 +1,14 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download, ShieldAlert } from "lucide-react";
+import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download, ShieldAlert, Boxes, Database, Images } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { WikiJobTab } from "./WikiJobTab";
-import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource, WikiLibrarianReport, WikiAuditReport } from "@/runtime/connector";
+import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource, WikiLibrarianReport, WikiAuditReport,
+  WikiInventoryRecord, WikiDatasetManifest, WikiCollectCatalog } from "@/runtime/connector";
 
 /**
  * Wiki Console (route /wiki/console) — query the knowledge base and generate a
@@ -51,6 +52,23 @@ export function WikiConsolePage() {
     setAudit(aud.status === "fulfilled" ? aud.value : null);
     setReportsLoaded(true);
     setLoadingReports(false);
+  }
+
+  const [inventory, setInventory] = useState<WikiInventoryRecord[]>([]);
+  const [datasets, setDatasets] = useState<WikiDatasetManifest[]>([]);
+  const [catalogs, setCatalogs] = useState<WikiCollectCatalog[]>([]);
+  const [curationLoaded, setCurationLoaded] = useState(false);
+
+  async function loadCuration() {
+    const [inv, ds, col] = await Promise.allSettled([
+      connector.getWikiInventory?.() ?? Promise.resolve([]),
+      connector.getWikiDatasets?.() ?? Promise.resolve([]),
+      connector.getWikiCollect?.() ?? Promise.resolve([]),
+    ]);
+    if (inv.status === "fulfilled") setInventory(inv.value);
+    if (ds.status === "fulfilled") setDatasets(ds.value);
+    if (col.status === "fulfilled") setCatalogs(col.value);
+    setCurationLoaded(true);
   }
 
   async function loadStatus() {
@@ -120,6 +138,7 @@ export function WikiConsolePage() {
             if (v === "status" && !status) void loadStatus();
             if (v === "watch" && !watch) void loadWatch();
             if (v === "reports" && !reportsLoaded) void loadReports();
+            if ((v === "inventory" || v === "datasets" || v === "collect") && !curationLoaded) void loadCuration();
           }}
         >
           <TabsList>
@@ -130,6 +149,9 @@ export function WikiConsolePage() {
             <TabsTrigger value="status"><Gauge className="mr-1 size-3.5" /> Status</TabsTrigger>
             <TabsTrigger value="watch"><Radio className="mr-1 size-3.5" /> Watch</TabsTrigger>
             <TabsTrigger value="reports"><ShieldAlert className="mr-1 size-3.5" /> Reports</TabsTrigger>
+            <TabsTrigger value="inventory"><Boxes className="mr-1 size-3.5" /> Inventory</TabsTrigger>
+            <TabsTrigger value="datasets"><Database className="mr-1 size-3.5" /> Datasets</TabsTrigger>
+            <TabsTrigger value="collect"><Images className="mr-1 size-3.5" /> Collect</TabsTrigger>
           </TabsList>
 
           {/* ── Search ── */}
@@ -375,6 +397,70 @@ export function WikiConsolePage() {
                   </ul>
                 )}
               </>
+            )}
+          </TabsContent>
+
+          {/* ── Inventory (curation) ── */}
+          <TabsContent value="inventory" className="mt-3">
+            <p className="mb-2 text-[12px] text-[color:var(--color-text-quaternary)]">
+              durable items / candidates / questions — managed via <code>codex-memory wiki-inventory</code>
+            </p>
+            {curationLoaded && inventory.length === 0 ? (
+              <p className="text-[12px] text-[color:var(--color-text-quaternary)]">No inventory records.</p>
+            ) : (
+              <ul className="space-y-1">
+                {inventory.map((r) => (
+                  <li key={r.slug} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                    <Badge variant={r.priority === "p0" ? "danger" : "outline"}>{r.priority}</Badge>
+                    <Badge variant="outline">{r.kind}</Badge>
+                    <Badge variant={r.status === "active" ? "success" : "outline"}>{r.status}</Badge>
+                    <span className="truncate text-[12px] text-foreground">{r.title}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </TabsContent>
+
+          {/* ── Datasets (curation) ── */}
+          <TabsContent value="datasets" className="mt-3">
+            <p className="mb-2 text-[12px] text-[color:var(--color-text-quaternary)]">
+              indexed datasets — the wiki is the interface, data stays put
+            </p>
+            {curationLoaded && datasets.length === 0 ? (
+              <p className="text-[12px] text-[color:var(--color-text-quaternary)]">No dataset manifests.</p>
+            ) : (
+              <ul className="space-y-1">
+                {datasets.map((d) => (
+                  <li key={d.datasetID} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                    <Badge variant="outline">{d.storage}</Badge>
+                    <Badge variant={d.status === "active" ? "success" : "outline"}>{d.status}</Badge>
+                    <span className="truncate text-[12px] text-foreground">{d.title}</span>
+                    <span className="ml-auto shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">
+                      {d.recordCount != null ? `${d.recordCount.toLocaleString()} rows` : "—"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </TabsContent>
+
+          {/* ── Collect (curation) ── */}
+          <TabsContent value="collect" className="mt-3">
+            <p className="mb-2 text-[12px] text-[color:var(--color-text-quaternary)]">
+              discovery catalogs — assets staged under <code>output/assets/</code>
+            </p>
+            {curationLoaded && catalogs.length === 0 ? (
+              <p className="text-[12px] text-[color:var(--color-text-quaternary)]">No collect catalogs.</p>
+            ) : (
+              <ul className="space-y-1">
+                {catalogs.map((c) => (
+                  <li key={c.slug} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                    <Images className="size-3.5 text-[color:var(--color-text-quaternary)]" />
+                    <span className="text-[12px] text-foreground">{c.slug}</span>
+                    <span className="ml-auto shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">{c.count} item(s)</span>
+                  </li>
+                ))}
+              </ul>
             )}
           </TabsContent>
         </Tabs>

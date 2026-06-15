@@ -417,6 +417,19 @@ export function makeMockConnector(): Connector {
         { id: 3, status: "current" },
       ],
     }),
+    getWikiInventory: async () => [
+      { slug: "rag", kind: "item", status: "active", priority: "p0", title: "RAG", summary: "retrieval-augmented generation" },
+      { slug: "ingest-arxiv", kind: "ingest-candidate", status: "proposed", priority: "p2", title: "arXiv cs.AI feed", nextAction: "wire FeedAdapter" },
+      { slug: "open-q-eval", kind: "question", status: "blocked", priority: "p1", title: "How to eval retrieval NDCG?" },
+    ],
+    getWikiDatasets: async () => [
+      { datasetID: "imagenet", title: "ImageNet", status: "external", storage: "remote", recordCount: 1281167 },
+      { datasetID: "local-notes", title: "Local notes", status: "active", storage: "local", sizeBytes: 40960, recordCount: 312 },
+    ],
+    getWikiCollect: async () => [
+      { slug: "memes", count: 24 },
+      { slug: "agent-tools", count: 8 },
+    ],
     startWikiResearch: async (params, onEvent) => {
       const seq: Array<[WikiJobLine, boolean]> = [
         [{ type: "event", kind: "started", mode: params.mode || "topic" }, false],
