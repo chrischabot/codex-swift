@@ -265,9 +265,13 @@ public enum CodeModeRuntime {
                 function __codex_imageUrl(arg){
                   var u=(typeof arg==='string')?arg:(arg&&arg.image_url);
                   if(u==null) throw new Error('image: expected a string URL or { image_url }');
+                  // Positive allow-list (#27732): only base64 data: URIs are
+                  // permitted. Strip leading whitespace/control chars (code<=32)
+                  // first so a smuggled remote URL cannot masquerade as data:.
                   var l=String(u).toLowerCase();
-                  if(l.indexOf('http://')===0||l.indexOf('https://')===0)
-                    throw new Error('Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead');
+                  while(l.length && l.charCodeAt(0)<=32) l=l.slice(1);
+                  if(l.indexOf("data:")!==0)
+                    throw new Error("Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead");
                   return u;
                 }
                 globalThis.image=function(arg,detail){
@@ -315,28 +319,54 @@ public enum CodeModeRuntime {
                     output += "\n[console]\n" + joined
                 }
 
-                // Collect the code-mode OUTPUT items the script composed.
-                let outputItems = (context.objectForKeyedSubscript("__codex_output")?
-                    .toArray() ?? []).compactMap { $0 as? [String: Any] }
-                // #27732 (AUTHORITATIVE host-side rule): a script can bypass the JS
-                // helper validation by pushing to `__codex_output` directly, so the
-                // host rejects any remote (http/https) image URL here.
-                for item in outputItems {
-                    let t = item["type"] as? String
-                    if t == "image" || t == "generated_image",
-                       let url = (item["image_url"] as? String)?.lowercased(),
-                       url.hasPrefix("http://") || url.hasPrefix("https://") {
-                        cont.resume(returning: (
-                            "Tool call failed: remote image URLs are not supported in tool outputs. "
-                            + "Pass a base64 data URI instead", false))
-                        return
-                    }
+                // Collect the code-mode OUTPUT items the script composed. We
+                // serialize with JavaScriptCore's own `JSON.stringify` rather
+                // than Foundation's `JSONSerialization`: a non-finite Double
+                // (NaN/Infinity) anywhere in `__codex_output` makes
+                // `JSONSerialization.data(withJSONObject:)` raise an Obj-C
+                // NSException that `try?` does NOT catch, aborting the whole
+                // process — and the script controls these values. JS renders
+                // NaN/Infinity as `null`, so it can never crash the host.
+                var outputJSON: String? = nil
+                if let outVal = context.objectForKeyedSubscript("__codex_output"),
+                   !outVal.isUndefined, !outVal.isNull,
+                   let stringify = context.objectForKeyedSubscript("JSON")?
+                       .objectForKeyedSubscript("stringify"),
+                   let s = stringify.call(withArguments: [outVal])?.toString(),
+                   s != "[]", s != "undefined", s != "null" {
+                    outputJSON = s
                 }
-                if !outputItems.isEmpty,
-                   let data = try? JSONSerialization.data(
-                       withJSONObject: outputItems, options: [.sortedKeys, .withoutEscapingSlashes]),
-                   let s = String(data: data, encoding: .utf8) {
-                    output += (output.isEmpty ? "" : "\n") + "[code-mode output]\n" + s
+                // #27732 (AUTHORITATIVE host-side rule): a script can bypass the
+                // JS helper validation by pushing to `__codex_output` directly,
+                // so the host re-validates here against a POSITIVE allow-list —
+                // every image item's `image_url` must be a String that, once
+                // leading whitespace/control chars are stripped, begins with
+                // `data:`. Anything else (remote URL, whitespace-smuggled URL,
+                // or a non-String value) fails closed.
+                if let json = outputJSON,
+                   let data = json.data(using: .utf8),
+                   let items = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+                    for item in items {
+                        let t = item["type"] as? String
+                        guard t == "image" || t == "generated_image" else { continue }
+                        let normalized = (item["image_url"] as? String)
+                            .map { url -> String in
+                                var s = Substring(url)
+                                while let f = s.first, f.unicodeScalars.allSatisfy({ $0.value <= 32 }) {
+                                    s = s.dropFirst()
+                                }
+                                return s.lowercased()
+                            }
+                        if normalized == nil || !normalized!.hasPrefix("data:") {
+                            cont.resume(returning: (
+                                "Tool call failed: remote image URLs are not supported in tool outputs. "
+                                + "Pass a base64 data URI instead", false))
+                            return
+                        }
+                    }
+                    if !items.isEmpty {
+                        output += (output.isEmpty ? "" : "\n") + "[code-mode output]\n" + json
+                    }
                 }
 
                 cont.resume(returning: (output, true))

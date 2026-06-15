@@ -63,6 +63,40 @@ final class CodeModeOutputTests: XCTestCase {
         XCTAssertTrue(out.contains("null-ok"), out)
     }
 
+    // --- P5b adversarial-review fixes (#27732 hardening) ---
+
+    func testNaNInOutputDoesNotCrashHost() async {
+        // CRITICAL: a non-finite Double in __codex_output used to abort the
+        // whole process (JSONSerialization NSException not caught by `try?`).
+        // We now serialize via JSC's JSON.stringify (NaN -> null), so the run
+        // must complete normally with the item rendered.
+        let (out, ok) = await run("""
+        text('before-nan');
+        __codex_output.push({type:'text', text:'b', n: 0/0, m: 1/0});
+        """)
+        XCTAssertTrue(ok, "NaN/Infinity in output must not crash; got: \(out)")
+        XCTAssertTrue(out.contains("before-nan"), out)
+        XCTAssertTrue(out.contains("\"n\":null"), out)   // NaN -> null
+    }
+
+    func testWhitespaceSmuggledRemoteUrlRejectedHostSide() async {
+        // MAJOR: leading whitespace/control chars must not smuggle a remote URL
+        // past the host allow-list (which strips code<=32 then requires data:).
+        let (out, ok) = await run(
+            #"__codex_output.push({type:'image', image_url:'  \t https://evil.example/x'});"#)
+        XCTAssertFalse(ok, "whitespace-prefixed remote URL must be rejected: \(out)")
+        XCTAssertTrue(out.contains("remote image URLs are not supported"), out)
+    }
+
+    func testNonStringImageUrlRejectedHostSide() async {
+        // NIT/type-confusion: a non-String image_url must fail closed, not pass
+        // the validation by skipping the `as? String` cast.
+        let (out, ok) = await run(
+            #"__codex_output.push({type:'image', image_url:123});"#)
+        XCTAssertFalse(ok, "non-string image_url must be rejected: \(out)")
+        XCTAssertTrue(out.contains("remote image URLs are not supported"), out)
+    }
+
     func testNoHelpersUsedLeavesOutputUnchanged() async {
         // Regression: a script that uses no output helpers behaves exactly as
         // before (return value + console only; no "[code-mode output]" block).
