@@ -197,7 +197,12 @@ public func makeWikiMemoryProvider(wiki: WikiMemoryConfig,
     let inference = makeInference(wiki: wiki, plan: plan, modelClient: modelClient,
                                   storeConfig: storeConfig,
                                   authProvider: authProvider)
-    let retriever = MemoryRetriever(store: store, inference: inference)
+    // Pass the resolved provider id (== the store's embedding stamp) as the query
+    // embed-cache discriminator, so a future in-place embedder swap on a long-lived
+    // retriever can't serve vectors cached under the old model (the isolation was inert
+    // while the id defaulted to "default").
+    let retriever = MemoryRetriever(store: store, inference: inference,
+                                    embedCacheModelId: plan.providerID)
     // Personas live in `[memory.personas.*]`; fall back to the five defaults.
     let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
         ?? (NSHomeDirectory() + "/.codex")
@@ -260,7 +265,10 @@ public func makeWikiRetriever(store: MemoryStore,
         embeddingProviderID: plan.providerID)
     let inference = makeInference(wiki: wiki, plan: plan, modelClient: modelClient,
                                   storeConfig: storeConfig, authProvider: authProvider)
-    return MemoryRetriever(store: store, inference: inference)
+    // providerID == stamp here (guarded above), so the embed-cache discriminator is
+    // provably the store stamp — cross-model cache isolation is now enforced, not inert.
+    return MemoryRetriever(store: store, inference: inference,
+                           embedCacheModelId: plan.providerID)
 }
 
 private enum ResolvedWikiInferenceBackend {
