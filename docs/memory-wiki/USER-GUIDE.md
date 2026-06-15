@@ -351,11 +351,20 @@ and the command palette):
 - The **Console — Watch tab** ✅ — the watched-source table over `wiki/watch/list`:
   each source's status badge (active/paused/error), cadence, handle, and
   due/scheduled state (register sources via `codex-memory wiki-watch add`).
-- 🧱 **Ingest / Research / Sessions / Reports tabs** — each needs its `wiki/*` RPC
-  (the read-only `wiki/status` + `wiki/watch/list` verticals are the template); the
-  long-running research/ingest *triggers* additionally need async-job streaming over
-  the WS gateway so the UI can show live progress. Today those run from the
-  `codex-memory` CLI (§§3, 5, 7, 8).
+- The **Console — Research tab** ✅ — type a topic (+ mode/depth), click Research,
+  and watch the run stream **live**: started → round → sources → compiled (with the
+  claim count) → round score → ✓ completed. Over `wiki/research/start`, which spawns
+  the research job and forwards its progress as `wiki/job/event` / `wiki/job/done`
+  notifications on the (auto-reconnecting **partysocket**) WebSocket.
+- The **Console — Ingest tab** ✅ — input + adapter + extract, then a live
+  per-candidate progress stream (written/skipped/failed) → final summary, over
+  `wiki/ingest/start`.
+- 🧱 **Sessions / Reports tabs** — read-only views over the research sessions +
+  librarian/audit reports; follow the established `wiki/status` template.
+
+The whole Console is exercised front-to-back by Playwright (`npm run test:e2e`,
+real browser, the live streaming tabs included) and the WS job path by a live
+backend test (`npm run test:e2e:live`).
 
 Every capability is reachable from the `codex-memory` CLI; the Console surfaces
 search, brief, and status in the browser today.
