@@ -2,6 +2,7 @@ import Foundation
 import WikiResearch
 import WikiIngest
 import MemoryStore
+import MemoryScore   // SpendGate (wiki-research budget bucket)
 import EgressGuard
 import PinnedFetcher
 import Tools
@@ -23,6 +24,7 @@ enum CodexMemoryWikiResearch {
         var json = false
         var extractClaims = true
         var progress = false      // emit NDJSON live events to stdout (for the WS job stream)
+        var maxUSD: Double?        // wiki-research SpendGate ceiling override (default $40 / env)
     }
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
 
@@ -44,17 +46,26 @@ enum CodexMemoryWikiResearch {
 
         // Claim extraction (the producer for the trust layer) uses OpenAI directly.
         let env = ProcessInfo.processInfo.environment
+        // Single shared budget bucket for the WHOLE wiki-research lane: claim extraction
+        // (OpenAI chat) + the web_search swarm + the gap reflector. Mirrors the 4 sibling
+        // lanes (wiki-contradictions / -librarian / -audit / -frontier), each of which
+        // meters its own bucket. Without this the lane has NO ceiling on paid calls.
+        let researchBudgetUSD = opt.maxUSD ?? Double(env["CODEX_MEMORY_WIKI_BUDGET_USD"] ?? "") ?? 40
+        let researchGate = SpendGate(store: bundle.store, config: .init(
+            monthlyCeilingUSD: researchBudgetUSD, bucket: "wiki-research",
+            inputUSDPerMTok: 0.15, outputUSDPerMTok: 0.60, reservationUSD: 0.10))
         let claimExtractor: WikiClaimExtractor? = (opt.extractClaims ? (env["OPENAI_API_KEY"].map {
-            WikiClaimExtractor(apiKey: $0, model: env["CODEXKIT_WIKI_CLAIM_MODEL"] ?? "gpt-4o-mini")
+            WikiClaimExtractor(apiKey: $0, model: env["CODEXKIT_WIKI_CLAIM_MODEL"] ?? "gpt-4o-mini",
+                               spendGate: researchGate)
         }) : nil)
 
         let orch = WikiResearchOrchestrator(
             probe: LiveKnowledgeProbe(retriever: bundle.retriever),
-            swarm: LiveResearchSwarm(webSearch: webSearch, perAngle: opt.perAngle),
+            swarm: LiveResearchSwarm(webSearch: webSearch, perAngle: opt.perAngle, spendGate: researchGate),
             compiler: LiveResearchCompiler(writer: writer, store: bundle.store, fetcher: fetcher,
                                            fetchedAt: now, vaultRoot: vaultRoot,
                                            claimExtractor: claimExtractor),
-            reflector: LiveGapReflector(webSearch: webSearch),
+            reflector: LiveGapReflector(webSearch: webSearch, spendGate: researchGate),
             now: { Int64(Date().timeIntervalSince1970) })
 
         let sessionStore = ResearchSessionStore(root: vaultRoot + "/research")
@@ -117,6 +128,7 @@ enum CodexMemoryWikiResearch {
             case "--per-angle": o.perAngle = Int(try val(a)) ?? 4
             case "--min-time": o.minTime = Int64(try val(a))
             case "--max-rounds": o.maxRounds = Int(try val(a)) ?? 3
+            case "--max-usd": o.maxUSD = Double(try val(a))
             case "--no-claims": o.extractClaims = false
             case "--progress": o.progress = true
             case "--json": o.json = true

@@ -32,6 +32,10 @@ struct LiveKnowledgeProbe: KnowledgeProbe {
 struct LiveResearchSwarm: ResearchSwarm {
     let webSearch: any WebSearchBackend
     let perAngle: Int
+    /// Budget admission control shared with the rest of the wiki-research lane.
+    /// nil → ungated (tests / offline). Each web_search is a real paid query, so it
+    /// is metered as a flat per-call token-equivalent against the wiki-research bucket.
+    var spendGate: SpendGate? = nil
 
     func gather(topic: String, mode: ResearchMode, angles: [SwarmAngle],
                 round: Int, gaps: [Gap]) async throws -> [RankedSource] {
@@ -39,7 +43,7 @@ struct LiveResearchSwarm: ResearchSwarm {
         var domainCount: [String: Int] = [:]
         for angle in angles {
             let query = "\(topic) — \(angle.focus)"
-            guard case .success(let answer) = await webSearch.search(query) else { continue }
+            guard let answer = await Self.gatedSearch(webSearch, query: query, gate: spendGate) else { continue }
             for (title, url) in Self.extractSources(answer).prefix(perAngle) {
                 let host = URL(string: url)?.host?.lowercased() ?? ""
                 domainCount[host, default: 0] += 1
@@ -51,6 +55,28 @@ struct LiveResearchSwarm: ResearchSwarm {
             }
         }
         return out
+    }
+
+    /// One budgeted web_search. When a gate is present the call is reserved+recorded
+    /// against the lane's monthly ceiling; a rate-limited or failed search yields nil
+    /// (the caller skips that angle/round — the loop winds down rather than overspends).
+    /// web_search exposes NO token usage, so we charge a flat per-call estimate (1000
+    /// input tokens) purely as a volume meter — this is intentional, not a real count.
+    static func gatedSearch(_ backend: any WebSearchBackend, query: String,
+                            gate: SpendGate?) async -> String? {
+        guard let gate else {
+            guard case .success(let a) = await backend.search(query) else { return nil }
+            return a
+        }
+        let call: SpendGate.TokenCall = { q, _, _ in
+            guard case .success(let a) = await backend.search(q) else {
+                throw WikiClaimExtractor.ExtractorError(message: "web_search failed")
+            }
+            return (a, 1000, 0)   // flat per-search meter; no spend recorded on failure
+        }
+        guard let outcome = try? await gate.run(prompt: query, model: "web_search", call),
+              case let .ran(receipt) = outcome else { return nil }
+        return receipt.text
     }
 
     /// Parse the "Sources:\n- <title> <url>" block (and any bare URLs) the
@@ -406,9 +432,11 @@ struct WikiClaimExtractor: Sendable {
 /// down rather than spinning).
 struct LiveGapReflector: GapReflector {
     let webSearch: any WebSearchBackend
+    /// Shared wiki-research budget; nil → ungated (back-compat). One search/round.
+    var spendGate: SpendGate? = nil
     func reflect(topic: String, rounds: [RoundRecord]) async throws -> [Gap] {
         let q = "List 3 specific, still-unanswered research questions about: \(topic). One per line."
-        guard case .success(let answer) = await webSearch.search(q) else { return [] }
+        guard let answer = await LiveResearchSwarm.gatedSearch(webSearch, query: q, gate: spendGate) else { return [] }
         var gaps: [Gap] = []
         for raw in answer.split(separator: "\n") {
             let line = raw.trimmingCharacters(in: CharacterSet(charactersIn: "-•*0123456789. \t"))
