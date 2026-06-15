@@ -123,7 +123,11 @@ enum CodexMemoryWikiInventory {
 
     static func formatViews(_ views: [InventoryViewRow], json: Bool) -> String {
         if json {
-            let rows = views.map { ["slug": $0.slug, "title": $0.title, "filters": $0.filters as Any].compactMapValues { $0 } }
+            let rows = views.map { v -> [String: Any] in
+                var o: [String: Any] = ["slug": v.slug, "title": v.title]
+                if let f = v.filters { o["filters"] = f }   // omit (not null) when absent
+                return o
+            }
             let d = (try? JSONSerialization.data(withJSONObject: ["count": views.count, "views": rows],
                         options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data("{}".utf8)
             return String(decoding: d, as: UTF8.self) + "\n"

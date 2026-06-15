@@ -59,6 +59,32 @@ final class WikiInventoryCLITests: XCTestCase {
         XCTAssertEqual((obj["records"] as? [[String: Any]])?.first?["slug"] as? String, "a")
     }
 
+    func testPriorityBoundaryRejectsOffByOneAndShort() throws {
+        for good in ["p0", "p1", "p2", "p3", "p4"] {
+            XCTAssertNoThrow(try Inv.parseAdd(["--slug", "s", "--kind", "item", "--title", "T", "--priority", good]), good)
+        }
+        for bad in ["p", "p10", "p5", "p00", "P0", "p-1", "x1", "1"] {
+            XCTAssertThrowsError(try Inv.parseAdd(["--slug", "s", "--kind", "item", "--title", "T", "--priority", bad]),
+                                 "must reject '\(bad)'")
+        }
+    }
+
+    func testFormatViews() throws {
+        let views = [
+            InventoryViewRow(slug: "p0", title: "P0 items", filters: #"{"priority":"p0"}"#, updatedAt: 1),
+            InventoryViewRow(slug: "open", title: "Open questions", updatedAt: 2),
+        ]
+        let human = Inv.formatViews(views, json: false)
+        XCTAssertTrue(human.contains("views: 2"))
+        XCTAssertTrue(human.contains("P0 items"))
+        let json = Inv.formatViews(views, json: true)
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(obj["count"] as? Int, 2)
+        let rows = try XCTUnwrap(obj["views"] as? [[String: Any]])
+        XCTAssertEqual(rows.first?["filters"] as? String, #"{"priority":"p0"}"#)
+        XCTAssertNil(rows.last?["filters"], "absent filters omitted")
+    }
+
     func testFormatShowIncludesOptionalFields() throws {
         let r = InventoryRecordRow(slug: "x", kind: "item", status: "active", priority: "p1", title: "X",
                                    summary: "the summary", nextAction: "do thing", tags: "t1", createdAt: 1, updatedAt: 2)
