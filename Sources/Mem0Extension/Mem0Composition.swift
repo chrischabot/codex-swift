@@ -88,7 +88,9 @@ public func makeMem0MemoryProvider(mem0: Mem0ProviderConfig,
         llm = MockLLM()
     }
 
-    let engine = Mem0Engine(config: Mem0Config(historyDbPath: dbPath),
+    var engineConfig = Mem0Config(historyDbPath: dbPath)
+    engineConfig.reconcileOnAdd = mem0.reconcileOnAdd   // TOML/env-derived (authoritative on the session path)
+    let engine = Mem0Engine(config: engineConfig,
                             embedder: embedder, llm: llm,
                             vectorStore: store, historyStore: store)
     let scope = mem0.scope

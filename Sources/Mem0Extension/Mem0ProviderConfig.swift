@@ -96,6 +96,10 @@ public struct Mem0ProviderConfig: Sendable, Equatable {
     public var llmModel: String
     public var embeddingBackend: Mem0InferenceBackend
     public var llmBackend: Mem0InferenceBackend
+    /// Enable the reconcile/supersede pass on add (TOML reconcile_on_add / env
+    /// CODEX_MEM0_RECONCILE). Default false here; the session path threads this into
+    /// Mem0Config.reconcileOnAdd.
+    public var reconcileOnAdd: Bool = false
 
     public init(dbPath: String? = nil, userId: String = "codex", agentId: String? = nil,
                 runId: String? = nil, topK: Int = 5, infer: Bool = true,
@@ -103,7 +107,8 @@ public struct Mem0ProviderConfig: Sendable, Equatable {
                 embeddingModel: String = "text-embedding-3-small", embeddingDimension: Int = 1536,
                 llmModel: String = "gpt-4o-mini",
                 embeddingBackend: Mem0InferenceBackend = .auto,
-                llmBackend: Mem0InferenceBackend = .auto) {
+                llmBackend: Mem0InferenceBackend = .auto,
+                reconcileOnAdd: Bool = false) {
         self.dbPath = dbPath
         self.userId = userId
         self.agentId = agentId
@@ -117,6 +122,7 @@ public struct Mem0ProviderConfig: Sendable, Equatable {
         self.llmModel = llmModel
         self.embeddingBackend = embeddingBackend
         self.llmBackend = llmBackend
+        self.reconcileOnAdd = reconcileOnAdd
     }
 
     public var scope: Mem0Scope { Mem0Scope(userId: userId, agentId: agentId, runId: runId) }
@@ -158,6 +164,12 @@ public struct Mem0ProviderConfig: Sendable, Equatable {
             out.llmBackend = v
         } else if let v = Mem0InferenceBackend.parse(env["CODEX_MEM0_LLM_BACKEND"]) {
             out.llmBackend = v
+        }
+        // Reconcile/supersede on add: TOML reconcile_on_add first, env CODEX_MEM0_RECONCILE fallback.
+        if let v = mem["reconcile_on_add"]?.boolValue {
+            out.reconcileOnAdd = v
+        } else if let v = env["CODEX_MEM0_RECONCILE"] {
+            out.reconcileOnAdd = (v == "1")
         }
         return out
     }

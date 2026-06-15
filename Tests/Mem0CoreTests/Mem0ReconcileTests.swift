@@ -10,6 +10,26 @@ import Foundation
 final class Mem0ReconcileTests: XCTestCase {
     private func umap(_ user: String) -> JSONObject { ["user_id": .string(user)] }
 
+    // MARK: the production enable seam (audit #1 — reconcile was hard-default-OFF)
+
+    func testEnvDefaultEnablesReconcileOnAdd() {
+        setenv("CODEX_MEM0_RECONCILE", "1", 1)
+        defer { unsetenv("CODEX_MEM0_RECONCILE") }
+        XCTAssertTrue(Mem0Config(historyDbPath: ":memory:").reconcileOnAdd,
+                      "CODEX_MEM0_RECONCILE=1 enables the supersede pass without touching the property")
+    }
+
+    func testAbsentEnvKeepsReconcileOff() {
+        unsetenv("CODEX_MEM0_RECONCILE")
+        XCTAssertFalse(Mem0Config(historyDbPath: ":memory:").reconcileOnAdd, "default off when unset")
+    }
+
+    func testEnvNonOneValueIsOff() {
+        setenv("CODEX_MEM0_RECONCILE", "0", 1)
+        defer { unsetenv("CODEX_MEM0_RECONCILE") }
+        XCTAssertFalse(Mem0Config(historyDbPath: ":memory:").reconcileOnAdd, "only \"1\" enables it")
+    }
+
     private func makeEngine(_ llm: any Mem0LLM, embedder: any Mem0Embedder, reconcile: Bool) -> Mem0Engine {
         var cfg = Mem0Config(historyDbPath: ":memory:")
         cfg.reconcileOnAdd = reconcile   // dupCosineThreshold 0.95 / reconcileCosineThreshold 0.70 (defaults)
