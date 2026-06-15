@@ -49,6 +49,14 @@ public enum WikiQueryWiring {
             }
         }
         guard let store = opened else { return nil }
+        // Boot orphan sweep: reap ingest/research rows left running/in_progress by a crash
+        // so wiki/status + wiki/sessions/list never show perpetual ghosts and a re-issue
+        // doesn't re-spend on a dead job. Best-effort — never fail wiki bring-up on it.
+        if let swept = try? await store.sweepStaleRunningSessions(now: Int64(Date().timeIntervalSince1970)),
+           swept.ingestJobs + swept.researchSessions > 0 {
+            FileHandle.standardError.write(Data(
+                "wiki boot sweep: reaped \(swept.ingestJobs) ingest job(s), \(swept.researchSessions) research session(s)\n".utf8))
+        }
         // Body files for manually-edited pages live next to the DB.
         let bodyRoot = (path as NSString).deletingLastPathComponent + "/wiki-bodies"
         // One process-lifetime cache for the wiki/index shaper (incremental
