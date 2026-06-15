@@ -20,13 +20,15 @@ public enum PollOutcome: Sendable, Equatable {
 public struct WatchSource: Sendable, Equatable {
     public var id: String
     public var volatility: Volatility
+    /// Adapter kind (github-owner|feed|arxiv|url) — selects how the round polls this source.
+    public var kind: String
     public var lastPolledAt: Int64
     public var errorCount: Int
     public var nextDueAt: Int64
     public var status: WatchStatus
-    public init(id: String, volatility: Volatility, lastPolledAt: Int64 = 0,
+    public init(id: String, volatility: Volatility, kind: String = "url", lastPolledAt: Int64 = 0,
                 errorCount: Int = 0, nextDueAt: Int64 = 0, status: WatchStatus = .active) {
-        self.id = id; self.volatility = volatility; self.lastPolledAt = lastPolledAt
+        self.id = id; self.volatility = volatility; self.kind = kind; self.lastPolledAt = lastPolledAt
         self.errorCount = errorCount; self.nextDueAt = nextDueAt; self.status = status
     }
 }

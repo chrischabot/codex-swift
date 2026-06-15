@@ -57,6 +57,7 @@ extension MemoryStore {
         WatchSource(
             id: r["id"] as? String ?? "",
             volatility: Volatility(rawValue: (r["volatility"] as? String) ?? "warm") ?? .warm,
+            kind: (r["kind"] as? String) ?? "url",
             lastPolledAt: (r["last_polled_at"] as? Int64) ?? 0,
             errorCount: Int((r["error_count"] as? Int64) ?? 0),
             nextDueAt: (r["next_due_at"] as? Int64) ?? 0,

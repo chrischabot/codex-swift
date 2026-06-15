@@ -1,19 +1,19 @@
 import Foundation
 import MemoryStore
 import WikiIngest
+import PinnedFetcher
+import EgressGuard
 
 /// `codex-memory wiki-watch <verb>` — register and schedule watched sources
 /// (§14.6). The cadence/backoff/due math is the deterministic WatchScheduler; this
-/// CLI is the registration + inspection surface.
+/// CLI is the registration + inspection + round-runner surface.
 ///
 ///   add <handle> [--cadence hot|warm|cold] [--kind k]   register / re-arm a source
 ///   list [--json]                                        show all watched sources
 ///   pause <handle> / resume <handle> / remove <handle>   manage one source
 ///   run-due [--json]                                     show sources currently due
-///
-/// The actual polling loop (fetch → change-gate → ingest) is the network-bearing
-/// step and is reported here as "due"; wiring it to the scheduled Cron round is the
-/// remaining watch milestone.
+///   run-round [--limit N] [--json]                       POLL the due sources now:
+///       fetch → content-SHA change-gate → ingest new items → advance the scheduler.
 enum CodexMemoryWikiWatch {
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
 
@@ -50,6 +50,15 @@ enum CodexMemoryWikiWatch {
             let due = try await store.dueWatchSources(now: now)
             return (formatDue(due, json: rest.contains("--json")), true)
 
+        case "run-round":
+            let limit = try parseLimit(rest) ?? 50
+            let fetcher = PinnedFetcher(guard_: EgressGuard(EgressPolicy(allowHTTP: true)))
+            let poller = LiveWatchPoller(registry: WikiAdapterRegistry(fetcher: fetcher),
+                                         writer: WikiIngestWriter(store: store, processor: bundle.processor),
+                                         fetchedAt: now, maxPerSource: 20)
+            let result = await WikiWatchOrchestrator.runRound(store: store, poller: poller, now: now, limit: limit)
+            return (formatRound(result, json: rest.contains("--json")), true)
+
         default:
             throw CLIError(message: "unknown wiki-watch verb '\(verb)'")
         }
@@ -80,8 +89,25 @@ enum CodexMemoryWikiWatch {
         if s.isEmpty { return "nothing due\n" }
         var out = "\(s.count) source(s) due to poll:\n"
         for w in s { out += "  \(w.id)\n" }
-        out += "(polling is the network-bearing step — wiring to the scheduled round is in progress)\n"
+        out += "(run `wiki-watch run-round` to poll + ingest the due sources)\n"
         return out
+    }
+
+    static func formatRound(_ r: WikiWatchOrchestrator.RoundResult, json: Bool) -> String {
+        if json {
+            return jsonLine(["polled": r.polled, "changed": r.changed, "unchanged": r.unchanged,
+                             "failed": r.failed, "itemsIngested": r.itemsIngested])
+        }
+        return "wiki-watch round: polled \(r.polled) — \(r.changed) changed, \(r.unchanged) unchanged, "
+            + "\(r.failed) failed; \(r.itemsIngested) item(s) ingested\n"
+    }
+
+    static func parseLimit(_ args: [String]) throws -> Int? {
+        guard let i = args.firstIndex(of: "--limit") else { return nil }
+        guard i + 1 < args.count, let n = Int(args[i + 1]), n > 0 else {
+            throw CLIError(message: "--limit must be a positive integer")
+        }
+        return n
     }
 
     static func jsonLine(_ obj: [String: Any]) -> String {
