@@ -26,8 +26,16 @@ public enum GenericResponses {
         "turns": .array([]),
         "updatedAt": .int(0),
     ])
+    // Upstream PluginDetail expanded in the 2026-06 sync: appTemplates (#26317)
+    // + nullable marketplacePath / shareUrl / description. (Keep this comment
+    // OUTSIDE the object literal — the conformance parser can't skip comments
+    // inside it.)
     private static let minimalPluginDetail: JSONValue = .object([
         "apps": .array([]),
+        "appTemplates": .array([]),
+        "marketplacePath": .null,
+        "shareUrl": .null,
+        "description": .null,
         "hooks": .array([]),
         "marketplaceName": .string(""),
         "mcpServers": .array([]),
