@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio } from "lucide-react";
+import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { useRuntime } from "@/runtime/RuntimeProvider";
+import { WikiJobTab } from "./WikiJobTab";
 import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource } from "@/runtime/connector";
 
 /**
@@ -104,6 +105,8 @@ export function WikiConsolePage() {
           <TabsList>
             <TabsTrigger value="search"><Search className="mr-1 size-3.5" /> Search</TabsTrigger>
             <TabsTrigger value="brief"><Sparkles className="mr-1 size-3.5" /> Brief</TabsTrigger>
+            <TabsTrigger value="research"><Telescope className="mr-1 size-3.5" /> Research</TabsTrigger>
+            <TabsTrigger value="ingest"><Download className="mr-1 size-3.5" /> Ingest</TabsTrigger>
             <TabsTrigger value="status"><Gauge className="mr-1 size-3.5" /> Status</TabsTrigger>
             <TabsTrigger value="watch"><Radio className="mr-1 size-3.5" /> Watch</TabsTrigger>
           </TabsList>
@@ -210,6 +213,16 @@ export function WikiConsolePage() {
                 )}
               </div>
             )}
+          </TabsContent>
+
+          {/* ── Research (live job) ── */}
+          <TabsContent value="research">
+            <WikiJobTab kind="research" />
+          </TabsContent>
+
+          {/* ── Ingest (live job) ── */}
+          <TabsContent value="ingest">
+            <WikiJobTab kind="ingest" />
           </TabsContent>
 
           {/* ── Status ── */}
