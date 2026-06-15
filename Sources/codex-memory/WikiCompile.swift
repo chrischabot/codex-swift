@@ -73,6 +73,7 @@ struct WikiLintOptions: Sendable {
     var json: Bool = false
     var maxBytes: Int64 = 10 * 1024 * 1024
     var limit: Int = 10_000
+    var apply: Bool = false   // auto-fix the safe, mechanical issues (idempotent)
 }
 
 struct WikiLintReport: Sendable, Equatable {
@@ -82,6 +83,7 @@ struct WikiLintReport: Sendable, Equatable {
     var checkedDocuments: Int = 0
     var issues: [WikiLintIssue] = []
     var storeHealth: MemoryStoreIndexHealth?
+    var appliedFixes: [String] = []   // human-readable record of --apply repairs
 
     var errorCount: Int { issues.filter { $0.severity == .error }.count }
     var warningCount: Int { issues.filter { $0.severity == .warning }.count }
@@ -89,6 +91,7 @@ struct WikiLintReport: Sendable, Equatable {
     var summaryLine: String {
         "wiki-lint summary: errors=\(errorCount) warnings=\(warningCount) "
             + "files=\(checkedFiles) documents=\(checkedDocuments)"
+            + (appliedFixes.isEmpty ? "" : " fixed=\(appliedFixes.count)")
     }
 
     func jsonObject() -> [String: Any] {
@@ -123,6 +126,7 @@ struct WikiLintReport: Sendable, Equatable {
                 "fts_integrity_error": health.ftsIntegrityError as Any,
             ].compactMapValues { unwrapOptional($0) }
         }
+        if !appliedFixes.isEmpty { out["applied_fixes"] = appliedFixes }
         return out.compactMapValues { unwrapOptional($0) }
     }
 }
@@ -302,17 +306,59 @@ public enum CodexMemoryWikiLint {
                     sourceURI: nil))
             }
         }
-        report.issues.append(WikiLintIssue(
-            severity: .info,
-            code: "claim_schema_missing",
-            message: "claims are currently compiled from graph edges; durable claim records are not implemented yet",
-            path: nil,
-            sourceURI: nil))
         report.issues.sort {
             ($0.severity.rawValue, $0.code, $0.path ?? "", $0.message)
                 < ($1.severity.rawValue, $1.code, $1.path ?? "", $1.message)
         }
+        // --apply: repair the safe, mechanical issues idempotently (currently the
+        // store-derived digest counts). Runs after detection so it can resolve the
+        // issues it fixes.
+        if options.apply {
+            applyDigestFixes(report: &report, vaultPath: options.vaultPath,
+                             documentCount: docs.count, health: health)
+        }
         return report
+    }
+
+    /// `--apply` fixer for the agent-digest projection. Regenerates the digest's
+    /// store-derived counts (the `stale_digest`/`missing_digest` drift signal) from the
+    /// store — the source of truth — preserving any existing per-page lists, and creating
+    /// a minimal digest if absent. Idempotent: once the counts match, a re-lint reports
+    /// no stale/missing digest. Does NOT rebuild the per-page lists (a full `wiki-compile`
+    /// does that), never creates absent OPTIONAL trees, and never mutates knowledge.
+    static func applyDigestFixes(report: inout WikiLintReport, vaultPath: String?,
+                                 documentCount: Int, health: MemoryStoreIndexHealth) {
+        guard let vaultPath else { return }
+        guard report.issues.contains(where: { $0.code == "stale_digest" || $0.code == "missing_digest" }) else { return }
+        let digestRel = "_digests/agent-digest.json"
+        let digestURL = URL(fileURLWithPath: vaultPath).appendingPathComponent(digestRel)
+        var object: [String: Any] = [:]
+        if let data = try? Data(contentsOf: digestURL),
+           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            object = existing   // preserve page lists + other fields
+        } else {
+            object["version"] = 1
+            object["source_pages"] = []; object["entity_pages"] = []; object["claim_pages"] = []
+        }
+        object["documents"] = documentCount   // must match lint's filtered doc count
+        object["chunks"] = health.chunkCount
+        object["entities"] = health.entityCount
+        object["edges"] = health.edgeCount
+        // Write THROUGH WikiVault so the digest path gets the same protections as every
+        // other vault write: refuses to overwrite a symlink, refuses paths that escape
+        // the canonicalized root, writes atomically, and matches wiki-compile's compact
+        // serialization (so the manifest sha doesn't needlessly drift).
+        do {
+            let vault = try WikiVault(path: vaultPath, dryRun: false)
+            try vault.write(relativePath: digestRel, content: jsonString(object) + "\n")
+        } catch {
+            report.appliedFixes.append("FAILED to write \(digestRel): \(error)")
+            return
+        }
+        report.appliedFixes.append("regenerated \(digestRel) counts "
+            + "(documents=\(documentCount), chunks=\(health.chunkCount), "
+            + "entities=\(health.entityCount), edges=\(health.edgeCount))")
+        report.issues.removeAll { $0.code == "stale_digest" || $0.code == "missing_digest" }
     }
 
     static func format(_ report: WikiLintReport, json: Bool) -> String {
@@ -322,6 +368,7 @@ public enum CodexMemoryWikiLint {
             let location = issue.path ?? issue.sourceURI ?? "-"
             lines.append("\(issue.severity.rawValue.uppercased()) \(issue.code) \(location): \(issue.message)")
         }
+        for fix in report.appliedFixes { lines.append("FIXED \(fix)") }
         return lines.joined(separator: "\n") + "\n"
     }
 }
@@ -549,7 +596,7 @@ private func makeAgentDigest(pages: [WikiCompiledPage],
         "entity_pages": entityPages,
         "claim_pages": claimPages,
         "limitations": [
-            "claim records are compiled from graph edges until the durable claim schema lands",
+            "per-page lists reflect the last full wiki-compile; counts are refreshed by wiki-lint --apply",
         ],
     ]
     return jsonString(object) + "\n"
@@ -740,7 +787,10 @@ private func lintVault(path: String,
         .appendingPathComponent("_digests/agent-digest.json").path
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: digestPath)),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        if health.documentCount > 0 {
+        // Gate on the SAME filtered set the digest tracks (non-compiled `documents`),
+        // not the raw store count, so missing-detection and the count written by
+        // --apply share one definition.
+        if !documents.isEmpty {
             report.issues.append(WikiLintIssue(
                 severity: .warning,
                 code: "missing_digest",
@@ -828,6 +878,7 @@ private func parseLintArgs(_ args: [String]) throws -> (options: WikiLintOptions
         case let s where s.hasPrefix("--db="):
             options.dbPath = String(s.dropFirst("--db=".count))
         case "--json": options.json = true
+        case "--apply": options.apply = true
         case "--max-bytes":
             i += 1
             guard i < args.count, let n = Int64(args[i]), n > 0 else {
