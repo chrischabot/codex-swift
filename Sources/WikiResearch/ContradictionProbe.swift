@@ -43,6 +43,9 @@ public struct ContradictionProbeReport: Sendable, Equatable {
     public var reviewQueue: [String]
     /// True when the maxJudgeCalls budget cut the run short.
     public var truncated: Bool
+    /// Graded predictions for the calibration scorer (gbrain.md 3.26). Property-level
+    /// default keeps the public init signature unchanged (ABI-safe); populated in run().
+    public var resolvedItems: [ResolvedItem] = []
     public init(pairsConsidered: Int = 0, pairsJudged: Int = 0, verdicts: [String: Int] = [:],
                 applied: Int = 0, reviewQueue: [String] = [], truncated: Bool = false) {
         self.pairsConsidered = pairsConsidered; self.pairsJudged = pairsJudged
@@ -98,6 +101,11 @@ public struct ContradictionProbe: Sendable {
                 report.verdicts[verdict.verdict.rawValue, default: 0] += 1
 
                 let action = SupersessionResolver.resolve(verdict, a: a, b: b, autoThreshold: autoThreshold)
+                // Emit a graded prediction for EVERY judged pair (independent of apply
+                // mode) so calibration coverage reflects judge quality, not whether the
+                // operator opted into mutations.
+                report.resolvedItems.append(
+                    CalibrationProbe.resolvedItem(for: verdict, a: a, b: b, action: action))
                 switch action {
                 case .skip:
                     break

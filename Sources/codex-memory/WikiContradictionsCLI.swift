@@ -71,17 +71,24 @@ enum CodexMemoryWikiContradictions {
         let now = Int64(Date().timeIntervalSince1970)
         // --apply IS the explicit operator opt-in gesture (gbrain.md note).
         let report = await probe.run(claims: claims, now: now, apply: opt.apply, store: bundle.store)
-        return (format(report, scope: opt.scope, applied: opt.apply, json: opt.json), true)
+        // Close the loop: score the judge's confidence-in-conflict per domain.
+        let scorecards = CalibrationScorer.scoreByDomain(report.resolvedItems)
+        return (format(report, scope: opt.scope, applied: opt.apply, json: opt.json, scorecards: scorecards), true)
     }
 
     static func format(_ r: ContradictionProbeReport, scope: ClaimStatus,
-                       applied: Bool, json: Bool) -> String {
+                       applied: Bool, json: Bool, scorecards: [DomainScorecard] = []) -> String {
         if json {
             let obj: [String: Any] = [
                 "scope": scope.rawValue, "apply": applied,
                 "considered": r.pairsConsidered, "judged": r.pairsJudged,
                 "verdicts": r.verdicts, "applied": r.applied,
                 "truncated": r.truncated, "reviewQueue": r.reviewQueue,
+                "calibration": scorecards.map { c -> [String: Any] in
+                    ["domain": c.domain, "n": c.n, "coldStart": c.coldStart,
+                     "brier": c.brier, "accuracy": c.accuracy,
+                     "partialRate": c.partialRate, "coverage": c.coverage]
+                },
             ]
             let d = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]))
                 ?? Data("{}".utf8)
@@ -95,6 +102,17 @@ enum CodexMemoryWikiContradictions {
                 .map { "\($0.key)=\($0.value)" }.joined(separator: " ") + "\n"
         }
         for line in r.reviewQueue.prefix(50) { out += "  · \(line)\n" }
+        if !scorecards.isEmpty {
+            out += "  calibration (per-domain confidence→outcome):\n"
+            for c in scorecards {
+                if c.coldStart {
+                    out += String(format: "    %@: cold-start (n=%d, coverage=%.2f)\n", c.domain, c.n, c.coverage)
+                } else {
+                    out += String(format: "    %@: brier=%.3f acc=%.2f n=%d coverage=%.2f\n",
+                                  c.domain, c.brier, c.accuracy, c.n, c.coverage)
+                }
+            }
+        }
         return out
     }
 
