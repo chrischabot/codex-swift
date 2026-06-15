@@ -15,7 +15,7 @@ wire-surface oracle is pinned in [`tools/conformance/PINNED_REV`](tools/conforma
 
 | Date | From → To | Upstream commit | Status | Plan |
 |---|---|---|---|---|
-| 2026-06-14/15 | `a280248021` → `dfd03ea01b` | `dfd03ea01b` (2026-06-14) | 🔵 P0–P5c + P6.3 ported, reviewed & live-validated; remainder dispositioned (N/A / documented divergence) ([decisions](docs/notes/catchup-remaining-decisions.md)) | [codex-catchup.md](codex-catchup.md) |
+| 2026-06-14/15 | `a280248021` → `dfd03ea01b` | `dfd03ea01b` (2026-06-14) | ✅ P0–P5c + P6.3 ported, reviewed & live-validated; close gate met (3208/0, oracle green); remainder dispositioned (N/A / documented divergence) ([decisions](docs/notes/catchup-remaining-decisions.md)) | [codex-catchup.md](codex-catchup.md) |
 | (baseline) | — → `a280248021` | `a280248021` (2026-05-16) | ✅ ported + fidelity-remediated (audit v1→v14) | — |
 
 Legend: ✅ landed & gate-green · 🔵 planned/in progress · ⛔ abandoned.
@@ -83,12 +83,12 @@ build harness, analytics/otel internals, Bedrock managed auth.
   - [x] **P5c** multi-agent v2 — **PORTED foundation + reviewed + tested.** Persisted (#25721) + encrypted-at-rest (#26210) agent metadata via `AgentRecordStore`/`EncryptedFileAgentRecordStore` (AES-GCM, write-through, hydrate-on-restart, default-off). Residency-LRU/reload/concurrency = single-operator divergences. 7 `AgentRecordStoreTests` + 37 MultiAgent tests (incl. live) green. (`25027f7`)
 - [~] **P6** persistence parity — **P6.3 SQLite corruption auto-recovery PORTED + reviewed + tested** (`d375fe9`). P6.1 = deliberate documented divergence; P6.2/6.4 = N/A. See `docs/notes/catchup-remaining-decisions.md`.
 
-**Close gate (2026-06-15) — met for the ported surface:**
-- [x] Schema-parity oracle green at the committed golden; `PINNED_REV` bumped. (Found + fixed a real `plugin/read` `PluginDetail` drift during E2E.)
-- [x] **Full non-live suite green** — 3060 tests / 0 failures.
-- [x] **Live E2E green** — live OpenAI-API suite 78/0; live `codexd`-binary smoke 9/9 (P1 methods + P4 goals + `thread/deleted`).
-- [x] **Severe-adversarial clean** — per-feature adversarial reviews (P1 ×7, P2 ×4, P5a-secrets ×8, P6.3 ×4 findings) all fixed; severe tests per feature.
-- [~] Remaining items dispositioned in `docs/notes/catchup-remaining-decisions.md` (N/A / deliberate divergence / optional future ports). A fresh re-audit (audit-v15) is the only open *optional* follow-up; the audit is generative-not-convergent (see [[audit-remediation-state]]).
+**Close gate (2026-06-15) — MET for the full ported surface (P0–P5c + P6.3):**
+- [x] Schema-parity oracle green at the committed golden; `PINNED_REV` bumped. (Found + fixed a real `plugin/read` `PluginDetail` drift; and a `concrete-response-report` tooling bug — it demanded fixtures for port-only typed methods that have no upstream response type. Now 41 checked / 0 failures / 27 port-only skipped.) Run against the preserved `/tmp/codex-target-schema` (`dfd03ea01b`) since `../codex` had been reset to the old baseline.
+- [x] **Full non-live suite green** — **3208 tests / 0 failures** (44 skipped), 912s.
+- [x] **Live E2E green** — live OpenAI-API suite 78/0 (prior); **live code-mode `LiveHarnessMcpCodeModeToolSearchTests` 3/0** (P5b, incl. live MCP-proxy round-trip) + **live multi-agent `LiveHarnessMultiAgentTests` 3/0** (P5c) this session; live `codexd`-binary smoke 9/9 (P1 methods + P4 goals + `thread/deleted`, unchanged).
+- [x] **Severe-adversarial clean** — per-feature adversarial reviews (P1 ×7, P2 ×4, P5a-secrets ×8, P5b-code-mode ×9, P5c-agent-store ×2, P6.3 ×4 findings) all fixed; severe tests per feature (`CodeModeOutputTests` 16/0, `AgentRecordStoreTests` 7/0).
+- [~] Remaining items dispositioned in `docs/notes/catchup-remaining-decisions.md` + `catchup-p5-divergences.md` (N/A / deliberate divergence). A fresh re-audit (audit-v15) is the only open *optional* follow-up; the audit is generative-not-convergent (see [[audit-remediation-state]]).
 
 ---
 
