@@ -1,13 +1,13 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download } from "lucide-react";
+import { ArrowLeft, Search, Sparkles, FileText, Gauge, Radio, Telescope, Download, ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { useRuntime } from "@/runtime/RuntimeProvider";
 import { WikiJobTab } from "./WikiJobTab";
-import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource } from "@/runtime/connector";
+import type { WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource, WikiLibrarianReport, WikiAuditReport } from "@/runtime/connector";
 
 /**
  * Wiki Console (route /wiki/console) — query the knowledge base and generate a
@@ -33,6 +33,25 @@ export function WikiConsolePage() {
 
   const [watch, setWatch] = useState<WikiWatchSource[] | null>(null);
   const [loadingWatch, setLoadingWatch] = useState(false);
+
+  const [librarian, setLibrarian] = useState<WikiLibrarianReport | null>(null);
+  const [audit, setAudit] = useState<WikiAuditReport | null>(null);
+  const [loadingReports, setLoadingReports] = useState(false);
+  const [reportsLoaded, setReportsLoaded] = useState(false);
+
+  async function loadReports() {
+    setLoadingReports(true);
+    // allSettled → the two reads are independent: one failing (or a connector that
+    // rejects) never blocks the other and never wedges the tab at null.
+    const [lib, aud] = await Promise.allSettled([
+      connector.getLibrarianReport?.() ?? Promise.resolve(null),
+      connector.getAuditReport?.() ?? Promise.resolve(null),
+    ]);
+    setLibrarian(lib.status === "fulfilled" ? lib.value : null);
+    setAudit(aud.status === "fulfilled" ? aud.value : null);
+    setReportsLoaded(true);
+    setLoadingReports(false);
+  }
 
   async function loadStatus() {
     if (!connector.getWikiStatus) return;
@@ -100,6 +119,7 @@ export function WikiConsolePage() {
           onValueChange={(v) => {
             if (v === "status" && !status) void loadStatus();
             if (v === "watch" && !watch) void loadWatch();
+            if (v === "reports" && !reportsLoaded) void loadReports();
           }}
         >
           <TabsList>
@@ -109,6 +129,7 @@ export function WikiConsolePage() {
             <TabsTrigger value="ingest"><Download className="mr-1 size-3.5" /> Ingest</TabsTrigger>
             <TabsTrigger value="status"><Gauge className="mr-1 size-3.5" /> Status</TabsTrigger>
             <TabsTrigger value="watch"><Radio className="mr-1 size-3.5" /> Watch</TabsTrigger>
+            <TabsTrigger value="reports"><ShieldAlert className="mr-1 size-3.5" /> Reports</TabsTrigger>
           </TabsList>
 
           {/* ── Search ── */}
@@ -290,6 +311,70 @@ export function WikiConsolePage() {
                   ))}
                 </ul>
               )
+            )}
+          </TabsContent>
+
+          {/* ── Reports (Librarian Tier-1 staleness + Audit Pass-2 drift) ── */}
+          <TabsContent value="reports" className="mt-3">
+            <div className="mb-3 flex items-center gap-2">
+              <Button variant="outline" size="xs" onClick={() => void loadReports()} disabled={loadingReports}>
+                {loadingReports ? "Refreshing…" : "Refresh"}
+              </Button>
+              <span className="text-[12px] text-[color:var(--color-text-quaternary)]">
+                trust scans — staleness + output-drift (read-only)
+              </span>
+            </div>
+            {reportsLoaded && !librarian && !audit && (
+              <p className="text-[12px] text-[color:var(--color-text-quaternary)]">
+                Could not load reports — is the memory wiki enabled (CODEXKIT_MEMORY)?
+              </p>
+            )}
+            {librarian && (
+              <>
+                <h4 className="text-[12px] font-medium text-foreground">Librarian — staleness</h4>
+                <div className="mt-1 grid grid-cols-2 gap-3">
+                  <Stat label="Pages scanned" value={librarian.pages} />
+                  <Stat label="Flagged for review" value={librarian.flagged} />
+                </div>
+                {librarian.stalest.length === 0 ? (
+                  <p className="mt-1 text-[12px] text-[color:var(--color-text-quaternary)]">No stale pages.</p>
+                ) : (
+                  <ul className="mt-2 space-y-1">
+                    {librarian.stalest.slice(0, 10).map((p) => (
+                      <li key={p.documentID} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                        {p.needsTier2 && <Badge variant="danger">flagged</Badge>}
+                        <Badge variant="outline">{p.volatility}</Badge>
+                        <span className="text-[12px] text-foreground">page #{p.documentID}</span>
+                        <span className="ml-auto shrink-0 text-[11px] text-[color:var(--color-text-quaternary)]">
+                          staleness {p.staleness.toFixed(1)} · {p.sourceCount} src · depth {p.depthProxy}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+            {audit && (
+              <>
+                <h4 className="mt-4 text-[12px] font-medium text-foreground">Audit — output drift</h4>
+                <div className="mt-1 grid grid-cols-3 gap-3">
+                  <Stat label="Tracked pages" value={audit.pages} />
+                  <Stat label="Drifted" value={audit.drifted} />
+                  <Stat label="Indirectly drifted" value={audit.indirectlyDrifted} />
+                </div>
+                {audit.pagesDetail.filter((p) => p.status !== "current").length === 0 ? (
+                  <p className="mt-1 text-[12px] text-[color:var(--color-text-quaternary)]">All pages current.</p>
+                ) : (
+                  <ul className="mt-2 space-y-1">
+                    {audit.pagesDetail.filter((p) => p.status !== "current").slice(0, 10).map((p) => (
+                      <li key={p.id} className="flex items-center gap-2 rounded-md border border-[color:var(--border)] px-3 py-2">
+                        <Badge variant={p.status === "drifted" ? "danger" : "outline"}>{p.status}</Badge>
+                        <span className="text-[12px] text-foreground">page #{p.id}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
             )}
           </TabsContent>
         </Tabs>

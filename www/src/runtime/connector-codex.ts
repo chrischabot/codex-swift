@@ -40,6 +40,8 @@ import type {
   WikiBrief,
   WikiGraph,
   WikiJobLine,
+  WikiAuditReport,
+  WikiLibrarianReport,
   WikiPage,
   WikiPageSummary,
   WikiTag,
@@ -1100,6 +1102,14 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
         }));
       } catch { return []; }
     },
+    getLibrarianReport: async () => {
+      try { return mapLibrarianReport((await rpc("wiki/librarian/report", {})) as Record<string, unknown>); }
+      catch { return null; }
+    },
+    getAuditReport: async () => {
+      try { return mapAuditReport((await rpc("wiki/audit/report", {})) as Record<string, unknown>); }
+      catch { return null; }
+    },
     startWikiResearch: async (params, onEvent) => {
       const r = (await rpc("wiki/research/start", params as unknown as Json)) as { jobId?: string };
       const jobId = r.jobId;
@@ -1174,6 +1184,36 @@ export function mapWikiIndexEntry(e: Record<string, unknown>): { id: string; tit
     }
   }
   return { id: idStr(e.id), title: pick(e, "title"), links, props };
+}
+
+/// Map the wiki/librarian/report wire shape → WikiLibrarianReport. Exported so the
+/// characterization tests lock the exact field names (documentID/needsTier2/…) against
+/// the Swift shaper — a rename breaks THESE, not the running app (silent-zero guard).
+export function mapLibrarianReport(r: Record<string, unknown>): WikiLibrarianReport {
+  const stalest = Array.isArray(r.stalest) ? (r.stalest as Record<string, unknown>[]) : [];
+  return {
+    pages: numOrU(r.pages) ?? 0,
+    flagged: numOrU(r.flagged) ?? 0,
+    stalest: stalest.map((p) => ({
+      documentID: numOrU(p.documentID) ?? 0,
+      volatility: pick(p, "volatility") || "warm",
+      staleness: numOrU(p.staleness) ?? 0,
+      needsTier2: p.needsTier2 === true,
+      sourceCount: numOrU(p.sourceCount) ?? 0,
+      depthProxy: numOrU(p.depthProxy) ?? 0,
+    })),
+  };
+}
+
+/// Map the wiki/audit/report wire shape → WikiAuditReport (see mapLibrarianReport).
+export function mapAuditReport(r: Record<string, unknown>): WikiAuditReport {
+  const detail = Array.isArray(r.pagesDetail) ? (r.pagesDetail as Record<string, unknown>[]) : [];
+  return {
+    pages: numOrU(r.pages) ?? 0,
+    drifted: numOrU(r.drifted) ?? 0,
+    indirectlyDrifted: numOrU(r.indirectlyDrifted) ?? 0,
+    pagesDetail: detail.map((p) => ({ id: numOrU(p.id) ?? 0, status: pick(p, "status") || "current" })),
+  };
 }
 
 // ── block / delta helpers ───────────────────────────────────────────────────

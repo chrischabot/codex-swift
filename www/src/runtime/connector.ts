@@ -250,6 +250,31 @@ export interface WikiWatchSource {
   due: boolean;
 }
 
+// ── Trust reports: Librarian Tier-1 staleness + Audit Pass-2 drift (read-only) ──
+export interface WikiLibrarianPage {
+  documentID: number;
+  volatility: string;  // hot | warm | cold
+  staleness: number;   // 0–100 composite (LOW = stale)
+  needsTier2: boolean; // flagged for a model coherence/utility review
+  sourceCount: number;
+  depthProxy: number;  // 1–5 (1–2 = thin)
+}
+export interface WikiLibrarianReport {
+  pages: number;
+  flagged: number;
+  stalest: WikiLibrarianPage[]; // stalest-first review queue
+}
+export interface WikiAuditPage {
+  id: number;
+  status: string; // drifted | indirectlyDrifted | current
+}
+export interface WikiAuditReport {
+  pages: number;
+  drifted: number;
+  indirectlyDrifted: number;
+  pagesDetail: WikiAuditPage[];
+}
+
 // ── Live jobs: streamed ingest/research (wiki/research/start, wiki/ingest/start) ──
 /** One streamed NDJSON line from a wiki job. `type` is "event" during the run and
  *  "result" at the end; the rest of the fields depend on `kind`. */
@@ -411,6 +436,10 @@ export interface Connector {
   getWikiStatus?(): Promise<WikiStatus | null>;
   /** Watched sources + their cadence / due status (the Watch tab). */
   getWikiWatch?(): Promise<WikiWatchSource[]>;
+  /** Librarian Tier-1 staleness report (Reports tab) — pure-local read. */
+  getLibrarianReport?(): Promise<WikiLibrarianReport | null>;
+  /** Audit Pass-2 output-drift report (Reports tab) — pure-local read. */
+  getAuditReport?(): Promise<WikiAuditReport | null>;
   /** Start a streamed research job; `onEvent` fires for each progress line until
    *  the terminal (`done=true`) result. Returns the jobId + a local unsubscribe. */
   startWikiResearch?(params: WikiResearchStartInput,

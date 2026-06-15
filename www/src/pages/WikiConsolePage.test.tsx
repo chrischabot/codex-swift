@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { RuntimeProvider } from "@/runtime/RuntimeProvider";
 import { makeMockConnector } from "@/runtime/connector-mock";
-import type { Connector, WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource } from "@/runtime/connector";
+import type { Connector, WikiPageSummary, WikiBrief, WikiStatus, WikiWatchSource, WikiLibrarianReport, WikiAuditReport } from "@/runtime/connector";
 import { WikiConsolePage } from "./WikiConsolePage";
 
 afterEach(cleanup);
@@ -96,5 +96,35 @@ describe("WikiConsolePage", () => {
     expect(screen.getByText("https://blog/feed")).toBeTruthy();
     expect(screen.getByText("due now")).toBeTruthy();
     expect(getWikiWatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads the trust reports (librarian + audit) when the Reports tab opens", async () => {
+    const librarian: WikiLibrarianReport = {
+      pages: 2, flagged: 1,
+      stalest: [
+        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2 },
+        { documentID: 99, volatility: "cold", staleness: 92, needsTier2: false, sourceCount: 6, depthProxy: 4 },
+      ],
+    };
+    const audit: WikiAuditReport = {
+      pages: 2, drifted: 1, indirectlyDrifted: 0,
+      pagesDetail: [{ id: 7, status: "drifted" }, { id: 5, status: "current" }],
+    };
+    const getLibrarianReport = vi.fn(async () => librarian);
+    const getAuditReport = vi.fn(async () => audit);
+    const connector = { ...makeMockConnector(), getLibrarianReport, getAuditReport } as Connector;
+    renderWith(connector);
+
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: /reports/i }), { button: 0 });
+    // librarian section
+    await waitFor(() => expect(screen.getByText("Librarian — staleness")).toBeTruthy());
+    expect(screen.getByText("Flagged for review")).toBeTruthy();
+    expect(screen.getByText("page #12")).toBeTruthy();
+    // audit section — the drifted page surfaces, the current one is filtered out
+    expect(screen.getByText("Audit — output drift")).toBeTruthy();
+    expect(screen.getByText("page #7")).toBeTruthy();
+    expect(screen.queryByText("page #5")).toBeNull();   // status=current is hidden in the audit list
+    expect(getLibrarianReport).toHaveBeenCalledTimes(1);
+    expect(getAuditReport).toHaveBeenCalledTimes(1);
   });
 });

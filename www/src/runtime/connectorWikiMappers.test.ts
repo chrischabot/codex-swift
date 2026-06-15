@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { idStr, mapWikiSummary, mapWikiPage, mapWikiIndexEntry } from "./connector-codex";
+import { idStr, mapWikiSummary, mapWikiPage, mapWikiIndexEntry, mapLibrarianReport, mapAuditReport } from "./connector-codex";
 
 // Characterization tests: lock the wire contract between the Swift wiki/* RPCs
 // (ids arrive as integers; fields like data/props/links may be missing) and the
@@ -83,5 +83,48 @@ describe("mapWikiIndexEntry", () => {
 
   it("a missing id maps to empty string (caller drops it via .filter(e=>e.id))", () => {
     expect(mapWikiIndexEntry({ title: "no id" }).id).toBe("");
+  });
+});
+
+describe("mapLibrarianReport", () => {
+  it("maps the exact Swift wire keys (documentID/needsTier2/depthProxy/…)", () => {
+    const r = mapLibrarianReport({
+      pages: 5, flagged: 2,
+      stalest: [
+        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2 },
+      ],
+    });
+    expect(r.pages).toBe(5);
+    expect(r.flagged).toBe(2);
+    expect(r.stalest).toHaveLength(1);
+    expect(r.stalest[0]).toEqual({
+      documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2,
+    });
+  });
+  it("defaults missing/empty fields (a Swift rename → zeros here, not silently in the UI)", () => {
+    const r = mapLibrarianReport({});
+    expect(r).toEqual({ pages: 0, flagged: 0, stalest: [] });
+    // a row missing documentID + a non-boolean needsTier2 default safely
+    const r2 = mapLibrarianReport({ stalest: [{ staleness: 50 }] });
+    expect(r2.stalest[0].documentID).toBe(0);
+    expect(r2.stalest[0].volatility).toBe("warm");
+    expect(r2.stalest[0].needsTier2).toBe(false);
+  });
+});
+
+describe("mapAuditReport", () => {
+  it("maps the exact Swift wire keys (pagesDetail/indirectlyDrifted/…)", () => {
+    const r = mapAuditReport({
+      pages: 3, drifted: 1, indirectlyDrifted: 1,
+      pagesDetail: [{ id: 7, status: "drifted" }, { id: 3, status: "current" }],
+    });
+    expect(r.pages).toBe(3);
+    expect(r.drifted).toBe(1);
+    expect(r.indirectlyDrifted).toBe(1);
+    expect(r.pagesDetail).toEqual([{ id: 7, status: "drifted" }, { id: 3, status: "current" }]);
+  });
+  it("defaults missing fields", () => {
+    expect(mapAuditReport({})).toEqual({ pages: 0, drifted: 0, indirectlyDrifted: 0, pagesDetail: [] });
+    expect(mapAuditReport({ pagesDetail: [{}] }).pagesDetail[0]).toEqual({ id: 0, status: "current" });
   });
 });

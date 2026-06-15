@@ -50,3 +50,12 @@ test("Watch tab lists watched sources", async ({ page }) => {
   await expect(page.getByText("https://github.com/openai")).toBeVisible();
   await expect(page.getByText("due now")).toBeVisible();
 });
+
+test("Reports tab shows librarian + audit trust scans", async ({ page }) => {
+  await page.getByRole("tab", { name: "Reports", exact: true }).click();
+  await expect(page.getByText("Librarian — staleness")).toBeVisible();
+  await expect(page.getByText("Flagged for review")).toBeVisible();
+  await expect(page.getByText("Audit — output drift")).toBeVisible();
+  // the drifted page surfaces; the mock has one drifted + one indirectly-drifted.
+  await expect(page.getByText("drifted", { exact: true })).toBeVisible();
+});

@@ -398,6 +398,25 @@ export function makeMockConnector(): Connector {
       { id: "https://github.com/openai", cadence: "hot", status: "active", errorCount: 0, due: true },
       { id: "https://blog.example.com/feed", cadence: "warm", status: "paused", errorCount: 0, due: false },
     ],
+    getLibrarianReport: async () => ({
+      pages: 3,
+      flagged: 2,
+      stalest: [
+        { documentID: 12, volatility: "hot", staleness: 18.4, needsTier2: true, sourceCount: 1, depthProxy: 2 },
+        { documentID: 7, volatility: "warm", staleness: 41.2, needsTier2: true, sourceCount: 3, depthProxy: 3 },
+        { documentID: 3, volatility: "cold", staleness: 92.0, needsTier2: false, sourceCount: 6, depthProxy: 4 },
+      ],
+    }),
+    getAuditReport: async () => ({
+      pages: 3,
+      drifted: 1,
+      indirectlyDrifted: 1,
+      pagesDetail: [
+        { id: 7, status: "drifted" },
+        { id: 12, status: "indirectlyDrifted" },
+        { id: 3, status: "current" },
+      ],
+    }),
     startWikiResearch: async (params, onEvent) => {
       const seq: Array<[WikiJobLine, boolean]> = [
         [{ type: "event", kind: "started", mode: params.mode || "topic" }, false],
