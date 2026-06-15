@@ -248,7 +248,42 @@ public enum CodeModeRuntime {
                 context.setObject(hostCall,
                                   forKeyedSubscript: "__codex_call_tool" as NSString)
 
-                let prelude = "var __logs=[]; var console={log:function(){__logs.push(Array.prototype.slice.call(arguments).map(String).join(' '));}}; globalThis.callTool=function(n,a){var r=__codex_call_tool(n, JSON.stringify(a||{})); try { return JSON.parse(r); } catch(e) { return r; } };"
+                // Base bridge (callTool + console) + the upstream code-mode
+                // OUTPUT-HELPER surface (P5b): scripts compose a structured output
+                // by calling image()/generatedImage()/text(), and keep per-run
+                // state via store()/load(). The host collects `__codex_output`
+                // after the run, validates it (#27732: no remote image URLs), and
+                // appends it to the tool output. Helpers VALIDATE in JS for early
+                // feedback, but the host re-validates (a script can push to
+                // `__codex_output` directly), so the security rule is authoritative.
+                let prelude = """
+                var __logs=[];
+                var console={log:function(){__logs.push(Array.prototype.slice.call(arguments).map(String).join(' '));}};
+                globalThis.callTool=function(n,a){var r=__codex_call_tool(n, JSON.stringify(a||{})); try { return JSON.parse(r); } catch(e) { return r; } };
+                globalThis.__codex_output=[];
+                globalThis.__codex_store={};
+                function __codex_imageUrl(arg){
+                  var u=(typeof arg==='string')?arg:(arg&&arg.image_url);
+                  if(u==null) throw new Error('image: expected a string URL or { image_url }');
+                  var l=String(u).toLowerCase();
+                  if(l.indexOf('http://')===0||l.indexOf('https://')===0)
+                    throw new Error('Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead');
+                  return u;
+                }
+                globalThis.image=function(arg,detail){
+                  var u=__codex_imageUrl(arg);
+                  var d=(detail!=null)?detail:(arg&&typeof arg==='object'?arg.detail:null);
+                  __codex_output.push({type:'image', image_url:u, detail:(d!=null?d:null)});
+                };
+                globalThis.generatedImage=function(result){
+                  if(!result||result.image_url==null) throw new Error('generatedImage: expected { image_url }');
+                  var u=__codex_imageUrl(result.image_url);
+                  __codex_output.push({type:'generated_image', image_url:u, output_hint:(result.output_hint!=null?result.output_hint:null)});
+                };
+                globalThis.text=function(s){ __codex_output.push({type:'text', text:String(s)}); };
+                globalThis.store=function(k,v){ __codex_store[String(k)]=v; };
+                globalThis.load=function(k){ var v=__codex_store[String(k)]; return v===undefined?null:v; };
+                """
                 context.evaluateScript(prelude)
 
                 let wrapped = "(function(){\n" + source + "\n})()"
@@ -278,6 +313,30 @@ public enum CodeModeRuntime {
                    let arr = logsValue.toArray(), !arr.isEmpty {
                     let joined = arr.map { "\($0)" }.joined(separator: "\n")
                     output += "\n[console]\n" + joined
+                }
+
+                // Collect the code-mode OUTPUT items the script composed.
+                let outputItems = (context.objectForKeyedSubscript("__codex_output")?
+                    .toArray() ?? []).compactMap { $0 as? [String: Any] }
+                // #27732 (AUTHORITATIVE host-side rule): a script can bypass the JS
+                // helper validation by pushing to `__codex_output` directly, so the
+                // host rejects any remote (http/https) image URL here.
+                for item in outputItems {
+                    let t = item["type"] as? String
+                    if t == "image" || t == "generated_image",
+                       let url = (item["image_url"] as? String)?.lowercased(),
+                       url.hasPrefix("http://") || url.hasPrefix("https://") {
+                        cont.resume(returning: (
+                            "Tool call failed: remote image URLs are not supported in tool outputs. "
+                            + "Pass a base64 data URI instead", false))
+                        return
+                    }
+                }
+                if !outputItems.isEmpty,
+                   let data = try? JSONSerialization.data(
+                       withJSONObject: outputItems, options: [.sortedKeys, .withoutEscapingSlashes]),
+                   let s = String(data: data, encoding: .utf8) {
+                    output += (output.isEmpty ? "" : "\n") + "[code-mode output]\n" + s
                 }
 
                 cont.resume(returning: (output, true))
