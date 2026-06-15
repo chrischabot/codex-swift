@@ -61,6 +61,14 @@ private actor Recorder {
     var roundCount: Int { rounds.count }
 }
 
+// A Sendable, lock-guarded event recorder for the @Sendable progress closure.
+private final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [ResearchProgress] = []
+    func append(_ e: ResearchProgress) { lock.lock(); events.append(e); lock.unlock() }
+    var all: [ResearchProgress] { lock.lock(); defer { lock.unlock() }; return events }
+}
+
 // A monotonic injected clock: each read advances by `step` seconds.
 private final class FakeClock: @unchecked Sendable {
     private let lock = NSLock()
@@ -189,6 +197,33 @@ final class WikiResearchOrchestratorTests: XCTestCase {
         let angles = await rec.anglesForRound(1)
         XCTAssertEqual(angles?.count, 5)
         XCTAssertTrue(angles?.contains("Opposing") ?? false)   // steelman angle present
+    }
+
+    // MARK: progress stream
+
+    func testProgressEventsEmittedInOrder() async throws {
+        let log = EventLog()
+        let swarm = CapturingSwarm(perRound: { _ in makeSources(3) }, recorder: Recorder())
+        let compiler = ScriptedCompiler { _, n in
+            CompileOutcome(articlesCreatedOrUpdated: n, crossRefsAdded: 4, existingArticles: 0, crossRefDensity: 0.2)
+        }
+        let orch = orchestrator(swarm: swarm, compiler: compiler, reflector: ScriptedReflector { _ in [] })
+        let config = ResearchConfig(onProgress: { log.append($0) })
+        let r = await orch.run(input: "graph neural networks", sessionID: "S", config: config)
+        XCTAssertEqual(r.status, "completed")
+
+        let events = log.all
+        // started → roundStarted → sourcesGathered → compiled → roundCompleted → finished
+        guard case .started(let mode) = events.first, mode == .topic else {
+            return XCTFail("first event should be .started(topic): \(events)")
+        }
+        XCTAssertTrue(events.contains(.roundStarted(round: 1)))
+        XCTAssertTrue(events.contains(.sourcesGathered(round: 1, count: 3)))
+        XCTAssertTrue(events.contains { if case .compiled(1, _, 4) = $0 { return true }; return false })
+        XCTAssertTrue(events.contains { if case .roundCompleted(1, _) = $0 { return true }; return false })
+        guard case .finished(let st, let rounds, _) = events.last, st == "completed", rounds == 1 else {
+            return XCTFail("last event should be .finished(completed,1): \(events)")
+        }
     }
 
     // MARK: retardmax skips reflection

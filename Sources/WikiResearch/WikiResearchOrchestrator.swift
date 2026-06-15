@@ -1,5 +1,15 @@
 import Foundation
 
+/// A live progress event emitted during a research run (for the WS job stream).
+public enum ResearchProgress: Sendable, Equatable {
+    case started(mode: ResearchMode)
+    case roundStarted(round: Int)
+    case sourcesGathered(round: Int, count: Int)
+    case compiled(round: Int, written: Int, claims: Int)
+    case roundCompleted(round: Int, score: Int)
+    case finished(status: String, rounds: Int, score: Int)
+}
+
 /// Config for a research run.
 public struct ResearchConfig: Sendable {
     public var depth: ResearchDepth
@@ -7,12 +17,14 @@ public struct ResearchConfig: Sendable {
     public var sourcesPerRound: Int               // top-N selection after dedupe
     public var maxRounds: Int                     // hard safety cap
     public var sessionStore: ResearchSessionStore? // the 3 corpus-root files (source of truth)
+    public var onProgress: (@Sendable (ResearchProgress) -> Void)?  // live stream hook
     public init(depth: ResearchDepth = .standard, minTimeBudget: Int64? = nil,
                 sourcesPerRound: Int = 5, maxRounds: Int = 5,
-                sessionStore: ResearchSessionStore? = nil) {
+                sessionStore: ResearchSessionStore? = nil,
+                onProgress: (@Sendable (ResearchProgress) -> Void)? = nil) {
         self.depth = depth; self.minTimeBudget = minTimeBudget
         self.sourcesPerRound = sourcesPerRound; self.maxRounds = maxRounds
-        self.sessionStore = sessionStore
+        self.sessionStore = sessionStore; self.onProgress = onProgress
     }
 }
 
@@ -44,6 +56,7 @@ public struct WikiResearchOrchestrator: Sendable {
         try? ss?.writeSession(session)
         try? ss?.appendEvent(SessionEvent(ts: start, phase: "start", event: "research_started",
                                           notes: "mode=\(mode.rawValue)"))
+        config.onProgress?(.started(mode: mode))
 
         var rounds: [RoundRecord] = []
         var history: [Int] = []
@@ -67,6 +80,7 @@ public struct WikiResearchOrchestrator: Sendable {
                 }
                 roundNum += 1
                 let roundStart = now()
+                config.onProgress?(.roundStarted(round: roundNum))
 
                 // Phase 1 + 2 angle selection. Round 1 = the broad angle table (or the
                 // probe's decomposed sub-questions for question mode); round 2+ drills
@@ -89,8 +103,11 @@ public struct WikiResearchOrchestrator: Sendable {
                                                        round: roundNum, gaps: gaps)
                 // Dedupe + select top-N.
                 let survivors = SourceDedup.dedupe(gathered, keep: config.sourcesPerRound)
+                config.onProgress?(.sourcesGathered(round: roundNum, count: survivors.count))
                 // Phase 4-5: ingest + compile.
                 let outcome = try await compiler.compile(topic: input, sources: survivors, round: roundNum)
+                config.onProgress?(.compiled(round: roundNum, written: outcome.articlesCreatedOrUpdated,
+                                             claims: outcome.crossRefsAdded))
 
                 let avgCred = survivors.isEmpty ? 0
                     : Double(survivors.map(\.credibility).reduce(0, +)) / Double(survivors.count)
@@ -115,6 +132,7 @@ public struct WikiResearchOrchestrator: Sendable {
                                                   round: roundNum, sourcesIngested: survivors.count,
                                                   articlesCompiled: outcome.articlesCreatedOrUpdated,
                                                   progressScore: score))
+                config.onProgress?(.roundCompleted(round: roundNum, score: score))
                 try? ss?.writeCheckpoint(SessionCheckpoint(sessionID: sessionID, updatedAt: ts,
                                                            status: "in_progress",
                                                            summary: "round \(roundNum): score \(score)",
@@ -155,6 +173,7 @@ public struct WikiResearchOrchestrator: Sendable {
             try? ss?.writeSession(session)
             try? ss?.appendEvent(SessionEvent(ts: now(), phase: "finish", event: "research_failed",
                                               round: roundNum, notes: "\(error)"))
+            config.onProgress?(.finished(status: "failed", rounds: rounds.count, score: history.last ?? 0))
             return ResearchResult(sessionID: sessionID, mode: mode, roundsCompleted: rounds.count,
                                   cumulativeSources: session.cumulativeSources,
                                   cumulativeArticles: session.cumulativeArticles,
@@ -174,6 +193,7 @@ public struct WikiResearchOrchestrator: Sendable {
         try? ss?.appendEvent(SessionEvent(ts: end, phase: "finish", event: "research_completed",
                                           round: roundNum, notes: "rounds=\(rounds.count)"))
         try? ss?.clearSession()
+        config.onProgress?(.finished(status: "completed", rounds: rounds.count, score: history.last ?? 0))
         return ResearchResult(sessionID: sessionID, mode: mode, roundsCompleted: rounds.count,
                               cumulativeSources: session.cumulativeSources,
                               cumulativeArticles: session.cumulativeArticles,
