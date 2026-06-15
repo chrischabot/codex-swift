@@ -1,10 +1,13 @@
 import Foundation
 
 /// Which job the sandboxed child runs. `probe` = header-only metadata (the
-/// original verb); `extract` = text/markdown extraction (PDF). Back-compat: a
-/// 2-arg invocation (`<kind> <path>`) still means probe.
+/// original verb); `extract` = text/markdown extraction (PDF); `statOnly` =
+/// kind-agnostic byte stat (size + bounded line count + capped sample) for
+/// untrusted DATA/text files (datasets), no decode. Back-compat: a 2-arg
+/// invocation `<kind> <path>` still means probe; `stat <path>` means statOnly.
 public enum MediaVerb: String, Sendable, Codable, CaseIterable {
     case probe, extract
+    case statOnly = "stat"
 }
 
 /// Outcome of a text extraction (distinct from a hard error: an image-only PDF

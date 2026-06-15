@@ -19,6 +19,11 @@ import MediaDecode
 struct MediaDecodeMain {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
+        // `stat <path>` → statOnly (kind-agnostic byte stat). Handled first because it
+        // takes no MediaKind. Never returns.
+        if args.count == 2, MediaVerb(rawValue: args[0]) == .statOnly, !args[1].isEmpty {
+            runStat(path: args[1])
+        }
         // 2 args = `<kind> <path>` → probe (back-compat). 3 args = `<verb> <kind> <path>`.
         let verb: MediaVerb
         let kindStr: String
@@ -55,7 +60,31 @@ struct MediaDecodeMain {
             catch let e as MediaExtractError { response = .error(e) }
             catch { response = .error(.internalError) }
             emitExtract(response)
+        case .statOnly:
+            runStat(path: path)   // unreachable (handled before kind parse); defensive
         }
+    }
+
+    /// The `statOnly` path: self-limit, then bounded byte-stat. Kind-agnostic, so it
+    /// never goes through the MediaKind parse. Never returns.
+    static func runStat(path: String) -> Never {
+        let caps = loadCaps().clamped()
+        let unset = ChildResourceLimits.applySelf(caps)
+        if !unset.isEmpty {
+            FileHandle.standardError.write(Data("codex-mediadecode: could not set rlimits: \(unset.joined(separator: ","))\n".utf8))
+        }
+        let response: MediaStatResponse
+        do { response = .ok(try MediaStatter.stat(path: path, caps: caps)) }
+        catch let e as MediaExtractError { response = .error(e) }
+        catch { response = .error(.internalError) }
+        emitStat(response)
+    }
+
+    static func emitStat(_ resp: MediaStatResponse) -> Never {
+        if let data = try? JSONEncoder().encode(resp), let json = String(data: data, encoding: .utf8) {
+            FileHandle.standardOutput.write(Data((json + "\n").utf8))
+        }
+        exit(resp.isOK ? 0 : 1)
     }
 
     static func emitExtract(_ resp: MediaExtractResponse) -> Never {

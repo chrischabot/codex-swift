@@ -102,6 +102,38 @@ public struct SandboxedMediaDecoder: Sendable {
                               killFailure: { MediaExtractError(probe: $0) })
     }
 
+    /// Byte-stat `path` under the SAME confinement as `probe`/`extract`. Kind-agnostic
+    /// (no MediaKind) — the sandboxed counterpart of the in-process dataset profiler, for
+    /// stat-ing UNTRUSTED data/text files. Never throws — every failure is a typed
+    /// `MediaExtractError`.
+    public func stat(path: String,
+                     caps rawCaps: MediaDecodeCaps = MediaDecodeCaps())
+    async -> Result<MediaStatResult, MediaExtractError> {
+        let caps = rawCaps.clamped()
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue,
+              fm.isReadableFile(atPath: path) else { return .failure(.unreadable) }
+        if let size = (try? fm.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue,
+           size > caps.maxInputBytes { return .failure(.oversizeInput) }
+        guard let helper = helperPath ?? Self.resolveHelper(), fm.isExecutableFile(atPath: helper) else {
+            return .failure(.helperUnavailable)
+        }
+        let policy = SandboxPolicy(mode: .readOnly, writableRoots: [], networkAllowed: false)
+        let sandbox = WorkspaceSandbox(policy)
+        let dir = (path as NSString).deletingLastPathComponent
+        let cwd = dir.isEmpty ? "/" : dir
+        let argv: [String]
+        // statOnly is kind-agnostic: `stat <path>` (2 args).
+        switch sandbox.sandboxedInvocation(argv: [helper, MediaVerb.statOnly.rawValue, path], cwd: cwd) {
+        case .run(let a): argv = a
+        case .deny: return .failure(.helperUnavailable)
+        }
+        return await runChild(argv: argv, caps: caps,
+                              parse: Self.parseStat,
+                              killFailure: { MediaExtractError(probe: $0) })
+    }
+
     // MARK: child process
 
     private func runChild<S, F: Error>(argv: [String], caps: MediaDecodeCaps,
@@ -235,6 +267,20 @@ public struct SandboxedMediaDecoder: Sendable {
     -> Result<MediaExtractResult, MediaExtractError> {
         if signalled { return .failure(.childCrashed) }
         if !data.isEmpty, let resp = try? JSONDecoder().decode(MediaExtractResponse.self, from: data) {
+            switch resp {
+            case .ok(let r):    return exitCode == 0 ? .success(r) : .failure(.childCrashed)
+            case .error(let e): return .failure(e)
+            }
+        }
+        return .failure(exitCode == 0 ? .internalError : .childCrashed)
+    }
+
+    /// statOnly counterpart of `parse` (same signalled-first / nonzero-exit distrust
+    /// discipline, MediaStatResponse wire shape).
+    static func parseStat(_ data: Data, _ exitCode: Int, _ signalled: Bool)
+    -> Result<MediaStatResult, MediaExtractError> {
+        if signalled { return .failure(.childCrashed) }
+        if !data.isEmpty, let resp = try? JSONDecoder().decode(MediaStatResponse.self, from: data) {
             switch resp {
             case .ok(let r):    return exitCode == 0 ? .success(r) : .failure(.childCrashed)
             case .error(let e): return .failure(e)

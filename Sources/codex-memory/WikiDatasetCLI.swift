@@ -1,5 +1,6 @@
 import Foundation
 import MemoryStore
+import MediaDecode   // SandboxedMediaDecoder.stat (the --sandbox profiling path)
 
 /// `codex-memory wiki-dataset <verb> [flags]` — index large/external/mutable data with
 /// manifests + notes (samples / profiles / query-recipes). The wiki is the interface;
@@ -12,7 +13,7 @@ import MemoryStore
 ///   add   --id D --title T --status S --storage (local|remote|external|hybrid)
 ///         [--locations --formats --license --summary --refresh-cadence]
 ///   show  <dataset-id> [--json]
-///   profile <dataset-id> --path <local-file> [--rows N]
+///   profile <dataset-id> --path <local-file> [--rows N] [--sandbox]   (--sandbox: stat under Seatbelt)
 ///   note  <dataset-id> --kind (sample|profile|query) --title T --body B
 enum CodexMemoryWikiDataset {
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
@@ -71,7 +72,7 @@ enum CodexMemoryWikiDataset {
     /// LOCAL/HYBRID manifests profile the given path (bounded) and store a profile + a
     /// capped sample note, updating the manifest's size_bytes/record_count.
     static func runProfile(_ args: [String], store: MemoryStore, now: Int64) async throws -> (String, Bool) {
-        var id = "", path: String?; var rows = maxSampleRows; var i = 0
+        var id = "", path: String?; var rows = maxSampleRows; var sandbox = false; var i = 0
         func val(_ f: String) throws -> String {
             i += 1; guard i < args.count else { throw CLIError(message: "\(f) requires a value") }
             return args[i]
@@ -79,6 +80,7 @@ enum CodexMemoryWikiDataset {
         while i < args.count {
             switch args[i] {
             case "--path": path = try val("--path")
+            case "--sandbox": sandbox = true   // stat under the Seatbelt child (untrusted files)
             case "--rows":
                 guard let n = Int(try val("--rows")), n > 0 else { throw CLIError(message: "--rows must be a positive integer") }
                 rows = min(n, maxSampleRows)   // hard cap — never store more than 20 rows
@@ -99,8 +101,11 @@ enum CodexMemoryWikiDataset {
             return ("wiki-dataset: \(id) is \(m.storage) — recorded a planned-steps note, fetched nothing\n", true)
         }
         guard let path else { throw CLIError(message: "profile requires --path for a \(m.storage) dataset") }
-        guard let p = DatasetProfiler.profileLocalFile(path: path, rowCap: rows) else {
-            return ("wiki-dataset: could not read '\(path)'\n", false)
+        let profile = sandbox
+            ? await DatasetProfiler.profileSandboxed(path: path, rowCap: rows)
+            : DatasetProfiler.profileLocalFile(path: path, rowCap: rows)
+        guard let p = profile else {
+            return ("wiki-dataset: could not \(sandbox ? "sandbox-stat" : "read") '\(path)'\n", false)
         }
         let lineStr = p.lineCount < 0 ? "≥\(p.sample.count) (file exceeds the read cap)" : String(p.lineCount)
         let profileBody = "Local file `\(path)`\n- size: \(p.sizeBytes) bytes\n- lines: \(lineStr)\n"
@@ -282,5 +287,21 @@ enum DatasetProfiler {
         // Exact count only when the whole file fit within the read cap.
         let lineCount = truncated ? -1 : lines.count
         return DatasetProfile(sizeBytes: size, lineCount: lineCount, sample: sample, truncated: truncated)
+    }
+
+    /// `--sandbox` profiling: run the bounded stat inside the Seatbelt `codex-mediadecode`
+    /// child (read-only, no-network, rlimit-capped) instead of in-process — for stat-ing
+    /// UNTRUSTED data files. Maps the typed `MediaStatResult` back into a `DatasetProfile`
+    /// (sample re-trimmed to the caller's rowCap; the child already hard-caps at 20).
+    /// Returns nil on any sandbox failure (helper unavailable / oversize / unreadable).
+    static func profileSandboxed(path: String, rowCap: Int = 20) async -> DatasetProfile? {
+        switch await SandboxedMediaDecoder().stat(path: path) {
+        case .success(let s):
+            let cap = min(max(1, rowCap), hardSampleCap)
+            return DatasetProfile(sizeBytes: Int64(s.byteSize), lineCount: s.lineCount,
+                                  sample: Array(s.sample.prefix(cap)), truncated: s.truncated)
+        case .failure:
+            return nil
+        }
     }
 }
