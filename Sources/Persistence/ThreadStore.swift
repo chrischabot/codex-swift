@@ -64,6 +64,10 @@ public struct GoalState: Sendable, Equatable {
 /// threads are in-memory only.
 public actor ThreadStore {
     public let codexHome: String
+    /// Non-nil when the state DB was auto-rebuilt from a corrupt on-disk file at
+    /// open (StateDB recovery, #26859). The supervisor/daemon can surface this as
+    /// a `configWarning` ("Codex rebuilt its local database").
+    public nonisolated let recoveryNotice: String?
     private let db: StateDB
     private let limits: Limits
     private var writers: [String: RolloutWriter] = [:]
@@ -104,7 +108,9 @@ public actor ThreadStore {
         self.codexHome = codexHome
         self.limits = limits
         try? FileManager.default.createDirectory(atPath: codexHome, withIntermediateDirectories: true)
-        self.db = try StateDB(path: codexHome + "/state.sqlite3")
+        let db = try StateDB(path: codexHome + "/state.sqlite3")
+        self.db = db
+        self.recoveryNotice = db.recoveryNotice
     }
 
     /// Compute the rollout file path for a NEW session, in upstream's

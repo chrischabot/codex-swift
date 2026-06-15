@@ -4,12 +4,21 @@ import ProtocolModel
 
 public enum StateDBError: Error, Sendable, CustomStringConvertible {
     case open(String), exec(String), prepare(String), step(String)
+    /// On-disk corruption detected via the SQLite result code (SQLITE_CORRUPT /
+    /// SQLITE_NOTADB), NOT by scanning error text. The ONLY error class that
+    /// triggers the destructive backup-and-rebuild recovery.
+    case corrupt(String)
+    /// Recovery itself failed (could not move the corrupt file aside). Carries
+    /// the underlying corruption so the real cause is never masked.
+    case recoveryFailed(String)
     public var description: String {
         switch self {
         case .open(let s): return "sqlite open: \(s)"
         case .exec(let s): return "sqlite exec: \(s)"
         case .prepare(let s): return "sqlite prepare: \(s)"
         case .step(let s): return "sqlite step: \(s)"
+        case .corrupt(let s): return "sqlite corrupt: \(s)"
+        case .recoveryFailed(let s): return "sqlite recovery failed: \(s)"
         }
     }
 }
@@ -86,21 +95,88 @@ public actor StateDB {
     // SQLITE_TRANSIENT: tell sqlite to copy bound text/blob.
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+    /// Non-nil when this DB was auto-rebuilt because the on-disk file was
+    /// corrupt/unreadable (upstream #26859 `init_sqlite_state_db_with_fresh_start
+    /// _on_corruption`). The corrupt file (+ WAL/SHM) was backed up; callers may
+    /// surface this to the user (a `configWarning` / "Codex rebuilt its local
+    /// database" notice).
+    public nonisolated let recoveryNotice: String?
+
     public init(path: String) throws {
+        do {
+            self.handle = try Self.openAndSetup(path)
+            self.recoveryNotice = nil
+        } catch let error as StateDBError {
+            // Auto-recover ONLY from on-disk corruption identified by the SQLite
+            // RESULT CODE (StateDBError.corrupt). Any other failure (permissions,
+            // OOM, locked, missing parent dir) is rethrown — we must never
+            // discard a healthy database.
+            guard case .corrupt = error,
+                  FileManager.default.fileExists(atPath: path) else {
+                throw error
+            }
+            // Move the corrupt file aside. If that FAILS the corrupt file is still
+            // present, so we must NOT reopen it (it would just re-throw and
+            // falsely claim a backup) — surface a distinct recoveryFailed error
+            // that preserves the original corruption.
+            let backup: String
+            do {
+                backup = try Self.backupCorruptDatabase(path)
+            } catch let moveError {
+                throw StateDBError.recoveryFailed(
+                    "could not move corrupt DB aside (\(moveError)); original: \(error)")
+            }
+            // The corrupt file is now gone from `path`, so this opens a fresh DB.
+            self.handle = try Self.openAndSetup(path)
+            self.recoveryNotice =
+                "Codex rebuilt its local database; the unreadable file was backed up to \(backup)."
+        }
+    }
+
+    /// Open the DB and run PRAGMAs + schema setup. A corrupt file may `open`
+    /// lazily but fails here when the first page / `sqlite_master` is read.
+    /// Corruption is classified by the SQLite RESULT CODE (while the handle is
+    /// alive), never by error-message text, so a path/SQL coincidence cannot
+    /// misclassify a healthy DB as corrupt.
+    private static func openAndSetup(_ path: String) throws -> SQLiteHandle {
         var raw: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         let rc = sqlite3_open_v2(path, &raw, flags, nil)
         guard rc == SQLITE_OK, let h = raw else {
+            let corrupt = isCorruptResultCode(rc)
             if let r = raw { sqlite3_close_v2(r) }
-            throw StateDBError.open("rc=\(rc) path=\(path)")
+            throw corrupt ? StateDBError.corrupt("open rc=\(rc)")
+                          : StateDBError.open("rc=\(rc) path=\(path)")
         }
-        // Assigned before schema setup: if setup throws, releasing `handle`
-        // runs SQLiteHandle.deinit which closes the database.
-        self.handle = SQLiteHandle(h)
-        try Self.execRaw(h, "PRAGMA journal_mode=WAL;")
-        try Self.execRaw(h, "PRAGMA synchronous=NORMAL;")
-        try Self.execRaw(h, "PRAGMA busy_timeout=5000;")
-        try Self.execRaw(h, """
+        // Releasing this handle on a thrown error runs SQLiteHandle.deinit (close).
+        let handle = SQLiteHandle(h)
+        do {
+            try setupSchema(h)
+        } catch {
+            // Capture the SQLite result code WHILE the handle is alive to classify
+            // corruption deterministically.
+            let corrupt = isCorruptResultCode(sqlite3_errcode(h))
+                || isCorruptResultCode(sqlite3_extended_errcode(h))
+            if corrupt { throw StateDBError.corrupt("setup: \(error)") }
+            throw error
+        }
+        return handle
+    }
+
+    /// True for SQLITE_CORRUPT / SQLITE_NOTADB (primary or extended result code).
+    static func isCorruptResultCode(_ rc: Int32) -> Bool {
+        let primary = rc & 0xFF
+        return primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB
+    }
+
+    private static func setupSchema(_ h: OpaquePointer) throws {
+        try execRaw(h, "PRAGMA journal_mode=WAL;")
+        try execRaw(h, "PRAGMA synchronous=NORMAL;")
+        try execRaw(h, "PRAGMA busy_timeout=5000;")
+        // Force a read of sqlite_master so a corrupt-but-openable file is detected
+        // here (deterministic recovery point) rather than on a later query.
+        try execRaw(h, "PRAGMA schema_version;")
+        try execRaw(h, """
         CREATE TABLE IF NOT EXISTS threads(
           id TEXT PRIMARY KEY,
           cwd TEXT NOT NULL,
@@ -121,14 +197,14 @@ public actor StateDB {
         );
         """)
         // Best-effort migrations for indexes created by an older schema.
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN name TEXT;")
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN memory_mode TEXT NOT NULL DEFAULT 'enabled';")
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN git_sha TEXT;")
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN git_branch TEXT;")
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN git_origin_url TEXT;")
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")
-        try? Self.execRaw(h, "ALTER TABLE threads ADD COLUMN archived_at INTEGER;")
-        try Self.execRaw(h, """
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN name TEXT;")
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN memory_mode TEXT NOT NULL DEFAULT 'enabled';")
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN git_sha TEXT;")
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN git_branch TEXT;")
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN git_origin_url TEXT;")
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;")
+        try? execRaw(h, "ALTER TABLE threads ADD COLUMN archived_at INTEGER;")
+        try execRaw(h, """
         CREATE TABLE IF NOT EXISTS goals(
           thread_id TEXT PRIMARY KEY,
           objective TEXT NOT NULL,
@@ -140,6 +216,32 @@ public actor StateDB {
           updated_at INTEGER NOT NULL
         );
         """)
+    }
+
+    /// Move the corrupt DB (+ WAL/SHM sidecars) aside so a fresh DB can be
+    /// created at `path`. The primary move is AUTHORITATIVE — it THROWS on
+    /// failure so the caller never reopens the still-corrupt file or claims a
+    /// non-existent backup. The backup name is collision-proof (a UUID, not a
+    /// 1-second timestamp) and never overwrites an existing backup, so two
+    /// processes recovering concurrently cannot destroy each other's copy of the
+    /// corrupt data.
+    static func backupCorruptDatabase(_ path: String) throws -> String {
+        let fm = FileManager.default
+        let backup = "\(path).corrupt-\(UUID().uuidString)"
+        try fm.moveItem(atPath: path, toPath: backup)   // propagate failure
+        // Sidecars are best-effort: a missing/locked WAL/SHM must not abort the
+        // recovery now that the (authoritative) main file is safely aside.
+        for suffix in ["-wal", "-shm"] {
+            let side = path + suffix
+            if fm.fileExists(atPath: side) {
+                try? fm.moveItem(atPath: side, toPath: backup + suffix)
+            }
+        }
+        // The corrupt file must actually be gone, or a fresh open would re-fail.
+        if fm.fileExists(atPath: path) {
+            throw StateDBError.recoveryFailed("corrupt DB still present at \(path) after backup attempt")
+        }
+        return backup
     }
 
     // MARK: handle-scoped helpers (no `self`; safe from a nonisolated init)

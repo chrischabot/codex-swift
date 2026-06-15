@@ -1939,4 +1939,78 @@ final class PersistenceTests: XCTestCase {
         XCTAssertFalse(again, "second delete → already gone (idempotent, reports non-existence)")
     }
 
+    // MARK: P6.3 — SQLite auto-recovery from a corrupted state DB (#26859)
+
+    private func threadRow(_ id: String) -> ThreadRow {
+        ThreadRow(id: id, cwd: "/w", model: "m", createdAt: 1, updatedAt: 1,
+                  archived: false, ephemeral: false, rolloutPath: "/r",
+                  lastCommittedSeq: 0, name: nil, memoryMode: "enabled",
+                  gitSha: nil, gitBranch: nil, gitOriginURL: nil)
+    }
+
+    func testCorruptStateDbAutoRecovers() async throws {
+        let home = NSTemporaryDirectory() + "corrupt-db-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let path = home + "/state.sqlite3"
+        // A non-sqlite file (garbage) at the DB path.
+        try Data(repeating: 0x41, count: 8192).write(to: URL(fileURLWithPath: path))
+
+        let db = try StateDB(path: path)
+        XCTAssertNotNil(db.recoveryNotice, "a corrupt/non-sqlite file must trigger recovery")
+        // The corrupt file was backed up aside.
+        let backups = (try? FileManager.default.contentsOfDirectory(atPath: home))?
+            .filter { $0.hasPrefix("state.sqlite3.corrupt-") } ?? []
+        XCTAssertFalse(backups.isEmpty, "corrupt file backed up before rebuild")
+        // The rebuilt DB is fully usable.
+        try await db.upsertThread(threadRow("t1"))
+        let row = try await db.getThread("t1")
+        XCTAssertEqual(row?.id, "t1")
+    }
+
+    func testHealthyStateDbIsNeverRebuilt() async throws {
+        let home = NSTemporaryDirectory() + "healthy-db-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        let path = home + "/state.sqlite3"
+        do {
+            let db = try StateDB(path: path)
+            XCTAssertNil(db.recoveryNotice, "fresh DB is not a recovery")
+            try await db.upsertThread(threadRow("keep"))
+            try await db.checkpoint()   // flush WAL into the main file
+        }
+        // Reopen the SAME healthy file: must NOT rebuild, and data is preserved.
+        let db2 = try StateDB(path: path)
+        XCTAssertNil(db2.recoveryNotice, "a healthy DB must never be discarded/rebuilt")
+        let kept = try await db2.getThread("keep")
+        XCTAssertEqual(kept?.id, "keep", "data preserved across reopen")
+        // No spurious backup created for a healthy DB.
+        let backups = (try? FileManager.default.contentsOfDirectory(atPath: home))?
+            .filter { $0.hasPrefix("state.sqlite3.corrupt-") } ?? []
+        XCTAssertTrue(backups.isEmpty)
+    }
+
+    func testNonCorruptionOpenFailureIsNotRecovered() {
+        // A path whose parent directory does not exist is an environmental open
+        // failure (rc=14), NOT corruption — it must throw, not silently "recover".
+        XCTAssertThrowsError(try StateDB(path: "/nonexistent-dir-xyz/state.sqlite3"))
+    }
+
+    func testThreadStoreSurfacesRecoveryAndStaysUsable() async throws {
+        let home = NSTemporaryDirectory() + "ts-recover-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: home) }
+        // Pre-corrupt the state DB the ThreadStore will open.
+        try Data(repeating: 0x42, count: 8192)
+            .write(to: URL(fileURLWithPath: home + "/state.sqlite3"))
+
+        let store = try ThreadStore(codexHome: home, limits: smallLimits())
+        XCTAssertNotNil(store.recoveryNotice, "ThreadStore surfaces the DB recovery notice")
+        // The store is fully usable after recovery.
+        let tid = ThreadId("thr_recovered")
+        _ = try await store.create(SessionConfig(threadId: tid, cwd: "/w"))
+        let listed = (try? await store.list(archived: false, limit: 10)) ?? []
+        XCTAssertTrue(listed.contains { $0.id == tid }, "store works after auto-recovery")
+    }
+
 }
