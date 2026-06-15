@@ -18,12 +18,17 @@ observable gain — the wrong engineering call.
 | **6.3** SQLite robustness | #26859 corruption auto-recovery | **PORTED + reviewed + tested (`d375fe9`).** |
 | **6.4** cold-resume / search | #23921 case-insensitive thread search; #27031 cold-resume no-reread | **N/A.** The port has **no thread/rollout content-search** surface at all (#23921 has nothing to make case-insensitive). #27031 is an upstream thread-MANAGER optimization (`RunningThreadResumeResult` reuse for an already-running thread) specific to upstream's thread-store/thread-manager architecture; the port's resume = deterministic `ThreadStore` rollout replay, a different design with no equivalent reread to elide. |
 
-## P5 — scope decisions (the two PORTS are done; these are the rest)
+## P5 — the three maintainer-approved ports
 
-| Item | Disposition |
+The maintainer signed off (P5 AskUserQuestion) on porting **encrypted secrets,
+code mode, and multi-agent v2** (and on documenting extensions + remote-control as
+divergences). So P5b/P5c are **approved ports IN PROGRESS**, not optional.
+
+| Item | Status |
 |---|---|
-| **P5b** code mode | **SCOPE DECISION — intentional partial.** The port's `CodeMode.swift` runtime is deliberately minimal (`callTool(name,args)` + console shim, `MACOS-COMPLETION`). The upstream code-mode PRs (#24180 durable session, #26719 web_search, #25923 image-gen, #27732 reject-remote-image-URL) all target a **rich JS output-helper surface** (`image()`/`generatedImage()`/`store()`/`load()`/…) the port does not ship — so #27732 is N/A (no `image()` to reject from). Building the full surface is a large new feature that changes a security-sensitive model-authored-JS contract; left as an explicit future feature, not a silent gap. |
-| **P5c** multi-agent v2 | **SCOPE DECISION — partial-by-design.** The port's multi-agent orchestrator is a known partial (`SessionEngineAgentRunner` is exercised only by the live multi-agent tests; no production `spawn_agent` wiring). The v2 features (residency LRU #26632, reload-on-delivery #26623, encrypted payloads #26210, persisted runtime metadata #25721) attach to a subsystem the port doesn't fully ship. SubagentStart/Stop hooks (P3.1) ARE wired into the runner that exists. Full v2 is a large port of a partial subsystem; left as an explicit future feature. |
+| **P5a** encrypted secrets | **PORTED + live-proven** (CLI auth + MCP OAuth). |
+| **P5b** code mode | **APPROVED PORT — in progress.** The port's `CodeMode.swift` is currently minimal (`callTool` + console shim). The upstream code-mode PRs (#24180 durable session, #26719 web_search, #25923 image-gen, #27732 reject-remote-image-URL) target a rich JS output-helper surface (`image()`/`generatedImage()`/`store()`/`load()`/…) to be built — output-item accumulator + helpers (with #27732's reject-remote-URL baked in) + durable session + engine integration, each its own gated wave. |
+| **P5c** multi-agent v2 | **APPROVED PORT — in progress.** Build on `SessionEngineAgentRunner`: residency LRU (#26632), reload-on-delivery (#26623), concurrency-by-active-execution (#26969), encrypted payloads (#26210, can reuse `LocalSecretsBackend`), persisted runtime metadata (#25721). SubagentStart/Stop hooks (P3.1) already wired into the runner. |
 
 ## Net state
 

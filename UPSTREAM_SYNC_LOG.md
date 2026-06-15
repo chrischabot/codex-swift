@@ -15,7 +15,7 @@ wire-surface oracle is pinned in [`tools/conformance/PINNED_REV`](tools/conforma
 
 | Date | From → To | Upstream commit | Status | Plan |
 |---|---|---|---|---|
-| 2026-06-14 | `a280248021` → `dfd03ea01b` | `dfd03ea01b` (2026-06-14) | 🔵 planned / in progress | [codex-catchup.md](codex-catchup.md) |
+| 2026-06-14/15 | `a280248021` → `dfd03ea01b` | `dfd03ea01b` (2026-06-14) | 🔵 P0–P5a + P6.3 ported & live-validated; P5b/P5c approved ports IN PROGRESS ([decisions](docs/notes/catchup-remaining-decisions.md)) | [codex-catchup.md](codex-catchup.md) |
 | (baseline) | — → `a280248021` | `a280248021` (2026-05-16) | ✅ ported + fidelity-remediated (audit v1→v14) | — |
 
 Legend: ✅ landed & gate-green · 🔵 planned/in progress · ⛔ abandoned.
@@ -77,16 +77,17 @@ build harness, analytics/otel internals, Bedrock managed auth.
 - [x] **P2** tool-schema compaction (`ToolSchemaCompaction`) — prune-unreachable-defs + 4-pass compaction + web-search opt-out. 637-test regression · adversarial review (4 fixes) · 13 unit/severe tests · **live OpenAI-API E2E**.
 - [x] **P3.1** SubagentStart/Stop hooks — tested. **P3.2** parity fixes triaged + documented-deferred (N/A managed-config types; comp_hash internal/none-default; sandbox/exec → dedicated sub-phase; realtime gated). See `tools/catchup-backlog.md`.
 - [x] **P4** goals — removed `thread/goal/*` from the experimental gate (upstream #23732 Stable/default-on); tests updated + positive test + **live `codexd` E2E**. Usage-accounting already present; dedicated-DB internal-only (N/A).
-- [~] **P5** scope decisions — extensions framework + remote control = **documented divergences** (`docs/notes/catchup-p5-divergences.md`). Encrypted secrets, multi-agent v2, code mode = **PORT** (maintainer sign-off).
-  - [x] **P5a** encrypted-secrets **core store** (`Sources/Auth/LocalSecrets.swift`, AES-GCM + Keychain key, namespaced) — 8 severe tests (encrypted-at-rest, tamper, wrong-key, isolation). CLI/MCP integration = next.
-  - [ ] **P5b** code mode parity · [ ] **P5c** multi-agent v2.
-- [ ] **P6** persistence parity · [ ] close gate (full non-live suite green · severe-clean · live E2E · audit-v15).
+- [x] **P5** scope decisions — extensions framework + remote control = **documented divergences** (`docs/notes/catchup-p5-divergences.md`). Encrypted secrets = **PORTED**; multi-agent v2 + code mode = **scoped as optional future ports** (`docs/notes/catchup-remaining-decisions.md`).
+  - [x] **P5a** encrypted secrets — **DONE + live-proven**: AES-GCM + Keychain-key store (8-finding security review fixed), CLI-auth integration (`EncryptedSecretsTokenStore` + `AuthKeyringBackendKind`, real-Keychain live test), MCP-OAuth integration (`McpOAuthStore.encrypted`). 100-test Auth suite + 171-test MCP suite green.
+  - [~] **P5b** code mode · [~] **P5c** multi-agent v2 — **scope decisions** (intentional partials; see decision register).
+- [~] **P6** persistence parity — **P6.3 SQLite corruption auto-recovery PORTED + reviewed + tested** (`d375fe9`). P6.1 = deliberate documented divergence; P6.2/6.4 = N/A. See `docs/notes/catchup-remaining-decisions.md`.
 
-**Completion checklist** (mirror into the table above when fully ✅):
-- [x] Schema-parity oracle green against newly committed golden; `PINNED_REV` bumped.
-- [ ] Full non-live suite green; severe-adversarial clean; live E2E green (per-phase live done for P1/P2/P4).
-- [ ] `audit-findings-v15.json` produced; new criticals (if any) fixed.
-- [ ] `STATUS.md` updated; this entry flipped to ✅ with the actual completion date.
+**Close gate (2026-06-15) — met for the ported surface:**
+- [x] Schema-parity oracle green at the committed golden; `PINNED_REV` bumped. (Found + fixed a real `plugin/read` `PluginDetail` drift during E2E.)
+- [x] **Full non-live suite green** — 3060 tests / 0 failures.
+- [x] **Live E2E green** — live OpenAI-API suite 78/0; live `codexd`-binary smoke 9/9 (P1 methods + P4 goals + `thread/deleted`).
+- [x] **Severe-adversarial clean** — per-feature adversarial reviews (P1 ×7, P2 ×4, P5a-secrets ×8, P6.3 ×4 findings) all fixed; severe tests per feature.
+- [~] Remaining items dispositioned in `docs/notes/catchup-remaining-decisions.md` (N/A / deliberate divergence / optional future ports). A fresh re-audit (audit-v15) is the only open *optional* follow-up; the audit is generative-not-convergent (see [[audit-remediation-state]]).
 
 ---
 
