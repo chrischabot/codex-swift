@@ -48,6 +48,39 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     private var gateWaiters: [(id: UInt64, cont: CheckedContinuation<Void, any Error>)] = []
     private var gateSeq: UInt64 = 0
 
+    // MARK: - tenant-scope fail-closed guard (ported from Mem0SQLiteStore, gbrain Wave 0.6)
+    //
+    // search/list/keywordSearch emit a WHERE only when PGFilterTranslator.willEmit is
+    // true, so a scope-less/all-null filter produced NO WHERE → every tenant's rows
+    // (fail-OPEN). This restores fail-CLOSED parity: a scope-less read returns [] before
+    // any SQL. Defense-in-depth (the engine always scopes); disable for admin/global tools
+    // with CODEX_MEM0_ALLOW_UNSCOPED=1.
+    public var enforceTenantScope: Bool =
+        ProcessInfo.processInfo.environment["CODEX_MEM0_ALLOW_UNSCOPED"] != "1"
+
+    static let tenantScopeKeys: Set<String> = ["user_id", "agent_id", "run_id"]
+
+    /// True when `filters` carries a tenant scope — a direct scope key with a non-null
+    /// value, or an `$or` whose every branch is itself scoped. Kept identical to
+    /// Mem0SQLiteStore.hasTenantScope so the two stores cannot drift.
+    static func hasTenantScope(_ filters: JSONObject) -> Bool {
+        for k in tenantScopeKeys {
+            if let v = filters[k], !v.isNull { return true }
+        }
+        if let branches = filters["$or"]?.arrayValue, !branches.isEmpty {
+            return branches.allSatisfy { ($0.objectValue).map(hasTenantScope) ?? false }
+        }
+        return false
+    }
+
+    /// Admin/test hook to toggle store-level scope enforcement.
+    public func setEnforceTenantScope(_ enabled: Bool) { enforceTenantScope = enabled }
+
+    /// Fail-closed gate for the filtered read paths.
+    private func scopeDenied(_ filters: JSONObject) -> Bool {
+        enforceTenantScope && !Self.hasTenantScope(filters)
+    }
+
     /// Acquire the gate. Cancellation-aware: a task cancelled WHILE waiting is
     /// removed from the queue and throws `CancellationError` instead of later
     /// waking up and running a DB op anyway. Pair with `defer { release() }` —
@@ -268,6 +301,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
     public func search(_ query: String, _ vector: [Float], topK: Int, filters: JSONObject) async throws -> [SearchHit] {
         try await acquire(); defer { release() }
         try validateFinite(vector)
+        if scopeDenied(filters) { return [] }   // fail closed: a scope-less read leaks nothing
         var b = PGQueryBuilder()
         b.raw("SELECT id, payload::text, (vector <=> ")
         try b.param(vectorLiteral(vector))           // $1 — reused in ORDER BY
@@ -337,6 +371,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
 
     public func list(_ filters: JSONObject, limit: Int?) async throws -> [SearchHit] {
         try await acquire(); defer { release() }
+        if scopeDenied(filters) { return [] }   // fail closed
         var b = PGQueryBuilder()
         b.raw("SELECT id, payload::text FROM memories")
         if PGFilterTranslator.willEmit(filters) {
@@ -366,6 +401,7 @@ public actor Mem0PgVectorStore: Mem0VectorStore, Mem0HistoryStore {
 
     public func keywordSearch(_ query: String, topK: Int, filters: JSONObject) async throws -> [SearchHit]? {
         try await acquire(); defer { release() }
+        if scopeDenied(filters) { return [] }   // fail closed (empty, not nil — parity with SQLite)
         var b = PGQueryBuilder()
         b.raw("SELECT id, payload::text, ts_rank(to_tsvector('simple', coalesce(payload ->> 'text_lemmatized', '')), plainto_tsquery('simple', ")
         try b.param(query)
