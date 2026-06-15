@@ -78,3 +78,19 @@ struct LiveWatchPoller: WatchPoller {
         return WatchPollResult(outcome: ingested > 0 ? .changed : .unchanged, itemsIngested: ingested, itemsUpdated: updated)
     }
 }
+
+/// Like `LiveWatchPoller` but stamps `fetchedAt` to the CURRENT time on EACH poll — for the
+/// long-running `wiki-watch schedule` loop, where rounds fired days apart must not all pin
+/// their revisions to the loop's start time. (A single round's `run-round` uses the fixed
+/// `LiveWatchPoller`; this is the multi-round counterpart.)
+struct SchedulePoller: WatchPoller {
+    let registry: WikiAdapterRegistry
+    let writer: WikiIngestWriter
+    let maxPerSource: Int
+
+    func poll(_ source: WatchSource) async -> WatchPollResult {
+        let now = Int64(Date().timeIntervalSince1970)
+        let live = LiveWatchPoller(registry: registry, writer: writer, fetchedAt: now, maxPerSource: maxPerSource)
+        return await live.poll(source)
+    }
+}

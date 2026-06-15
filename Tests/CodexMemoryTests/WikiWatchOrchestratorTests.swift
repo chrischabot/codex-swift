@@ -89,6 +89,68 @@ final class WikiWatchOrchestratorTests: XCTestCase {
         XCTAssertEqual(r, WikiWatchOrchestrator.RoundResult())
     }
 
+    // MARK: scheduled rounds (wiki-watch schedule)
+
+    /// Clock that jumps `step` each call so every round re-sees its sources as due
+    /// (advanceWatch reschedules forward; without time advancing, only round 1 polls).
+    private final class FakeClock: @unchecked Sendable {
+        private var t: Int64; private let step: Int64; private let lock = NSLock()
+        init(start: Int64, step: Int64) { t = start; self.step = step }
+        func now() -> Int64 { lock.withLock { let v = t; t += step; return v } }
+    }
+    private final class SleepCounter: @unchecked Sendable {
+        private let lock = NSLock(); private var n = 0
+        func sleep(_ s: Int64) async { lock.withLock { n += 1 } }
+        var count: Int { lock.withLock { n } }
+    }
+    private final class LineCollector: @unchecked Sendable {
+        private let lock = NSLock(); private var lines: [String] = []
+        func add(_ s: String) { lock.withLock { lines.append(s) } }
+        var count: Int { lock.withLock { lines.count } }
+    }
+
+    func testScheduleRunsBoundedRoundsAndAccumulates() async throws {
+        let store = try makeStore()
+        try await store.addWatch(id: "a", kind: "url", volatility: .hot, now: addNow)
+        try await store.addWatch(id: "b", kind: "url", volatility: .hot, now: addNow)
+        let poller = ScriptedPoller([
+            "a": WatchPollResult(outcome: .changed, itemsIngested: 2, itemsUpdated: 1),
+            "b": WatchPollResult(outcome: .changed, itemsIngested: 1, itemsUpdated: 0),
+        ])
+        let clock = FakeClock(start: addNow + 86_400, step: 400 * 86_400)   // each round far in the future → all due
+        let sleeper = SleepCounter()
+        let lines = LineCollector()
+        let tally = await WikiWatchSchedule.run(
+            store: store, poller: poller, intervalSeconds: 3600, limit: 100, maxRounds: 3,
+            now: { clock.now() }, sleep: { await sleeper.sleep($0) }, emit: { lines.add($0) })
+        XCTAssertEqual(tally.rounds, 3)
+        XCTAssertEqual(tally.polled, 6, "2 due sources × 3 rounds")
+        XCTAssertEqual(tally.itemsIngested, 9, "(2+1) per round × 3")
+        XCTAssertEqual(tally.itemsUpdated, 3, "1 update per round × 3")
+        XCTAssertEqual(sleeper.count, 2, "sleeps BETWEEN rounds, not after the last")
+        XCTAssertEqual(lines.count, 3, "one emit line per round")
+    }
+
+    func testScheduleZeroRoundsDoesNothing() async throws {
+        let store = try makeStore()
+        try await store.addWatch(id: "a", kind: "url", volatility: .hot, now: addNow)
+        let poller = ScriptedPoller([:])
+        let sleeper = SleepCounter()
+        let fixedNow = roundNow
+        let tally = await WikiWatchSchedule.run(
+            store: store, poller: poller, intervalSeconds: 1, limit: 10, maxRounds: 0,
+            now: { fixedNow }, sleep: { await sleeper.sleep($0) })
+        XCTAssertEqual(tally, WikiWatchSchedule.Tally())
+        XCTAssertEqual(poller.polled.count, 0)
+        XCTAssertEqual(sleeper.count, 0)
+    }
+
+    func testTierIntervalsAreCadenceOrdered() {
+        XCTAssertLessThan(WikiWatchSchedule.tierInterval(.hot), WikiWatchSchedule.tierInterval(.warm))
+        XCTAssertLessThan(WikiWatchSchedule.tierInterval(.warm), WikiWatchSchedule.tierInterval(.cold))
+        XCTAssertEqual(WikiWatchSchedule.tierInterval(.hot), WikiWatchSchedule.defaultIntervalSeconds)
+    }
+
     func testWatchSourceKindRoundTrips() async throws {
         let store = try makeStore()
         try await store.addWatch(id: "openai", kind: "github-owner", volatility: .hot, now: addNow)

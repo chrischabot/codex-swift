@@ -14,11 +14,14 @@ import EgressGuard
 ///   run-due [--json]                                     show sources currently due
 ///   run-round [--limit N] [--json]                       POLL the due sources now:
 ///       fetch → content-SHA change-gate → ingest new items → advance the scheduler.
+///   schedule [--interval S] [--rounds N] [--limit N]     LOOP run-round every S seconds
+///       (default daily; per-source cadence still gates what's due). --rounds caps it
+///       (omit = run until killed); for launchd/systemd-supervised periodic freshness.
 enum CodexMemoryWikiWatch {
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
 
     static func run(args: [String]) async throws -> (output: String, ok: Bool) {
-        guard let verb = args.first else { throw CLIError(message: "wiki-watch needs a verb: add|list|pause|resume|remove|run-due") }
+        guard let verb = args.first else { throw CLIError(message: "wiki-watch needs a verb: add|list|pause|resume|remove|run-due|run-round|schedule") }
         let rest = Array(args.dropFirst())
         let bundle = try await CodexMemoryRun.assemble()
         let now = Int64(Date().timeIntervalSince1970)
@@ -58,6 +61,25 @@ enum CodexMemoryWikiWatch {
                                          fetchedAt: now, maxPerSource: 20)
             let result = await WikiWatchOrchestrator.runRound(store: store, poller: poller, now: now, limit: limit)
             return (formatRound(result, json: rest.contains("--json")), true)
+
+        case "schedule":
+            let limit = try parseLimit(rest) ?? 50
+            let interval = try parseIntOpt(rest, "--interval") ?? WikiWatchSchedule.defaultIntervalSeconds
+            let maxRounds = try parseIntOpt(rest, "--rounds").map { Int($0) }   // nil = run forever
+            let fetcher = PinnedFetcher(guard_: EgressGuard(EgressPolicy(allowHTTP: true)))
+            // Each round re-stamps fetchedAt to the current time (a long-running loop
+            // must not pin every revision to the start time).
+            let writer = WikiIngestWriter(store: store, processor: bundle.processor)
+            let registry = WikiAdapterRegistry(fetcher: fetcher)
+            let json = rest.contains("--json")
+            let tally = await WikiWatchSchedule.run(
+                store: store,
+                poller: SchedulePoller(registry: registry, writer: writer, maxPerSource: 20),
+                intervalSeconds: interval, limit: limit, maxRounds: maxRounds,
+                now: { Int64(Date().timeIntervalSince1970) },
+                sleep: { secs in try? await Task.sleep(nanoseconds: UInt64(max(0, secs)) * 1_000_000_000) },
+                emit: { line in if !json { FileHandle.standardError.write(Data((line + "\n").utf8)) } })
+            return (formatSchedule(tally, json: json), true)
 
         default:
             throw CLIError(message: "unknown wiki-watch verb '\(verb)'")
@@ -109,6 +131,26 @@ enum CodexMemoryWikiWatch {
             throw CLIError(message: "--limit must be a positive integer")
         }
         return n
+    }
+
+    /// Parse a positive Int64 option (e.g. `--interval`, `--rounds`); nil when absent.
+    static func parseIntOpt(_ args: [String], _ flag: String) throws -> Int64? {
+        guard let i = args.firstIndex(of: flag) else { return nil }
+        guard i + 1 < args.count, let n = Int64(args[i + 1]), n > 0 else {
+            throw CLIError(message: "\(flag) must be a positive integer")
+        }
+        return n
+    }
+
+    static func formatSchedule(_ t: WikiWatchSchedule.Tally, json: Bool) -> String {
+        if json {
+            return jsonLine(["rounds": t.rounds, "polled": t.polled, "changed": t.changed,
+                             "unchanged": t.unchanged, "failed": t.failed,
+                             "itemsIngested": t.itemsIngested, "itemsUpdated": t.itemsUpdated])
+        }
+        let newItems = max(0, t.itemsIngested - t.itemsUpdated)
+        return "wiki-watch schedule: \(t.rounds) round(s) — polled \(t.polled), \(t.changed) changed; "
+            + "\(newItems) new, \(t.itemsUpdated) updated, \(t.failed) failed\n"
     }
 
     static func jsonLine(_ obj: [String: Any]) -> String {
