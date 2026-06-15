@@ -82,7 +82,7 @@ public struct AgentSpawnSpec: Sendable, Equatable {
     }
 }
 
-public struct AgentRecord: Sendable, Equatable {
+public struct AgentRecord: Sendable, Equatable, Codable {
     public var path: AgentPath
     public var status: AgentStatus
     public var result: String?
@@ -105,30 +105,59 @@ public enum AgentError: Error, Sendable, Equatable {
 
 public actor AgentRegistry {
     private var records: [String: AgentRecord] = [:]
+    /// Optional write-through persistence (P5c #25721/#26210). `nil` keeps the
+    /// historical pure-in-memory behavior — every mutator below no-ops the store
+    /// hop when it is absent, so callers that don't opt in are unaffected.
+    ///
+    /// In-memory `records` is the source of truth and is always last-writer
+    /// correct (the synchronous map write happens before the `await store?.put`
+    /// suspension, in program order). The persisted copy may briefly lag under
+    /// concurrent mutations of the *same* path (actor reentrancy across the await)
+    /// and converges on the next write. `AgentOrchestrator` serializes a given
+    /// agent's lifecycle, so same-path concurrency does not arise in practice.
+    private let store: AgentRecordStore?
 
-    public init() {}
+    public init() { self.store = nil }
 
-    public func reserve(_ p: AgentPath, parent: AgentPath?) throws {
+    public init(store: AgentRecordStore?) { self.store = store }
+
+    /// Load any persisted records into memory (call once on startup so a daemon
+    /// restart resurfaces prior sub-agent metadata). In-memory records win over
+    /// persisted ones on key collision.
+    public func hydrate() async {
+        guard let store else { return }
+        for rec in await store.all() where records[rec.path.raw] == nil {
+            records[rec.path.raw] = rec
+        }
+    }
+
+    public func reserve(_ p: AgentPath, parent: AgentPath?) async throws {
         if records[p.raw] != nil { throw AgentError.pathExists(p.raw) }
-        records[p.raw] = AgentRecord(path: p, status: .pending, result: nil,
-                                     error: nil, parent: parent,
-                                     createdAt: MonotonicClock.now())
+        let rec = AgentRecord(path: p, status: .pending, result: nil,
+                              error: nil, parent: parent,
+                              createdAt: MonotonicClock.now())
+        records[p.raw] = rec
+        await store?.put(rec)
     }
 
-    public func register(_ rec: AgentRecord) {
+    public func register(_ rec: AgentRecord) async {
         records[rec.path.raw] = rec
+        await store?.put(rec)
     }
 
-    public func setStatus(_ p: AgentPath, _ s: AgentStatus) {
+    public func setStatus(_ p: AgentPath, _ s: AgentStatus) async {
+        guard records[p.raw] != nil else { return }
         records[p.raw]?.status = s
+        if let rec = records[p.raw] { await store?.put(rec) }
     }
 
     public func setResult(_ p: AgentPath, output: String?, error: String?,
-                          status: AgentStatus) {
+                          status: AgentStatus) async {
         guard records[p.raw] != nil else { return }
         records[p.raw]?.result = output
         records[p.raw]?.error = error
         records[p.raw]?.status = status
+        if let rec = records[p.raw] { await store?.put(rec) }
     }
 
     public func get(_ p: AgentPath) -> AgentRecord? { records[p.raw] }
@@ -137,9 +166,15 @@ public actor AgentRegistry {
         records.values.sorted { $0.path.raw < $1.path.raw }
     }
 
-    public func remove(_ p: AgentPath) { records[p.raw] = nil }
+    public func remove(_ p: AgentPath) async {
+        records[p.raw] = nil
+        await store?.remove(p)
+    }
 
-    public func releaseReserved(_ p: AgentPath) { records[p.raw] = nil }
+    public func releaseReserved(_ p: AgentPath) async {
+        records[p.raw] = nil
+        await store?.remove(p)
+    }
 }
 
 // MARK: - AgentOrchestrator
@@ -153,14 +188,15 @@ public actor AgentOrchestrator {
     public let selfPath: AgentPath
 
     public init(selfPath: AgentPath = .root,
+                store: AgentRecordStore? = nil,
                 runner: @escaping @Sendable (AgentSpawnSpec) async -> AgentRunResult) {
-        self.registry = AgentRegistry()
+        self.registry = AgentRegistry(store: store)
         self.selfPath = selfPath
         self.runner = runner
     }
 
-    public init(selfPath: AgentPath = .root) {
-        self.registry = AgentRegistry()
+    public init(selfPath: AgentPath = .root, store: AgentRecordStore? = nil) {
+        self.registry = AgentRegistry(store: store)
         self.selfPath = selfPath
         self.runner = { _ in
             AgentRunResult(status: .completed, output: "(no runner configured)",

@@ -94,3 +94,48 @@ deliberate, contained runtime. The user-visible authoring surface matches upstre
 only the execution *model* (synchronous vs. durable-async) differs, and that
 difference is the source of every omission above. Revisit only if the port adopts a
 V8/event-loop runtime.
+
+---
+
+## Multi-agent v2 — persistence ported, scaling optimizations diverged
+
+Upstream's multi-agent v2 lives in a hosted **thread-manager** designed for many
+concurrent sub-agents across tenants. The Swift port's orchestrator
+(`Sources/HarnessCore/MultiAgent.swift`: `AgentRegistry` + `AgentOrchestrator`) is
+an in-process, single-operator design. The v2 *collaboration tool surface*
+(`spawn_agent` / `wait_agent` / `close_agent` / `send_input` / list) is already
+present; this catchup added the foundational persistence layer and dispositioned
+the multi-tenant scaling optimizations.
+
+**Ported (#25721 persisted metadata + #26210 encrypted payloads):**
+`Sources/HarnessCore/AgentRecordStore.swift` adds an **optional write-through
+store** to `AgentRegistry`. Sub-agent records survive a daemon restart
+(`AgentRegistry.hydrate()`), and each record's free-text `result`/`error` payload
+is **sealed at rest with AES-GCM** (`EncryptedFileAgentRecordStore`), using the
+same CryptoKit primitive as `Auth.LocalSecretsBackend` (key injectable from the
+same Keychain material when wired from a layer that has `Auth`). Routing metadata
+(path/parent/status/timestamps) stays in cleartext. Default is **off** (`nil`
+store ⇒ historical pure-in-memory behavior, zero change for non-opt-in callers).
+The file is atomically replaced and re-asserted `0600` on every write; a corrupt
+file is preserved as a `.corrupt-<pid>` sidecar rather than silently discarded.
+Adversarial-reviewed (1 MAJOR perms-window fix + corrupt-file preservation);
+`AgentRecordStoreTests` (7 tests: restart-survives, encrypted-at-rest, wrong-key
+fail-closed, remove, perms-stable, corrupt-preserved, storeless-in-memory).
+
+**Divergences (hosted multi-tenant scaling — not needed single-operator):**
+- **Residency LRU (#26632).** Upstream caps resident sub-agent sessions and evicts
+  the LRU to bound memory. The port keeps all records in the in-memory map; a
+  single operator spawns a bounded handful, so the unbounded map is acceptable. The
+  write-through store above is exactly the substrate an LRU+evict would build on.
+- **Reload-on-delivery (#26623).** Reloading an evicted agent's session when a
+  message arrives only matters once eviction exists; moot without residency LRU.
+- **Concurrency-by-active-execution (#26969).** Bounding concurrency by active
+  executions is a fairness/resource control for many-tenant load; the port's
+  orchestrator already serializes a given agent's lifecycle and isn't resource-
+  contended at single-operator scale.
+
+Rationale mirrors the extensions/remote-control divergences: these are scale and
+multi-tenancy optimizations whose value is in the hosted product's trust/scale
+model, not the single-operator port. Revisit if the port grows to host many
+concurrent agents under memory pressure — the persisted/encrypted store is the
+foundation that work would extend.
