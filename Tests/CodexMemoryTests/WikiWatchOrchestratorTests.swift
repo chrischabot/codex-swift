@@ -47,6 +47,22 @@ final class WikiWatchOrchestratorTests: XCTestCase {
         XCTAssertEqual(byID["a"]?.lastPolledAt, roundNow)
     }
 
+    func testRunRoundTalliesUpdatesSeparately() async throws {
+        let store = try makeStore()
+        try await store.addWatch(id: "a", kind: "url", volatility: .hot, now: addNow)
+        try await store.addWatch(id: "b", kind: "url", volatility: .hot, now: addNow)
+        let poller = ScriptedPoller([
+            // a: 3 new revisions, 2 of which superseded a prior one (updates).
+            "a": WatchPollResult(outcome: .changed, itemsIngested: 3, itemsUpdated: 2),
+            // b: 1 brand-new item (no update).
+            "b": WatchPollResult(outcome: .changed, itemsIngested: 1, itemsUpdated: 0),
+        ])
+        let r = await WikiWatchOrchestrator.runRound(store: store, poller: poller, now: roundNow, limit: 100)
+        XCTAssertEqual(r.itemsIngested, 4)
+        XCTAssertEqual(r.itemsUpdated, 2, "updates summed across sources")
+        XCTAssertEqual(r.changed, 2)
+    }
+
     func testRunRoundRespectsLimit() async throws {
         let store = try makeStore()
         for id in ["a", "b", "c"] { try await store.addWatch(id: id, kind: "url", volatility: .hot, now: addNow) }

@@ -203,16 +203,28 @@ final class WikiIngestTests: XCTestCase {
             provenance: CollectionProvenance(adapter: "url"), fetched: 1)
         let r1 = try await writer.write(cand, extract: false)
         XCTAssertFalse(r1.skipped)
-        // Changed content under the SAME canonical URI → a NEW immutable revision.
+        XCTAssertNil(r1.revisionOf, "first ingest is a CREATE — supersedes nothing")
+        // Changed content under the SAME canonical URI → a NEW immutable revision (an UPDATE).
         cand.bodyMarkdown = "completely different replacement content with other distinct words"
+        cand.fetched = 1_700_000_000   // 2023-11-14 UTC → deterministic change-marker date
         let r2 = try await writer.write(cand, extract: false)
         XCTAssertFalse(r2.skipped)
         XCTAssertNotEqual(r2.documentID, r1.documentID)
+        XCTAssertEqual(r2.revisionOf, r1.documentID, "UPDATE records the superseded prior revision")
+        // §14.6 "what changed" marker stamped on the new revision's source_meta.
+        let meta = try await store.sourceMeta(documentID: r2.documentID)
+        XCTAssertNotNil(meta?.frontmatter)
+        XCTAssertTrue(meta?.frontmatter?.contains("\"changed_on\":\"2023-11-14\"") ?? false, meta?.frontmatter ?? "nil")
+        XCTAssertTrue(meta?.frontmatter?.contains("\"supersedes_doc\":\(r1.documentID)") ?? false, meta?.frontmatter ?? "nil")
+        // The original revision carries NO change marker (it superseded nothing).
+        let meta1 = try await store.sourceMeta(documentID: r1.documentID)
+        XCTAssertNil(meta1?.frontmatter)
         let twoDocs = try await store.documentCount()
         XCTAssertEqual(twoDocs, 2)   // both revisions present (old not clobbered)
         // Re-ingesting the same changed content → revision dedupe (no duplicate).
         let r3 = try await writer.write(cand, extract: false)
         XCTAssertTrue(r3.skipped)
+        XCTAssertNil(r3.revisionOf, "a skipped no-op is not an update")
         XCTAssertEqual(r3.documentID, r2.documentID)
         let stillTwo = try await store.documentCount()
         XCTAssertEqual(stillTwo, 2)

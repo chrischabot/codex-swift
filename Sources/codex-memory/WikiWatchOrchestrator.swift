@@ -11,9 +11,10 @@ import WikiIngest
 /// The verdict of polling one source, for the scheduler + the round tally.
 struct WatchPollResult: Sendable, Equatable {
     var outcome: PollOutcome
-    var itemsIngested: Int
-    init(outcome: PollOutcome, itemsIngested: Int = 0) {
-        self.outcome = outcome; self.itemsIngested = itemsIngested
+    var itemsIngested: Int          // non-skipped writes (new revisions: CREATE + UPDATE)
+    var itemsUpdated: Int           // subset of itemsIngested that superseded a prior revision
+    init(outcome: PollOutcome, itemsIngested: Int = 0, itemsUpdated: Int = 0) {
+        self.outcome = outcome; self.itemsIngested = itemsIngested; self.itemsUpdated = itemsUpdated
     }
 }
 
@@ -24,7 +25,7 @@ protocol WatchPoller: Sendable {
 
 enum WikiWatchOrchestrator {
     struct RoundResult: Sendable, Equatable {
-        var polled = 0, changed = 0, unchanged = 0, failed = 0, itemsIngested = 0
+        var polled = 0, changed = 0, unchanged = 0, failed = 0, itemsIngested = 0, itemsUpdated = 0
     }
 
     /// One round: due sources → poll → advance. Bounded by `limit`. Each source's
@@ -38,7 +39,7 @@ enum WikiWatchOrchestrator {
             try? await store.advanceWatch(id: s.id, outcome: res.outcome, now: now)
             r.polled += 1
             switch res.outcome {
-            case .changed: r.changed += 1; r.itemsIngested += res.itemsIngested
+            case .changed: r.changed += 1; r.itemsIngested += res.itemsIngested; r.itemsUpdated += res.itemsUpdated
             case .unchanged: r.unchanged += 1
             case .failed: r.failed += 1
             }
@@ -62,14 +63,18 @@ struct LiveWatchPoller: WatchPoller {
         let adapter = registry.resolve(source.id, forced: kind)
         let req = IngestRequest(input: source.id, adapter: kind, limit: maxPerSource, fetchedAt: fetchedAt)
         var ingested = 0
+        var updated = 0
         do {
             for try await cand in adapter.enumerate(req) {
                 if ingested >= maxPerSource { break }
-                if let r = try? await writer.write(cand, extract: false), !r.skipped { ingested += 1 }
+                if let r = try? await writer.write(cand, extract: false), !r.skipped {
+                    ingested += 1
+                    if r.revisionOf != nil { updated += 1 }   // superseded a prior revision → an UPDATE
+                }
             }
         } catch {
             return WatchPollResult(outcome: .failed(retryAfterSeconds: nil))
         }
-        return WatchPollResult(outcome: ingested > 0 ? .changed : .unchanged, itemsIngested: ingested)
+        return WatchPollResult(outcome: ingested > 0 ? .changed : .unchanged, itemsIngested: ingested, itemsUpdated: updated)
     }
 }

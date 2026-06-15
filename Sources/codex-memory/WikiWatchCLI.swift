@@ -96,10 +96,11 @@ enum CodexMemoryWikiWatch {
     static func formatRound(_ r: WikiWatchOrchestrator.RoundResult, json: Bool) -> String {
         if json {
             return jsonLine(["polled": r.polled, "changed": r.changed, "unchanged": r.unchanged,
-                             "failed": r.failed, "itemsIngested": r.itemsIngested])
+                             "failed": r.failed, "itemsIngested": r.itemsIngested, "itemsUpdated": r.itemsUpdated])
         }
+        let newItems = max(0, r.itemsIngested - r.itemsUpdated)
         return "wiki-watch round: polled \(r.polled) — \(r.changed) changed, \(r.unchanged) unchanged, "
-            + "\(r.failed) failed; \(r.itemsIngested) item(s) ingested\n"
+            + "\(r.failed) failed; \(r.itemsIngested) item(s) ingested (\(newItems) new, \(r.itemsUpdated) updated)\n"
     }
 
     static func parseLimit(_ args: [String]) throws -> Int? {
