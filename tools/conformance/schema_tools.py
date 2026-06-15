@@ -885,6 +885,19 @@ def concrete_response_fixtures() -> dict[str, object]:
             "rateLimitsByLimitId": None,
         },
         "skills/list": {"data": []},
+        "skills/extraRoots/set": empty,
+        "thread/delete": empty,
+        "permissionProfile/list": {"data": [], "nextCursor": None},
+        "account/usage/read": {
+            "summary": {
+                "currentStreakDays": None,
+                "lifetimeTokens": None,
+                "longestRunningTurnSec": None,
+                "longestStreakDays": None,
+                "peakDailyTokens": None,
+            },
+            "dailyUsageBuckets": None,
+        },
         "mcpServerStatus/list": {"data": [], "nextCursor": None},
         "collaborationMode/list": {"data": []},
         "app/list": {"data": [], "nextCursor": None},
@@ -901,13 +914,19 @@ def concrete_response_report(repo_root: Path, codex_tree: Path) -> dict[str, obj
     fixtures = concrete_response_fixtures()
     checked: dict[str, object] = {}
     failures: list[str] = []
+    skipped: dict[str, str] = {}
     for method in sorted(typed_methods):
-        if method not in fixtures:
-            failures.append(f"{method}: missing concrete response fixture")
-            continue
         response = response_types.get(method)
         if response is None:
-            failures.append(f"{method}: missing response type mapping")
+            # Port-only typed method (e.g. wiki/*, channels/*, cron/*): there is
+            # no upstream response schema to conform to, so a concrete-response
+            # fixture would be meaningless (and could never match). This report
+            # validates ported UPSTREAM methods only; port extensions are out of
+            # scope here and are recorded as skipped rather than failed.
+            skipped[method] = "no upstream response type (port-only method)"
+            continue
+        if method not in fixtures:
+            failures.append(f"{method}: missing concrete response fixture")
             continue
         alternatives, reason = response_schema_alternatives(codex_tree, response[0], response[1])
         if reason:
@@ -937,6 +956,8 @@ def concrete_response_report(repo_root: Path, codex_tree: Path) -> dict[str, obj
         "checkedCount": len(checked),
         "checked": checked,
         "failures": failures,
+        "skippedCount": len(skipped),
+        "skipped": skipped,
     }
 
 
