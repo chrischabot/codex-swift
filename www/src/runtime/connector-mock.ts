@@ -33,6 +33,7 @@ import type {
   DiffViewModel,
   SendOptions,
   ThreadStreamEvent,
+  WikiJobLine,
 } from "./connector";
 
 let counter = 1;
@@ -375,6 +376,49 @@ export function makeMockConnector(): Connector {
     },
 
     getTimeline: async (threadId) => seedTimeline[threadId] ?? [],
+
+    // ── Memory Wiki (mock) — enough for the Console + E2E to exercise every tab.
+    searchWiki: async (query) => [
+      { id: "1", title: `Result for “${query}”`, excerpt: "A mock wiki page about " + query, source: "web" },
+      { id: "2", title: "Vector Databases", excerpt: "FAISS, HNSW, IVF…", source: "arxiv" },
+    ],
+    getWikiBrief: async (topic) => ({
+      topic, summary: `A concise, cited synthesis about ${topic}.`, confidence: "medium",
+      key_points: [{ text: `${topic} is well-studied.`, citation_ids: ["c1"] }],
+      citations: [{ id: "c1", doc_uri: "https://example.com/" + encodeURIComponent(topic), snippet: "…" }],
+    }),
+    getWikiStatus: async () => ({
+      documents: 4986, pages: 2, flaggedStale: 1,
+      recentJobs: [
+        { jobID: "j1", input: "https://github.com/openai", status: "done",
+          candidates: 4, written: 4, skipped: 0, failed: 0 },
+      ],
+    }),
+    getWikiWatch: async () => [
+      { id: "https://github.com/openai", cadence: "hot", status: "active", errorCount: 0, due: true },
+      { id: "https://blog.example.com/feed", cadence: "warm", status: "paused", errorCount: 0, due: false },
+    ],
+    startWikiResearch: async (params, onEvent) => {
+      const seq: Array<[WikiJobLine, boolean]> = [
+        [{ type: "event", kind: "started", mode: params.mode || "topic" }, false],
+        [{ type: "event", kind: "round_started", round: 1 }, false],
+        [{ type: "event", kind: "sources", round: 1, count: 3 }, false],
+        [{ type: "event", kind: "compiled", round: 1, written: 2, claims: 8 }, false],
+        [{ type: "event", kind: "round_completed", round: 1, score: 44 }, false],
+        [{ type: "result", status: "completed", rounds: 1, sources: 3, pages: 2, finalScore: 44 }, true],
+      ];
+      seq.forEach(([line, done], i) => setTimeout(() => onEvent(line, done), 120 * (i + 1)));
+      return { jobId: "mock-research", cancel: () => {} };
+    },
+    startWikiIngest: async (_params, onEvent) => {
+      const seq: Array<[WikiJobLine, boolean]> = [
+        [{ type: "event", kind: "candidate", seq: 1, status: "written", uri: "https://github.com/o/r1" }, false],
+        [{ type: "event", kind: "candidate", seq: 2, status: "written", uri: "https://github.com/o/r2" }, false],
+        [{ type: "result", status: "done", written: 2, skipped: 0, failed: 0 }, true],
+      ];
+      seq.forEach(([line, done], i) => setTimeout(() => onEvent(line, done), 120 * (i + 1)));
+      return { jobId: "mock-ingest", cancel: () => {} };
+    },
   };
 }
 
