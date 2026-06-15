@@ -193,6 +193,16 @@ case "wiki-contradictions":
         exit(2)
     }
 
+case "wiki-refresh":
+    do {
+        let result = try await CodexMemoryWikiRefresh.run(args: Array(args.dropFirst()))
+        FileHandle.standardOutput.write(Data(result.output.utf8))
+        exit(result.ok ? 0 : 1)
+    } catch {
+        FileHandle.standardError.write(Data("wiki-refresh failed: \(error)\n".utf8))
+        exit(2)
+    }
+
 case "code-index":
     do {
         let result = try await CodexMemoryCodeIndex.run(args: Array(args.dropFirst()))
@@ -232,6 +242,7 @@ case "help", "--help", "-h":
       wiki-query      Query the knowledge (hybrid retrieval) and print ranked hits.
       wiki-watch      Register/list watched sources (add|list|pause|resume|remove|run-due).
       wiki-audit      Output-drift scan: pages compiled from since-changed claims.
+      wiki-refresh    Re-fetch + re-verify due (stale) sources (--due); bump verified_at.
       wiki-research   Multi-round web research swarm → credibility filter → ingest.
       run             Long-running daemon: ingest → process → score, with MCP.
 
