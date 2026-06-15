@@ -99,6 +99,10 @@ public actor MemoryRetriever {
         // Wave 2.16). `.general` reproduces the historical 0.7/0.2/0.1 weights, so
         // an ordinary query is byte-for-byte unchanged.
         let weights = QueryIntentClassifier.resolve(trimmed).weights
+        // Pre-normalize the query once for the title exact-match bonus (gbrain Wave 2.18).
+        // entity intent carries exactMatchBonus=0.15; every other intent carries 0.0, so
+        // this is a no-op off the entity lane.
+        let exactKeys = Self.exactMatchKeys(trimmed)
         let topK = Self.clampedPositive(k ?? config.finalTopK, defaultValue: 10, max: 100)
         let fuseTopK = Self.clampedPositive(config.fuseTopK, defaultValue: 50, max: 1_000)
         async let bm25Task = bm25TopHits(query)
@@ -148,9 +152,19 @@ public actor MemoryRetriever {
             let bm25Score = bm25Scores[chunk.id] ?? 0
             let vecScore  = vecScores[chunk.id]  ?? 0
             let rerankScore = Double(rerankScores[i])
-            let s = weights.rerank * rerankScore
+            var s = weights.rerank * rerankScore
                   + weights.vec * vecScore
                   + weights.bm25 * bm25Score
+            // Entity-intent exact-title bonus (gbrain Wave 2.18): a document whose title
+            // literally equals the query gets weights.exactMatchBonus added to its BASE
+            // score, so it participates in the floor-ratio gate and isn't gated out by a
+            // near-tie weak page. Gated to entity intent (bonus 0.0 elsewhere) + a strict
+            // normalized match, so general/temporal/event ranking is byte-for-byte unchanged.
+            if weights.exactMatchBonus > 0,
+               let title = doc.title,
+               Self.titleExactlyMatches(title, keys: exactKeys) {
+                s += weights.exactMatchBonus
+            }
             base.append((chunk, doc, bm25Score, vecScore, rerankScore, s))
         }
         // Floor-ratio gate: one threshold computed on the BASE scores before any
@@ -177,6 +191,34 @@ public actor MemoryRetriever {
         }
         ranked.sort { $0.score > $1.score }
         return Array(ranked.prefix(topK))
+    }
+
+    /// Normalized forms of the query used for the title exact-match bonus: the
+    /// lowercased/whitespace-collapsed query plus, when the classifier's entity wrappers
+    /// are present, the query with surrounding double-quotes and a single leading '@'
+    /// stripped — so quoted spans and @handles still match a plainly-titled document.
+    static func exactMatchKeys(_ query: String) -> Set<String> {
+        func norm(_ s: String) -> String {
+            s.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        var keys: Set<String> = []
+        let base = norm(query)
+        if !base.isEmpty { keys.insert(base) }
+        var stripped = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped.hasPrefix("\""), stripped.hasSuffix("\""), stripped.count >= 2 {
+            stripped = String(stripped.dropFirst().dropLast())
+        }
+        if stripped.hasPrefix("@") { stripped = String(stripped.dropFirst()) }
+        let s2 = norm(stripped)
+        if !s2.isEmpty { keys.insert(s2) }
+        return keys
+    }
+
+    /// Strict normalized equality of a candidate title against any query key.
+    static func titleExactlyMatches(_ title: String, keys: Set<String>) -> Bool {
+        guard !keys.isEmpty else { return false }
+        let t = title.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return !t.isEmpty && keys.contains(t)
     }
 
     private static func clampedPositive(_ value: Int,
