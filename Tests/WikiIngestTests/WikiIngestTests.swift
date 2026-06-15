@@ -315,6 +315,14 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(cands[0].provenance.adapter, "arxiv")
     }
 
+    // A Sendable, lock-guarded recorder for the @Sendable ingest-progress closure.
+    final class IngestEventLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var events: [WikiIngestOrchestrator.Progress] = []
+        func append(_ e: WikiIngestOrchestrator.Progress) { lock.lock(); events.append(e); lock.unlock() }
+        var all: [WikiIngestOrchestrator.Progress] { lock.lock(); defer { lock.unlock() }; return events }
+    }
+
     // MARK: ingest ledger + orchestrator
 
     private func makeStore() throws -> (MemoryStore, String) {
@@ -412,6 +420,30 @@ final class WikiIngestTests: XCTestCase {
         XCTAssertEqual(s2.skipped, 2)
         let count2 = try await store.documentCount()
         XCTAssertEqual(count2, 2)
+    }
+
+    func testOrchestratorEmitsProgressEvents() async throws {
+        let (store, dir) = try makeStore(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let processor = MemoryProcessor(store: store, inference: MockInferenceProvider(embeddingDimension: 8))
+        let writer = WikiIngestWriter(store: store, processor: processor)
+        let json = """
+        [{"name":"r1","full_name":"o/r1","description":"first repo with enough text to chunk nicely here",
+          "html_url":"https://github.com/o/r1","language":"Swift","stargazers_count":3},
+         {"name":"r2","full_name":"o/r2","description":"second repo also with enough descriptive body text",
+          "html_url":"https://github.com/o/r2","language":"Go","stargazers_count":5}]
+        """
+        let reg = WikiAdapterRegistry(fetcher: publicFetcher(HTMLTransport(html: json, contentType: "application/json")))
+        let orch = WikiIngestOrchestrator(registry: reg, writer: writer, store: store, now: { 42 })
+        let log = IngestEventLog()
+        _ = await orch.ingest(IngestRequest(input: "https://github.com/o", fetchedAt: 42), jobID: "JOB",
+                              onProgress: { log.append($0) })
+        let events = log.all
+        // two candidate events (both written) + a finished event
+        let candidates = events.filter { if case .candidate = $0 { return true }; return false }
+        XCTAssertEqual(candidates.count, 2)
+        XCTAssertTrue(events.contains { if case .candidate(1, _, "written") = $0 { return true }; return false })
+        XCTAssertTrue(events.contains { if case .finished(2, 0, 0) = $0 { return true }; return false })
+        XCTAssertTrue({ if case .finished = events.last { return true }; return false }())
     }
 
     func testOrchestratorDryRunWritesNothing() async throws {

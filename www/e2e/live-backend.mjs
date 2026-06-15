@@ -22,7 +22,8 @@ function rpc(method, params) {
 }
 
 const fail = (msg) => { console.error("FAIL:", msg); process.exit(1); };
-const timer = setTimeout(() => fail("timeout waiting for wiki/job/done"), 20000);
+// Generous: REAL=1 runs actual research (web + LLM), which takes well over a minute.
+const timer = setTimeout(() => fail("timeout waiting for wiki/job/done"), Number(process.env.JOB_TIMEOUT_MS ?? 200000));
 
 ws.on("open", async () => {
   try {

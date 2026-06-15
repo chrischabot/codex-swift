@@ -26,6 +26,7 @@ enum CodexMemoryWikiIngest {
         var corpus: String?
         var jobID: String?
         var allowHTTP = true     // SSRF protection is the private-IP block, not the scheme
+        var progress = false     // emit NDJSON live events to stdout (for the WS job stream)
     }
 
     struct CLIError: Error, CustomStringConvertible {
@@ -63,7 +64,14 @@ enum CodexMemoryWikiIngest {
         let req = IngestRequest(input: opt.input, adapter: opt.adapter, rawType: opt.rawType,
                                 limit: opt.limit, dryRun: opt.dryRun, fetchedAt: now)
         let jobID = opt.jobID ?? UUID().uuidString
-        let summary = await orch.ingest(req, jobID: jobID, extract: opt.extract, corpus: opt.corpus)
+        let onProgress: (@Sendable (WikiIngestOrchestrator.Progress) -> Void)? = opt.progress
+            ? ({ @Sendable ev in FileHandle.standardOutput.write(Data((WikiProgress.ingestEvent(ev) + "\n").utf8)) })
+            : nil
+        let summary = await orch.ingest(req, jobID: jobID, extract: opt.extract, corpus: opt.corpus,
+                                        onProgress: onProgress)
+        if opt.progress {
+            return (WikiProgress.ingestResult(summary) + "\n", summary.status != "failed")
+        }
         return (format(summary, json: opt.json), summary.status != "failed")
     }
 
@@ -119,6 +127,7 @@ enum CodexMemoryWikiIngest {
             case "--dry-run":  o.dryRun = true
             case "--extract":  o.extract = true
             case "--json":     o.json = true
+            case "--progress": o.progress = true
             case "--allow-http": o.allowHTTP = true
             case "--https-only": o.allowHTTP = false
             default:

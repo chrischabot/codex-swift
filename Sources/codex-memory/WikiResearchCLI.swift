@@ -22,6 +22,7 @@ enum CodexMemoryWikiResearch {
         var maxRounds = 3
         var json = false
         var extractClaims = true
+        var progress = false      // emit NDJSON live events to stdout (for the WS job stream)
     }
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
 
@@ -57,12 +58,20 @@ enum CodexMemoryWikiResearch {
             now: { Int64(Date().timeIntervalSince1970) })
 
         let sessionStore = ResearchSessionStore(root: vaultRoot + "/research")
+        // In --progress mode, stream NDJSON events to stdout as the run proceeds.
+        let onProgress: (@Sendable (ResearchProgress) -> Void)? = opt.progress
+            ? ({ @Sendable ev in FileHandle.standardOutput.write(Data((WikiProgress.researchEvent(ev) + "\n").utf8)) })
+            : nil
         let config = ResearchConfig(depth: opt.depth, minTimeBudget: opt.minTime,
                                     sourcesPerRound: opt.sources, maxRounds: opt.maxRounds,
-                                    sessionStore: sessionStore)
+                                    sessionStore: sessionStore, onProgress: onProgress)
         let sessionID = "research-\(now)"
         let result = await orch.run(input: opt.topic, sessionID: sessionID,
                                     forcedMode: opt.mode, config: config)
+        // --progress: a final NDJSON result line; otherwise the human/--json summary.
+        if opt.progress {
+            return (WikiProgress.researchResult(result) + "\n", result.status != "failed")
+        }
         return (format(result, json: opt.json), result.status != "failed")
     }
 
@@ -109,6 +118,7 @@ enum CodexMemoryWikiResearch {
             case "--min-time": o.minTime = Int64(try val(a))
             case "--max-rounds": o.maxRounds = Int(try val(a)) ?? 3
             case "--no-claims": o.extractClaims = false
+            case "--progress": o.progress = true
             case "--json": o.json = true
             default:
                 if a.hasPrefix("-") { throw CLIError(message: "unknown flag \(a)") }

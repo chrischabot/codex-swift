@@ -30,8 +30,15 @@ public struct WikiIngestOrchestrator: Sendable {
         public var dryRun: Bool
     }
 
+    /// A live progress event emitted during an ingest (for the WS job stream).
+    public enum Progress: Sendable, Equatable {
+        case candidate(seq: Int, uri: String, status: String)   // written | deduped | failed
+        case finished(written: Int, skipped: Int, failed: Int)
+    }
+
     public func ingest(_ req: IngestRequest, jobID: String, extract: Bool = false,
-                       corpus: String? = nil) async -> Summary {
+                       corpus: String? = nil,
+                       onProgress: (@Sendable (Progress) -> Void)? = nil) async -> Summary {
         let adapter = registry.resolve(req.input, forced: req.adapter)
 
         // Dry-run: enumerate only — no writes, no ledger, no side effects.
@@ -66,11 +73,14 @@ public struct WikiIngestOrchestrator: Sendable {
                                                        status: status, documentID: r.documentID,
                                                        error: nil, recordedAt: now())
                     if r.skipped { skipped += 1 } else { written += 1; docIDs.append(r.documentID) }
+                    onProgress?(.candidate(seq: seq, uri: cand.sourceURI,
+                                           status: r.skipped ? "deduped" : "written"))
                 } catch {
                     try? await store.ingestRecordItem(jobID: jobID, seq: seq, sourceURI: cand.sourceURI,
                                                        status: .failed, documentID: nil,
                                                        error: "\(error)", recordedAt: now())
                     failed += 1
+                    onProgress?(.candidate(seq: seq, uri: cand.sourceURI, status: "failed"))
                 }
             }
         } catch {
@@ -83,6 +93,7 @@ public struct WikiIngestOrchestrator: Sendable {
         }
         try? await store.ingestFinish(jobID: jobID, status: "done", finishedAt: now(),
                                       cursor: cursor, error: nil)
+        onProgress?(.finished(written: written, skipped: skipped, failed: failed))
         return Summary(jobID: jobID, status: "done", candidates: seq, written: written,
                        skipped: skipped, failed: failed, documentIDs: docIDs, cursor: cursor,
                        error: nil, dryRun: false)
