@@ -116,10 +116,22 @@ enum CodexMemoryWikiArtifact {
 
     static func file(store: MemoryStore, vaultRoot: String, now: Int64,
                      slug: String, title: String, category: String, format: String?, outputType: String?,
-                     body: String, strict: Bool, enforceGrounding: Bool) async throws -> (String, Bool) {
+                     body: String, strict: Bool, enforceGrounding: Bool, project: String? = nil) async throws -> (String, Bool) {
         // Path-traversal guard: the slug is the on-disk filename — never let it escape.
         guard isSafeSlug(slug) else {
             return ("wiki-\(category): REFUSED — unsafe slug '\(slug)' (use [a-z0-9-_], no slashes/dots)\n", false)
+        }
+        // §5.C Project pre-flight gate: a `--project` must name a REGISTERED project (one
+        // whose WHY.md is written) before any artifact can be filed into it. This is the
+        // "state why first" trust mechanism — checked BEFORE we write anything.
+        if let proj = project {
+            guard WikiProject.isSafeSlug(proj) else {
+                return ("wiki-\(category): REFUSED — unsafe project slug '\(proj)'\n", false)
+            }
+            guard WikiProject.isRegistered(vaultRoot, proj) else {
+                return ("wiki-\(category): REFUSED — project '\(proj)' has no WHY.md "
+                    + "(run `wiki-project create \(proj) --why \"…\"` first)\n", false)
+            }
         }
         // Resolve grounding citations against the store by DIRECT lookup of each cited id
         // (no bulk fetch-and-cap — a real-but-stale page beyond a LIMIT must still resolve).
@@ -142,13 +154,30 @@ enum CodexMemoryWikiArtifact {
                 let id = try await write(store: store, vaultRoot: vaultRoot, now: now, slug: slug, title: title,
                                          category: category, format: format, outputType: outputType, body: body,
                                          claims: citedClaimIDs)
-                return ("wiki-\(category): filed \(slug) (id \(id)) — WARN ungrounded (\(violations.count)): \(summary)\n", true)
+                let routed = routeToProject(vaultRoot: vaultRoot, project: project, category: category,
+                                            slug: slug, title: title, body: body, now: now)
+                return ("wiki-\(category): filed \(slug) (id \(id))\(routed) — WARN ungrounded (\(violations.count)): \(summary)\n", true)
             }
         }
         let id = try await write(store: store, vaultRoot: vaultRoot, now: now, slug: slug, title: title,
                                  category: category, format: format, outputType: outputType, body: body,
                                  claims: citedClaimIDs)
-        return ("wiki-\(category): filed \(slug) (id \(id))\n", true)
+        let routed = routeToProject(vaultRoot: vaultRoot, project: project, category: category,
+                                    slug: slug, title: title, body: body, now: now)
+        return ("wiki-\(category): filed \(slug) (id \(id))\(routed)\n", true)
+    }
+
+    /// Route a filed artifact into its project folder (when `--project` is set). Best-effort:
+    /// the durable synthesis row is the source of truth, so a routing hiccup must not fail the
+    /// file. Returns a message fragment for the CLI output (empty when no project).
+    static func routeToProject(vaultRoot: String, project: String?, category: String,
+                               slug: String, title: String, body: String, now: Int64) -> String {
+        guard let proj = project else { return "" }
+        guard let path = try? WikiProject.route(vaultRoot: vaultRoot, slug: proj, category: category,
+                                                artifactSlug: slug, title: title, body: body, now: now) else {
+            return " (project routing failed)"
+        }
+        return " → project:\(proj) (\((path as NSString).lastPathComponent))"
     }
 
     /// Write the body to `<vaultRoot>/wiki/<category>/<slug>.md` (file failures throw
@@ -182,7 +211,7 @@ enum CodexMemoryWikiArtifact {
         let vaultRoot = (MemoryStoreConfig.defaultPath() as NSString).deletingLastPathComponent
         return try await file(store: bundle.store, vaultRoot: vaultRoot, now: Int64(Date().timeIntervalSince1970),
                               slug: o.slug, title: o.title, category: "plan", format: format, outputType: nil,
-                              body: o.body, strict: o.strict, enforceGrounding: true)
+                              body: o.body, strict: o.strict, enforceGrounding: true, project: o.project)
     }
 
     static func runOutput(args: [String]) async throws -> (output: String, ok: Bool) {
@@ -198,10 +227,10 @@ enum CodexMemoryWikiArtifact {
         // surfaced but not enforced (outputs aren't decisions).
         return try await file(store: bundle.store, vaultRoot: vaultRoot, now: Int64(Date().timeIntervalSince1970),
                               slug: o.slug, title: o.title, category: "report", format: nil, outputType: type,
-                              body: o.body, strict: false, enforceGrounding: false)
+                              body: o.body, strict: false, enforceGrounding: false, project: o.project)
     }
 
-    struct Options { var slug = "", title = "", body = "", strict = false; var format: String? }
+    struct Options { var slug = "", title = "", body = "", strict = false; var format: String?; var project: String? }
 
     static func parse(_ args: [String], formats: Set<String>, formatFlag: String) throws -> Options {
         var o = Options(); var i = 0
@@ -216,6 +245,7 @@ enum CodexMemoryWikiArtifact {
                 guard let s = try? String(contentsOfFile: p, encoding: .utf8) else { throw CLIError(message: "could not read --body-file \(p)") }
                 o.body = s
             case "--strict": o.strict = true
+            case "--project": o.project = try val("--project")
             case formatFlag: o.format = try val(formatFlag)
             default: throw CLIError(message: "unknown flag \(args[i])")
             }
