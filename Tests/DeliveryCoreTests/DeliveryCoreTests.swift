@@ -130,6 +130,52 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(n, 1, "the second same-key send is deduped (executor called once)")
     }
 
+    // The audit fix: the dedup window survives a restart (was in-memory only → a crash
+    // emptied it, so recover()+re-enqueue of a just-delivered key double-sent).
+
+    func testDedupWindowSurvivesRestart() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var acked = job("j1", key: "K"); acked.state = .acked
+        writeLog(dir, [acked])                              // a delivery committed before the crash
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: clock.fn)   // restart: re-seeds from the log
+        let r = await q.enqueue(job("j2", key: "K"))         // fresh enqueue of the same key post-restart
+        let n = await exec.count()
+        XCTAssertTrue(r.deduped, "a key acked before the crash stays deduped after restart")
+        XCTAssertEqual(n, 0, "the executor is NOT called — no cross-restart double-send")
+    }
+
+    func testReseedExpiresAfterWindow() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var acked = job("j1", key: "K"); acked.state = .acked
+        writeLog(dir, [acked])
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: clock.fn)
+        clock.advance(200)                                   // past the re-seeded window
+        let r = await q.enqueue(job("j2", key: "K"))
+        let n = await exec.count()
+        XCTAssertFalse(r.deduped, "the re-seeded window is a real bounded window, not a permanent block")
+        XCTAssertEqual(n, 1)
+    }
+
+    func testFailedKeyIsNotReseeded() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var failed = job("j1", key: "K"); failed.state = .failed
+        writeLog(dir, [failed])                              // dead-lettered before the crash
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: clock.fn)
+        let r = await q.enqueue(job("j2", key: "K"))         // a legitimate operator retry
+        let n = await exec.count()
+        XCTAssertFalse(r.deduped, "a re-enqueue of a FAILED key is a legit retry — must NOT be swallowed")
+        XCTAssertEqual(n, 1)
+    }
+
     func testIdempotencyDedupExpiresAfterWindow() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let exec = ScriptedExecutor([.acked])

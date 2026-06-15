@@ -158,6 +158,21 @@ public actor DurableDeliveryQueue {
         self.seqCounter = folded.latest.values.map(\.seq).max() ?? 0
         self.appendedBytes = folded.bytes
         self.latestPerJob = folded.latest
+        // Re-seed the (in-memory) idempotency dedup window from the durable log so it
+        // SURVIVES a restart. ackedKeys is otherwise empty after a crash, so a recover()
+        // re-drive PLUS a fresh enqueue of a just-delivered key would double-send. The log
+        // has no per-record ack timestamp and the prior process's monotonic clock is
+        // meaningless after a reboot, so we grant each already-acked key a FRESH full
+        // window from THIS process's now() — which can only briefly OVER-suppress (never
+        // double-send) and self-expires after dedupWindowSeconds. Only `.acked` seeds the
+        // window: `.failed` is dead-letter, and a re-enqueue of a failed key is a
+        // legitimate operator retry that must NOT be deduped.
+        if dedupWindowSeconds > 0 {
+            let seedT = now()
+            for job in folded.latest.values where job.state == .acked {
+                if let key = job.idempotencyKey { ackedKeys[key] = seedT }
+            }
+        }
         // All stored properties are initialized → safe to call an instance method.
         if !existed { fsyncDirectory() }
     }
