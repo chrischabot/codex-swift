@@ -300,7 +300,7 @@ case "help", "--help", "-h":
       wiki-librarian  Tier-1 staleness scan over compiled wiki pages (scan).
       wiki-status     Dashboard: doc/page counts, flagged-stale, recent ingest log.
       wiki-query      Query the knowledge (hybrid retrieval) and print ranked hits.
-      wiki-watch      Register/list watched sources (add|list|pause|resume|remove|run-due).
+      wiki-watch      Watched sources (add|list|pause|resume|remove|run-due|run-round); run-round polls due.
       wiki-audit      Output-drift scan: pages compiled from since-changed claims.
       wiki-refresh    Re-fetch + re-verify due (stale) sources (--due); bump verified_at.
       wiki-inventory  Durable inventory CRUD (list|add|show|save-view|views) — compact table.
