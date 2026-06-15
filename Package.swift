@@ -358,7 +358,7 @@ let package = Package(
                 dependencies: ["MemoryStore", "MemoryInfer", "MemoryIngest", "MemoryProcess",
                                "MemoryScore", "MemoryRetrieve", "MemoryMCP",
                                "WikiIngest", "WikiResearch", "PinnedFetcher", "EgressGuard",
-                               "MediaDecode", "Tools",
+                               "MediaDecode", "Tools", "Push",
                                "Config", "Observability", "InfraPrimitives", "ModelClient",
                                "Auth"],
                 swiftSettings: strict),

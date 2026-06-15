@@ -74,4 +74,50 @@ final class WikiDigestTests: XCTestCase {
         XCTAssertThrowsError(try CodexMemoryWikiDigest.parse(["--since", "-5"]))
         XCTAssertThrowsError(try CodexMemoryWikiDigest.parse(["--bogus"]))
     }
+
+    func testParseDeliverTarget() throws {
+        let o = try CodexMemoryWikiDigest.parse(["--deliver", "ntfy:my-topic"])
+        XCTAssertEqual(o.deliver, "ntfy:my-topic")
+        XCTAssertThrowsError(try CodexMemoryWikiDigest.parse(["--deliver"]))   // value required
+    }
+
+    // MARK: Push delivery (mocked send — no network)
+
+    private actor SendCapture {
+        private(set) var value: (target: String, text: String)?
+        func record(_ t: String, _ x: String) { value = (t, x) }
+    }
+
+    func testDeliverSendsToValidTarget() async {
+        let captured = SendCapture()
+        let (ok, detail) = await WikiDigestDelivery.deliver(text: "# digest body", target: "ntfy:topic-x") { tgt, txt in
+            await captured.record(tgt, txt); return (true, "queued")
+        }
+        XCTAssertTrue(ok); XCTAssertEqual(detail, "queued")
+        let rec = await captured.value
+        XCTAssertEqual(rec?.target, "ntfy:topic-x")
+        XCTAssertEqual(rec?.text, "# digest body")
+    }
+
+    func testDeliverRejectsEmptyTarget() async {
+        let (ok, detail) = await WikiDigestDelivery.deliver(text: "x", target: "   ") { _, _ in (true, "sent") }
+        XCTAssertFalse(ok); XCTAssertTrue(detail.contains("empty"))
+    }
+
+    func testDeliverRejectsSchemelessTarget() async {
+        for bad in ["justtopic", ":rest", "scheme:"] {
+            let (ok, detail) = await WikiDigestDelivery.deliver(text: "x", target: bad) { _, _ in
+                XCTFail("send must NOT be called for an invalid target '\(bad)'"); return (true, "")
+            }
+            XCTAssertFalse(ok, "target '\(bad)' must be rejected")
+            XCTAssertTrue(detail.contains("scheme:rest"))
+        }
+    }
+
+    func testDeliverPropagatesSendFailure() async {
+        let (ok, detail) = await WikiDigestDelivery.deliver(text: "x", target: "webhook:https://e/x") { _, _ in
+            (false, "no sink registered for scheme 'webhook'")
+        }
+        XCTAssertFalse(ok); XCTAssertTrue(detail.contains("no sink"))
+    }
 }
