@@ -15,7 +15,7 @@ wire-surface oracle is pinned in [`tools/conformance/PINNED_REV`](tools/conforma
 
 | Date | From → To | Upstream commit | Status | Plan |
 |---|---|---|---|---|
-| 2026-06-14/15 | `a280248021` → `dfd03ea01b` | `dfd03ea01b` (2026-06-14) | 🔵 P0–P5a + P6.3 ported & live-validated; P5b/P5c approved ports IN PROGRESS ([decisions](docs/notes/catchup-remaining-decisions.md)) | [codex-catchup.md](codex-catchup.md) |
+| 2026-06-14/15 | `a280248021` → `dfd03ea01b` | `dfd03ea01b` (2026-06-14) | 🔵 P0–P5c + P6.3 ported, reviewed & live-validated; remainder dispositioned (N/A / documented divergence) ([decisions](docs/notes/catchup-remaining-decisions.md)) | [codex-catchup.md](codex-catchup.md) |
 | (baseline) | — → `a280248021` | `a280248021` (2026-05-16) | ✅ ported + fidelity-remediated (audit v1→v14) | — |
 
 Legend: ✅ landed & gate-green · 🔵 planned/in progress · ⛔ abandoned.
@@ -79,7 +79,8 @@ build harness, analytics/otel internals, Bedrock managed auth.
 - [x] **P4** goals — removed `thread/goal/*` from the experimental gate (upstream #23732 Stable/default-on); tests updated + positive test + **live `codexd` E2E**. Usage-accounting already present; dedicated-DB internal-only (N/A).
 - [x] **P5** scope decisions — extensions framework + remote control = **documented divergences** (`docs/notes/catchup-p5-divergences.md`). Encrypted secrets = **PORTED**; multi-agent v2 + code mode = **scoped as optional future ports** (`docs/notes/catchup-remaining-decisions.md`).
   - [x] **P5a** encrypted secrets — **DONE + live-proven**: AES-GCM + Keychain-key store (8-finding security review fixed), CLI-auth integration (`EncryptedSecretsTokenStore` + `AuthKeyringBackendKind`, real-Keychain live test), MCP-OAuth integration (`McpOAuthStore.encrypted`). 100-test Auth suite + 171-test MCP suite green.
-  - [~] **P5b** code mode · [~] **P5c** multi-agent v2 — **scope decisions** (intentional partials; see decision register).
+  - [x] **P5b** code mode — **PORTED to the JSC-feasible level + reviewed + tested.** Output-helper surface (`text`/`image`/`generatedImage`/`store`/`load`) with #27732 reject-remote-image as a host-authoritative `data:`-only allow-list, plus `exit`/`notify`/`tools.<name>`/`ALL_TOOLS` + sandbox global-deletion. 9 adversarial findings fixed (incl. NaN process-crash, whitespace-smuggle, exit-laundering). Durable session/timers/live-notify/modules = V8-vs-JSC divergences. 16/16 `CodeModeOutputTests`. (`17d63eb`, `0eb2000`)
+  - [x] **P5c** multi-agent v2 — **PORTED foundation + reviewed + tested.** Persisted (#25721) + encrypted-at-rest (#26210) agent metadata via `AgentRecordStore`/`EncryptedFileAgentRecordStore` (AES-GCM, write-through, hydrate-on-restart, default-off). Residency-LRU/reload/concurrency = single-operator divergences. 7 `AgentRecordStoreTests` + 37 MultiAgent tests (incl. live) green. (`25027f7`)
 - [~] **P6** persistence parity — **P6.3 SQLite corruption auto-recovery PORTED + reviewed + tested** (`d375fe9`). P6.1 = deliberate documented divergence; P6.2/6.4 = N/A. See `docs/notes/catchup-remaining-decisions.md`.
 
 **Close gate (2026-06-15) — met for the ported surface:**
