@@ -25,6 +25,7 @@ enum CodexMemoryWikiResearch {
         var extractClaims = true
         var progress = false      // emit NDJSON live events to stdout (for the WS job stream)
         var maxUSD: Double?        // wiki-research SpendGate ceiling override (default $40 / env)
+        var lintMode: String?      // off|lint|strict — production enable for the write-gate link lint
     }
     struct CLIError: Error, CustomStringConvertible { let message: String; var description: String { message } }
 
@@ -38,6 +39,9 @@ enum CodexMemoryWikiResearch {
             throw CLIError(message: "no web-search backend configured (set OPENAI_API_KEY or PERPLEXITY_API_KEY)")
         }
 
+        // Production enable for the write-gate link lint (env wins in resolveMode; this is
+        // the operator surface — previously only a test ever set strict mode).
+        if let lm = opt.lintMode { setenv("CODEXKIT_WIKI_LINT_ON_WRITE", lm, 1) }
         let bundle = try await CodexMemoryRun.assemble()
         let now = Int64(Date().timeIntervalSince1970)
         let fetcher = PinnedFetcher(guard_: EgressGuard(EgressPolicy(allowHTTP: true)))
@@ -129,6 +133,10 @@ enum CodexMemoryWikiResearch {
             case "--min-time": o.minTime = Int64(try val(a))
             case "--max-rounds": o.maxRounds = Int(try val(a)) ?? 3
             case "--max-usd": o.maxUSD = Double(try val(a))
+            case "--lint-mode":
+                let m = try val(a).lowercased()
+                guard ["off", "lint", "strict"].contains(m) else { throw CLIError(message: "--lint-mode must be off|lint|strict") }
+                o.lintMode = m
             case "--no-claims": o.extractClaims = false
             case "--progress": o.progress = true
             case "--json": o.json = true

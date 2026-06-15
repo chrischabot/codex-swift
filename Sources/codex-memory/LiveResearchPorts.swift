@@ -193,15 +193,26 @@ struct LiveResearchCompiler: ResearchCompiler {
             // already persisted stand on their own evidence), so strict mode actually
             // refuses the write instead of leaving the bad page behind.
             let synthSlug = "research-" + Self.slugify(topic) + "-r\(round)"
+            // Prior rounds of THIS topic are the only real PAGE slugs we can link to
+            // (external sources are documents, not pages → linking them = brokenLink). We
+            // collect them so the emitted [[See Also]] edges resolve (else strict mode
+            // would false-block every research page).
+            let priorSlugs = ((try? await store.syntheses(category: "synthesis")) ?? [])
+                .map(\.slug)
+                .filter { $0.hasPrefix("research-" + Self.slugify(topic) + "-r") && $0 != synthSlug }
+            // Build the body ONCE — the same string the linter validates AND the writer
+            // persists (the old body:"" made brokenLink/seeAlso loops a structural no-op).
+            let synthBody = Self.renderSynthesisBody(topic: topic, round: round,
+                                                     sources: ingestedDocs.map(\.uri), seeAlso: priorSlugs)
+            var validSlugs = Set(priorSlugs); validSlugs.insert(synthSlug)
             let gate = WikiWriteGate(mode: await WikiWriteGate.resolveMode(store: store),
                                      vaultRoot: vaultRoot)
-            let verdict = gate.validate(WikiLintPage(slug: synthSlug, body: "", category: "synthesis",
+            let verdict = gate.validate(WikiLintPage(slug: synthSlug, body: synthBody, category: "synthesis",
                                                      claimLinkCount: linkableClaims.count),
-                                        validSlugs: [synthSlug])
+                                        validSlugs: validSlugs)
             // Phase 3: write the page + link its claims, only when not blocked.
             if !verdict.block,
-               let synthID = try? await writeSynthesis(topic: topic, round: round,
-                                                       sources: ingestedDocs.map(\.uri)) {
+               let synthID = try? await writeSynthesis(slug: synthSlug, topic: topic, body: synthBody) {
                 for cid in linkableClaims {
                     try? await store.linkSynthesisClaim(synthesis: synthID, claim: cid)
                     claimsLinked += 1
@@ -213,10 +224,22 @@ struct LiveResearchCompiler: ResearchCompiler {
                               existingArticles: pageCount, crossRefDensity: claimsLinked > 0 ? 0.7 : 0.2)
     }
 
-    private func writeSynthesis(topic: String, round: Int, sources: [String]) async throws -> Int64 {
-        let slug = "research-" + Self.slugify(topic) + "-r\(round)"
+    /// Render the synthesis page body ONCE so the write gate and the on-disk file are
+    /// byte-identical. External sources stay plain `- <url>` citations (they are
+    /// documents, not pages → linking them would be a brokenLink). The `## See Also`
+    /// block carries `[[prior-round-slug]]` edges — the only real page slugs in the graph
+    /// — so the link-graph linter has links to validate (was structurally empty before).
+    static func renderSynthesisBody(topic: String, round: Int, sources: [String], seeAlso: [String]) -> String {
         var body = "# \(topic)\n\n_Compiled by research round \(round)._\n\n## Sources\n"
         for s in sources { body += "- \(s)\n" }
+        if !seeAlso.isEmpty {
+            body += "\n## See Also\n"
+            for slug in seeAlso { body += "- [[\(slug)]]\n" }
+        }
+        return body
+    }
+
+    private func writeSynthesis(slug: String, topic: String, body: String) async throws -> Int64 {
         let dir = vaultRoot + "/wiki/synthesis"
         // Let file failures throw BEFORE upserting — never register a synthesis row
         // pointing at a body file that doesn't exist.

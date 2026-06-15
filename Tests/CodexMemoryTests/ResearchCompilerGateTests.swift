@@ -62,4 +62,47 @@ final class ResearchCompilerGateTests: XCTestCase {
         let page = try await store.synthesis(slug: slug)
         XCTAssertNotNil(page, "lint mode logs but never blocks → the page is still written")
     }
+
+    // MARK: link-graph lint is now LIVE on the write path (was a structural no-op via body:"")
+
+    func testRenderSynthesisBodyEmitsSeeAlsoLinks() {
+        let withPrior = LiveResearchCompiler.renderSynthesisBody(
+            topic: "Graph Nets", round: 2, sources: ["https://e/a"], seeAlso: ["research-graph-nets-r1"])
+        XCTAssertTrue(withPrior.contains("## See Also"))
+        XCTAssertTrue(withPrior.contains("[[research-graph-nets-r1]]"), "prior-round edge emitted")
+        XCTAssertTrue(withPrior.contains("- https://e/a"), "external sources stay plain citations, not [[links]]")
+        // No prior rounds → no See-Also section (round 1 has nothing real to link).
+        let bare = LiveResearchCompiler.renderSynthesisBody(topic: "X", round: 1, sources: [], seeAlso: [])
+        XCTAssertFalse(bare.contains("## See Also"))
+    }
+
+    func testStrictBlocksBrokenSeeAlsoLink() {
+        // THE adversarial proof the linter now ITERATES: a [[link]] to a non-existent
+        // slug must trip brokenLink in strict mode. With the old body:"" this could never
+        // fire (links(in:"") == []), so the link-graph check named this axis was dead.
+        let body = LiveResearchCompiler.renderSynthesisBody(
+            topic: "T", round: 2, sources: ["https://e/a"], seeAlso: ["research-t-r1"])
+        let gate = WikiWriteGate(mode: .strict, vaultRoot: NSTemporaryDirectory())
+        let v = gate.validate(WikiLintPage(slug: "research-t-r2", body: body, category: "synthesis",
+                                           claimLinkCount: 1),               // grounded → isolate the brokenLink
+                              validSlugs: ["research-t-r2"])                 // r1 NOT present → broken
+        XCTAssertTrue(v.block, "a broken See-Also link blocks in strict mode (linter now iterates)")
+        XCTAssertTrue(v.issues.contains { $0.kind == .brokenLink && $0.target == "research-t-r1" })
+    }
+
+    func testStrictAcceptsValidSeeAlsoLink() {
+        let body = LiveResearchCompiler.renderSynthesisBody(
+            topic: "T", round: 2, sources: ["https://e/a"], seeAlso: ["research-t-r1"])
+        let gate = WikiWriteGate(mode: .strict, vaultRoot: NSTemporaryDirectory())
+        let v = gate.validate(WikiLintPage(slug: "research-t-r2", body: body, category: "synthesis",
+                                           claimLinkCount: 1),
+                              validSlugs: ["research-t-r2", "research-t-r1"])  // resolves
+        XCTAssertFalse(v.block, "a valid prior-round See-Also link must NOT false-block the research write-path")
+    }
+
+    func testLintModeCLIFlagParsesAndValidates() throws {
+        let opt = try CodexMemoryWikiResearch.parse(["graph nets", "--lint-mode", "strict"])
+        XCTAssertEqual(opt.lintMode, "strict")
+        XCTAssertThrowsError(try CodexMemoryWikiResearch.parse(["t", "--lint-mode", "bogus"]))
+    }
 }
