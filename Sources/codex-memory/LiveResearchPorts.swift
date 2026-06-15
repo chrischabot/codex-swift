@@ -307,14 +307,25 @@ struct WikiClaimExtractor: Sendable {
         var description: String { message }
     }
 
-    func extract(text: String, maxClaims: Int) async -> [String] {
-        let sys = """
+    /// Version stamp for the held-out scoring harness (gbrain.md §9.6 #2): tie a
+    /// scoring receipt to this prompt revision; a drift gate (PromptVersionGateTests)
+    /// catches a silent edit. BUMP when `systemPrompt` changes.
+    static let promptVersion = "wiki-claim-v1"
+
+    /// The claim-extraction system prompt. `maxClaims` is the only dynamic field, so
+    /// the gate hashes a fixed-`maxClaims` render.
+    static func systemPrompt(maxClaims: Int) -> String {
+        """
         You extract atomic, verifiable factual claims from the provided text. Each \
         claim is ONE self-contained declarative sentence that could be independently \
         fact-checked. Skip opinions, questions, hedging, and navigation/boilerplate. \
         Respond ONLY with JSON of the form {"claims": ["claim 1", "claim 2"]} with at \
         most \(maxClaims) claims. \(ContextSanitizer.dataPreamble)
         """
+    }
+
+    func extract(text: String, maxClaims: Int) async -> [String] {
+        let sys = Self.systemPrompt(maxClaims: maxClaims)
         // The text is arbitrary fetched web content — neutralize injection vectors
         // before it enters the prompt.
         let userContent = ContextSanitizer.sanitize(String(text.prefix(8000)))

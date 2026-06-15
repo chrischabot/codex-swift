@@ -14,11 +14,23 @@ public struct WikiMemoryProvider: MemoryProvider, Sendable {
     private let retriever: MemoryRetriever
     private let toolset: [any Tool]
     private let rerank: Bool
+    /// Optional push-context resolver (gbrain.md Wave 4). When set, `volunteer`
+    /// extracts entity salience over the rolling window and resolves confidence-
+    /// gated pointers. Property-level default keeps `init` stable; set it with
+    /// `volunteering(with:)` at the composition root.
+    public var pointerResolver: PointerResolver? = nil
 
     public init(retriever: MemoryRetriever, tools: [any Tool] = [], rerank: Bool = true) {
         self.retriever = retriever
         self.toolset = tools
         self.rerank = rerank
+    }
+
+    /// Return a copy that volunteers page pointers via `resolver` (push context).
+    public func volunteering(with resolver: PointerResolver) -> WikiMemoryProvider {
+        var copy = self
+        copy.pointerResolver = resolver
+        return copy
     }
 
     public func recall(_ query: String, limit: Int) async -> [MemorySnippet] {
@@ -29,6 +41,21 @@ public struct WikiMemoryProvider: MemoryProvider, Sendable {
     }
 
     public func tools() -> [any Tool] { toolset }
+
+    /// Proactive push context (gbrain.md Wave 4): zero-LLM entity salience over the
+    /// rolling window → confidence-gated pointers → compact `name — kind` snippets
+    /// citing the page slug. Empty (opt-out) when no resolver is configured.
+    public func volunteer(_ window: ConversationWindow) async -> [MemorySnippet] {
+        guard let resolver = pointerResolver else { return [] }
+        let turns = window.turns.map { SalienceTurn(role: $0.role, text: $0.text) }
+        let candidates = EntitySalience.extract(window: turns)
+        guard !candidates.isEmpty else { return [] }
+        let pointers = (try? await resolver.resolve(candidates)) ?? []
+        return pointers.map {
+            MemorySnippet(text: "\($0.display) — \($0.targetKind)",
+                          score: $0.confidence, citation: $0.targetCanonical)
+        }
+    }
 
     /// Pure mapping `RetrievedHit → MemorySnippet` (extracted so it can be
     /// unit-tested without standing up the whole retriever/inference stack).

@@ -124,6 +124,12 @@ public actor RemoteOpenAICompatibleProvider: LocalInferenceProvider {
 // MARK: - prompt templates + JSON parser
 
 enum ExtractionPrompt {
+    /// Version stamp for the held-out scoring harness (gbrain.md §9.6 #2): tie a
+    /// scoring receipt to this exact prompt revision, and let a drift gate
+    /// (PromptVersionGateTests) catch a silent edit. BUMP THIS whenever the
+    /// instruction scaffold below changes (the gate fails until you do).
+    static let promptVersion = "extract-graph-v1"
+
     static func render(batch: ChunkBatch, schema: ExtractionSchema) -> String {
         // Compact, deterministic prompt that asks for one JSON object per
         // chunk under top-level keys "chunks". A real GPT-5.5 deployment
@@ -222,6 +228,9 @@ enum ExtractionPrompt {
 }
 
 enum ContextualisePrompt {
+    /// Version stamp (gbrain.md §9.6 #2) — see `ExtractionPrompt.promptVersion`.
+    static let promptVersion = "contextualise-v1"
+
     static func render(chunk: Chunk, document: DocumentDigest) -> String {
         """
         Produce a single sentence (≤30 words) that situates the following chunk

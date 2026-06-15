@@ -146,7 +146,7 @@ public struct Mem0Engine: Sendable {
         }
 
         let cleaned = Mem0Text.removeCodeBlocks(response)
-        let extracted = cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        var extracted = cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? [] : Self.parseMemoryArray(cleaned)
         if extracted.isEmpty {
             try? await historyStore.saveMessages(messages, scope: sessionScope)
@@ -165,6 +165,24 @@ public struct Mem0Engine: Sendable {
         } else {
             for t in memTexts {
                 if let v = try? await embedder.embed(t, .add) { embedMap[t] = v }
+            }
+        }
+
+        // Phase 3.5: reconciliation (gbrain.md Wave 0.4) — OFF by default. When on,
+        // split extracted facts into ADD (fall through to Phase 4–6) vs near-dup-skip
+        // vs an LLM update pass over mid-band matches (UPDATE/DELETE/ADD/NONE). This
+        // closes the documented ADD-only gap so a corrected fact supersedes the stale
+        // one instead of accumulating a contradictory duplicate.
+        var reconcileResults: [AddResult] = []
+        if config.reconcileOnAdd {
+            let outcome = await reconcileExtracted(extracted, embedMap: embedMap,
+                                                   searchFilters: searchFilters)
+            extracted = outcome.addFacts
+            reconcileResults = outcome.results
+            if extracted.isEmpty {
+                // Only updates/deletes/skips happened — still persist the conversation.
+                try? await historyStore.saveMessages(messages, scope: sessionScope)
+                return reconcileResults
             }
         }
 
@@ -245,9 +263,147 @@ public struct Mem0Engine: Sendable {
         // Phase 7: best-effort entity linking.
         await linkEntities(persisted, searchFilters)
 
-        // Phase 8: persist messages + return.
+        // Phase 8: persist messages + return (reconciliation UPDATE/DELETE results first).
         try? await historyStore.saveMessages(messages, scope: sessionScope)
-        return persisted.map { AddResult(id: $0.id, memory: $0.text, event: "ADD") }
+        return reconcileResults + persisted.map { AddResult(id: $0.id, memory: $0.text, event: "ADD") }
+    }
+
+    private struct ReconcileOutcome {
+        var addFacts: [JSONValue]   // facts that should still flow through Phase 4–6 as ADDs
+        var results: [AddResult]    // UPDATE/DELETE results already applied
+    }
+
+    /// Two-tier reconciliation of newly-extracted facts against existing memories
+    /// (gbrain.md Wave 0.4). Per fact: a cosine fast-path skips near-duplicates
+    /// (≥ dupCosineThreshold) with NO LLM; a mid-band match (≥ reconcileCosineThreshold)
+    /// is collected for ONE batched LLM update pass (the dormant
+    /// `getUpdateMemoryMessages`) that emits UPDATE/DELETE/ADD/NONE; everything else
+    /// is a clear ADD. UPDATE/DELETE are applied via the existing primitives. On any
+    /// LLM failure we fall back to ADD-all (never silently lose a fact).
+    private func reconcileExtracted(_ extracted: [JSONValue], embedMap: [String: [Float]],
+                                    searchFilters: JSONObject) async -> ReconcileOutcome {
+        let dupCos = config.dupCosineThreshold
+        let lowCos = config.reconcileCosineThreshold
+        var adds: [JSONValue] = []
+        var results: [AddResult] = []
+        var seenHashes = Set<String>()
+
+        for mem in extracted {
+            guard let text = mem.objectValue?["text"]?.stringValue, !text.isEmpty,
+                  !Mem0SecretScanner.containsSecret(text), let emb = embedMap[text] else { continue }
+            let h = md5Hex(text)
+            if seenHashes.contains(h) { continue }
+            seenHashes.insert(h)
+
+            let top = (try? await vectorStore.search(text, emb, topK: 1, filters: searchFilters))?.first
+            let cos = top?.score ?? 0
+            let matchText = top?.payload["data"]?.stringValue ?? ""
+
+            // Near-duplicate fast-path: skip with NO write/LLM ONLY when the new fact
+            // is also (normalized) textually identical — a high cosine ALONE can be a
+            // CORRECTION (number swap) or NEGATION, which must NOT be silently dropped.
+            if top != nil, cos >= dupCos, Self.normalizedEqual(text, matchText) { continue }
+
+            guard let top, cos >= lowCos else {
+                adds.append(mem)   // clearly new (below the reconcile band, or no match)
+                continue
+            }
+
+            // Reconcile THIS fact against its SINGLE match. Per-fact scope means an
+            // injected fact can only ever touch its OWN matched memory — never
+            // mass-delete others — and an omitted/aborted decision re-ADDs (no loss).
+            switch await reconcileOne(newText: text, newEmb: emb, matchID: top.id, matchText: matchText) {
+            case .addNew: adds.append(.object(["text": .string(text)]))
+            case .skip:   break
+            case .applied(let r): results.append(r)
+            }
+        }
+        return ReconcileOutcome(addFacts: adds, results: results)
+    }
+
+    private enum OneOutcome { case addNew, skip, applied(AddResult) }
+
+    /// Reconcile ONE new fact against ONE existing match via the LLM update pass.
+    /// The LLM sees ONLY this single (fact, match) pair, so it can only ever
+    /// UPDATE/DELETE `matchID` — never another memory (no mass-delete). An omitted
+    /// decision or ANY LLM failure re-ADDs the fact (never silently lost). Both
+    /// texts are sanitized before they enter the prompt.
+    private func reconcileOne(newText: String, newEmb: [Float],
+                              matchID: String, matchText: String) async -> OneOutcome {
+        let retrievedOld: [JSONValue] = [.object([
+            "id": .string(matchID), "text": .string(Self.sanitizeForPrompt(matchText))])]
+        let newFacts: [JSONValue] = [.object(["text": .string(Self.sanitizeForPrompt(newText))])]
+        let prompt = Mem0Prompts.getUpdateMemoryMessages(retrievedOldMemory: retrievedOld, responseContent: newFacts)
+        guard let resp = try? await llm.generate([.user(prompt)], GenerateOptions(responseFormatJSON: true)) else {
+            return .addNew   // LLM failure → never lose the fact
+        }
+        for e in Self.parseMemoryArray(Mem0Text.removeCodeBlocks(resp)) {
+            guard let obj = e.objectValue else { continue }
+            let id = obj["id"]?.stringValue ?? ""
+            let evText = obj["text"]?.stringValue ?? ""
+            switch (obj["event"]?.stringValue ?? "").uppercased() {
+            case "UPDATE" where id == matchID:
+                guard !evText.isEmpty, !Mem0SecretScanner.containsSecret(evText) else { return .addNew }
+                let emb: [Float]?
+                if evText == newText { emb = newEmb } else { emb = try? await embedder.embed(evText, .update) }
+                // metadata: nil → updateMemory preserves the EXISTING record's scope +
+                // created_at (it re-derives user/agent/run/actor/role from that row).
+                if (try? await updateMemory(matchID, data: evText, precomputed: emb, metadata: nil)) != nil {
+                    return .applied(AddResult(id: matchID, memory: evText, event: "UPDATE"))
+                }
+                return .addNew
+            case "DELETE" where id == matchID:
+                if (try? await deleteMemory(matchID, existing: nil)) != nil {
+                    return .applied(AddResult(id: matchID, memory: matchText, event: "DELETE"))
+                }
+                return .skip
+            case "ADD":
+                return .addNew
+            case "NONE", "":
+                return .skip   // explicit redundancy (≥ reconcile band) → drop
+            default:
+                continue
+            }
+        }
+        return .addNew   // no applicable decision (LLM omission) → never lose the fact
+    }
+
+    /// Normalized text equality (lowercase + whitespace-collapsed) — distinguishes a
+    /// true duplicate from a high-cosine contradiction in the dedup fast-path.
+    static func normalizedEqual(_ a: String, _ b: String) -> Bool {
+        func norm(_ s: String) -> String {
+            s.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        return norm(a) == norm(b)
+    }
+
+    /// Neutralize injection vectors in UNTRUSTED fact/memory text before it enters
+    /// the reconcile update prompt. Mem0Core can't import MemoryInfer's
+    /// `ContextSanitizer`, so this inlines its core: defang markdown code fences (so
+    /// an injected ```{"memory":…}``` block isn't read as structure) and
+    /// bracket-neutralize role/envelope breakout tags. Structural JSON injection is
+    /// further contained because `serializeMemories` JSON-encodes the text as a
+    /// string value.
+    static func sanitizeForPrompt(_ text: String) -> String {
+        var s = text.replacingOccurrences(of: "```", with: "'''")
+        // Neutralize ANY tag-like token `<…>` by bracket-swapping (`<`→`[`, `>`→`]`),
+        // not just a fixed allowlist — robust to whitespace (`< memory >`), case
+        // (`<MeMoRy>`), and tags off the list (`<prompt>`, `<context>`,
+        // `<|im_start|>`). "Tag-like" = optional `/`, then a CONTIGUOUS word/marker
+        // name (letters, digits, `| _ : -`), optionally space-padded, closed by `>`.
+        // Requiring a contiguous name avoids mangling benign prose like `a < b and c > d`.
+        if let re = try? NSRegularExpression(pattern: #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#) {
+            let ns = s as NSString
+            let mutable = NSMutableString(string: s)
+            // Apply in reverse so earlier match ranges stay valid as we mutate.
+            for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)).reversed() {
+                let tok = ns.substring(with: m.range)
+                let neutral = tok.replacingOccurrences(of: "<", with: "[").replacingOccurrences(of: ">", with: "]")
+                mutable.replaceCharacters(in: m.range, with: neutral)
+            }
+            s = mutable as String
+        }
+        return s
     }
 
     /// Procedural memory. Port of `create_procedural_memory`.

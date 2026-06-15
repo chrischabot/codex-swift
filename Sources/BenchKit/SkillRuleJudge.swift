@@ -28,7 +28,44 @@ public enum SkillRule: Sendable, Equatable {
     }
 }
 
-public struct SkillRuleResult: Sendable, Equatable {
+/// Tagged JSON form so a case file can carry rules: `{"kind":"contains","value":"x"}`
+/// for string rules, `{"kind":"maxChars","n":500}` for count rules.
+extension SkillRule: Codable {
+    private enum CodingKeys: String, CodingKey { case kind, value, n }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(String.self, forKey: .kind)
+        func str() throws -> String { try c.decode(String.self, forKey: .value) }
+        func int() throws -> Int { try c.decode(Int.self, forKey: .n) }
+        switch kind {
+        case "contains": self = .contains(try str())
+        case "notContains": self = .notContains(try str())
+        case "regex": self = .regex(try str())
+        case "sectionPresent": self = .sectionPresent(try str())
+        case "toolCalled": self = .toolCalled(try str())
+        case "maxChars": self = .maxChars(try int())
+        case "minChars": self = .minChars(try int())
+        case "minCitations": self = .minCitations(try int())
+        default:
+            throw DecodingError.dataCorruptedError(forKey: .kind, in: c, debugDescription: "unknown rule kind \(kind)")
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .contains(let s): try c.encode("contains", forKey: .kind); try c.encode(s, forKey: .value)
+        case .notContains(let s): try c.encode("notContains", forKey: .kind); try c.encode(s, forKey: .value)
+        case .regex(let s): try c.encode("regex", forKey: .kind); try c.encode(s, forKey: .value)
+        case .sectionPresent(let s): try c.encode("sectionPresent", forKey: .kind); try c.encode(s, forKey: .value)
+        case .toolCalled(let s): try c.encode("toolCalled", forKey: .kind); try c.encode(s, forKey: .value)
+        case .maxChars(let n): try c.encode("maxChars", forKey: .kind); try c.encode(n, forKey: .n)
+        case .minChars(let n): try c.encode("minChars", forKey: .kind); try c.encode(n, forKey: .n)
+        case .minCitations(let n): try c.encode("minCitations", forKey: .kind); try c.encode(n, forKey: .n)
+        }
+    }
+}
+
+public struct SkillRuleResult: Sendable, Equatable, Codable {
     public var rule: String
     public var passed: Bool
     public init(rule: String, passed: Bool) { self.rule = rule; self.passed = passed }

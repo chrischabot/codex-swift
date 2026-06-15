@@ -2767,6 +2767,13 @@ public actor SessionEngine {
             // turn's query can never leak forward; recall guards on non-empty.
             let userText = input.compactMap(\.text).joined(separator: "\n")
             threadStore.insert(LatestUserInput(text: userText))
+            // Rolling conversation window for push-context (gbrain.md Wave 4): append
+            // the user turn here; the assistant reply is appended at turn teardown.
+            // Bounded to the last 8 turns, thread-scoped. Maintained unconditionally
+            // (cheap string list) — only the opt-in volunteer contributor reads it, so
+            // this changes no behavior when push-context is off.
+            let priorWindow = threadStore.get(ConversationWindow.self) ?? ConversationWindow()
+            threadStore.insert(priorWindow.appending(role: "user", text: userText, max: 8))
             let recalled = await withExtensionTimeout([PromptFragment]()) {
                 await registry.promptFragments(sessionStore: sessionStore,
                                                threadStore: threadStore)
@@ -4262,6 +4269,18 @@ public actor SessionEngine {
             // this turn produced no assistant message, so nothing leaks forward;
             // the capture closure decides what to do with "".
             turnStore.insert(LatestAssistantOutput(text: lastAgentMessage ?? ""))
+            // Append the assistant reply to the thread-scoped rolling window so the
+            // NEXT turn's push-context can see it (gbrain.md Wave 4). Gate on the
+            // window ending in a `.user` turn — a REGULAR turn appended the user
+            // message this turn, so the pairing is real. /review, /compact, and other
+            // non-runTurn tasks reach finishTurn WITHOUT a paired user append, so they
+            // skip (their sub-agent output must not pollute the push-context window).
+            if let agent = lastAgentMessage, !agent.isEmpty {
+                let w = extThreadStore.get(ConversationWindow.self) ?? ConversationWindow()
+                if w.turns.last?.role == "user" {
+                    extThreadStore.insert(w.appending(role: "assistant", text: agent, max: 8))
+                }
+            }
             if status == .interrupted {
                 registry.onTurnAbort(TurnAbortInput(threadStore: extThreadStore,
                                                     turnStore: turnStore,
