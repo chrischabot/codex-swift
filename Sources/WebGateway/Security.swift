@@ -38,6 +38,8 @@ enum MethodGate {
         "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename", "wiki/brief", "wiki/query", "wiki/status", "wiki/watch/list",
         // Trust reports — pure-local reads (Tier-1 staleness / Pass-2 drift), no spend/egress.
         "wiki/librarian/report", "wiki/audit/report",
+        // Curation reads — compact-table projections (inventory/datasets/collect), no spend/egress.
+        "wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list",
         "wiki/research/start", "wiki/ingest/start",
         // turn lifecycle
         "turn/start", "turn/steer", "turn/interrupt", "review/start",

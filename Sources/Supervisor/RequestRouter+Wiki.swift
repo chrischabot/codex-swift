@@ -50,6 +50,12 @@ extension RequestRouter {
             await replyWiki(conn, id) { try await $0.librarianReport() }
         case .wikiAuditReport(let id):
             await replyWiki(conn, id) { try await $0.auditReport() }
+        case .wikiInventoryList(let id):
+            await replyWiki(conn, id) { try await $0.inventoryList() }
+        case .wikiDatasetList(let id):
+            await replyWiki(conn, id) { try await $0.datasetList() }
+        case .wikiCollectList(let id):
+            await replyWiki(conn, id) { try await $0.collectList() }
         case .wikiIndex(let id):
             await replyWiki(conn, id) { try await $0.index() }
         case .wikiPageUpsert(let id, let p):

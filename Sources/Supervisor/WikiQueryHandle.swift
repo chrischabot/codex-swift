@@ -54,6 +54,12 @@ public struct WikiQueryHandle: Sendable {
     /// Audit Pass-2 output-drift report (pure timestamps, no spend/egress): which
     /// compiled pages were built from a since-changed claim. A Tier-A read.
     public var auditReport: @Sendable () async throws -> JSONValue
+    /// Inventory records (compact-table projection). Tier-A read.
+    public var inventoryList: @Sendable () async throws -> JSONValue
+    /// Dataset manifests. Tier-A read.
+    public var datasetList: @Sendable () async throws -> JSONValue
+    /// Collect catalogs with item counts. Tier-A read.
+    public var collectList: @Sendable () async throws -> JSONValue
 
     public init(
         list: @escaping @Sendable (Int) async throws -> JSONValue,
@@ -72,7 +78,10 @@ public struct WikiQueryHandle: Sendable {
         status: @escaping @Sendable () async throws -> JSONValue,
         watchList: @escaping @Sendable () async throws -> JSONValue,
         librarianReport: @escaping @Sendable () async throws -> JSONValue,
-        auditReport: @escaping @Sendable () async throws -> JSONValue
+        auditReport: @escaping @Sendable () async throws -> JSONValue,
+        inventoryList: @escaping @Sendable () async throws -> JSONValue,
+        datasetList: @escaping @Sendable () async throws -> JSONValue,
+        collectList: @escaping @Sendable () async throws -> JSONValue
     ) {
         self.list = list
         self.pageGet = pageGet
@@ -91,5 +100,8 @@ public struct WikiQueryHandle: Sendable {
         self.watchList = watchList
         self.librarianReport = librarianReport
         self.auditReport = auditReport
+        self.inventoryList = inventoryList
+        self.datasetList = datasetList
+        self.collectList = collectList
     }
 }

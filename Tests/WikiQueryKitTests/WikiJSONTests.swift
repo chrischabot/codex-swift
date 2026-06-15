@@ -446,6 +446,53 @@ final class WikiJSONTests: XCTestCase {
         XCTAssertEqual(aud.obj?["pages"]?.int, 0)
         XCTAssertEqual(aud.obj?["drifted"]?.int, 0)
     }
+
+    // MARK: - curation reads (inventory / datasets / collect) — Tier-A read RPCs
+
+    func testInventoryListShaper() async throws {
+        _ = try await store.upsertInventoryRecord(InventoryRecordRow(
+            slug: "rag", kind: "item", status: "active", priority: "p1", title: "RAG",
+            summary: "retrieval", createdAt: 1, updatedAt: 1))
+        let r = try await WikiJSON.inventoryList(store, limit: 50)
+        XCTAssertEqual(r.obj?["count"]?.int, 1)
+        let rec = r.obj?["records"]?.arr?.first
+        XCTAssertEqual(rec?.obj?["slug"]?.str, "rag")
+        XCTAssertEqual(rec?.obj?["priority"]?.str, "p1")
+        XCTAssertEqual(rec?.obj?["summary"]?.str, "retrieval")
+    }
+
+    func testDatasetListShaper() async throws {
+        _ = try await store.upsertDatasetManifest(DatasetManifestRow(
+            datasetID: "d1", title: "D1", status: "active", storage: "local",
+            sizeBytes: 99, recordCount: 3, createdAt: 1, updatedAt: 1))
+        let r = try await WikiJSON.datasetList(store, limit: 50)
+        XCTAssertEqual(r.obj?["count"]?.int, 1)
+        let d = r.obj?["datasets"]?.arr?.first
+        XCTAssertEqual(d?.obj?["datasetID"]?.str, "d1")
+        XCTAssertEqual(d?.obj?["sizeBytes"]?.int, 99)
+        XCTAssertEqual(d?.obj?["recordCount"]?.int, 3)
+    }
+
+    func testCollectListShaper() async throws {
+        _ = try await store.upsertCollectItem(CollectItemRow(catalogSlug: "memes", rowNumber: 1, title: "a", canonicalURL: "https://e/1", createdAt: 1))
+        _ = try await store.upsertCollectItem(CollectItemRow(catalogSlug: "memes", rowNumber: 2, title: "b", canonicalURL: "https://e/2", createdAt: 1))
+        _ = try await store.upsertCollectItem(CollectItemRow(catalogSlug: "tools", rowNumber: 1, title: "c", canonicalURL: "https://e/3", createdAt: 1))
+        let r = try await WikiJSON.collectList(store)
+        XCTAssertEqual(r.obj?["count"]?.int, 2, "two catalogs")
+        let byCat = Dictionary(uniqueKeysWithValues: (r.obj?["catalogs"]?.arr ?? []).map {
+            ($0.obj?["slug"]?.str ?? "", $0.obj?["count"]?.int ?? 0)
+        })
+        XCTAssertEqual(byCat["memes"], 2); XCTAssertEqual(byCat["tools"], 1)
+    }
+
+    func testCurationReadsEmptyStore() async throws {
+        let inv = try await WikiJSON.inventoryList(store)
+        let ds = try await WikiJSON.datasetList(store)
+        let col = try await WikiJSON.collectList(store)
+        XCTAssertEqual(inv.obj?["count"]?.int, 0)
+        XCTAssertEqual(ds.obj?["count"]?.int, 0)
+        XCTAssertEqual(col.obj?["count"]?.int, 0)
+    }
 }
 
 // Minimal JSONValue accessors for assertions.

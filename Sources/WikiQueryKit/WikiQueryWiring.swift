@@ -76,7 +76,10 @@ public enum WikiQueryWiring {
             status:    { try await WikiJSON.status(store) },
             watchList:  { try await WikiJSON.watchList(store) },
             librarianReport: { try await WikiJSON.librarianReport(store) },
-            auditReport:     { try await WikiJSON.auditReport(store) })
+            auditReport:     { try await WikiJSON.auditReport(store) },
+            inventoryList:   { try await WikiJSON.inventoryList(store) },
+            datasetList:     { try await WikiJSON.datasetList(store) },
+            collectList:     { try await WikiJSON.collectList(store) })
     }
 }
 
@@ -167,6 +170,40 @@ public enum WikiJSON {
             "indirectlyDrifted": .int(Int64(indirect)),
             "pagesDetail": .array(rows),
         ])
+    }
+
+    /// Inventory records (compact-table projection; never reads bodies). Tier-A read.
+    public static func inventoryList(_ store: MemoryStore, limit: Int = 500) async throws -> JSONValue {
+        let recs = try await store.inventoryRecords(limit: limit)
+        let rows = recs.map { r -> JSONValue in
+            var o: [String: JSONValue] = ["slug": .string(r.slug), "kind": .string(r.kind),
+                                          "status": .string(r.status), "priority": .string(r.priority),
+                                          "title": .string(r.title)]
+            if let s = r.summary { o["summary"] = .string(s) }
+            if let n = r.nextAction { o["nextAction"] = .string(n) }
+            return .object(o)
+        }
+        return .object(["count": .int(Int64(recs.count)), "records": .array(rows)])
+    }
+
+    /// Dataset manifests (the Datasets tab). Tier-A read.
+    public static func datasetList(_ store: MemoryStore, limit: Int = 500) async throws -> JSONValue {
+        let m = try await store.datasetManifests(limit: limit)
+        let rows = m.map { d -> JSONValue in
+            var o: [String: JSONValue] = ["datasetID": .string(d.datasetID), "title": .string(d.title),
+                                          "status": .string(d.status), "storage": .string(d.storage)]
+            if let s = d.sizeBytes { o["sizeBytes"] = .int(s) }
+            if let r = d.recordCount { o["recordCount"] = .int(r) }
+            return .object(o)
+        }
+        return .object(["count": .int(Int64(m.count)), "datasets": .array(rows)])
+    }
+
+    /// Collect catalogs with item counts (the Collect tab). Tier-A read.
+    public static func collectList(_ store: MemoryStore) async throws -> JSONValue {
+        let cats = try await store.collectCatalogs()
+        let rows = cats.map { c -> JSONValue in .object(["slug": .string(c.slug), "count": .int(Int64(c.count))]) }
+        return .object(["count": .int(Int64(cats.count)), "catalogs": .array(rows)])
     }
 
     /// Watched sources + cadence + due status (the Watch tab / §14.6 list view).

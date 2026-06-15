@@ -2260,4 +2260,17 @@ final class ProtocolModelTests: XCTestCase {
         XCTAssertTrue(ClientRequest.typedMethods.contains("wiki/librarian/report"))
         XCTAssertTrue(ClientRequest.typedMethods.contains("wiki/audit/report"))
     }
+
+    /// Phase 5 curation reads parse + round-trip to their wire names.
+    func testWikiCurationReadMethodsParseAndRoundTrip() throws {
+        guard case .wikiInventoryList = try ClientRequest.parse(req("wiki/inventory/list", nil)) else { return XCTFail("inventory/list") }
+        guard case .wikiDatasetList = try ClientRequest.parse(req("wiki/dataset/list", nil)) else { return XCTFail("dataset/list") }
+        guard case .wikiCollectList = try ClientRequest.parse(req("wiki/collect/list", nil)) else { return XCTFail("collect/list") }
+        XCTAssertEqual(ClientRequest.wikiInventoryList(.int(1)).method, "wiki/inventory/list")
+        XCTAssertEqual(ClientRequest.wikiDatasetList(.int(1)).method, "wiki/dataset/list")
+        XCTAssertEqual(ClientRequest.wikiCollectList(.int(1)).method, "wiki/collect/list")
+        for m in ["wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list"] {
+            XCTAssertTrue(ClientRequest.typedMethods.contains(m), m)
+        }
+    }
 }
