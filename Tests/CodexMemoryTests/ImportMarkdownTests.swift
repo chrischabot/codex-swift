@@ -61,6 +61,30 @@ final class ImportMarkdownTests: XCTestCase {
         return options
     }
 
+    /// The load-bearing data-integrity fix: progress JSON must expose `succeeded`
+    /// (imported+unchanged) DISTINCT from `processed` (which includes failures), so the
+    /// resilient import driver gates COMPLETE on success — not on a count that an
+    /// all-failed clean-checkout run would still drive to discovered (stamping a degraded
+    /// corpus authoritative).
+    func testProgressJSONSeparatesSucceededFromFailedProcessed() throws {
+        let path = try tempDir() + "/progress.json"
+        let report = MarkdownImportReport(jobID: "j", roots: [], discovered: 6,
+                                          imported: 2, unchanged: 1, failed: 3)
+        writeProgress(report, to: path)
+        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as! [String: Any]
+        XCTAssertEqual(json["succeeded"] as? Int, 3, "succeeded = imported+unchanged ONLY (excludes failures)")
+        XCTAssertEqual(json["processed"] as? Int, 6, "processed still counts attempts incl. failures (display/stuck)")
+        XCTAssertEqual(json["failed"] as? Int, 3)
+        XCTAssertEqual(json["discovered"] as? Int, 6)
+        // An all-failed run: succeeded stays 0 < discovered → the script's COMPLETE gate
+        // (succeeded>=discovered) never fires, so it retries/aborts instead of declaring done.
+        let allFailed = MarkdownImportReport(jobID: "j", roots: [], discovered: 5, failed: 5)
+        writeProgress(allFailed, to: path)
+        let j2 = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path))) as! [String: Any]
+        XCTAssertEqual(j2["succeeded"] as? Int, 0, "an all-failed run reports zero success → never COMPLETE")
+        XCTAssertEqual(j2["processed"] as? Int, 5)
+    }
+
     func testDryRunManifestIsDeterministicAndSkipsUnsafeFiles() async throws {
         let root = try tempDir(); defer { try? FileManager.default.removeItem(atPath: root) }
         let outside = try tempDir("outside"); defer { try? FileManager.default.removeItem(atPath: outside) }

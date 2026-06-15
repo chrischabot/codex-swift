@@ -32,13 +32,20 @@ while true; do
     >"$LOG/$job.out" 2>"$LOG/$job.err"
   code=$?
   proc=$(python3 -c "import json;print(json.load(open('$prog'))['processed'])" 2>/dev/null || echo 0)
+  # COMPLETE gates on SUCCEEDED (imported+unchanged), NEVER on processed (which counts
+  # failures) — else an all-failed clean-checkout run would be declared done and stamp a
+  # degraded corpus authoritative. Fallback 0 so an old binary lacking the field can't
+  # trip the OR clause.
+  succ=$(python3 -c "import json;print(json.load(open('$prog')).get('succeeded',0))" 2>/dev/null || echo 0)
   disc=$(python3 -c "import json;print(json.load(open('$prog'))['discovered'])" 2>/dev/null || echo 999999)
-  echo "[$(date +%H:%M:%S)] $job attempt=$attempt exit=$code processed=$proc/$disc"
-  if [ "$code" = "0" ] || { [ "$proc" -ge "$disc" ] && [ "$disc" -gt 0 ]; }; then
-    echo "[$(date +%H:%M:%S)] $job COMPLETE (processed=$proc/$disc)"; break
+  echo "[$(date +%H:%M:%S)] $job attempt=$attempt exit=$code succeeded=$succ processed=$proc/$disc"
+  if [ "$code" = "0" ] || { [ "$succ" -ge "$disc" ] && [ "$disc" -gt 0 ]; }; then
+    echo "[$(date +%H:%M:%S)] $job COMPLETE (succeeded=$succ/$disc)"; break
   fi
-  if [ "$proc" -le "$last" ]; then stuck=$((stuck + 1)); else stuck=0; fi
-  last=$proc
+  # Stuck-detection tracks forward progress on SUCCEEDED so a corpus that only ever FAILS
+  # is detected as stuck and aborted (visible failure) rather than looping forever.
+  if [ "$succ" -le "$last" ]; then stuck=$((stuck + 1)); else stuck=0; fi
+  last=$succ
   if [ "$stuck" -ge 4 ]; then
     echo "[$(date +%H:%M:%S)] $job STUCK at $proc/$disc — aborting (see $LOG/$job.err)"; break
   fi

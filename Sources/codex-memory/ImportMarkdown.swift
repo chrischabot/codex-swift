@@ -684,10 +684,17 @@ private func argumentError(_ message: String) -> NSError {
 /// can poll live counts. No-op when no progress path was requested.
 func writeProgress(_ report: MarkdownImportReport, to path: String?) {
     guard let path else { return }
-    let processed = report.imported + report.unchanged + report.failed
+    // `succeeded` = imported + unchanged ONLY (NOT failed). The resilient import driver
+    // gates COMPLETE on this, never on `processed` (which includes failures) — else a
+    // clean-checkout run where MLX throws providerUnavailable on every doc would reach
+    // processed==discovered and be declared "complete", stamping an empty/degraded corpus
+    // authoritative. `processed` stays for display + the stuck-detector.
+    let succeeded = report.imported + report.unchanged
+    let processed = succeeded + report.failed
     let obj: [String: Any] = [
         "discovered": report.discovered,
         "processed": processed,
+        "succeeded": succeeded,
         "imported": report.imported,
         "unchanged": report.unchanged,
         "skipped": report.skipped,
