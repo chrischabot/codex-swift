@@ -164,8 +164,18 @@ public enum CodexMemoryWikiCompile {
         let vault = try WikiVault(path: vaultPath, dryRun: options.dryRun)
         let documents = try await store.documentChunkSummaries(limit: options.limit)
             .filter { !isCompiledURI($0.document.sourceURI) }
-        let entities = try await store.entities(limit: options.limit)
+        // Code-intelligence symbols (.symbol/.module) are a SEPARATE index, not human wiki
+        // content — exclude them from compiled entity pages. Otherwise a code-indexed repo
+        // floods the wiki with symbol pages AND those pages become hybrid/lexical search hits.
+        let entities = try await store.entities(limit: options.limit, excludingKinds: EntityKind.codeIntel)
+        var codeIntelIDs: Set<Int64> = []
+        for kind in EntityKind.codeIntel {
+            for e in try await store.entities(kind: kind, limit: options.limit) { codeIntelIDs.insert(e.id) }
+        }
+        // Drop claim/edge pages whose endpoint is a code symbol (it would render a raw numeric
+        // id for the excluded entity). Memory↔memory edges are untouched.
         let edges = try await store.edges(limit: options.limit)
+            .filter { !codeIntelIDs.contains($0.src) && !codeIntelIDs.contains($0.dst) }
         let entityByID = Dictionary(uniqueKeysWithValues: entities.map { ($0.id, $0) })
 
         var pages: [WikiCompiledPage] = []
@@ -290,7 +300,9 @@ public enum CodexMemoryWikiLint {
 
         let docs = try await store.documentChunkSummaries(limit: options.limit)
             .filter { !isCompiledURI($0.document.sourceURI) }
-        let entities = try await store.entities(limit: options.limit)
+        // Exclude code-intel symbols from the orphan-entity lint — a code symbol with no
+        // edges is normal, not a wiki-memory orphan worth warning about.
+        let entities = try await store.entities(limit: options.limit, excludingKinds: EntityKind.codeIntel)
         if let vaultPath = options.vaultPath {
             try lintVault(path: vaultPath, documents: docs,
                           health: health, into: &report)

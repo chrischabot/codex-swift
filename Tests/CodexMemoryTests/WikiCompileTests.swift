@@ -85,6 +85,43 @@ final class WikiCompileTests: XCTestCase {
         XCTAssertEqual(afterStableRerun, afterPreserve)
     }
 
+    // Code-intelligence entities (.symbol/.module) are a SEPARATE index, not human wiki
+    // content. They must NOT be compiled into entity/claim pages nor indexed into the
+    // searchable compiled corpus — otherwise a code-indexed repo floods the wiki and its
+    // symbol pages pollute hybrid/lexical recall.
+    func testCodeIntelSymbolsAreNotCompiledOrIndexed() async throws {
+        let vault = try tempDir(); defer { try? FileManager.default.removeItem(atPath: vault) }
+        let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }
+        _ = try await seedDocument(store: store)
+        // One real memory entity (person) and one code symbol, joined by an edge.
+        let alice = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Alice", firstSeen: 1, lastSeen: 1))
+        let symbol = try await store.upsertEntity(EntityRow(
+            kind: .symbol, canonical: "parseZxcvbnConfig", firstSeen: 1, lastSeen: 1))
+        _ = try await store.upsertEdge(EdgeRow(
+            src: alice, dst: symbol, relation: "authored", firstSeen: 1, lastSeen: 1))
+
+        var options = WikiCompileOptions()
+        options.vaultPath = vault
+        options.indexCompiledPages = true
+        options.clock = { 1_800_000_000 }
+        let report = try await CodexMemoryWikiCompile.compile(
+            store: store, processor: processor, options: options)
+
+        XCTAssertEqual(report.failed, 0)
+        XCTAssertEqual(report.entityPages, 1, "only the person entity is compiled, not the code symbol")
+        XCTAssertEqual(report.claimPages, 0, "the edge touching a code symbol is dropped (no raw-id page)")
+        XCTAssertFalse(report.outputs.contains { $0.contains("entities/symbol/") },
+                       "no symbol page is written to the vault")
+
+        // The symbol never entered the searchable compiled corpus: no indexed doc references it.
+        let compiledSymbolDoc = try await store.document(byURI:
+            "wiki://compiled/" + (report.outputs.first { $0.contains("entities/symbol/") } ?? "entities/symbol/none.md"))
+        XCTAssertNil(compiledSymbolDoc, "no compiled symbol document exists")
+        let hits = try await store.searchLexical("parseZxcvbnConfig", k: 20)
+        XCTAssertTrue(hits.isEmpty, "the code symbol is not recallable from the compiled wiki search index")
+    }
+
     func testIndexedCompileIsIdempotentAndReplacesStaleSearchRows() async throws {
         let vault = try tempDir(); defer { try? FileManager.default.removeItem(atPath: vault) }
         let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }
