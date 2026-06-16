@@ -388,11 +388,14 @@ public struct Mem0Engine: Sendable {
         var s = text.replacingOccurrences(of: "```", with: "'''")
         // Neutralize ANY tag-like token `<…>` by bracket-swapping (`<`→`[`, `>`→`]`),
         // not just a fixed allowlist — robust to whitespace (`< memory >`), case
-        // (`<MeMoRy>`), and tags off the list (`<prompt>`, `<context>`,
-        // `<|im_start|>`). "Tag-like" = optional `/`, then a CONTIGUOUS word/marker
-        // name (letters, digits, `| _ : -`), optionally space-padded, closed by `>`.
-        // Requiring a contiguous name avoids mangling benign prose like `a < b and c > d`.
-        if let re = try? NSRegularExpression(pattern: #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#) {
+        // (`<MeMoRy>`), tags off the list (`<prompt>`, `<|im_start|>`), AND ATTRIBUTED
+        // role/tool tags (`<system role="override">`, `<tool_call name="delete_all">`).
+        // After the contiguous name, accept EITHER a bare close (`\s*/?>`) OR an attribute
+        // span that contains an `=` (`\s+[^>]*=[^>]*>`). Requiring the `=` admits real
+        // attributed tags (the prior pattern allowed NO attributes → they bypassed)
+        // WITHOUT defanging benign multi-word prose like `x < y and a > b` (no `=`, so
+        // neither alternative matches — both prose-safety and attribute-coverage hold).
+        if let re = try? NSRegularExpression(pattern: #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*(?:\s*/?>|\s+[^>]*=[^>]*>)"#) {
             let ns = s as NSString
             let mutable = NSMutableString(string: s)
             // Apply in reverse so earlier match ranges stay valid as we mutate.
