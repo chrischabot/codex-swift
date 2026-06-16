@@ -169,8 +169,19 @@ public actor DurableDeliveryQueue {
         // legitimate operator retry that must NOT be deduped.
         if dedupWindowSeconds > 0 {
             let seedT = now()
-            for job in folded.latest.values where job.state == .acked {
-                if let key = job.idempotencyKey { ackedKeys[key] = seedT }
+            // `fold` keys by job.id, so ONE idempotency key can appear under several ids:
+            // an acked job1 (seq 1) AND a later failed job2 (seq 2). Seeding the window from
+            // the stale acked record would shadow the failed key's legitimate operator retry.
+            // Reduce to the LATEST record per key (highest seq) first, then seed only when
+            // THAT record is `.acked` — so a key whose newest state is `.failed` stays retryable.
+            var latestByKey: [String: OutboundJob] = [:]
+            for job in folded.latest.values {
+                guard let key = job.idempotencyKey else { continue }
+                if let prev = latestByKey[key], prev.seq >= job.seq { continue }
+                latestByKey[key] = job
+            }
+            for (key, job) in latestByKey where job.state == .acked {
+                ackedKeys[key] = seedT
             }
         }
         // All stored properties are initialized → safe to call an instance method.

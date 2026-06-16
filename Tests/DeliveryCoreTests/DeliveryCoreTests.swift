@@ -176,6 +176,42 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(n, 1)
     }
 
+    // The re-seed reduces per-JOB-ID (fold's key), so ONE idempotency key with an acked
+    // record under one id AND a later failed record under another id appeared twice; the
+    // old loop seeded the window from the stale acked one, swallowing the failed key's
+    // legitimate retry. Re-seed must reduce to the LATEST record per key (highest seq).
+    func testAckedDoesNotShadowFailedRetryAcrossRestart() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var acked = job("j1", key: "K"); acked.state = .acked; acked.seq = 1
+        var failed = job("j2", key: "K"); failed.state = .failed; failed.seq = 2  // later, different id
+        writeLog(dir, [acked, failed])
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: clock.fn)
+        let r = await q.enqueue(job("j3", key: "K"))         // operator retry; newest state for K is .failed
+        let n = await exec.count()
+        XCTAssertFalse(r.deduped, "a stale acked record must NOT shadow the key's LATER failed state")
+        XCTAssertEqual(n, 1, "the retry of the failed key is actually delivered")
+    }
+
+    // The reverse ordering must still suppress: a failed attempt (seq 1) SUPERSEDED by a
+    // later ack (seq 2) for the same key → the latest state is acked → window re-seeded.
+    func testLaterAckWinsOverEarlierFailedAcrossRestart() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var failed = job("j1", key: "K"); failed.state = .failed; failed.seq = 1
+        var acked = job("j2", key: "K"); acked.state = .acked; acked.seq = 2     // later success
+        writeLog(dir, [failed, acked])
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: clock.fn)
+        let r = await q.enqueue(job("j3", key: "K"))
+        let n = await exec.count()
+        XCTAssertTrue(r.deduped, "the key's NEWEST state is acked → deduped, no double-send")
+        XCTAssertEqual(n, 0)
+    }
+
     func testIdempotencyDedupExpiresAfterWindow() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let exec = ScriptedExecutor([.acked])
