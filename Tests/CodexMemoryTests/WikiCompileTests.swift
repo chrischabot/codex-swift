@@ -122,6 +122,42 @@ final class WikiCompileTests: XCTestCase {
         XCTAssertTrue(hits.isEmpty, "the code symbol is not recallable from the compiled wiki search index")
     }
 
+    // LIMIT-STARVATION regression: when symbol population exceeds the row limit, a
+    // degree-ordered per-kind query truncates LOW-degree symbols, but their edges can still
+    // fall inside the edges() slice. The earlier fix filtered edges against a separately-
+    // limited code-intel id set, so a truncated symbol's edge survived → a compiled+indexed
+    // claim page rendering the symbol's raw numeric id. Membership against the filtered
+    // entityByID closes it regardless of limit.
+    func testLowDegreeCodeSymbolDoesNotLeakUnderLimitStarvation() async throws {
+        let vault = try tempDir(); defer { try? FileManager.default.removeItem(atPath: vault) }
+        let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }
+        _ = try await seedDocument(store: store)
+        let alice = try await store.upsertEntity(EntityRow(
+            kind: .person, canonical: "Alice", firstSeen: 1, lastSeen: 1))
+        // Two HIGH-degree symbols (self-loops → degree 2) that win the top-N by degree DESC.
+        let hi1 = try await store.upsertEntity(EntityRow(kind: .symbol, canonical: "HighDegreeOne", firstSeen: 1, lastSeen: 1))
+        let hi2 = try await store.upsertEntity(EntityRow(kind: .symbol, canonical: "HighDegreeTwo", firstSeen: 1, lastSeen: 1))
+        _ = try await store.upsertEdge(EdgeRow(src: hi1, dst: hi1, relation: "self", firstSeen: 1, lastSeen: 1))
+        _ = try await store.upsertEdge(EdgeRow(src: hi2, dst: hi2, relation: "self", firstSeen: 1, lastSeen: 1))
+        // A LOW-degree symbol that a limit=2 per-kind query (ORDER BY degree DESC) truncates.
+        let leak = try await store.upsertEntity(EntityRow(kind: .symbol, canonical: "leakingSymbolXyz", firstSeen: 1, lastSeen: 1))
+        _ = try await store.upsertEdge(EdgeRow(src: alice, dst: leak, relation: "authored", firstSeen: 1, lastSeen: 1))
+
+        var options = WikiCompileOptions()
+        options.vaultPath = vault
+        options.limit = 2                      // smaller than the symbol population → starvation
+        options.indexCompiledPages = true
+        options.clock = { 1_800_000_000 }
+        let report = try await CodexMemoryWikiCompile.compile(store: store, processor: processor, options: options)
+
+        XCTAssertEqual(report.failed, 0)
+        XCTAssertEqual(report.claimPages, 0, "the Alice→leaked-symbol edge must be dropped, not rendered with a raw id")
+        XCTAssertFalse(report.outputs.contains { $0.contains("/claims/") },
+                       "no claim page leaks a code-symbol endpoint under limit starvation")
+        let hits = try await store.searchLexical("\(leak)", k: 20)  // the raw numeric id
+        XCTAssertTrue(hits.isEmpty, "the truncated symbol's numeric id is not recallable from a leaked page")
+    }
+
     func testIndexedCompileIsIdempotentAndReplacesStaleSearchRows() async throws {
         let vault = try tempDir(); defer { try? FileManager.default.removeItem(atPath: vault) }
         let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }

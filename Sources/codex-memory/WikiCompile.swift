@@ -168,15 +168,16 @@ public enum CodexMemoryWikiCompile {
         // content — exclude them from compiled entity pages. Otherwise a code-indexed repo
         // floods the wiki with symbol pages AND those pages become hybrid/lexical search hits.
         let entities = try await store.entities(limit: options.limit, excludingKinds: EntityKind.codeIntel)
-        var codeIntelIDs: Set<Int64> = []
-        for kind in EntityKind.codeIntel {
-            for e in try await store.entities(kind: kind, limit: options.limit) { codeIntelIDs.insert(e.id) }
-        }
-        // Drop claim/edge pages whose endpoint is a code symbol (it would render a raw numeric
-        // id for the excluded entity). Memory↔memory edges are untouched.
-        let edges = try await store.edges(limit: options.limit)
-            .filter { !codeIntelIDs.contains($0.src) && !codeIntelIDs.contains($0.dst) }
         let entityByID = Dictionary(uniqueKeysWithValues: entities.map { ($0.id, $0) })
+        // Drop edges whose endpoint is NOT a compiled memory entity (a code symbol excluded
+        // above, OR an entity beyond the limit window). Membership is tested against the
+        // already-filtered entityByID — the EXACT set the pages render against — rather than a
+        // SEPARATELY-limited code-intel id set: a degree-ordered per-kind query could truncate
+        // low-degree symbols out of that set while their edges stayed inside the edges() slice,
+        // leaking a claim page that renders the symbol's raw numeric id into the searchable
+        // corpus. This membership test is immune to that limit starvation.
+        let edges = try await store.edges(limit: options.limit)
+            .filter { entityByID[$0.src] != nil && entityByID[$0.dst] != nil }
 
         var pages: [WikiCompiledPage] = []
         pages.reserveCapacity(documents.count + entities.count + edges.count)
