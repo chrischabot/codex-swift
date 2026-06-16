@@ -27,12 +27,10 @@ extension MemoryStore {
          WHERE status='running' AND started_at < ?
         RETURNING job_id;
         """, [.int(now), .int(cutoff)])
-        // COALESCE(start_time, 0): start_time is NULLABLE (upsertResearchSession binds .null
-        // when startTime is nil), so the old `start_time IS NOT NULL AND start_time < ?`
-        // could NEVER reap a NULL-start_time running session — a perpetual ghost in
-        // wiki/sessions/list. Treat NULL as epoch 0 (always older than the cutoff). Safe at
-        // boot: the sweep runs before any session is created this boot, so a NULL stamp is
-        // necessarily a prior-run orphan, not an in-flight session from THIS boot.
+        // start_time is NULLABLE (upsertResearchSession binds .null when startTime is nil);
+        // COALESCE(start_time, 0) treats a NULL stamp as epoch 0 so it sorts older than any
+        // cutoff and is reaped. Safe at boot: the sweep runs before any session is created this
+        // boot, so a NULL stamp is necessarily a prior-run orphan, not an in-flight session.
         let research = try run("""
         UPDATE research_session SET status='failed'
          WHERE status IN ('in_progress', 'running')

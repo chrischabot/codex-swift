@@ -126,12 +126,11 @@ final class MethodGateTests: XCTestCase {
         }
     }
 
-    // MARK: owner/write tier (audit — a flat single bearer let any token holder write/spend)
+    // MARK: owner/write tier — Tier-B effectful RPCs require a distinct owner credential, not the read bearer
 
-    /// DATA-DRIVEN coverage (the old test iterated ownerTier itself → circular, couldn't
-    /// detect an omission). allowed = pureReads ∪ ownerTier exactly: every allowed method
-    /// is classified, and EVERY non-read is owner-gated. Adding an effectful method to
-    /// `allowed` without owner-gating it (or mislabelling it a read) fails here.
+    /// Coverage invariant: allowed == pureReads ∪ ownerTier exactly — every allowed method is
+    /// classified, and every non-read is owner-gated. Adding an effectful method to `allowed`
+    /// without owner-gating it (or mislabelling it a read) fails here.
     func testEveryNonReadAllowedMethodIsOwnerGated() {
         let effectful = MethodGate.allowed.subtracting(MethodGate.pureReads)
         for m in effectful {
@@ -148,7 +147,7 @@ final class MethodGateTests: XCTestCase {
     }
 
     func testDangerousMethodsAreOwnerGated() {
-        // The specific holes the adversarial review found: an RCE shell + paid/destructive lanes.
+        // The dangerous lanes that MUST stay owner-gated: an RCE shell + every paid/destructive RPC.
         for m in ["thread/shellCommand", "turn/start", "thread/start", "thread/resume", "thread/fork",
                   "review/start", "git/action", "automation/action", "marketplace/add", "memory/reset",
                   "thread/realtime/start", "experimentalFeature/enablement/set",

@@ -181,8 +181,8 @@ public actor DurableDeliveryQueue {
         // Re-seed the (in-memory) idempotency dedup window from the durable log so it
         // SURVIVES a restart. ackedKeys is otherwise empty after a crash, so a recover()
         // re-drive PLUS a fresh enqueue of a just-delivered key would double-send. The log
-        // has no per-record ack timestamp and the prior process's monotonic clock is
-        // meaningless after a reboot, so we grant each already-acked key a FRESH full
+        // has no per-record ack timestamp and a monotonic clock value does not survive a
+        // reboot, so we grant each already-acked key a FRESH full
         // window from THIS process's now() — which can only briefly OVER-suppress (never
         // double-send) and self-expires after dedupWindowSeconds. Only `.acked` seeds the
         // window: `.failed` is dead-letter, and a re-enqueue of a failed key is a
@@ -346,10 +346,9 @@ public actor DurableDeliveryQueue {
     // MARK: core state machine
 
     private func drive(_ job0: OutboundJob) async -> DeliveryReceipt {
-        // ALWAYS release the caller-reserved idempotency key on ANY exit,
-        // including the single-driver early-return below. Declaring this defer
-        // BEFORE the guard is the fix: a defer placed after the guard would not
-        // run on the early-return path, permanently poisoning the key.
+        // ALWAYS release the caller-reserved idempotency key on ANY exit, including the
+        // single-driver early-return below. This defer MUST precede the guard so the key is
+        // released on the early-return path too — otherwise it stays stuck in inFlightKeys.
         defer { if let key = job0.idempotencyKey { inFlightKeys.remove(key) } }
         // Single-driver-per-id: a second recover()/enqueue() for an id already
         // being driven is a no-op. The deduped receipt's finalState is the
@@ -484,10 +483,9 @@ public actor DurableDeliveryQueue {
     /// Rewrite the log keeping only the latest record per NON-acked id (failed
     /// jobs are KEPT as dead-letter), so it tracks the LIVE backlog. Acked records
     /// are dropped — cross-restart dedup memory lives in the bounded `dedup.jsonl`
-    /// sidecar instead, so the main log never accumulates delivered history (an
-    /// earlier attempt to retain within-window acked records here caused per-ack
-    /// compaction thrash and distinct-key growth). Returns the kept set so
-    /// `recover()` reuses it without a second parse.
+    /// sidecar instead, so the main log stays bounded by the live backlog and never
+    /// accumulates delivered history. Returns the kept set so `recover()` reuses it
+    /// without a second parse.
     @discardableResult
     private func compact() -> [OutboundJob] {
         let live = latestPerJob.values

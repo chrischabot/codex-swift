@@ -387,30 +387,25 @@ public struct Mem0Engine: Sendable {
     /// string value.
     static func sanitizeForPrompt(_ text: String) -> String {
         var s = text.replacingOccurrences(of: "```", with: "'''")
-        // Neutralize tag-like tokens `<…>` by bracket-swapping (`<`→`[`, `>`→`]`). TWO passes,
-        // because attribute payload is what breaks a single regex (an `=`-gated attribute span
-        // both MISSES valueless attrs like `<system role>` AND over-matches `=`-bearing prose
-        // like `if a < b then c = d > f`):
+        // Neutralize tag-like tokens `<…>` by bracket-swapping (`<`→`[`, `>`→`]`) in two
+        // complementary passes:
         //
         //  PASS 1 — BARE tags, ANY name: optional `/`, a CONTIGUOUS word/marker name (letters,
-        //    digits, `| _ : -`), optional space padding, close. Defangs `<prompt>`, `<MeMoRy>`,
-        //    `< memory >`, `<|im_start|>`, `</system>` with ZERO prose false-positives (the
-        //    immediate close after the name means `x < y and a > b` and `c = d` can't match).
+        //    digits, `| _ : -`), optional space padding, close. The immediate close after the
+        //    name means prose like `x < y and a > b` or `c = d` can't match, so it has no false
+        //    positives. Defangs `<prompt>`, `<MeMoRy>`, `< memory >`, `<|im_start|>`, `</system>`.
         //
-        //  PASS 2 — ATTRIBUTED forms of the closed injection-marker vocabulary, regardless of
-        //    attribute payload (valued `<system role="override">` OR valueless `<system role>`).
-        //    Scoped to the names a model actually honors as control directives, so the permissive
-        //    `[^>]*` attribute tail is safe — benign prose almost never opens `<system …>` etc.,
-        //    and defanging it if it did is the safe choice. (Inherent residual: a novel ATTRIBUTED
-        //    tag whose name is OUTSIDE the vocabulary still passes — but `<word word>` markup is
+        //  PASS 2 — ATTRIBUTED forms (valued `<system role="override">` OR valueless
+        //    `<system role>`), scoped to the injection-marker vocabulary so the permissive
+        //    `[^>]*` attribute tail can't mangle benign `<word word>` prose. (Residual: a novel
+        //    attributed tag whose name is outside the vocabulary passes — `<word word>` is
         //    regex-indistinguishable from prose without a name list, and the real threat surface
-        //    is exactly these known role/tool/chat-template markers.)
+        //    is the known role/tool/chat-template markers.)
         let bareTag = #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#
-        // PASS 2's vocabulary IS the canonical InfraPrimitives.PromptInjectionVocab.markers —
-        // the SAME list MemoryInfer.ContextSanitizer.breakoutTags uses, so the two sanitizers
-        // cannot drift (the earlier hand-copied subset is what let attributed <tool_use …> /
-        // <tool_result …> leak). Sort longest-first so `\b` resolves prefix pairs (tool vs
-        // tool_call vs tool_calls, function vs function_call) cleanly under alternation.
+        // PASS 2's vocabulary is the canonical InfraPrimitives.PromptInjectionVocab.markers,
+        // shared with MemoryInfer.ContextSanitizer.breakoutTags so the two sanitizers cannot
+        // drift. Sort longest-first so `\b` under alternation resolves prefix pairs (tool vs
+        // tool_call vs tool_calls, function vs function_call) to the longest match.
         let markers = PromptInjectionVocab.markers
             .sorted { $0.count > $1.count }
             .joined(separator: "|")

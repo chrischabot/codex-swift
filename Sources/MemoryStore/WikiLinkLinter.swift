@@ -69,21 +69,17 @@ public enum WikiLinkLinter {
     /// "See Also" sections, so grounding/reciprocity treat navigation links and content
     /// citations distinctly.
     ///
-    /// CONTRACT (the robust, fail-closed rule a six-round adversarial-review panel converged
-    /// on — distinguishing "navigation" from "content" links WITHIN a See-Also section is
-    /// fundamentally ambiguous in free-form prose, so we don't try): every `[[link]]` under a
-    /// "See Also" heading, up to the next heading/fence, is NAVIGATION. Content and its
-    /// grounding citations belong in the body (above See-Also) or under their own heading. A
-    /// link-FREE trailing note after the entries (and a link-free lead-in before them) is the
-    /// only prose split out — it carries no links, so it affects only the readable text, never
-    /// a grounding/reciprocity verdict.
+    /// Rule: a "See Also" section runs from its heading to the next heading/fence, and EVERY
+    /// `[[link]]` in it is NAVIGATION — never a content/grounding citation. (Telling navigation
+    /// from content links apart inside a free-form See-Also section is ambiguous, so we don't
+    /// try.) Grounding citations belong in the body (above See-Also) or under their own heading.
     ///
     /// A "See Also" heading is recognized in all three realistic spellings — ATX (`## See
-    /// Also`), SETEXT (`See Also` + `----`/`====` underline), and BOLD (`**See Also**`) — and
+    /// Also`), SETEXT (`See Also` + `----`/`====` underline), and BOLD (`**See Also**`) —
     /// matched STRICTLY (exactly "See Also", optional `:`), so a page TITLE like `# See also:
-    /// the GPU landscape` is NOT mistaken for a section heading. Fenced code blocks are inert;
+    /// the GPU landscape` is not mistaken for a section heading. Fenced code blocks are inert;
     /// a fence open is CommonMark-correct (≤3-space indent — a ≥4-space-indented ``` line is an
-    /// indented code block, not a fence, and must not trigger a section-eating fence scan).
+    /// indented code block, not a fence).
     private static func partitionSeeAlso(_ body: String) -> (content: String, seeAlso: String) {
         let lines = body.components(separatedBy: "\n")
         func matches(_ s: String, _ pattern: String) -> Bool {
@@ -109,12 +105,14 @@ public enum WikiLinkLinter {
             if i + 1 < lines.count && isSeeAlsoText(line) && isSetextUnderline(lines[i + 1]) { return 2 }  // setext
             return nil
         }
-        // A heading begins at line i if it's ATX, or a setext title: a plain (non-list,
-        // non-blank, non-underline) line whose NEXT line is an `=`/`-` underline.
+        // A heading begins at line i if it's ATX, or a SETEXT title: a plain prose line whose
+        // NEXT line is an `=`/`-` underline. The title must NOT be a list item, blank, an
+        // underline itself, or a wiki-link line — a `[[x]]` line followed by `---` is a nav
+        // entry plus a thematic break, not a heading, so it does not end a See-Also section.
         func startsHeading(at i: Int) -> Bool {
             if isATXHeading(lines[i]) { return true }
-            return i + 1 < lines.count && !isListItemOrBlank(lines[i])
-                && !isSetextUnderline(lines[i]) && isSetextUnderline(lines[i + 1])
+            return i + 1 < lines.count && isSetextUnderline(lines[i + 1])
+                && !isListItemOrBlank(lines[i]) && !isSetextUnderline(lines[i]) && !carriesLink(lines[i])
         }
         var content: [String] = []
         var seeAlso: [String] = []
@@ -130,22 +128,10 @@ public enum WikiLinkLinter {
             }
             if let hlen = seeAlsoHeadingLen(at: i) {
                 i += hlen   // drop the See Also heading (1 line ATX/bold, 2 lines setext)
-                // Consume the section to the next heading / fence. Every line here is navigation:
-                // a [[link]] on it is a see-also edge, never content. The ONLY thing split out is
-                // a link-FREE trailing prose note after at least one navigational entry (a
-                // closing remark) — it has no links, so it changes only the readable text.
-                var sawNavEntry = false
+                // The whole section, to the next heading/fence, is navigation: every [[link]]
+                // here is a see-also edge, never a content citation.
                 while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
-                    let line = lines[i]
-                    if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                        // blank line is neutral (separates entries / lead-in)
-                    } else if carriesLink(line) {
-                        sawNavEntry = true                      // a navigational entry (any link-bearing line)
-                    } else if sawNavEntry {
-                        break                                   // link-FREE prose after entries = trailing note
-                    }
-                    // a link-free line before any entry is a pure lead-in: falls through, consumed.
-                    seeAlso.append(line); i += 1
+                    seeAlso.append(lines[i]); i += 1
                 }
                 continue
             }
@@ -172,10 +158,9 @@ public enum WikiLinkLinter {
                     issues.append(WikiLinkIssue(page: page.slug, kind: .nonReciprocalSeeAlso, target: target))
                 }
             }
-            // ungrounded synthesis: a grounding-required page that cites nothing real.
-            // A "See Also" edge is NAVIGATION, not a citation — counting it as grounding
-            // let a page with 0 claims and only a see-also link slip past strict mode. Judge
-            // grounding on CONTENT links (the body with the see-also SECTION excised).
+            // ungrounded synthesis: a grounding-required page that cites nothing real. A
+            // "See Also" edge is navigation, not a citation, so grounding is judged on CONTENT
+            // links only (the body with every See-Also section excised).
             let contentLinks = links(in: bodyExcludingSeeAlso(page.body))
             if groundingRequired.contains(page.category)
                 && page.claimLinkCount == 0 && contentLinks.isEmpty {

@@ -8,9 +8,8 @@ import Foundation
 /// - `Mem0Core.Mem0Engine.sanitizeForPrompt` PASS-2 attributed-marker pass
 ///
 /// Adding a marker here extends BOTH sanitizers at once. (This module is dependency-free, so
-/// it is a safe shared leaf for both `MemoryInfer` and `Mem0Core` — neither can import the
-/// other, which is exactly why a divergent hand-copied subset leaked attributed `<tool_use …>`
-/// / `<tool_result …>` tags before this was centralized.)
+/// it is a safe shared leaf for both `MemoryInfer` and `Mem0Core` — neither imports the other,
+/// so a single shared list is the only way to keep their vocabularies identical.)
 public enum PromptInjectionVocab {
     public static let markers: [String] = [
         // ChatML / special model control tokens.

@@ -228,10 +228,8 @@ public enum CodexMemoryRun {
         let archive = MemoryArchive.open(codexHome: codexHome)
         let processor = MemoryProcessor(store: store, inference: inference,
                                         archive: archive)
-        // Pass the resolved provider id (== the store's embedding stamp) as the query
-        // embed-cache discriminator — the third construction site, missed when the other
-        // two were wired. Without it the cache keys on "default" and a future in-place
-        // embedder swap could serve vectors cached under the old model.
+        // Key the query embed-cache by the resolved provider id (== the store's embedding
+        // stamp) so a long-lived retriever never serves vectors cached under a different embedder.
         let retriever = MemoryRetriever(store: store, inference: inference,
                                         embedCacheModelId: plan.providerID)
         let scorer = Scorer(store: store)

@@ -348,7 +348,7 @@ final class DeliveryCoreTests: XCTestCase {
     // compacts and the job log drops acked records, so the dedup window is re-seeded from the
     // durable `dedup.jsonl` SIDECAR (which compaction does not touch). A key delivered then
     // compacted-through must still dedup after a restart.
-    func testCompactionPreservesWithinWindowAckedKeyForReseed() async throws {
+    func testCompactionPreservesDedupViaSidecarForReseed() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let clock = FakeClock()
         do {
@@ -367,9 +367,8 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(n, 0, "no cross-restart double-send of an already-delivered key")
     }
 
-    // The round-4 regression fix: the JOB LOG must stay the LIVE backlog even for a heavily
-    // KEYED workload — keyed dedup memory lives in the sidecar, NOT retained in queue.jsonl.
-    // (The earlier within-window retention defeated this bound and thrashed compaction.)
+    // The JOB LOG stays the LIVE backlog even under a heavily KEYED workload: keyed
+    // cross-restart dedup memory lives in the dedup.jsonl sidecar, never retained in queue.jsonl.
     func testJobLogStaysBoundedUnderManyKeyedAcks() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let clock = FakeClock()
@@ -441,7 +440,7 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(n, 1)
     }
 
-    // Within the window, the durable sidecar STILL dedups across restart (the round-3 guarantee).
+    // Within the window, the durable sidecar dedups across a restart.
     func testSidecarDedupSurvivesRestartWithinWindow() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let mono = FakeClock(); let wall = FakeClock()

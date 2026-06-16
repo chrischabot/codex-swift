@@ -85,8 +85,8 @@ public actor MemoryRetriever {
     public nonisolated var embedCacheHitCount: Int { embedCache.hitCount }
     public nonisolated var embedCacheMissCount: Int { embedCache.missCount }
     public nonisolated func invalidateEmbedCache() { embedCache.invalidateAll() }
-    /// The cross-model cache discriminator actually in force (the resolved embedding
-    /// provider id when wired correctly; "default" if a caller forgot to pass it).
+    /// The cross-model cache discriminator in force: the resolved embedding provider id, or
+    /// "default" when no id was supplied at init.
     public nonisolated var embedCacheModelId: String { embedCache.modelId }
 
     /// Run the full pipeline. `rerank` defaults to true; tests and the

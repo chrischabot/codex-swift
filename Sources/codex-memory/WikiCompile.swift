@@ -169,13 +169,10 @@ public enum CodexMemoryWikiCompile {
         // floods the wiki with symbol pages AND those pages become hybrid/lexical search hits.
         let entities = try await store.entities(limit: options.limit, excludingKinds: EntityKind.codeIntel)
         let entityByID = Dictionary(uniqueKeysWithValues: entities.map { ($0.id, $0) })
-        // Drop edges whose endpoint is NOT a compiled memory entity (a code symbol excluded
-        // above, OR an entity beyond the limit window). Membership is tested against the
-        // already-filtered entityByID — the EXACT set the pages render against — rather than a
-        // SEPARATELY-limited code-intel id set: a degree-ordered per-kind query could truncate
-        // low-degree symbols out of that set while their edges stayed inside the edges() slice,
-        // leaking a claim page that renders the symbol's raw numeric id into the searchable
-        // corpus. This membership test is immune to that limit starvation.
+        // Drop edges whose endpoint is not a compiled memory entity. Membership is tested
+        // against entityByID — the exact entity set the pages render against — so an edge to a
+        // code symbol or to an entity beyond the limit window is dropped rather than rendered as
+        // a claim page with a raw numeric id.
         let edges = try await store.edges(limit: options.limit)
             .filter { entityByID[$0.src] != nil && entityByID[$0.dst] != nil }
 

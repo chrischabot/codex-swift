@@ -49,10 +49,8 @@ final class RetrieveTests: XCTestCase {
     }
 
     // The query embed-cache must be keyed by the resolved embedding provider id, so a
-    // long-lived retriever cannot serve vectors cached under a different model. Three
-    // construction sites set this; Run.swift was the one missed and silently kept the
-    // "default" key (cross-model isolation inert). Assert the discriminator propagates,
-    // and that the unwired default is the sentinel the bug exposed.
+    // long-lived retriever cannot serve vectors cached under a different model. Assert the
+    // discriminator propagates, and that omitting it falls back to the "default" sentinel.
     func testEmbedCacheDiscriminatorIsTheProviderId() async throws {
         let path = NSTemporaryDirectory() + "retr-disc-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

@@ -122,12 +122,10 @@ final class WikiCompileTests: XCTestCase {
         XCTAssertTrue(hits.isEmpty, "the code symbol is not recallable from the compiled wiki search index")
     }
 
-    // LIMIT-STARVATION regression: when symbol population exceeds the row limit, a
-    // degree-ordered per-kind query truncates LOW-degree symbols, but their edges can still
-    // fall inside the edges() slice. The earlier fix filtered edges against a separately-
-    // limited code-intel id set, so a truncated symbol's edge survived → a compiled+indexed
-    // claim page rendering the symbol's raw numeric id. Membership against the filtered
-    // entityByID closes it regardless of limit.
+    // LIMIT-STARVATION invariant: when the symbol population exceeds the row limit, a
+    // low-degree symbol can be truncated out of the entity set while its edge still falls inside
+    // the edges() slice. Membership against the filtered entityByID drops that edge regardless
+    // of limit, so no claim page renders the symbol's raw numeric id.
     func testLowDegreeCodeSymbolDoesNotLeakUnderLimitStarvation() async throws {
         let vault = try tempDir(); defer { try? FileManager.default.removeItem(atPath: vault) }
         let (db, store, processor) = try stack(); defer { try? FileManager.default.removeItem(atPath: db) }
