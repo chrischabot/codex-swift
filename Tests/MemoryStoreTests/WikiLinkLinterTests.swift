@@ -76,4 +76,21 @@ final class WikiLinkLinterTests: XCTestCase {
             .filter { $0.kind == .ungrounded }.map(\.page)
         XCTAssertEqual(ungrounded, ["plan1"])   // only the citation-less plan
     }
+
+    // A See-Also edge is NAVIGATION, not a citation: a grounding-required page whose ONLY
+    // [[link]] sits under a "See Also" heading (and 0 claims) cites nothing real → ungrounded.
+    // A page with the SAME link as a CONTENT link (body, not see-also) is grounded.
+    func testSeeAlsoOnlyLinkDoesNotGroundButContentLinkDoes() {
+        let pages = [
+            // only a see-also link, 0 claims → ungrounded
+            WikiLintPage(slug: "a", body: "intro\n\n## See Also\n- [[b]]\n", category: "report",
+                         claimLinkCount: 0),
+            // a real content citation (not under See Also) → grounded
+            WikiLintPage(slug: "b", body: "this report builds on [[a]] directly.\n\n## See Also\n- [[a]]\n",
+                         category: "report", claimLinkCount: 0),
+        ]
+        let ungrounded = WikiLinkLinter.lint(pages, validSlugs: ["a", "b"])
+            .filter { $0.kind == .ungrounded }.map(\.page)
+        XCTAssertEqual(ungrounded, ["a"], "see-also-only is ungrounded; a content link grounds")
+    }
 }

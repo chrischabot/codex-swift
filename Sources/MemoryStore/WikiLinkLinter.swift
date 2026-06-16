@@ -63,6 +63,22 @@ public enum WikiLinkLinter {
         return links(in: tail)
     }
 
+    /// The body with the "See Also" section (its heading through end-of-section) removed,
+    /// so grounding can be judged on CONTENT links only. Returns the body unchanged when
+    /// there is no see-also heading. (Positional removal — NOT set subtraction — so a target
+    /// that is BOTH a prose citation and a see-also entry still counts as real grounding.)
+    public static func bodyExcludingSeeAlso(_ body: String) -> String {
+        guard let r = body.range(of: #"(?im)^#{1,6}[ \t]+see also\b.*$"#, options: .regularExpression)
+        else { return body }
+        var end = body.endIndex
+        if let nextHeading = body.range(of: "\n#", range: r.upperBound..<body.endIndex) {
+            end = nextHeading.lowerBound
+        }
+        var trimmed = body
+        trimmed.removeSubrange(r.lowerBound..<end)
+        return trimmed
+    }
+
     /// Lint a page set. `validSlugs` defaults to the slugs of `pages` (a self-contained
     /// corpus); pass a superset to allow links to pages outside the linted batch.
     public static func lint(_ pages: [WikiLintPage], validSlugs: Set<String>? = nil) -> [WikiLinkIssue] {
@@ -81,9 +97,13 @@ public enum WikiLinkLinter {
                     issues.append(WikiLinkIssue(page: page.slug, kind: .nonReciprocalSeeAlso, target: target))
                 }
             }
-            // ungrounded synthesis: a grounding-required page that cites nothing real
+            // ungrounded synthesis: a grounding-required page that cites nothing real.
+            // A "See Also" edge is NAVIGATION, not a citation — counting it as grounding
+            // let a page with 0 claims and only a see-also link slip past strict mode. Judge
+            // grounding on CONTENT links (the body with the see-also SECTION excised).
+            let contentLinks = links(in: bodyExcludingSeeAlso(page.body))
             if groundingRequired.contains(page.category)
-                && page.claimLinkCount == 0 && links(in: page.body).isEmpty {
+                && page.claimLinkCount == 0 && contentLinks.isEmpty {
                 issues.append(WikiLinkIssue(page: page.slug, kind: .ungrounded, target: nil))
             }
         }

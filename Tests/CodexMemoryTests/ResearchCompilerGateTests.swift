@@ -100,6 +100,22 @@ final class ResearchCompilerGateTests: XCTestCase {
         XCTAssertFalse(v.block, "a valid prior-round See-Also link must NOT false-block the research write-path")
     }
 
+    // THE grounding seam: a See-Also edge is NAVIGATION, not a citation. A synthesis page
+    // with ZERO linked claims and ONLY a (valid) See-Also link cited nothing real — but the
+    // old check (`links(in:body).isEmpty`) saw the see-also link and called it grounded, so
+    // strict mode let it through. Grounding now counts CONTENT links only, so this blocks.
+    func testStrictBlocksUngroundedEvenWithSeeAlsoLink() {
+        let body = LiveResearchCompiler.renderSynthesisBody(
+            topic: "T", round: 2, sources: ["https://e/a"], seeAlso: ["research-t-r1"])
+        let gate = WikiWriteGate(mode: .strict, vaultRoot: NSTemporaryDirectory())
+        let v = gate.validate(WikiLintPage(slug: "research-t-r2", body: body, category: "synthesis",
+                                           claimLinkCount: 0),                 // nothing real cited
+                              validSlugs: ["research-t-r2", "research-t-r1"])  // see-also resolves (not broken)
+        XCTAssertTrue(v.block, "0 claims + only a navigational See-Also link = ungrounded, must block in strict")
+        XCTAssertTrue(v.issues.contains { $0.kind == .ungrounded },
+                      "the block reason is ungrounded, not a spurious brokenLink")
+    }
+
     func testLintModeCLIFlagParsesAndValidates() throws {
         let opt = try CodexMemoryWikiResearch.parse(["graph nets", "--lint-mode", "strict"])
         XCTAssertEqual(opt.lintMode, "strict")
