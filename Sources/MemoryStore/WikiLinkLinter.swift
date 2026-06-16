@@ -84,6 +84,15 @@ public enum WikiLinkLinter {
     /// is a nav entry plus a thematic break, not a setext heading. Fenced code blocks are inert;
     /// a fence open is CommonMark-correct (≤3-space indent — a ≥4-space-indented ``` line is an
     /// indented code block, not a fence).
+    ///
+    /// CONVENTION & inherent limit: place "See Also" as a TRAILING section (followed only by
+    /// other top-level sections), the way it is conventionally used and the way the research
+    /// compiler emits it. A deeper sub-heading after a "See Also" is, by syntax alone,
+    /// indistinguishable between a nav group-label (`### Internal`) and a genuine content
+    /// subsection (`### Root Cause`) — markdown cannot tell them apart. The rule resolves this
+    /// the safe way for a write-GUARDIAN: a deeper heading nests as navigation, so a citation-
+    /// less page never slips the grounding gate (the failure mode is a conservative false block
+    /// of an unconventional layout, never a silent pass of an ungrounded page).
     private static func partitionSeeAlso(_ body: String) -> (content: String, seeAlso: String) {
         let lines = body.components(separatedBy: "\n")
         func matches(_ s: String, _ pattern: String) -> Bool {
