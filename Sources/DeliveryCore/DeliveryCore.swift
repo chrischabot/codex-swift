@@ -169,18 +169,15 @@ public actor DurableDeliveryQueue {
         // legitimate operator retry that must NOT be deduped.
         if dedupWindowSeconds > 0 {
             let seedT = now()
-            // `fold` keys by job.id, so ONE idempotency key can appear under several ids:
-            // an acked job1 (seq 1) AND a later failed job2 (seq 2). Seeding the window from
-            // the stale acked record would shadow the failed key's legitimate operator retry.
-            // Reduce to the LATEST record per key (highest seq) first, then seed only when
-            // THAT record is `.acked` — so a key whose newest state is `.failed` stays retryable.
-            var latestByKey: [String: OutboundJob] = [:]
-            for job in folded.latest.values {
-                guard let key = job.idempotencyKey else { continue }
-                if let prev = latestByKey[key], prev.seq >= job.seq { continue }
-                latestByKey[key] = job
-            }
-            for (key, job) in latestByKey where job.state == .acked {
+            // Seed from the LAST-APPENDED record per idempotency key. `seq` is assigned at
+            // ENQUEUE time and does NOT track when a job acked/failed, so reducing by seq is
+            // wrong: a lower-seq job can ack chronologically AFTER a higher-seq job fails (e.g.
+            // a crash-residue job re-driven by recover() appends its ack after a newer job's
+            // failure). The append-only log records terminal transitions in true chronological
+            // order, so `fold` builds lastByKey by overwriting per key in file order — its last
+            // entry is the genuine newest state. Seed only when that is `.acked`; a key whose
+            // newest state is `.failed` stays retryable (the operator-retry case).
+            for (key, job) in folded.lastByKey where job.state == .acked {
                 ackedKeys[key] = seedT
             }
         }
@@ -442,17 +439,23 @@ public actor DurableDeliveryQueue {
     /// prior complete record for that id correctly remains authoritative. Used
     /// once, by `init`, to seed the in-memory mirror + the seq/byte counters;
     /// steady-state reads go through `latestPerJob`, not the log.
-    private nonisolated static func fold(logPath: String) -> (latest: [String: OutboundJob], bytes: Int) {
+    private nonisolated static func fold(logPath: String)
+        -> (latest: [String: OutboundJob], lastByKey: [String: OutboundJob], bytes: Int) {
         let decoder = JSONDecoder()
         guard let data = FileManager.default.contents(atPath: logPath),
-              let text = String(data: data, encoding: .utf8) else { return ([:], 0) }
+              let text = String(data: data, encoding: .utf8) else { return ([:], [:], 0) }
         var latest: [String: OutboundJob] = [:]
+        // lastByKey overwrites per idempotency key in FILE (append) order, so its final
+        // entry per key is that key's chronologically-newest terminal state — the correct
+        // signal for dedup-window re-seeding (seq is enqueue-time, not transition-time).
+        var lastByKey: [String: OutboundJob] = [:]
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             if let job = try? decoder.decode(OutboundJob.self, from: Data(line.utf8)) {
                 latest[job.id] = job
+                if let key = job.idempotencyKey { lastByKey[key] = job }
             }
         }
-        return (latest, data.count)
+        return (latest, lastByKey, data.count)
     }
 }
 

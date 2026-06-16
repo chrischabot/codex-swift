@@ -212,6 +212,27 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(n, 0)
     }
 
+    // seq is enqueue-time, NOT transition-time: a lower-seq job can ACK chronologically
+    // AFTER a higher-seq job FAILS (e.g. a crash-residue job re-driven by recover() appends
+    // its ack after a newer job's failure). The durable log is appended in true terminal
+    // order, so the LAST-appended record per key is authoritative. Here acked(seq5) is
+    // appended AFTER failed(seq6): the key IS delivered → must dedup, not double-send. A
+    // seq-based reduction would pick failed(seq6) and wrongly re-send.
+    func testAckAppendedAfterHigherSeqFailedSuppressesAcrossRestart() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var failed = job("j1", key: "K"); failed.state = .failed; failed.seq = 6  // higher seq, earlier in log
+        var acked = job("j2", key: "K"); acked.state = .acked; acked.seq = 5      // lower seq, appended LATER
+        writeLog(dir, [failed, acked])   // append order: failed then acked → acked is the latest state
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: clock.fn)
+        let r = await q.enqueue(job("j3", key: "K"))
+        let n = await exec.count()
+        XCTAssertTrue(r.deduped, "the last-appended state for K is acked → suppress (append order, not seq)")
+        XCTAssertEqual(n, 0, "no double-send of an already-delivered key")
+    }
+
     func testIdempotencyDedupExpiresAfterWindow() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let exec = ScriptedExecutor([.acked])
