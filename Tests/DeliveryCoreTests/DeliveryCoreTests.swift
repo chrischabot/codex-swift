@@ -344,6 +344,44 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertEqual(n, 2, "each attempt entered the executor (then timed out) — never wedged")
     }
 
+    // Compaction must NOT hollow out the cross-restart dedup re-seed. recover() always
+    // compacts; if compaction dropped the acked record for a within-window key, the next
+    // process's re-seed had nothing to seed from → an already-delivered key double-sent. Now
+    // compaction RETAINS within-window keyed acked records, so the window survives.
+    func testCompactionPreservesWithinWindowAckedKeyForReseed() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let clock = FakeClock()
+        do {
+            let exec = ScriptedExecutor([.acked])
+            let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                         dedupWindowSeconds: 100, compactThresholdBytes: 4096, now: clock.fn)
+            _ = await q.enqueue(job("j1", key: "K"))   // delivered
+            _ = await q.recover()                       // recover() ALWAYS compacts
+        }
+        let exec2 = ScriptedExecutor([.acked])
+        let q2 = DurableDeliveryQueue(directory: dir, executor: exec2, backoff: fastBackoff,
+                                      dedupWindowSeconds: 100, now: clock.fn)   // restart, re-seed from log
+        let r = await q2.enqueue(job("j2", key: "K"))   // same key, within window
+        let n = await exec2.count()
+        XCTAssertTrue(r.deduped, "a key acked then compacted-through stays deduped after restart")
+        XCTAssertEqual(n, 0, "no cross-restart double-send of an already-delivered key")
+    }
+
+    // The retention is WINDOW-BOUNDED: once the dedup window elapses, the next compaction
+    // drops the acked record (no unbounded log growth from delivered keys).
+    func testCompactionDropsAckedKeyAfterWindowElapses() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, compactThresholdBytes: 4096, now: clock.fn)
+        _ = await q.enqueue(job("j1", key: "K"))
+        clock.advance(200)                              // past the window
+        _ = await q.recover()                           // compaction now prunes K and drops its record
+        let text = (try? String(contentsOfFile: dir + "/queue.jsonl", encoding: .utf8)) ?? "x"
+        XCTAssertFalse(text.contains("\"K\""), "an out-of-window acked key is not retained — log stays bounded")
+    }
+
     func testCompactionBoundsLogToLiveBacklog() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let exec = ScriptedExecutor([.acked])

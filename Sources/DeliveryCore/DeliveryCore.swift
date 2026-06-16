@@ -274,7 +274,11 @@ public actor DurableDeliveryQueue {
     @discardableResult
     public func recover() async -> [DeliveryReceipt] {
         let live = compact()
-        let pending = live.filter { $0.state != .failed }.sorted { $0.seq < $1.seq }
+        // Re-drive only NON-terminal jobs. compact() may now retain within-window acked
+        // records (for the dedup re-seed), so exclude .acked as well as .failed — driving an
+        // acked job would re-send it. (The dedup check below also guards this, but excluding
+        // here is the clear contract.)
+        let pending = live.filter { $0.state != .failed && $0.state != .acked }.sorted { $0.seq < $1.seq }
         var receipts: [DeliveryReceipt] = []
         for var job in pending {
             seqCounter = Swift.max(seqCounter, job.seq)
@@ -383,13 +387,25 @@ public actor DurableDeliveryQueue {
         if appendedBytes > compactThresholdBytes { _ = compact() }
     }
 
-    /// Rewrite the log keeping only the latest record per NON-acked id (failed
-    /// jobs are KEPT as dead-letter), so it tracks the live backlog. Returns the
-    /// kept set so `recover()` reuses it without a second parse.
+    /// Rewrite the log keeping the latest record per NON-acked id (failed jobs are
+    /// KEPT as dead-letter), PLUS acked records whose idempotency key is still within
+    /// the live dedup window — so the cross-restart re-seed (which reads acked records
+    /// off the log) is not hollowed out by compaction, while remaining bounded by the
+    /// window. Returns the kept set so `recover()` reuses it without a second parse.
     @discardableResult
     private func compact() -> [OutboundJob] {
+        // Expire stale window entries first so the retention test below is window-bounded.
+        pruneDedup()
         let live = latestPerJob.values
-            .filter { $0.state != .acked }
+            .filter { job in
+                if job.state != .acked { return true }     // re-drive backlog + dead-letter
+                // Keep an acked record ONLY while its key is still within the dedup window.
+                // Without this, compaction deletes the very records the init re-seed relies
+                // on, so an already-delivered key double-sends after compaction+restart. Once
+                // the key's window expires (pruneDedup drops it), the next compaction drops it.
+                guard let key = job.idempotencyKey else { return false }
+                return ackedKeys[key] != nil
+            }
             .sorted { $0.seq < $1.seq }
         guard !live.isEmpty || FileManager.default.fileExists(atPath: logPath) else { return live }
         var data = Data()
@@ -419,9 +435,10 @@ public actor DurableDeliveryQueue {
             fh = FileHandle(forWritingAtPath: logPath)
             _ = try? fh?.seekToEnd()
             appendedBytes = data.count
-            // The log now holds exactly `live` (acked records dropped); mirror it
-            // in memory so a compacted-away acked job reports `nil` status, just as
-            // a fresh re-parse would. Reached ONLY when the replace succeeded.
+            // The log now holds exactly `live` (acked records dropped EXCEPT those still
+            // within the dedup window); mirror it in memory so status() matches a fresh
+            // re-parse — a compacted-away acked job reports `nil`, a retained within-window
+            // one reports `.acked`. Reached ONLY when the replace succeeded.
             latestPerJob = Dictionary(uniqueKeysWithValues: live.map { ($0.id, $0) })
         } catch {
             // Compaction is best-effort and the rewrite did NOT take effect: the
