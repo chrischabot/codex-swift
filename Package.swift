@@ -369,7 +369,7 @@ let package = Package(
         // MemoryProvider adapter selected by `[memory].provider = "mem0"`.
         // See docs/MEM0.md.
         // -----------------------------------------------------------------
-        .target(name: "Mem0Core", swiftSettings: strict),
+        .target(name: "Mem0Core", dependencies: ["InfraPrimitives"], swiftSettings: strict),
         .target(name: "Mem0Store",
                 dependencies: ["Mem0Core", "CSQLite"],
                 swiftSettings: strict),
@@ -476,7 +476,7 @@ let package = Package(
                                "Tools", "InfraPrimitives"],
                 swiftSettings: strict),
         .testTarget(name: "Mem0CoreTests",
-                dependencies: ["Mem0Core"], swiftSettings: strict),
+                dependencies: ["Mem0Core", "InfraPrimitives"], swiftSettings: strict),
         .testTarget(name: "Mem0StoreTests",
                 dependencies: ["Mem0Store", "Mem0Core"], swiftSettings: strict),
         .testTarget(name: "Mem0ExtensionTests",

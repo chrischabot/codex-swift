@@ -1,4 +1,5 @@
 import Foundation
+import InfraPrimitives
 
 /// Options for `Mem0Engine.add`. Port of the Rust `AddOptions`.
 public struct AddOptions: Sendable {
@@ -405,18 +406,14 @@ public struct Mem0Engine: Sendable {
         //    regex-indistinguishable from prose without a name list, and the real threat surface
         //    is exactly these known role/tool/chat-template markers.)
         let bareTag = #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#
-        // The PASS-2 vocabulary MIRRORS MemoryInfer.ContextSanitizer.breakoutTags (Mem0Core
-        // cannot import MemoryInfer, so it is duplicated here) PLUS function/tool_response.
-        // KEEP IN SYNC: an attributed form of a marker present in breakoutTags but missing
-        // here passes through LIVE — testValuelessAttributeMarkersAreDefanged enumerates the
-        // full contract and fails on drift. Longest alternatives first so `\b` resolves cleanly.
-        let markers = [
-            "im_start", "im_end", "endoftext", "eot_id", "start_header_id", "end_header_id",
-            "bos", "eos", "system", "assistant", "user", "developer",
-            "tool_calls", "tool_call", "tool_use", "tool_response", "tool_result", "tool",
-            "function_call", "function", "context", "instructions", "instruction", "prompt",
-            "think", "chat_session", "trajectory", "take", "document",
-        ].joined(separator: "|")
+        // PASS 2's vocabulary IS the canonical InfraPrimitives.PromptInjectionVocab.markers —
+        // the SAME list MemoryInfer.ContextSanitizer.breakoutTags uses, so the two sanitizers
+        // cannot drift (the earlier hand-copied subset is what let attributed <tool_use …> /
+        // <tool_result …> leak). Sort longest-first so `\b` resolves prefix pairs (tool vs
+        // tool_call vs tool_calls, function vs function_call) cleanly under alternation.
+        let markers = PromptInjectionVocab.markers
+            .sorted { $0.count > $1.count }
+            .joined(separator: "|")
         let attributedMarker = #"(?i)<\s*/?\s*(?:\|\s*)?(?:\#(markers))\b[^>]*>"#
         for pattern in [bareTag, attributedMarker] {
             guard let re = try? NSRegularExpression(pattern: pattern) else { continue }

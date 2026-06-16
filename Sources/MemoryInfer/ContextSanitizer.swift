@@ -1,4 +1,5 @@
 import Foundation
+import InfraPrimitives
 
 /// Neutralizes prompt-injection / envelope-escape sequences in UNTRUSTED text
 /// (fetched web pages, arXiv abstracts, GitHub READMEs, Claude transcripts)
@@ -22,17 +23,9 @@ public enum ContextSanitizer {
     /// Tags whose presence in data could break out of the data envelope or
     /// hijack a chat template. Neutralized by swapping `<`/`>` for `[`/`]`.
     /// Matched case-insensitively, opening or closing, with or without attributes.
-    static let breakoutTags: [String] = [
-        // ChatML / special model control tokens — critical for the MLX chat path,
-        // which feeds extraction prompts through a chat template.
-        "im_start", "im_end", "endoftext", "eot_id",
-        "start_header_id", "end_header_id", "bos", "eos",
-        // Conversation roles + common envelope / instruction tags.
-        "system", "assistant", "user", "developer",
-        "tool", "tool_call", "tool_calls", "tool_use", "tool_result", "function_call",
-        "context", "instruction", "instructions", "prompt",
-        "think", "chat_session", "trajectory", "take", "document",
-    ]
+    /// SINGLE SOURCE OF TRUTH: `InfraPrimitives.PromptInjectionVocab.markers`, shared with
+    /// `Mem0Core.Mem0Engine.sanitizeForPrompt` so the two sanitizers cannot drift.
+    static let breakoutTags: [String] = PromptInjectionVocab.markers
 
     /// Instruction-override lead-ins that try to make the model disregard its
     /// system prompt. High-signal, low-false-positive. Neutralized by wrapping in

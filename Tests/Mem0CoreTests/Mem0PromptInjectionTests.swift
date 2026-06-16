@@ -1,5 +1,6 @@
 import XCTest
 @testable import Mem0Core
+import InfraPrimitives
 
 /// Audit fix: the default live extraction prompt (generateAdditiveExtractionPrompt)
 /// interpolated untrusted, re-poisonable content (stored memories + raw turns) RAW with
@@ -63,21 +64,15 @@ final class Mem0PromptInjectionTests: XCTestCase {
         XCTAssertEqual(Mem0Engine.sanitizeForPrompt("<im_start system>"), "[im_start system]")
     }
 
-    // FULL CONTRACT — the round-3 review found the PASS-2 vocabulary had drifted from the
-    // codebase's canonical ContextSanitizer.breakoutTags, so ATTRIBUTED forms of the missing
-    // markers (notably <tool_use id=…> / <tool_result …> — the host model family's own tool
-    // markers) passed through LIVE. This enumerates every breakoutTags name (+ tool_use,
-    // tool_response, function) and asserts BOTH a valued and a valueless attributed form
-    // defangs. If breakoutTags grows but the engine vocabulary doesn't, this fails. KEEP IN
-    // SYNC with MemoryInfer.ContextSanitizer.breakoutTags + Mem0Engine.sanitizeForPrompt.
+    // FULL CONTRACT, bound to the CANONICAL source. The round-3/round-4 reviews found the
+    // PASS-2 vocabulary had drifted from (and could not be auto-checked against) the canonical
+    // marker list, so ATTRIBUTED forms of missing markers (notably <tool_use id=…> /
+    // <tool_result …>) passed through LIVE. This iterates InfraPrimitives.PromptInjectionVocab
+    // .markers — the SINGLE source both sanitizers now consume — and asserts BOTH a valued and
+    // a valueless attributed form defangs. Because it binds to the canonical list, ANY future
+    // marker added there that the engine fails to cover makes this test fail (true drift-lock).
     func testEveryBreakoutMarkerDefangsAttributedAndValueless() {
-        let markers = [
-            "im_start", "im_end", "endoftext", "eot_id", "start_header_id", "end_header_id",
-            "bos", "eos", "system", "assistant", "user", "developer",
-            "tool", "tool_call", "tool_calls", "tool_use", "tool_response", "tool_result",
-            "function_call", "function", "context", "instruction", "instructions", "prompt",
-            "think", "chat_session", "trajectory", "take", "document",
-        ]
+        let markers = PromptInjectionVocab.markers
         for m in markers {
             // valued attribute
             let valued = Mem0Engine.sanitizeForPrompt("<\(m) id=\"x\">payload")
