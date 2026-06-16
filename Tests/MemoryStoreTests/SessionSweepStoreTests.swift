@@ -56,4 +56,17 @@ final class SessionSweepStoreTests: XCTestCase {
         let s = try await store.researchSession(id: "s")
         XCTAssertEqual(s?.status, "in_progress", "an in-flight session from this boot is preserved")
     }
+
+    // start_time is NULLABLE; the old `start_time IS NOT NULL AND start_time < ?` could
+    // NEVER reap a NULL-start_time running session → a perpetual ghost. COALESCE(.,0)
+    // treats NULL as epoch 0 so a prior-run orphan with no start stamp is reaped at boot.
+    func testReapsNullStartTimeResearchSession() async throws {
+        let store = try makeStore()
+        try await store.upsertResearchSession(ResearchSessionRow(
+            sessionID: "ghost", startTime: nil, status: "running"))
+        let r = try await store.sweepStaleRunningSessions(now: now)
+        XCTAssertEqual(r.researchSessions, 1, "a NULL-start_time running session must be reaped, not left a ghost")
+        let s = try await store.researchSession(id: "ghost")
+        XCTAssertEqual(s?.status, "failed")
+    }
 }
