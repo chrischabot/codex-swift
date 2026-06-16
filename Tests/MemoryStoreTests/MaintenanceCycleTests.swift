@@ -98,6 +98,47 @@ final class MaintenanceCycleTests: XCTestCase {
         XCTAssertEqual(revCount, 1)
     }
 
+    // RECONCILE: markers must not grow monotonically — the cycle drops markers no longer
+    // in the live flagged/drifted set, and a deleted document clears its orphan marker.
+
+    func testCycleReconcilesAwayStaleMarkers() async throws {
+        let store = try makeStore()
+        // Markers for ids the live scan will NOT flag/drift (here: non-existent ids).
+        try await store.setMetaValue("librarian_tier2:9999", "1")
+        try await store.setMetaValue("synthesis_review:8888", "drifted")
+        let preLib = try await store.metaCount(prefix: "librarian_tier2:")
+        let preRev = try await store.metaCount(prefix: "synthesis_review:")
+        XCTAssertEqual(preLib, 1); XCTAssertEqual(preRev, 1)
+
+        _ = await MaintenanceCycle(store: store).run(now: 1_800_000_000)
+
+        let postLib = try await store.metaCount(prefix: "librarian_tier2:")
+        let postRev = try await store.metaCount(prefix: "synthesis_review:")
+        XCTAssertEqual(postLib, 0, "a librarian marker no longer flagged is reconciled away (was monotone-growing)")
+        XCTAssertEqual(postRev, 0, "a drift marker no longer drifted is reconciled away")
+    }
+
+    func testDryRunDoesNotReconcileMarkers() async throws {
+        let store = try makeStore()
+        try await store.setMetaValue("librarian_tier2:9999", "1")
+        _ = await MaintenanceCycle(store: store).run(now: 1_800_000_000, dryRun: true)
+        let n = try await store.metaCount(prefix: "librarian_tier2:")
+        XCTAssertEqual(n, 1, "dry-run mutates nothing — neither writes nor reconciles markers")
+    }
+
+    func testDeletedDocumentClearsItsLibrarianMarker() async throws {
+        let store = try makeStore()
+        let docID = try await store.upsertDocument(DocumentRow(
+            source: .manual, sourceURI: "wiki://x", bodyPath: "inline:x",
+            fetchedAt: 1, contentSHA: Data([1]), rawBytes: 10))
+        try await store.setMetaValue("librarian_tier2:\(docID)", "1")
+        let before = try await store.metaValue("librarian_tier2:\(docID)")
+        XCTAssertNotNil(before)
+        try await store.deleteDocument(id: docID)
+        let after = try await store.metaValue("librarian_tier2:\(docID)")
+        XCTAssertNil(after, "purgeDocumentRows drops the orphan marker immediately")
+    }
+
     func testMetaEntriesEscapesLikeWildcards() async throws {
         let store = try makeStore()
         try await store.setMetaValue("50%_off\\promoA", "1")   // literal % _ \ in the key

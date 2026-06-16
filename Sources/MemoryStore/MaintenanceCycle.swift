@@ -78,9 +78,20 @@ public actor MaintenanceCycle {
             do {
                 let drift = try await store.auditDriftScan()
                 var touched = 0
+                let driftedIDs = Set(drift.filter { $0.status != .current }.map { $0.id })
                 for (id, status) in drift where status != .current {
                     if !dryRun { try await store.setMetaValue("synthesis_review:\(id)", status.rawValue) }
                     touched += 1
+                }
+                // RECONCILE (the cycle is the source of truth): drop markers for syntheses
+                // no longer drifted — a recovered page OR a deleted page (absent from the
+                // scan → not in driftedIDs). Without this the marker queue only grows.
+                if !dryRun {
+                    for (key, _) in (try? await store.metaEntries(prefix: "synthesis_review:")) ?? [] {
+                        if let id = Int64(key.dropFirst("synthesis_review:".count)), !driftedIDs.contains(id) {
+                            try await store.deleteMeta(key: key)
+                        }
+                    }
                 }
                 phases.append(.init(name: "drift", status: .ok, touched: touched, durationMs: Self.ms(since: t)))
             } catch {
@@ -95,9 +106,19 @@ public actor MaintenanceCycle {
             do {
                 let scores = try await store.librarianScan(now: now, tier2Threshold: tier2Threshold)
                 var touched = 0
+                let flaggedIDs = Set(scores.filter { $0.needsTier2 }.map { $0.documentID })
                 for s in scores where s.needsTier2 {
                     if !dryRun { try await store.setMetaValue("librarian_tier2:\(s.documentID)", "1") }
                     touched += 1
+                }
+                // RECONCILE: drop markers for pages no longer flagged (re-verified/refreshed)
+                // or gone (deleted) — keeps status.flaggedStale honest instead of monotone-growing.
+                if !dryRun {
+                    for (key, _) in (try? await store.metaEntries(prefix: "librarian_tier2:")) ?? [] {
+                        if let id = Int64(key.dropFirst("librarian_tier2:".count)), !flaggedIDs.contains(id) {
+                            try await store.deleteMeta(key: key)
+                        }
+                    }
                 }
                 phases.append(.init(name: "librarian", status: .ok, touched: touched, durationMs: Self.ms(since: t)))
             } catch {

@@ -331,6 +331,12 @@ extension MemoryStore {
         try metaEntries(prefix: prefix).count
     }
 
+    /// Delete one durable `meta` key (a review marker the maintenance cycle reconciled
+    /// away, or one orphaned by a document delete). No-op if absent.
+    public func deleteMeta(key: String) throws {
+        try run("DELETE FROM meta WHERE key=?;", [.text(key)])
+    }
+
     /// Incremental-compile cutoff (mirrors llm-wiki's "Last compiled"): only
     /// documents fetched after this stamp are recompiled by default.
     public func lastCompiledAt() throws -> Int64? {

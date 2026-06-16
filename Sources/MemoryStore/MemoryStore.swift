@@ -517,6 +517,9 @@ public actor MemoryStore {
         // originally-indexed text.
         try purgeChunks(documentId: id)
         try run("DELETE FROM document WHERE id=?;", [.int(id)])
+        // Drop the doc-keyed librarian review marker so a deleted page leaves no orphan
+        // marker inflating status.flaggedStale (the cycle also reconciles, but be immediate).
+        try run("DELETE FROM meta WHERE key=?;", [.text("librarian_tier2:\(id)")])
     }
 
     /// Purge a document's chunk rows + their derived index rows (FTS5, vec0,
