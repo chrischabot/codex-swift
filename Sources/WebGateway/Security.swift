@@ -89,9 +89,13 @@ enum MethodGate {
         // Realtime voice session (paid); listVoices is a read and stays Tier-A.
         "thread/realtime/start", "thread/realtime/appendText",
         "thread/realtime/appendAudio", "thread/realtime/stop",
-        // Wiki write surface + PAID extraction lanes.
+        // Wiki write surface + PAID extraction lanes. wiki/query spends too: at
+        // depth>=2 it drives MemoryRetriever.search → a billable embedding (and a
+        // rerank at depth 3) for every distinct query when the store's embedder is
+        // remote, so a read bearer could otherwise run up unbounded API cost.
+        // (wiki/brief stays Tier-A: it is lexical-only/BM25 — "Local only; no cloud spend".)
         "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename",
-        "wiki/research/start", "wiki/ingest/start",
+        "wiki/research/start", "wiki/ingest/start", "wiki/query",
         // Daemon config mutation + feature-flag flips.
         "config/value/write", "config/batchWrite", "config/mcpServer/reload",
         "experimentalFeature/enablement/set",
@@ -112,7 +116,7 @@ enum MethodGate {
         "thread/list", "thread/loaded/list", "thread/read",
         "thread/turns/list", "thread/turns/items/list", "thread/goal/get",
         "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks",
-        "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/brief", "wiki/query",
+        "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/brief",
         "wiki/status", "wiki/watch/list", "wiki/librarian/report", "wiki/audit/report",
         "wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list", "wiki/sessions/list",
         "thread/realtime/listVoices",

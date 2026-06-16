@@ -151,7 +151,10 @@ final class MethodGateTests: XCTestCase {
         // The specific holes the adversarial review found: an RCE shell + paid/destructive lanes.
         for m in ["thread/shellCommand", "turn/start", "thread/start", "thread/resume", "thread/fork",
                   "review/start", "git/action", "automation/action", "marketplace/add", "memory/reset",
-                  "thread/realtime/start", "experimentalFeature/enablement/set"] {
+                  "thread/realtime/start", "experimentalFeature/enablement/set",
+                  // wiki/query spends (remote embed + rerank at depth>=2) — a read bearer
+                  // must not be able to drive unbounded paid API calls through it.
+                  "wiki/query"] {
             XCTAssertTrue(MethodGate.requiresOwner(m), "\(m) reachable by a read bearer = privilege escalation")
         }
     }
@@ -159,7 +162,9 @@ final class MethodGateTests: XCTestCase {
     func testPureReadsAreNotOwnerTier() {
         for m in ["wiki/list", "wiki/page/get", "wiki/search", "wiki/graph",
                   "wiki/librarian/report", "wiki/sessions/list", "thread/list", "account/read",
-                  "thread/read", "config/read", "thread/realtime/listVoices"] {
+                  "thread/read", "config/read", "thread/realtime/listVoices",
+                  // wiki/brief is lexical-only (BM25, no embedding/cloud spend) → stays Tier-A.
+                  "wiki/brief"] {
             XCTAssertFalse(MethodGate.requiresOwner(m), "\(m) is a read — stays Tier-A only")
         }
     }
