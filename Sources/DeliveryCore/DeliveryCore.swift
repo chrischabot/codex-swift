@@ -121,6 +121,17 @@ public actor DurableDeliveryQueue {
     private var latestPerJob: [String: OutboundJob]
     private var fh: FileHandle? = nil
     private let encoder = JSONEncoder()
+    /// Durable cross-restart dedup memory, decoupled from the (compacted) job log. One tiny
+    /// record per delivered key; bounded to the distinct keys delivered WITHIN the dedup
+    /// window via `compactDedup`. The job log stays the LIVE backlog (acked records dropped).
+    private let dedupLogPath: String
+    private var dedupFH: FileHandle? = nil
+    private var dedupAppendedBytes: Int = 0
+
+    /// One sidecar entry: an idempotency key that was acked, and when (monotonic). The `t`
+    /// is only used for in-process window pruning; across a restart it is meaningless, so the
+    /// re-seed grants a fresh window (key set only).
+    private struct DedupRecord: Codable { let k: String; let t: Double }
 
     public init(directory: String,
                 executor: any DeliveryExecutor,
@@ -148,6 +159,7 @@ public actor DurableDeliveryQueue {
         let folded = DurableDeliveryQueue.fold(logPath: path)
         self.dir = directory
         self.logPath = path
+        self.dedupLogPath = directory + "/dedup.jsonl"
         self.executor = executor
         self.backoff = backoff
         self.maxAttempts = Swift.max(1, maxAttempts)
@@ -180,7 +192,18 @@ public actor DurableDeliveryQueue {
             for (key, job) in folded.lastByKey where job.state == .acked {
                 ackedKeys[key] = seedT
             }
+            // PRIMARY durable source: the dedup sidecar (the job log drops acked records on
+            // compaction). Grant each recorded key a fresh window — prior-process monotonic
+            // stamps are meaningless after a reboot, so this over-suppresses at worst and never
+            // double-sends; pruneDedup/compactDedup bound it. Union with the log seeding above
+            // covers a clean shutdown whose acked records are still in the (uncompacted) log.
+            for key in DurableDeliveryQueue.foldDedupKeys(path: dedupLogPath) { ackedKeys[key] = seedT }
         }
+        if !FileManager.default.fileExists(atPath: dedupLogPath) {
+            FileManager.default.createFile(atPath: dedupLogPath, contents: nil)
+        }
+        self.dedupAppendedBytes = (try? FileManager.default
+            .attributesOfItem(atPath: dedupLogPath)[.size] as? Int) ?? 0
         // All stored properties are initialized → safe to call an instance method.
         if !existed { fsyncDirectory() }
     }
@@ -274,11 +297,7 @@ public actor DurableDeliveryQueue {
     @discardableResult
     public func recover() async -> [DeliveryReceipt] {
         let live = compact()
-        // Re-drive only NON-terminal jobs. compact() may now retain within-window acked
-        // records (for the dedup re-seed), so exclude .acked as well as .failed — driving an
-        // acked job would re-send it. (The dedup check below also guards this, but excluding
-        // here is the clear contract.)
-        let pending = live.filter { $0.state != .failed && $0.state != .acked }.sorted { $0.seq < $1.seq }
+        let pending = live.filter { $0.state != .failed }.sorted { $0.seq < $1.seq }
         var receipts: [DeliveryReceipt] = []
         for var job in pending {
             seqCounter = Swift.max(seqCounter, job.seq)
@@ -335,7 +354,7 @@ public actor DurableDeliveryQueue {
             case .acked:
                 job.state = .acked
                 _ = persist(job)
-                if let key = job.idempotencyKey { ackedKeys[key] = now() }
+                if let key = job.idempotencyKey { ackedKeys[key] = now(); appendDedup(key) }
                 maybeCompact()
                 return DeliveryReceipt(id: job.id, finalState: .acked,
                                        attempts: job.attempts, deduped: false)
@@ -387,25 +406,66 @@ public actor DurableDeliveryQueue {
         if appendedBytes > compactThresholdBytes { _ = compact() }
     }
 
-    /// Rewrite the log keeping the latest record per NON-acked id (failed jobs are
-    /// KEPT as dead-letter), PLUS acked records whose idempotency key is still within
-    /// the live dedup window — so the cross-restart re-seed (which reads acked records
-    /// off the log) is not hollowed out by compaction, while remaining bounded by the
-    /// window. Returns the kept set so `recover()` reuses it without a second parse.
+    // MARK: durable dedup sidecar (decoupled from the job log)
+
+    /// Read the sidecar to the SET of keys it records (latest wins; t is ignored here — the
+    /// re-seed grants a fresh window). A torn final line is dropped, like the job-log fold.
+    private nonisolated static func foldDedupKeys(path: String) -> Set<String> {
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        let decoder = JSONDecoder()
+        var keys: Set<String> = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            if let r = try? decoder.decode(DedupRecord.self, from: Data(line.utf8)) { keys.insert(r.k) }
+        }
+        return keys
+    }
+
+    /// Append a tiny dedup record for `key`. Best-effort, NO fsync: a lost record only risks a
+    /// tolerated at-least-once duplicate, never a lost delivery. Compacts the sidecar when it
+    /// outgrows the threshold so it stays bounded by the distinct within-window key count.
+    private func appendDedup(_ key: String) {
+        guard dedupWindowSeconds > 0 else { return }
+        if dedupFH == nil { dedupFH = FileHandle(forWritingAtPath: dedupLogPath); _ = try? dedupFH?.seekToEnd() }
+        guard let fh = dedupFH,
+              var line = try? encoder.encode(DedupRecord(k: key, t: now())) else { return }
+        line.append(0x0A)
+        do { try fh.write(contentsOf: line); dedupAppendedBytes += line.count } catch { return }
+        if dedupAppendedBytes > compactThresholdBytes { compactDedup() }
+    }
+
+    /// Rewrite the sidecar to one record per still-live key (after expiring the window), so it
+    /// is bounded by the distinct keys delivered WITHIN the window — not lifetime delivery
+    /// count. Best-effort: on failure the (larger but valid) append-only sidecar is left intact.
+    private func compactDedup() {
+        pruneDedup()
+        var data = Data()
+        for (key, t) in ackedKeys {
+            if var line = try? encoder.encode(DedupRecord(k: key, t: t)) { line.append(0x0A); data.append(line) }
+        }
+        let tmp = dedupLogPath + ".compact"
+        do {
+            try data.write(to: URL(fileURLWithPath: tmp), options: .atomic)
+            try? dedupFH?.close(); dedupFH = nil
+            try FileManager.default.replaceItemAt(URL(fileURLWithPath: dedupLogPath),
+                                                  withItemAt: URL(fileURLWithPath: tmp))
+            dedupAppendedBytes = data.count
+        } catch {
+            try? FileManager.default.removeItem(atPath: tmp)
+        }
+    }
+
+    /// Rewrite the log keeping only the latest record per NON-acked id (failed
+    /// jobs are KEPT as dead-letter), so it tracks the LIVE backlog. Acked records
+    /// are dropped — cross-restart dedup memory lives in the bounded `dedup.jsonl`
+    /// sidecar instead, so the main log never accumulates delivered history (an
+    /// earlier attempt to retain within-window acked records here caused per-ack
+    /// compaction thrash and distinct-key growth). Returns the kept set so
+    /// `recover()` reuses it without a second parse.
     @discardableResult
     private func compact() -> [OutboundJob] {
-        // Expire stale window entries first so the retention test below is window-bounded.
-        pruneDedup()
         let live = latestPerJob.values
-            .filter { job in
-                if job.state != .acked { return true }     // re-drive backlog + dead-letter
-                // Keep an acked record ONLY while its key is still within the dedup window.
-                // Without this, compaction deletes the very records the init re-seed relies
-                // on, so an already-delivered key double-sends after compaction+restart. Once
-                // the key's window expires (pruneDedup drops it), the next compaction drops it.
-                guard let key = job.idempotencyKey else { return false }
-                return ackedKeys[key] != nil
-            }
+            .filter { $0.state != .acked }
             .sorted { $0.seq < $1.seq }
         guard !live.isEmpty || FileManager.default.fileExists(atPath: logPath) else { return live }
         var data = Data()
@@ -435,10 +495,9 @@ public actor DurableDeliveryQueue {
             fh = FileHandle(forWritingAtPath: logPath)
             _ = try? fh?.seekToEnd()
             appendedBytes = data.count
-            // The log now holds exactly `live` (acked records dropped EXCEPT those still
-            // within the dedup window); mirror it in memory so status() matches a fresh
-            // re-parse — a compacted-away acked job reports `nil`, a retained within-window
-            // one reports `.acked`. Reached ONLY when the replace succeeded.
+            // The log now holds exactly `live` (acked records dropped); mirror it
+            // in memory so a compacted-away acked job reports `nil` status, just as
+            // a fresh re-parse would. Reached ONLY when the replace succeeded.
             latestPerJob = Dictionary(uniqueKeysWithValues: live.map { ($0.id, $0) })
         } catch {
             // Compaction is best-effort and the rewrite did NOT take effect: the

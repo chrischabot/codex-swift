@@ -345,9 +345,9 @@ final class DeliveryCoreTests: XCTestCase {
     }
 
     // Compaction must NOT hollow out the cross-restart dedup re-seed. recover() always
-    // compacts; if compaction dropped the acked record for a within-window key, the next
-    // process's re-seed had nothing to seed from → an already-delivered key double-sent. Now
-    // compaction RETAINS within-window keyed acked records, so the window survives.
+    // compacts and the job log drops acked records, so the dedup window is re-seeded from the
+    // durable `dedup.jsonl` SIDECAR (which compaction does not touch). A key delivered then
+    // compacted-through must still dedup after a restart.
     func testCompactionPreservesWithinWindowAckedKeyForReseed() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let clock = FakeClock()
@@ -355,31 +355,49 @@ final class DeliveryCoreTests: XCTestCase {
             let exec = ScriptedExecutor([.acked])
             let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
                                          dedupWindowSeconds: 100, compactThresholdBytes: 4096, now: clock.fn)
-            _ = await q.enqueue(job("j1", key: "K"))   // delivered
-            _ = await q.recover()                       // recover() ALWAYS compacts
+            _ = await q.enqueue(job("j1", key: "K"))   // delivered → sidecar records K
+            _ = await q.recover()                       // recover() ALWAYS compacts (drops acked K from queue.jsonl)
         }
         let exec2 = ScriptedExecutor([.acked])
         let q2 = DurableDeliveryQueue(directory: dir, executor: exec2, backoff: fastBackoff,
-                                      dedupWindowSeconds: 100, now: clock.fn)   // restart, re-seed from log
+                                      dedupWindowSeconds: 100, now: clock.fn)   // restart, re-seed from sidecar
         let r = await q2.enqueue(job("j2", key: "K"))   // same key, within window
         let n = await exec2.count()
-        XCTAssertTrue(r.deduped, "a key acked then compacted-through stays deduped after restart")
+        XCTAssertTrue(r.deduped, "a key acked then compacted-through stays deduped after restart (via sidecar)")
         XCTAssertEqual(n, 0, "no cross-restart double-send of an already-delivered key")
     }
 
-    // The retention is WINDOW-BOUNDED: once the dedup window elapses, the next compaction
-    // drops the acked record (no unbounded log growth from delivered keys).
-    func testCompactionDropsAckedKeyAfterWindowElapses() async throws {
+    // The round-4 regression fix: the JOB LOG must stay the LIVE backlog even for a heavily
+    // KEYED workload — keyed dedup memory lives in the sidecar, NOT retained in queue.jsonl.
+    // (The earlier within-window retention defeated this bound and thrashed compaction.)
+    func testJobLogStaysBoundedUnderManyKeyedAcks() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let clock = FakeClock()
+        let exec = ScriptedExecutor([.acked])
+        // 60 DISTINCT keys, large window, small threshold (cf. testCompactionBoundsLogToLiveBacklog).
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100_000, compactThresholdBytes: 200, now: clock.fn)
+        for i in 0..<60 { _ = await q.enqueue(job("j\(i)", key: "K\(i)")) }
+        let text = (try? String(contentsOfFile: dir + "/queue.jsonl", encoding: .utf8)) ?? ""
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).count
+        XCTAssertLessThan(lines, 30, "the job log tracks the live backlog, not delivered keyed history (\(lines) lines)")
+    }
+
+    // The sidecar itself stays bounded by the distinct WITHIN-WINDOW key count: keys acked
+    // before the window elapses are pruned on compaction, not accumulated for the daemon's
+    // life. (Enough distinct keys to cross the 4096-byte compaction floor for tiny records.)
+    func testDedupSidecarIsWindowBounded() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let clock = FakeClock()
         let exec = ScriptedExecutor([.acked])
         let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
-                                     dedupWindowSeconds: 100, compactThresholdBytes: 4096, now: clock.fn)
-        _ = await q.enqueue(job("j1", key: "K"))
-        clock.advance(200)                              // past the window
-        _ = await q.recover()                           // compaction now prunes K and drops its record
-        let text = (try? String(contentsOfFile: dir + "/queue.jsonl", encoding: .utf8)) ?? "x"
-        XCTAssertFalse(text.contains("\"K\""), "an out-of-window acked key is not retained — log stays bounded")
+                                     dedupWindowSeconds: 100, compactThresholdBytes: 200, now: clock.fn)
+        for i in 0..<240 { _ = await q.enqueue(job("old\(i)", key: "OLD\(i)")) }  // first cohort (> 4096 B)
+        clock.advance(200)                                                        // expire the first cohort
+        for i in 0..<10 { _ = await q.enqueue(job("new\(i)", key: "NEW\(i)")) }   // triggers compactDedup → prune
+        let text = (try? String(contentsOfFile: dir + "/dedup.jsonl", encoding: .utf8)) ?? ""
+        XCTAssertFalse(text.contains("\"OLD"), "expired-window keys are pruned from the sidecar")
+        XCTAssertTrue(text.contains("\"NEW"), "current-window keys remain")
     }
 
     func testCompactionBoundsLogToLiveBacklog() async throws {
