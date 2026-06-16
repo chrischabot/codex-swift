@@ -128,19 +128,38 @@ final class MethodGateTests: XCTestCase {
 
     // MARK: owner/write tier (audit — a flat single bearer let any token holder write/spend)
 
-    func testEffectfulMethodsAreOwnerTierAndStillAllowed() {
-        for m in ["wiki/page/upsert", "wiki/page/delete", "wiki/page/rename",
-                  "wiki/research/start", "wiki/ingest/start", "config/value/write",
-                  "config/batchWrite", "remoteControl/enable", "remoteControl/disable",
-                  "environment/add", "plugin/install", "plugin/uninstall"] {
-            XCTAssertTrue(MethodGate.requiresOwner(m), "\(m) must be owner-tier")
-            XCTAssertTrue(MethodGate.isAllowed(m), "owner-tier is a strict subset of Tier-A allowed")
+    /// DATA-DRIVEN coverage (the old test iterated ownerTier itself → circular, couldn't
+    /// detect an omission). allowed = pureReads ∪ ownerTier exactly: every allowed method
+    /// is classified, and EVERY non-read is owner-gated. Adding an effectful method to
+    /// `allowed` without owner-gating it (or mislabelling it a read) fails here.
+    func testEveryNonReadAllowedMethodIsOwnerGated() {
+        let effectful = MethodGate.allowed.subtracting(MethodGate.pureReads)
+        for m in effectful {
+            XCTAssertTrue(MethodGate.requiresOwner(m), "effectful method \(m) MUST be owner-tier")
+        }
+        // pureReads and ownerTier must be disjoint + together cover all of allowed (no
+        // method left unclassified, none both a read and owner-gated).
+        XCTAssertTrue(MethodGate.pureReads.isDisjoint(with: MethodGate.ownerTier),
+                      "a method cannot be both a pure read and owner-tier")
+        XCTAssertEqual(MethodGate.allowed, MethodGate.pureReads.union(MethodGate.ownerTier),
+                       "every allowed method is classified as exactly one of read / owner-tier")
+        XCTAssertTrue(MethodGate.ownerTier.isSubset(of: MethodGate.allowed),
+                      "owner-tier is a strict gate layered on Tier-A (subset of allowed)")
+    }
+
+    func testDangerousMethodsAreOwnerGated() {
+        // The specific holes the adversarial review found: an RCE shell + paid/destructive lanes.
+        for m in ["thread/shellCommand", "turn/start", "thread/start", "thread/resume", "thread/fork",
+                  "review/start", "git/action", "automation/action", "marketplace/add", "memory/reset",
+                  "thread/realtime/start", "experimentalFeature/enablement/set"] {
+            XCTAssertTrue(MethodGate.requiresOwner(m), "\(m) reachable by a read bearer = privilege escalation")
         }
     }
 
     func testPureReadsAreNotOwnerTier() {
         for m in ["wiki/list", "wiki/page/get", "wiki/search", "wiki/graph",
-                  "wiki/librarian/report", "wiki/sessions/list", "thread/list", "account/read"] {
+                  "wiki/librarian/report", "wiki/sessions/list", "thread/list", "account/read",
+                  "thread/read", "config/read", "thread/realtime/listVoices"] {
             XCTAssertFalse(MethodGate.requiresOwner(m), "\(m) is a read — stays Tier-A only")
         }
     }

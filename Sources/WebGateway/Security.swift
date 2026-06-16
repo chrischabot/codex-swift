@@ -74,15 +74,56 @@ enum MethodGate {
     /// config.toml; remoteControl/environment/plugin reshape the control plane. Keep in
     /// sync deliberately — never relax to a prefix.
     static let ownerTier: Set<String> = [
+        // Threads: create/resume/fork spawn paid turns; metadata mutations; compaction
+        // spends; rollback/inject mutate history; shellCommand runs an UNSANDBOXED
+        // full-access shell (RCE — the single most dangerous entry).
+        "thread/start", "thread/resume", "thread/fork",
+        "thread/name/set", "thread/pin/set", "thread/archive", "thread/unarchive",
+        "thread/unsubscribe", "thread/compact/start",
+        "thread/rollback", "thread/inject_items", "thread/shellCommand",
+        "thread/goal/set", "thread/goal/clear", "thread/memoryMode/set", "memory/reset",
+        // Turns: paid model turns + their control verbs; review/start spends too.
+        "turn/start", "turn/steer", "turn/interrupt", "review/start",
+        // git diff-rail (push/pr/revert = destructive) + scheduled automations (deferred spend).
+        "git/action", "automation/action",
+        // Realtime voice session (paid); listVoices is a read and stays Tier-A.
+        "thread/realtime/start", "thread/realtime/appendText",
+        "thread/realtime/appendAudio", "thread/realtime/stop",
+        // Wiki write surface + PAID extraction lanes.
         "wiki/page/upsert", "wiki/page/delete", "wiki/page/rename",
         "wiki/research/start", "wiki/ingest/start",
+        // Daemon config mutation + feature-flag flips.
         "config/value/write", "config/batchWrite", "config/mcpServer/reload",
+        "experimentalFeature/enablement/set",
+        // Control plane: remote control, environment enrollment, plugin/marketplace install.
         "remoteControl/enable", "remoteControl/disable",
-        "environment/add", "plugin/install", "plugin/uninstall",
+        "environment/add", "plugin/install", "plugin/uninstall", "marketplace/add",
     ]
     static func requiresOwner(_ method: String) -> Bool { ownerTier.contains(method) }
 
     static func isAllowed(_ method: String) -> Bool { allowed.contains(method) }
+
+    /// The pure-READ subset of `allowed` (list/get/read/search/status — no spend, no
+    /// mutation, no control-plane change). The coverage test asserts every non-read
+    /// allowed method is in `ownerTier`, so adding an effectful method to `allowed`
+    /// without owner-gating it fails CI. Exposed for that test only.
+    static let pureReads: Set<String> = [
+        "initialize",
+        "thread/list", "thread/loaded/list", "thread/read",
+        "thread/turns/list", "thread/turns/items/list", "thread/goal/get",
+        "wiki/list", "wiki/page/get", "wiki/search", "wiki/graph", "wiki/backlinks",
+        "wiki/entityBacklinks", "wiki/tags", "wiki/index", "wiki/brief", "wiki/query",
+        "wiki/status", "wiki/watch/list", "wiki/librarian/report", "wiki/audit/report",
+        "wiki/inventory/list", "wiki/dataset/list", "wiki/collect/list", "wiki/sessions/list",
+        "thread/realtime/listVoices",
+        "model/list", "modelProvider/capabilities/read", "config/read",
+        "account/read", "account/rateLimits/read", "experimentalFeature/list",
+        "configRequirements/read", "skills/list", "mcpServerStatus/list", "hooks/list",
+        "collaborationMode/list", "app/list",
+        "plugin/list", "plugin/installed", "plugin/read",
+        "fuzzyFileSearch", "fuzzyFileSearch/sessionStart", "fuzzyFileSearch/sessionUpdate",
+        "fuzzyFileSearch/sessionStop", "remoteControl/status/read",
+    ]
 }
 
 /// Runtime security policy for a gateway listener, derived from config.

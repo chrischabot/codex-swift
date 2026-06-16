@@ -679,7 +679,11 @@ export function makeCodexConnector(opts: CodexConnectorOptions = {}): Connector 
       if (ws && ws.readyState === WebSocket.OPEN) return;
       setStatus({ kind: "connecting" });
       await new Promise<void>((resolve, reject) => {
-        ws = new ReconnectingWebSocket(url, opts.token ? [`bearer.${opts.token}`] : undefined, {
+        // Present the token as BOTH the read bearer and the owner credential. When the
+        // owner token == the read bearer (loopback / single-operator), this unlocks the
+        // Tier-B (mutating/paid) RPCs; a read-only client whose token is NOT the owner
+        // secret simply fails the owner check and stays browse-only.
+        ws = new ReconnectingWebSocket(url, opts.token ? [`bearer.${opts.token}`, `owner.${opts.token}`] : undefined, {
           // Auto-reconnect with backoff; the connector's own readyState guard +
           // preOpenQueue control send ordering, so disable partysocket's buffer.
           maxRetries: Infinity,
