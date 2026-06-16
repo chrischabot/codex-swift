@@ -67,11 +67,13 @@ public enum WikiLinkLinter {
 
     /// Split a body into its non-see-also CONTENT and the concatenated text of ALL its
     /// "See Also" sections. A section starts at an ATX `#…###### See Also` heading and runs
-    /// until the NEXT heading — ATX (`# …`) OR setext (a plain line immediately followed by
-    /// an `===`/`---` underline). Walks line-wise so it (a) catches MULTIPLE See-Also blocks
-    /// — the prior first-block-only/ATX-only logic let a 2nd block's links count as content
-    /// AND ate a setext-headed content section after the see-also block — and (b) does not
-    /// mistake a list item or a stray `---` INSIDE the section for a heading boundary.
+    /// only over the LIST that follows it — its contiguous list-item / blank lines — ending at
+    /// the first line that is not a list item or blank (trailing prose), the next heading, or a
+    /// code fence. Walks line-wise so it: (a) catches MULTIPLE See-Also blocks; (b) does NOT
+    /// absorb trailing or interleaved CONTENT (prose with real citations after/between
+    /// see-also lists stays in content — the prior next-heading-only bound ate it, falsely
+    /// flagging grounded pages ungrounded); (c) suppresses detection inside fenced code blocks
+    /// (a literal `## See Also` / `===` inside a ``` fence is inert, not a real heading).
     private static func partitionSeeAlso(_ body: String) -> (content: String, seeAlso: String) {
         let lines = body.components(separatedBy: "\n")
         func matches(_ s: String, _ pattern: String) -> Bool {
@@ -80,6 +82,7 @@ public enum WikiLinkLinter {
         func isATXHeading(_ s: String) -> Bool { matches(s, #"^#{1,6}[ \t]+\S"#) }
         func isSeeAlsoHeading(_ s: String) -> Bool { matches(s, #"(?i)^#{1,6}[ \t]+see also\b"#) }
         func isSetextUnderline(_ s: String) -> Bool { matches(s, #"^[ \t]*(=+|-+)[ \t]*$"#) }
+        func isFenceMarker(_ s: String) -> Bool { matches(s, #"^[ \t]*(`{3,}|~{3,})"#) }
         func isListItemOrBlank(_ s: String) -> Bool {
             s.trimmingCharacters(in: .whitespaces).isEmpty || matches(s, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
         }
@@ -94,9 +97,22 @@ public enum WikiLinkLinter {
         var seeAlso: [String] = []
         var i = 0
         while i < lines.count {
+            // A code fence (and its body, up to and including the closing fence) is ALWAYS
+            // content — never scanned for headings — so fenced markup can't fake a boundary.
+            if isFenceMarker(lines[i]) {
+                content.append(lines[i]); i += 1
+                while i < lines.count && !isFenceMarker(lines[i]) { content.append(lines[i]); i += 1 }
+                if i < lines.count { content.append(lines[i]); i += 1 }   // closing fence
+                continue
+            }
             if isSeeAlsoHeading(lines[i]) {
                 i += 1   // drop the See Also heading itself
-                while i < lines.count && !startsHeading(at: i) { seeAlso.append(lines[i]); i += 1 }
+                // Consume ONLY the following list (list items + interspersed blanks). Trailing
+                // prose, a fence, or the next heading ends the section and falls into content.
+                while i < lines.count && !isFenceMarker(lines[i])
+                      && !startsHeading(at: i) && isListItemOrBlank(lines[i]) {
+                    seeAlso.append(lines[i]); i += 1
+                }
                 continue
             }
             content.append(lines[i]); i += 1
