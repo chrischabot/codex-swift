@@ -128,10 +128,16 @@ public actor DurableDeliveryQueue {
     private var dedupFH: FileHandle? = nil
     private var dedupAppendedBytes: Int = 0
 
-    /// One sidecar entry: an idempotency key that was acked, and when (monotonic). The `t`
-    /// is only used for in-process window pruning; across a restart it is meaningless, so the
-    /// re-seed grants a fresh window (key set only).
-    private struct DedupRecord: Codable { let k: String; let t: Double }
+    /// Wall-clock source for the sidecar's durable ack timestamps. Distinct from `now`
+    /// (monotonic): a monotonic stamp is meaningless across a reboot, so cross-restart window
+    /// EXPIRY needs real wall time. Injectable for deterministic tests; defaults to real time.
+    private let wallNow: @Sendable () -> Double
+
+    /// One sidecar entry: an idempotency key that was acked, and the WALL-clock time it was
+    /// acked (`w`). Wall time so the re-seed can honor the remaining window across a restart
+    /// (monotonic would be meaningless after a reboot). A missing/legacy `w` decodes to 0,
+    /// i.e. treated as long-expired (safe: falls back to at-least-once, never double-suppresses).
+    private struct DedupRecord: Codable { let k: String; var w: Double = 0 }
 
     public init(directory: String,
                 executor: any DeliveryExecutor,
@@ -140,7 +146,8 @@ public actor DurableDeliveryQueue {
                 attemptTimeout: Duration = .seconds(60),
                 dedupWindowSeconds: Double = 300,
                 compactThresholdBytes: Int = 1 << 20,
-                now: @escaping @Sendable () -> Double = { MonotonicClock.now() }) {
+                now: @escaping @Sendable () -> Double = { MonotonicClock.now() },
+                wallNow: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 }) {
         try? FileManager.default.createDirectory(atPath: directory,
                                                  withIntermediateDirectories: true)
         let path = directory + "/queue.jsonl"
@@ -167,6 +174,7 @@ public actor DurableDeliveryQueue {
         self.dedupWindowSeconds = dedupWindowSeconds
         self.compactThresholdBytes = Swift.max(4096, compactThresholdBytes)
         self.now = now
+        self.wallNow = wallNow
         self.seqCounter = folded.latest.values.map(\.seq).max() ?? 0
         self.appendedBytes = folded.bytes
         self.latestPerJob = folded.latest
@@ -193,11 +201,23 @@ public actor DurableDeliveryQueue {
                 ackedKeys[key] = seedT
             }
             // PRIMARY durable source: the dedup sidecar (the job log drops acked records on
-            // compaction). Grant each recorded key a fresh window — prior-process monotonic
-            // stamps are meaningless after a reboot, so this over-suppresses at worst and never
-            // double-sends; pruneDedup/compactDedup bound it. Union with the log seeding above
-            // covers a clean shutdown whose acked records are still in the (uncompacted) log.
-            for key in DurableDeliveryQueue.foldDedupKeys(path: dedupLogPath) { ackedKeys[key] = seedT }
+            // compaction). Runs LAST so it is authoritative over the log seeding above. For
+            // each recorded key:
+            //   (a) FAILURE-AWARE: if the key's NEWEST log state is `.failed`, it is an operator
+            //       retry — drop it from the window so the retry is not swallowed (mirrors the
+            //       `.acked`-only rule the log seed enforces; the sidecar only records acks, so
+            //       without this a stale ack would shadow a later failure).
+            //   (b) EXPIRY-AWARE: honor the REMAINING window using the durable WALL stamp. A key
+            //       acked longer than the window ago is dropped (windowed-dedup contract survives
+            //       a restart); otherwise seed a back-dated monotonic time so the leftover window
+            //       — not a fresh full one — applies.
+            let wallSeed = wallNow()
+            for (key, w) in DurableDeliveryQueue.foldDedup(path: dedupLogPath) {
+                if folded.lastByKey[key]?.state == .failed { ackedKeys[key] = nil; continue }
+                let elapsed = wallSeed - w
+                if elapsed >= dedupWindowSeconds { ackedKeys[key] = nil; continue }
+                ackedKeys[key] = seedT - max(0, elapsed)
+            }
         }
         if !FileManager.default.fileExists(atPath: dedupLogPath) {
             FileManager.default.createFile(atPath: dedupLogPath, contents: nil)
@@ -408,27 +428,28 @@ public actor DurableDeliveryQueue {
 
     // MARK: durable dedup sidecar (decoupled from the job log)
 
-    /// Read the sidecar to the SET of keys it records (latest wins; t is ignored here — the
-    /// re-seed grants a fresh window). A torn final line is dropped, like the job-log fold.
-    private nonisolated static func foldDedupKeys(path: String) -> Set<String> {
+    /// Read the sidecar to the latest WALL-ack time per key. A torn final line is dropped, like
+    /// the job-log fold. Later records win (append order), so the freshest ack time per key.
+    private nonisolated static func foldDedup(path: String) -> [String: Double] {
         guard let data = FileManager.default.contents(atPath: path),
-              let text = String(data: data, encoding: .utf8) else { return [] }
+              let text = String(data: data, encoding: .utf8) else { return [:] }
         let decoder = JSONDecoder()
-        var keys: Set<String> = []
+        var latest: [String: Double] = [:]
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            if let r = try? decoder.decode(DedupRecord.self, from: Data(line.utf8)) { keys.insert(r.k) }
+            if let r = try? decoder.decode(DedupRecord.self, from: Data(line.utf8)) { latest[r.k] = r.w }
         }
-        return keys
+        return latest
     }
 
-    /// Append a tiny dedup record for `key`. Best-effort, NO fsync: a lost record only risks a
-    /// tolerated at-least-once duplicate, never a lost delivery. Compacts the sidecar when it
-    /// outgrows the threshold so it stays bounded by the distinct within-window key count.
+    /// Append a tiny dedup record for `key`, stamped with the durable WALL time. Best-effort, NO
+    /// fsync: a lost record only risks a tolerated at-least-once duplicate, never a lost
+    /// delivery. Compacts when it outgrows the threshold so it stays bounded by the distinct
+    /// within-window key count.
     private func appendDedup(_ key: String) {
         guard dedupWindowSeconds > 0 else { return }
         if dedupFH == nil { dedupFH = FileHandle(forWritingAtPath: dedupLogPath); _ = try? dedupFH?.seekToEnd() }
         guard let fh = dedupFH,
-              var line = try? encoder.encode(DedupRecord(k: key, t: now())) else { return }
+              var line = try? encoder.encode(DedupRecord(k: key, w: wallNow())) else { return }
         line.append(0x0A)
         do { try fh.write(contentsOf: line); dedupAppendedBytes += line.count } catch { return }
         if dedupAppendedBytes > compactThresholdBytes { compactDedup() }
@@ -440,8 +461,13 @@ public actor DurableDeliveryQueue {
     private func compactDedup() {
         pruneDedup()
         var data = Data()
-        for (key, t) in ackedKeys {
-            if var line = try? encoder.encode(DedupRecord(k: key, t: t)) { line.append(0x0A); data.append(line) }
+        // Derive each surviving key's WALL ack time from its (monotonic) age — both clocks
+        // advance together within this process — so the rewritten record preserves the original
+        // ack time, keeping cross-restart expiry honest.
+        let monoNow = now(), wall = wallNow()
+        for (key, mono) in ackedKeys {
+            let w = wall - max(0, monoNow - mono)
+            if var line = try? encoder.encode(DedupRecord(k: key, w: w)) { line.append(0x0A); data.append(line) }
         }
         let tmp = dedupLogPath + ".compact"
         do {

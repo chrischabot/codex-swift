@@ -400,6 +400,68 @@ final class DeliveryCoreTests: XCTestCase {
         XCTAssertTrue(text.contains("\"NEW"), "current-window keys remain")
     }
 
+    // (a) FAILURE-AWARE re-seed: the sidecar only records ACKS, so a key acked earlier then
+    // permanently failed later (newest LOG state .failed) must NOT be re-seeded from the stale
+    // sidecar ack — that is an operator retry and swallowing it loses the delivery.
+    func testSidecarAckDoesNotShadowFailedRetry() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        var acked = job("j1", key: "K"); acked.state = .acked; acked.seq = 1
+        var failed = job("j2", key: "K"); failed.state = .failed; failed.seq = 2
+        writeLog(dir, [acked, failed])      // newest log state for K is .failed
+        try "{\"k\":\"K\",\"w\":0}\n".write(toFile: dir + "/dedup.jsonl", atomically: true, encoding: .utf8)
+        let mono = FakeClock(); let wall = FakeClock()   // wall==0 matches the sidecar w==0 → within window
+        let exec = ScriptedExecutor([.acked])
+        let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                     dedupWindowSeconds: 100, now: mono.fn, wallNow: wall.fn)
+        let r = await q.enqueue(job("j3", key: "K"))
+        let n = await exec.count()
+        XCTAssertFalse(r.deduped, "a stale sidecar ack must NOT shadow the key's newest .failed log state")
+        XCTAssertEqual(n, 1, "the failed key's retry is actually delivered")
+    }
+
+    // (b) EXPIRY-AWARE re-seed: the windowed-dedup contract must survive a restart. A key acked
+    // longer than the window ago (by durable WALL time) is re-deliverable after a restart — the
+    // sidecar must not grant it a fresh full window forever.
+    func testSidecarDedupWindowExpiresAcrossRestart() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let mono = FakeClock(); let wall = FakeClock()
+        do {
+            let exec = ScriptedExecutor([.acked])
+            let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                         dedupWindowSeconds: 100, now: mono.fn, wallNow: wall.fn)
+            _ = await q.enqueue(job("j1", key: "K"))   // sidecar records K at wall==0
+        }
+        wall.advance(200)                              // wall time passes the window across the restart
+        let exec2 = ScriptedExecutor([.acked])
+        let q2 = DurableDeliveryQueue(directory: dir, executor: exec2, backoff: fastBackoff,
+                                      dedupWindowSeconds: 100, now: mono.fn, wallNow: wall.fn)
+        let r = await q2.enqueue(job("j2", key: "K"))
+        let n = await exec2.count()
+        XCTAssertFalse(r.deduped, "an ack older than the window (wall time) is re-deliverable after restart")
+        XCTAssertEqual(n, 1)
+    }
+
+    // Within the window, the durable sidecar STILL dedups across restart (the round-3 guarantee).
+    func testSidecarDedupSurvivesRestartWithinWindow() async throws {
+        let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
+        let mono = FakeClock(); let wall = FakeClock()
+        do {
+            let exec = ScriptedExecutor([.acked])
+            let q = DurableDeliveryQueue(directory: dir, executor: exec, backoff: fastBackoff,
+                                         dedupWindowSeconds: 100, now: mono.fn, wallNow: wall.fn)
+            _ = await q.enqueue(job("j1", key: "K"))
+            _ = await q.recover()                      // compact the acked record out of the job log
+        }
+        wall.advance(40)                               // still within the 100s window
+        let exec2 = ScriptedExecutor([.acked])
+        let q2 = DurableDeliveryQueue(directory: dir, executor: exec2, backoff: fastBackoff,
+                                      dedupWindowSeconds: 100, now: mono.fn, wallNow: wall.fn)
+        let r = await q2.enqueue(job("j2", key: "K"))
+        let n = await exec2.count()
+        XCTAssertTrue(r.deduped, "within the window, a delivered key stays deduped after restart (via sidecar)")
+        XCTAssertEqual(n, 0)
+    }
+
     func testCompactionBoundsLogToLiveBacklog() async throws {
         let dir = tmpDir(); defer { try? FileManager.default.removeItem(atPath: dir) }
         let exec = ScriptedExecutor([.acked])
