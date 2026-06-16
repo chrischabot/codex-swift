@@ -385,33 +385,29 @@ public struct Mem0Engine: Sendable {
     /// bracket-neutralize role/envelope breakout tags. Structural JSON injection is
     /// further contained because `serializeMemories` JSON-encodes the text as a
     /// string value.
+    // PASS 1 — BARE tags, ANY name: optional `/`, a CONTIGUOUS word/marker name (letters,
+    // digits, `| _ : -`), optional space padding, close. The immediate close after the name
+    // means prose like `x < y and a > b` or `c = d` can't match, so it has no false positives.
+    // Defangs `<prompt>`, `<MeMoRy>`, `< memory >`, `<|im_start|>`, `</system>`.
+    private static let bareTagRegex = try? NSRegularExpression(pattern: #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#)
+    // PASS 2 — ATTRIBUTED forms (valued `<system role="override">` OR valueless `<system role>`),
+    // scoped to the canonical InfraPrimitives.PromptInjectionVocab.markers vocabulary (shared
+    // with MemoryInfer.ContextSanitizer.breakoutTags so the two sanitizers cannot drift) so the
+    // permissive `[^>]*` attribute tail can't mangle benign `<word word>` prose. Markers are
+    // sorted longest-first so `\b` under alternation resolves prefix pairs (tool vs tool_call vs
+    // tool_calls, function vs function_call) to the longest match. (Residual: a novel attributed
+    // tag whose name is outside the vocabulary passes — `<word word>` is regex-indistinguishable
+    // from prose without a name list, and the real threat surface is the known markers.)
+    private static let attributedMarkerRegex: NSRegularExpression? = {
+        let markers = PromptInjectionVocab.markers.sorted { $0.count > $1.count }.joined(separator: "|")
+        return try? NSRegularExpression(pattern: #"(?i)<\s*/?\s*(?:\|\s*)?(?:\#(markers))\b[^>]*>"#)
+    }()
+
     static func sanitizeForPrompt(_ text: String) -> String {
         var s = text.replacingOccurrences(of: "```", with: "'''")
         // Neutralize tag-like tokens `<…>` by bracket-swapping (`<`→`[`, `>`→`]`) in two
-        // complementary passes:
-        //
-        //  PASS 1 — BARE tags, ANY name: optional `/`, a CONTIGUOUS word/marker name (letters,
-        //    digits, `| _ : -`), optional space padding, close. The immediate close after the
-        //    name means prose like `x < y and a > b` or `c = d` can't match, so it has no false
-        //    positives. Defangs `<prompt>`, `<MeMoRy>`, `< memory >`, `<|im_start|>`, `</system>`.
-        //
-        //  PASS 2 — ATTRIBUTED forms (valued `<system role="override">` OR valueless
-        //    `<system role>`), scoped to the injection-marker vocabulary so the permissive
-        //    `[^>]*` attribute tail can't mangle benign `<word word>` prose. (Residual: a novel
-        //    attributed tag whose name is outside the vocabulary passes — `<word word>` is
-        //    regex-indistinguishable from prose without a name list, and the real threat surface
-        //    is the known role/tool/chat-template markers.)
-        let bareTag = #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#
-        // PASS 2's vocabulary is the canonical InfraPrimitives.PromptInjectionVocab.markers,
-        // shared with MemoryInfer.ContextSanitizer.breakoutTags so the two sanitizers cannot
-        // drift. Sort longest-first so `\b` under alternation resolves prefix pairs (tool vs
-        // tool_call vs tool_calls, function vs function_call) to the longest match.
-        let markers = PromptInjectionVocab.markers
-            .sorted { $0.count > $1.count }
-            .joined(separator: "|")
-        let attributedMarker = #"(?i)<\s*/?\s*(?:\|\s*)?(?:\#(markers))\b[^>]*>"#
-        for pattern in [bareTag, attributedMarker] {
-            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+        // complementary passes (compiled once, as the regex statics above).
+        for re in [bareTagRegex, attributedMarkerRegex].compactMap({ $0 }) {
             let ns = s as NSString
             let mutable = NSMutableString(string: s)
             // Apply in reverse so earlier match ranges stay valid as we mutate.

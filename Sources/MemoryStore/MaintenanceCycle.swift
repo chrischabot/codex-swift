@@ -83,16 +83,7 @@ public actor MaintenanceCycle {
                     if !dryRun { try await store.setMetaValue("synthesis_review:\(id)", status.rawValue) }
                     touched += 1
                 }
-                // RECONCILE (the cycle is the source of truth): drop markers for syntheses
-                // no longer drifted — a recovered page OR a deleted page (absent from the
-                // scan → not in driftedIDs). Without this the marker queue only grows.
-                if !dryRun {
-                    for (key, _) in (try? await store.metaEntries(prefix: "synthesis_review:")) ?? [] {
-                        if let id = Int64(key.dropFirst("synthesis_review:".count)), !driftedIDs.contains(id) {
-                            try await store.deleteMeta(key: key)
-                        }
-                    }
-                }
+                if !dryRun { try await reconcileMarkers(prefix: "synthesis_review:", live: driftedIDs) }
                 phases.append(.init(name: "drift", status: .ok, touched: touched, durationMs: Self.ms(since: t)))
             } catch {
                 phases.append(.init(name: "drift", status: .partial, touched: 0, durationMs: Self.ms(since: t)))
@@ -111,15 +102,7 @@ public actor MaintenanceCycle {
                     if !dryRun { try await store.setMetaValue("librarian_tier2:\(s.documentID)", "1") }
                     touched += 1
                 }
-                // RECONCILE: drop markers for pages no longer flagged (re-verified/refreshed)
-                // or gone (deleted) — keeps status.flaggedStale honest instead of monotone-growing.
-                if !dryRun {
-                    for (key, _) in (try? await store.metaEntries(prefix: "librarian_tier2:")) ?? [] {
-                        if let id = Int64(key.dropFirst("librarian_tier2:".count)), !flaggedIDs.contains(id) {
-                            try await store.deleteMeta(key: key)
-                        }
-                    }
-                }
+                if !dryRun { try await reconcileMarkers(prefix: "librarian_tier2:", live: flaggedIDs) }
                 phases.append(.init(name: "librarian", status: .ok, touched: touched, durationMs: Self.ms(since: t)))
             } catch {
                 phases.append(.init(name: "librarian", status: .partial, touched: 0, durationMs: Self.ms(since: t)))
@@ -133,5 +116,16 @@ public actor MaintenanceCycle {
     static func ms(since t: ContinuousClock.Instant) -> Int {
         let c = (ContinuousClock.now - t).components
         return Int(c.seconds * 1000 + c.attoseconds / 1_000_000_000_000_000)
+    }
+
+    /// Drop every `prefix<id>` review marker whose id is no longer in the live set — a recovered
+    /// or deleted page (absent from the scan). The cycle is the source of truth, so without this
+    /// the marker queue only grows.
+    private func reconcileMarkers(prefix: String, live: Set<Int64>) async throws {
+        for (key, _) in (try? await store.metaEntries(prefix: prefix)) ?? [] {
+            if let id = Int64(key.dropFirst(prefix.count)), !live.contains(id) {
+                try await store.deleteMeta(key: key)
+            }
+        }
     }
 }

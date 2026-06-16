@@ -174,16 +174,20 @@ public enum WikiLinkLinter {
     /// corpus); pass a superset to allow links to pages outside the linted batch.
     public static func lint(_ pages: [WikiLintPage], validSlugs: Set<String>? = nil) -> [WikiLinkIssue] {
         let valid = validSlugs ?? Set(pages.map(\.slug))
-        let seeAlsoBySlug = Dictionary(uniqueKeysWithValues:
-            pages.map { ($0.slug, Set(seeAlsoLinks(in: $0.body))) })
+        // Partition each page once (the See-Also scan is the costly part) and reuse it for the
+        // reciprocity map and the per-page checks below. (Duplicate slugs are unsupported — the
+        // map traps on them, as before.)
+        let partBySlug = Dictionary(uniqueKeysWithValues: pages.map { ($0.slug, partitionSeeAlso($0.body)) })
+        let seeAlsoBySlug = partBySlug.mapValues { Set(links(in: $0.seeAlso)) }
         var issues: [WikiLinkIssue] = []
         for page in pages {
+            let part = partBySlug[page.slug] ?? partitionSeeAlso(page.body)
             // broken links
             for target in links(in: page.body) where !valid.contains(target) {
                 issues.append(WikiLinkIssue(page: page.slug, kind: .brokenLink, target: target))
             }
             // non-reciprocal see-also (only when the target exists in this batch)
-            for target in seeAlsoLinks(in: page.body) where seeAlsoBySlug[target] != nil {
+            for target in links(in: part.seeAlso) where seeAlsoBySlug[target] != nil {
                 if !(seeAlsoBySlug[target]?.contains(page.slug) ?? false) {
                     issues.append(WikiLinkIssue(page: page.slug, kind: .nonReciprocalSeeAlso, target: target))
                 }
@@ -191,7 +195,7 @@ public enum WikiLinkLinter {
             // ungrounded synthesis: a grounding-required page that cites nothing real. A
             // "See Also" edge is navigation, not a citation, so grounding is judged on CONTENT
             // links only (the body with every See-Also section excised).
-            let contentLinks = links(in: bodyExcludingSeeAlso(page.body))
+            let contentLinks = links(in: part.content)
             if groundingRequired.contains(page.category)
                 && page.claimLinkCount == 0 && contentLinks.isEmpty {
                 issues.append(WikiLinkIssue(page: page.slug, kind: .ungrounded, target: nil))
