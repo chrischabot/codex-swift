@@ -152,6 +152,35 @@ final class WikiLinkLinterTests: XCTestCase {
                        "a --- separator after a [[link]] does not end the section")
     }
 
+    // A See-Also list grouped with SUB-HEADINGS (### Internal / ### External, or a setext
+    // "Related\n----") is all navigation — a DEEPER heading is a group label that nests inside
+    // the section (document-outline semantics), not a boundary that leaks the links to content.
+    func testSubHeadingGroupsNestInsideSeeAlso() {
+        let atx = "# Reliability Report\n\nSummary.\n\n## See Also\n\n### Internal docs\n- [[oncall-runbook]]\n"
+            + "\n### External resources\n- [[sre-book]]\n"
+        XCTAssertEqual(Set(WikiLinkLinter.seeAlsoLinks(in: atx)), ["oncall-runbook", "sre-book"],
+                       "### sub-group headings under ## See Also nest as group labels")
+        let g = WikiLinkLinter.lint([WikiLintPage(slug: "r", body: atx, category: "report", claimLinkCount: 0)],
+                                    validSlugs: ["r", "oncall-runbook", "sre-book"])
+        XCTAssertTrue(g.contains { $0.kind == .ungrounded }, "a nav-only heading-grouped report is ungrounded")
+    }
+
+    // A real CONTENT heading after the See-Also section ends it — including a SETEXT heading
+    // whose prose title contains a [[link]] ("Root Cause in [[redis-cluster]]\n----"). The
+    // section must NOT swallow that heading + its citations (which would falsely flag the
+    // genuinely-grounded page ungrounded and block its strict-mode write).
+    func testSetextContentHeadingWithLinkEndsSeeAlso() {
+        let body = "# Incident Retrospective\n\nSummary.\n\n## See Also\n- [[oncall-runbook]]\n\n"
+            + "Root Cause in [[redis-cluster]]\n-------------------------------\n"
+            + "Telemetry from [[grafana-dashboard]] shows the herd; fix in [[pr-4821]].\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: body), ["oncall-runbook"],
+                       "a setext content heading (prose title, even with a link) ends the section")
+        XCTAssertTrue(WikiLinkLinter.bodyExcludingSeeAlso(body).contains("[[redis-cluster]]"))
+        let g = WikiLinkLinter.lint([WikiLintPage(slug: "r", body: body, category: "report", claimLinkCount: 0)],
+                                    validSlugs: ["r", "oncall-runbook", "redis-cluster", "grafana-dashboard", "pr-4821"])
+        XCTAssertFalse(g.contains { $0.kind == .ungrounded }, "the page's real citations ground it")
+    }
+
     // A See-Also written as MULTIPLE prose sentences, each carrying links, is ALL navigation.
     // Both sentences' links are see-also edges (reciprocity sees them; they do not ground).
     func testMultiSentenceProseSeeAlsoIsAllNavigation() {

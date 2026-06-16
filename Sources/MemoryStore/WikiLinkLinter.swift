@@ -69,15 +69,19 @@ public enum WikiLinkLinter {
     /// "See Also" sections, so grounding/reciprocity treat navigation links and content
     /// citations distinctly.
     ///
-    /// Rule: a "See Also" section runs from its heading to the next heading/fence, and EVERY
-    /// `[[link]]` in it is NAVIGATION — never a content/grounding citation. (Telling navigation
-    /// from content links apart inside a free-form See-Also section is ambiguous, so we don't
-    /// try.) Grounding citations belong in the body (above See-Also) or under their own heading.
+    /// Rule: a "See Also" section runs from its heading until the next heading of level ≤ its
+    /// own (or a fence), and EVERY `[[link]]` in it is NAVIGATION — never a content/grounding
+    /// citation. (Telling navigation from content links apart inside a free-form See-Also
+    /// section is ambiguous, so we don't try.) Standard document-outline nesting applies: a
+    /// DEEPER sub-heading (a group label like `### Internal` under `## See Also`) stays inside
+    /// the section, while a sibling/shallower heading ends it. Grounding citations belong in the
+    /// body (above See-Also) or under their own heading.
     ///
     /// A "See Also" heading is recognized in all three realistic spellings — ATX (`## See
-    /// Also`), SETEXT (`See Also` + `----`/`====` underline), and BOLD (`**See Also**`) —
-    /// matched STRICTLY (exactly "See Also", optional `:`), so a page TITLE like `# See also:
-    /// the GPU landscape` is not mistaken for a section heading. Fenced code blocks are inert;
+    /// Also`), SETEXT (`See Also` + `----`/`====` underline), and BOLD (`**See Also**`, treated
+    /// as H2) — matched STRICTLY (exactly "See Also", optional `:`), so a page TITLE like `# See
+    /// also: the GPU landscape` is not mistaken for a section heading. A link-only line + `---`
+    /// is a nav entry plus a thematic break, not a setext heading. Fenced code blocks are inert;
     /// a fence open is CommonMark-correct (≤3-space indent — a ≥4-space-indented ``` line is an
     /// indented code block, not a fence).
     private static func partitionSeeAlso(_ body: String) -> (content: String, seeAlso: String) {
@@ -85,34 +89,49 @@ public enum WikiLinkLinter {
         func matches(_ s: String, _ pattern: String) -> Bool {
             s.range(of: pattern, options: .regularExpression) != nil
         }
-        func isATXHeading(_ s: String) -> Bool { matches(s, #"^#{1,6}[ \t]+\S"#) }
         func isSetextUnderline(_ s: String) -> Bool { matches(s, #"^[ \t]*(=+|-+)[ \t]*$"#) }
         // A fence open may be indented at most 3 spaces (CommonMark); 4+ spaces is indented code.
         func isFenceMarker(_ s: String) -> Bool { matches(s, #"^ {0,3}(`{3,}|~{3,})"#) }
         func isListItemOrBlank(_ s: String) -> Bool {
             s.trimmingCharacters(in: .whitespaces).isEmpty || matches(s, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
         }
-        func carriesLink(_ s: String) -> Bool { matches(s, #"\[\[[^\]]+\]\]"#) }
+        // A line whose only content is wiki-link(s) (optionally blockquote-prefixed). Such a
+        // line followed by `---` is a nav entry plus a thematic break — NOT a setext heading
+        // titled `[[x]]` — so it must not end a See-Also section.
+        func isLinkOnly(_ s: String) -> Bool {
+            let stripped = matches(s, #"^[ \t]*>"#)
+                ? s.replacingOccurrences(of: #"^[ \t]*>[ \t]*"#, with: "", options: .regularExpression) : s
+            return matches(stripped, #"^[ \t]*(\[\[[^\]]+\]\][ \t]*)+$"#)
+        }
+        // The heading LEVEL (1–6) at line i — ATX (`#` count) or setext (`===`→1, `---`→2 over a
+        // plain prose title) — or nil. A section runs until the next heading of level ≤ its own,
+        // so a DEEPER sub-heading (a group label like `### Internal` under `## See Also`) nests
+        // inside it while a sibling/shallower heading ends it.
+        func headingLevel(at i: Int) -> Int? {
+            let line = lines[i]
+            if matches(line, #"^#{1,6}[ \t]+\S"#) { return line.prefix(while: { $0 == "#" }).count }
+            guard i + 1 < lines.count, !isListItemOrBlank(line),
+                  !isSetextUnderline(line), !isLinkOnly(line) else { return nil }   // setext title
+            if matches(lines[i + 1], #"^[ \t]*=+[ \t]*$"#) { return 1 }
+            if matches(lines[i + 1], #"^[ \t]*-+[ \t]*$"#) { return 2 }
+            return nil
+        }
         // STRICT "See Also" title text (exact words, optional trailing colon) — so a page title
         // beginning "See also …" is never read as a section heading.
         func isSeeAlsoText(_ s: String) -> Bool { matches(s, #"(?i)^[ \t]*see also[ \t]*:?[ \t]*$"#) }
-        // A "See Also" heading at line i, in ATX / BOLD (1 line) or SETEXT (2 lines) form.
-        // Returns how many lines it occupies, or nil.
-        func seeAlsoHeadingLen(at i: Int) -> Int? {
+        // A "See Also" heading at line i, in ATX / BOLD (1 line) or SETEXT (2 lines) form;
+        // returns its level and line count, or nil. Bold has no native level → treated as H2.
+        func seeAlsoHeading(at i: Int) -> (level: Int, len: Int)? {
             let line = lines[i]
-            if matches(line, #"(?i)^#{1,6}[ \t]+see also[ \t]*:?[ \t]*$"#) { return 1 }   // ATX
-            if matches(line, #"(?i)^[ \t]*\*\*[ \t]*see also[ \t]*\*\*[ \t]*:?[ \t]*$"#) { return 1 }  // bold
-            if i + 1 < lines.count && isSeeAlsoText(line) && isSetextUnderline(lines[i + 1]) { return 2 }  // setext
+            if matches(line, #"(?i)^#{1,6}[ \t]+see also[ \t]*:?[ \t]*$"#) {
+                return (line.prefix(while: { $0 == "#" }).count, 1)   // ATX
+            }
+            if matches(line, #"(?i)^[ \t]*\*\*[ \t]*see also[ \t]*\*\*[ \t]*:?[ \t]*$"#) { return (2, 1) }  // bold
+            if i + 1 < lines.count && isSeeAlsoText(line) {
+                if matches(lines[i + 1], #"^[ \t]*=+[ \t]*$"#) { return (1, 2) }   // setext H1
+                if matches(lines[i + 1], #"^[ \t]*-+[ \t]*$"#) { return (2, 2) }   // setext H2
+            }
             return nil
-        }
-        // A heading begins at line i if it's ATX, or a SETEXT title: a plain prose line whose
-        // NEXT line is an `=`/`-` underline. The title must NOT be a list item, blank, an
-        // underline itself, or a wiki-link line — a `[[x]]` line followed by `---` is a nav
-        // entry plus a thematic break, not a heading, so it does not end a See-Also section.
-        func startsHeading(at i: Int) -> Bool {
-            if isATXHeading(lines[i]) { return true }
-            return i + 1 < lines.count && isSetextUnderline(lines[i + 1])
-                && !isListItemOrBlank(lines[i]) && !isSetextUnderline(lines[i]) && !carriesLink(lines[i])
         }
         var content: [String] = []
         var seeAlso: [String] = []
@@ -126,11 +145,13 @@ public enum WikiLinkLinter {
                 if i < lines.count { content.append(lines[i]); i += 1 }   // closing fence
                 continue
             }
-            if let hlen = seeAlsoHeadingLen(at: i) {
-                i += hlen   // drop the See Also heading (1 line ATX/bold, 2 lines setext)
-                // The whole section, to the next heading/fence, is navigation: every [[link]]
-                // here is a see-also edge, never a content citation.
-                while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
+            if let h = seeAlsoHeading(at: i) {
+                i += h.len   // drop the See Also heading (1 line ATX/bold, 2 lines setext)
+                // The section runs until a fence or a heading of level ≤ the See-Also level;
+                // every [[link]] in it is a see-also edge, never a content citation. A deeper
+                // sub-heading (a group label) and any prose/separator stay inside the section.
+                while i < lines.count && !isFenceMarker(lines[i]) {
+                    if let lvl = headingLevel(at: i), lvl <= h.level { break }
                     seeAlso.append(lines[i]); i += 1
                 }
                 continue
