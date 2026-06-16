@@ -107,13 +107,14 @@ public enum WikiLinkLinter {
             }
             if isSeeAlsoHeading(lines[i]) {
                 i += 1   // drop the See Also heading itself
-                // Consume the section's body up to the next heading / fence. A see-also ENTRY
-                // is a list item OR a link-only line (bare or blockquoted `[[x]]`s) — NOT prose
-                // that merely mentions a link. A non-entry, non-blank line is allowed as a
-                // LEAD-IN before any entry ("Related pages:"); once an entry has appeared, the
-                // first non-entry, non-blank line is TRAILING CONTENT and ends the section —
-                // whether or not a blank separates it (gating the end on a blank let prose
-                // glued directly to an entry leak in, falsely flagging grounding/reciprocity).
+                // Consume the section's body up to the next heading / fence. A see-also ENTRY is
+                // a list item, a link-only line (bare/blockquoted `[[x]]`s), OR a prose line that
+                // CARRIES a `[[link]]` ("review [[a]] and [[b]]") — anything navigational. A
+                // link-FREE prose line is a pure LEAD-IN ("Related pages:") allowed before the
+                // entries. Once an entry has appeared, the first non-entry, non-blank line is
+                // TRAILING CONTENT and ends the section (whether or not a blank separates it).
+                // Keying the end only on a STRUCTURED entry let a prose-only see-also run to EOF
+                // and swallow a trailing content citation, falsely flagging grounding/reciprocity.
                 func isEntryLine(_ line: String) -> Bool {
                     if matches(line, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#) { return true }   // list item
                     let stripped = matches(line, #"^[ \t]*>"#)
@@ -121,6 +122,7 @@ public enum WikiLinkLinter {
                         : line
                     return matches(stripped, #"^[ \t]*(\[\[[^\]]+\]\][ \t]*)+$"#)        // link-only line
                 }
+                func carriesLink(_ line: String) -> Bool { matches(line, #"\[\[[^\]]+\]\]"#) }
                 var sawEntry = false
                 while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
                     let line = lines[i]
@@ -128,8 +130,10 @@ public enum WikiLinkLinter {
                         // blank line within the section is neutral (separates entries / lead-in)
                     } else if sawEntry && !isEntryLine(line) {
                         break                                   // prose after an entry = trailing content
-                    } else if isEntryLine(line) {
-                        sawEntry = true                         // a lead-in before the first entry falls through
+                    } else if isEntryLine(line) || carriesLink(line) {
+                        // a structured entry OR a prose line bearing a [[link]] closes the lead-in
+                        // window; a link-free prose line falls through as a pure lead-in.
+                        sawEntry = true
                     }
                     seeAlso.append(line); i += 1
                 }

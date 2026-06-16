@@ -219,6 +219,26 @@ final class WikiLinkLinterTests: XCTestCase {
         XCTAssertFalse(rec.contains { $0.target == "peer" }, "a body content link on the next line is not a see-also edge")
     }
 
+    // A See-Also section written entirely as PROSE with inline links (no bullets, no link-only
+    // lines) running to EOF must still end at the first trailing-content prose line — the
+    // round-6 break keyed on a STRUCTURED entry, so a prose-only see-also consumed the body's
+    // trailing citation, falsely flagging the report .ungrounded (blocked in strict mode).
+    func testProseOnlySeeAlsoDoesNotSwallowTrailingContent() {
+        let body = "# Quarterly Report\n\nThe data shows growth.\n\n## See Also\n"
+            + "Readers may also wish to review [[nav1]] and [[nav2]].\n"
+            + "This conclusion rests on the figures in [[real]].\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: body), ["nav1", "nav2"],
+                       "the prose see-also line is navigation; the trailing citation line is content")
+        XCTAssertTrue(WikiLinkLinter.bodyExcludingSeeAlso(body).contains("[[real]]"))
+        let g = WikiLinkLinter.lint([WikiLintPage(slug: "report", body: body, category: "report", claimLinkCount: 0)],
+                                    validSlugs: ["report", "nav1", "nav2", "real"])
+        XCTAssertFalse(g.contains { $0.kind == .ungrounded }, "the trailing [[real]] grounds the report")
+
+        // control: a link-free prose lead-in stays a pure lead-in (not an entry)
+        let leadIn = "## See Also\nRelated pages:\n- [[nav1]]\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: leadIn), ["nav1"])
+    }
+
     // A See-Also edge is NAVIGATION, not a citation: a grounding-required page whose ONLY
     // [[link]] sits under a "See Also" heading (and 0 claims) cites nothing real → ungrounded.
     // A page with the SAME link as a CONTENT link (body, not see-also) is grounded.
