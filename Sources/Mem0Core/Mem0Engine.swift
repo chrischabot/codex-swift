@@ -386,16 +386,29 @@ public struct Mem0Engine: Sendable {
     /// string value.
     static func sanitizeForPrompt(_ text: String) -> String {
         var s = text.replacingOccurrences(of: "```", with: "'''")
-        // Neutralize ANY tag-like token `<…>` by bracket-swapping (`<`→`[`, `>`→`]`),
-        // not just a fixed allowlist — robust to whitespace (`< memory >`), case
-        // (`<MeMoRy>`), tags off the list (`<prompt>`, `<|im_start|>`), AND ATTRIBUTED
-        // role/tool tags (`<system role="override">`, `<tool_call name="delete_all">`).
-        // After the contiguous name, accept EITHER a bare close (`\s*/?>`) OR an attribute
-        // span that contains an `=` (`\s+[^>]*=[^>]*>`). Requiring the `=` admits real
-        // attributed tags (the prior pattern allowed NO attributes → they bypassed)
-        // WITHOUT defanging benign multi-word prose like `x < y and a > b` (no `=`, so
-        // neither alternative matches — both prose-safety and attribute-coverage hold).
-        if let re = try? NSRegularExpression(pattern: #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*(?:\s*/?>|\s+[^>]*=[^>]*>)"#) {
+        // Neutralize tag-like tokens `<…>` by bracket-swapping (`<`→`[`, `>`→`]`). TWO passes,
+        // because attribute payload is what breaks a single regex (an `=`-gated attribute span
+        // both MISSES valueless attrs like `<system role>` AND over-matches `=`-bearing prose
+        // like `if a < b then c = d > f`):
+        //
+        //  PASS 1 — BARE tags, ANY name: optional `/`, a CONTIGUOUS word/marker name (letters,
+        //    digits, `| _ : -`), optional space padding, close. Defangs `<prompt>`, `<MeMoRy>`,
+        //    `< memory >`, `<|im_start|>`, `</system>` with ZERO prose false-positives (the
+        //    immediate close after the name means `x < y and a > b` and `c = d` can't match).
+        //
+        //  PASS 2 — ATTRIBUTED forms of the closed injection-marker vocabulary, regardless of
+        //    attribute payload (valued `<system role="override">` OR valueless `<system role>`).
+        //    Scoped to the names a model actually honors as control directives, so the permissive
+        //    `[^>]*` attribute tail is safe — benign prose almost never opens `<system …>` etc.,
+        //    and defanging it if it did is the safe choice. (Inherent residual: a novel ATTRIBUTED
+        //    tag whose name is OUTSIDE the vocabulary still passes — but `<word word>` markup is
+        //    regex-indistinguishable from prose without a name list, and the real threat surface
+        //    is exactly these known role/tool/chat-template markers.)
+        let bareTag = #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#
+        let markers = "tool_call|tool_response|function_call|im_start|im_end|system|user|assistant|developer|tool|function|prompt|context"
+        let attributedMarker = #"(?i)<\s*/?\s*(?:\|\s*)?(?:\#(markers))\b[^>]*>"#
+        for pattern in [bareTag, attributedMarker] {
+            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
             let ns = s as NSString
             let mutable = NSMutableString(string: s)
             // Apply in reverse so earlier match ranges stay valid as we mutate.
