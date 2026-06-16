@@ -107,20 +107,31 @@ public enum WikiLinkLinter {
             }
             if isSeeAlsoHeading(lines[i]) {
                 i += 1   // drop the See Also heading itself
-                // Consume the section's body up to the next heading / fence. A non-list,
-                // non-blank line is allowed as a LEAD-IN before the list begins (e.g.
-                // "Related pages:", or bare `[[link]]` / blockquote `> [[x]]` entries that
-                // aren't bullets); it only ENDS the section as trailing prose once a list
-                // item has appeared. (Requiring a bullet at the FIRST body line — the prior
-                // bound — wrongly leaked lead-in/bare-link see-also blocks into content,
-                // defeating grounding + reciprocity.)
-                var sawListItem = false
+                // Consume the section's body up to the next heading / fence. A see-also ENTRY
+                // is a list item OR a link-only line (bare or blockquoted `[[x]]`s) — NOT prose
+                // that merely mentions a link. A non-entry, non-blank line is allowed as a
+                // LEAD-IN before any entry ("Related pages:"); it only ENDS the section as
+                // trailing prose once a blank line has SEPARATED the entries from it. Gating
+                // the end solely on a bullet (the prior bound) leaked bullet-less see-also
+                // blocks' trailing content into the section, defeating grounding + reciprocity.
+                func isEntryLine(_ line: String) -> Bool {
+                    if matches(line, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#) { return true }   // list item
+                    let stripped = matches(line, #"^[ \t]*>"#)
+                        ? line.replacingOccurrences(of: #"^[ \t]*>[ \t]*"#, with: "", options: .regularExpression)
+                        : line
+                    return matches(stripped, #"^[ \t]*(\[\[[^\]]+\]\][ \t]*)+$"#)        // link-only line
+                }
+                var sawEntry = false
+                var blankSinceEntry = false
                 while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
                     let line = lines[i]
-                    let isItem = matches(line, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
-                    let isBlank = line.trimmingCharacters(in: .whitespaces).isEmpty
-                    if isItem { sawListItem = true }
-                    else if !isBlank && sawListItem { break }   // trailing prose after the list
+                    if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        if sawEntry { blankSinceEntry = true }
+                    } else if blankSinceEntry && !isEntryLine(line) {
+                        break                                   // blank then prose = trailing content
+                    } else {
+                        sawEntry = true; blankSinceEntry = false
+                    }
                     seeAlso.append(line); i += 1
                 }
                 continue

@@ -172,6 +172,32 @@ final class WikiLinkLinterTests: XCTestCase {
         XCTAssertTrue(WikiLinkLinter.bodyExcludingSeeAlso(trailing).contains("[[real]]"))
     }
 
+    // A BULLET-LESS See-Also section (bare [[link]] / blockquote entries, no bullets) followed
+    // by trailing content prose must NOT absorb that content — the round-4 sawListItem bound
+    // only broke after a bullet, so bullet-less blocks swallowed real citations (false
+    // ungrounded + false non-reciprocal). The end-trigger now fires on blank-then-prose for
+    // any entry style.
+    func testBareLinkSeeAlsoMustNotAbsorbTrailingContent() {
+        let body = "## See Also\n[[nav1]]\n[[nav2]]\n\nGrounded at [[real]].\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: body), ["nav1", "nav2"],
+                       "trailing content link must NOT be swept into a bullet-less see-also block")
+        XCTAssertTrue(WikiLinkLinter.bodyExcludingSeeAlso(body).contains("[[real]]"))
+
+        // grounding false-negative guard: the real citation grounds the report
+        let g = WikiLinkLinter.lint([WikiLintPage(slug: "r",
+            body: "# R\n\n## See Also\n[[nav1]]\n\nThe analysis is grounded in [[real]].\n",
+            category: "report", claimLinkCount: 0)], validSlugs: ["r", "nav1", "real"])
+        XCTAssertFalse(g.contains { $0.kind == .ungrounded }, "trailing [[real]] grounds the page")
+
+        // reciprocity false-positive guard: a body content link must not be read as see-also
+        let rec = WikiLinkLinter.lint([
+            WikiLintPage(slug: "a", body: "# A\n\n## See Also\n[[nav]]\n\nThis builds on [[peer]] in the body.\n", category: "concept"),
+            WikiLintPage(slug: "peer", body: "no backlink", category: "concept"),
+            WikiLintPage(slug: "nav", body: "nav\n\n## See Also\n[[a]]\n", category: "concept"),
+        ]).filter { $0.kind == .nonReciprocalSeeAlso }
+        XCTAssertFalse(rec.contains { $0.target == "peer" }, "a body content link is not a see-also edge")
+    }
+
     // A See-Also edge is NAVIGATION, not a citation: a grounding-required page whose ONLY
     // [[link]] sits under a "See Also" heading (and 0 claims) cites nothing real → ungrounded.
     // A page with the SAME link as a CONTENT link (body, not see-also) is grounded.
