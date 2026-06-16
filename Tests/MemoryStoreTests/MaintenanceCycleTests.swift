@@ -126,17 +126,21 @@ final class MaintenanceCycleTests: XCTestCase {
         XCTAssertEqual(n, 1, "dry-run mutates nothing — neither writes nor reconciles markers")
     }
 
-    func testDeletedDocumentClearsItsLibrarianMarker() async throws {
+    // CROSS-AXIS REGRESSION: librarian_tier2 markers are keyed by synthesis.id (librarianScan
+    // SELECTs FROM synthesis), NOT document.id — independent id sequences routinely collide.
+    // A document delete must therefore NOT touch a synthesis-keyed marker sharing the number,
+    // or it would destroy a still-valid synthesis's marker and under-count flaggedStale. The
+    // cycle reconcile (not document delete) is the source of truth for orphan markers.
+    func testDocumentDeleteDoesNotDestroySynthesisKeyedMarker() async throws {
         let store = try makeStore()
         let docID = try await store.upsertDocument(DocumentRow(
             source: .manual, sourceURI: "wiki://x", bodyPath: "inline:x",
             fetchedAt: 1, contentSHA: Data([1]), rawBytes: 10))
+        // A marker for the SYNTHESIS that happens to share the document's numeric id.
         try await store.setMetaValue("librarian_tier2:\(docID)", "1")
-        let before = try await store.metaValue("librarian_tier2:\(docID)")
-        XCTAssertNotNil(before)
         try await store.deleteDocument(id: docID)
         let after = try await store.metaValue("librarian_tier2:\(docID)")
-        XCTAssertNil(after, "purgeDocumentRows drops the orphan marker immediately")
+        XCTAssertNotNil(after, "document delete must NOT destroy a synthesis-keyed marker sharing the id")
     }
 
     func testMetaEntriesEscapesLikeWildcards() async throws {

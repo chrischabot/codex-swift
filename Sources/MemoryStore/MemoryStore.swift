@@ -517,9 +517,13 @@ public actor MemoryStore {
         // originally-indexed text.
         try purgeChunks(documentId: id)
         try run("DELETE FROM document WHERE id=?;", [.int(id)])
-        // Drop the doc-keyed librarian review marker so a deleted page leaves no orphan
-        // marker inflating status.flaggedStale (the cycle also reconciles, but be immediate).
-        try run("DELETE FROM meta WHERE key=?;", [.text("librarian_tier2:\(id)")])
+        // NOTE: do NOT delete librarian_tier2:<id> here. Those markers are keyed by
+        // synthesis.id (librarianScan SELECTs FROM synthesis), NOT document.id — the two
+        // tables have independent rowid sequences, so a document-keyed delete cannot clear
+        // the intended marker and would destroy an UNRELATED synthesis's still-valid marker
+        // that happens to share the numeric id (under-counting status.flaggedStale). The
+        // MaintenanceCycle reconcile is the source of truth: it drops markers for syntheses
+        // no longer flagged or absent from the scan.
     }
 
     /// Purge a document's chunk rows + their derived index rows (FTS5, vec0,
