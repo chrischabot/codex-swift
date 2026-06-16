@@ -110,10 +110,10 @@ public enum WikiLinkLinter {
                 // Consume the section's body up to the next heading / fence. A see-also ENTRY
                 // is a list item OR a link-only line (bare or blockquoted `[[x]]`s) — NOT prose
                 // that merely mentions a link. A non-entry, non-blank line is allowed as a
-                // LEAD-IN before any entry ("Related pages:"); it only ENDS the section as
-                // trailing prose once a blank line has SEPARATED the entries from it. Gating
-                // the end solely on a bullet (the prior bound) leaked bullet-less see-also
-                // blocks' trailing content into the section, defeating grounding + reciprocity.
+                // LEAD-IN before any entry ("Related pages:"); once an entry has appeared, the
+                // first non-entry, non-blank line is TRAILING CONTENT and ends the section —
+                // whether or not a blank separates it (gating the end on a blank let prose
+                // glued directly to an entry leak in, falsely flagging grounding/reciprocity).
                 func isEntryLine(_ line: String) -> Bool {
                     if matches(line, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#) { return true }   // list item
                     let stripped = matches(line, #"^[ \t]*>"#)
@@ -122,15 +122,14 @@ public enum WikiLinkLinter {
                     return matches(stripped, #"^[ \t]*(\[\[[^\]]+\]\][ \t]*)+$"#)        // link-only line
                 }
                 var sawEntry = false
-                var blankSinceEntry = false
                 while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
                     let line = lines[i]
                     if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                        if sawEntry { blankSinceEntry = true }
-                    } else if blankSinceEntry && !isEntryLine(line) {
-                        break                                   // blank then prose = trailing content
-                    } else {
-                        sawEntry = true; blankSinceEntry = false
+                        // blank line within the section is neutral (separates entries / lead-in)
+                    } else if sawEntry && !isEntryLine(line) {
+                        break                                   // prose after an entry = trailing content
+                    } else if isEntryLine(line) {
+                        sawEntry = true                         // a lead-in before the first entry falls through
                     }
                     seeAlso.append(line); i += 1
                 }

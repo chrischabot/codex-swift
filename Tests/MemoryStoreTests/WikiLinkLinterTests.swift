@@ -198,6 +198,27 @@ final class WikiLinkLinterTests: XCTestCase {
         XCTAssertFalse(rec.contains { $0.target == "peer" }, "a body content link is not a see-also edge")
     }
 
+    // Trailing content glued DIRECTLY to a see-also entry (NO blank separator) must still end
+    // the section — the round-5 blank-separator gate let `[[real]]` on the very next line leak
+    // into see-also, falsely flagging the page .ungrounded (which BLOCKS the write in strict
+    // mode) and the body link .nonReciprocalSeeAlso.
+    func testNoBlankSeparatorBetweenEntryAndTrailingContent() {
+        let body = "# R\n\n## See Also\n[[nav1]]\nThe analysis is grounded in [[real]].\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: body), ["nav1"],
+                       "prose on the line right after an entry is content, not a see-also edge")
+        XCTAssertTrue(WikiLinkLinter.bodyExcludingSeeAlso(body).contains("[[real]]"))
+        let g = WikiLinkLinter.lint([WikiLintPage(slug: "r", body: body, category: "report", claimLinkCount: 0)],
+                                    validSlugs: ["r", "nav1", "real"])
+        XCTAssertFalse(g.contains { $0.kind == .ungrounded }, "the directly-trailing [[real]] grounds the page")
+
+        let rec = WikiLinkLinter.lint([
+            WikiLintPage(slug: "a", body: "# A\n\n## See Also\n[[nav]]\nThis builds on [[peer]] in the body.\n", category: "concept"),
+            WikiLintPage(slug: "peer", body: "no backlink", category: "concept"),
+            WikiLintPage(slug: "nav", body: "nav\n\n## See Also\n[[a]]\n", category: "concept"),
+        ]).filter { $0.kind == .nonReciprocalSeeAlso }
+        XCTAssertFalse(rec.contains { $0.target == "peer" }, "a body content link on the next line is not a see-also edge")
+    }
+
     // A See-Also edge is NAVIGATION, not a citation: a grounding-required page whose ONLY
     // [[link]] sits under a "See Also" heading (and 0 claims) cites nothing real → ungrounded.
     // A page with the SAME link as a CONTENT link (body, not see-also) is grounded.
