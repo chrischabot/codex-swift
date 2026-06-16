@@ -66,25 +66,48 @@ public enum WikiLinkLinter {
     }
 
     /// Split a body into its non-see-also CONTENT and the concatenated text of ALL its
-    /// "See Also" sections. A section starts at an ATX `#…###### See Also` heading and runs
-    /// only over the LIST that follows it — its contiguous list-item / blank lines — ending at
-    /// the first line that is not a list item or blank (trailing prose), the next heading, or a
-    /// code fence. Walks line-wise so it: (a) catches MULTIPLE See-Also blocks; (b) does NOT
-    /// absorb trailing or interleaved CONTENT (prose with real citations after/between
-    /// see-also lists stays in content — the prior next-heading-only bound ate it, falsely
-    /// flagging grounded pages ungrounded); (c) suppresses detection inside fenced code blocks
-    /// (a literal `## See Also` / `===` inside a ``` fence is inert, not a real heading).
+    /// "See Also" sections, so grounding/reciprocity treat navigation links and content
+    /// citations distinctly.
+    ///
+    /// CONTRACT (the robust, fail-closed rule a six-round adversarial-review panel converged
+    /// on — distinguishing "navigation" from "content" links WITHIN a See-Also section is
+    /// fundamentally ambiguous in free-form prose, so we don't try): every `[[link]]` under a
+    /// "See Also" heading, up to the next heading/fence, is NAVIGATION. Content and its
+    /// grounding citations belong in the body (above See-Also) or under their own heading. A
+    /// link-FREE trailing note after the entries (and a link-free lead-in before them) is the
+    /// only prose split out — it carries no links, so it affects only the readable text, never
+    /// a grounding/reciprocity verdict.
+    ///
+    /// A "See Also" heading is recognized in all three realistic spellings — ATX (`## See
+    /// Also`), SETEXT (`See Also` + `----`/`====` underline), and BOLD (`**See Also**`) — and
+    /// matched STRICTLY (exactly "See Also", optional `:`), so a page TITLE like `# See also:
+    /// the GPU landscape` is NOT mistaken for a section heading. Fenced code blocks are inert;
+    /// a fence open is CommonMark-correct (≤3-space indent — a ≥4-space-indented ``` line is an
+    /// indented code block, not a fence, and must not trigger a section-eating fence scan).
     private static func partitionSeeAlso(_ body: String) -> (content: String, seeAlso: String) {
         let lines = body.components(separatedBy: "\n")
         func matches(_ s: String, _ pattern: String) -> Bool {
             s.range(of: pattern, options: .regularExpression) != nil
         }
         func isATXHeading(_ s: String) -> Bool { matches(s, #"^#{1,6}[ \t]+\S"#) }
-        func isSeeAlsoHeading(_ s: String) -> Bool { matches(s, #"(?i)^#{1,6}[ \t]+see also\b"#) }
         func isSetextUnderline(_ s: String) -> Bool { matches(s, #"^[ \t]*(=+|-+)[ \t]*$"#) }
-        func isFenceMarker(_ s: String) -> Bool { matches(s, #"^[ \t]*(`{3,}|~{3,})"#) }
+        // A fence open may be indented at most 3 spaces (CommonMark); 4+ spaces is indented code.
+        func isFenceMarker(_ s: String) -> Bool { matches(s, #"^ {0,3}(`{3,}|~{3,})"#) }
         func isListItemOrBlank(_ s: String) -> Bool {
             s.trimmingCharacters(in: .whitespaces).isEmpty || matches(s, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
+        }
+        func carriesLink(_ s: String) -> Bool { matches(s, #"\[\[[^\]]+\]\]"#) }
+        // STRICT "See Also" title text (exact words, optional trailing colon) — so a page title
+        // beginning "See also …" is never read as a section heading.
+        func isSeeAlsoText(_ s: String) -> Bool { matches(s, #"(?i)^[ \t]*see also[ \t]*:?[ \t]*$"#) }
+        // A "See Also" heading at line i, in ATX / BOLD (1 line) or SETEXT (2 lines) form.
+        // Returns how many lines it occupies, or nil.
+        func seeAlsoHeadingLen(at i: Int) -> Int? {
+            let line = lines[i]
+            if matches(line, #"(?i)^#{1,6}[ \t]+see also[ \t]*:?[ \t]*$"#) { return 1 }   // ATX
+            if matches(line, #"(?i)^[ \t]*\*\*[ \t]*see also[ \t]*\*\*[ \t]*:?[ \t]*$"#) { return 1 }  // bold
+            if i + 1 < lines.count && isSeeAlsoText(line) && isSetextUnderline(lines[i + 1]) { return 2 }  // setext
+            return nil
         }
         // A heading begins at line i if it's ATX, or a setext title: a plain (non-list,
         // non-blank, non-underline) line whose NEXT line is an `=`/`-` underline.
@@ -105,36 +128,23 @@ public enum WikiLinkLinter {
                 if i < lines.count { content.append(lines[i]); i += 1 }   // closing fence
                 continue
             }
-            if isSeeAlsoHeading(lines[i]) {
-                i += 1   // drop the See Also heading itself
-                // Consume the section's body up to the next heading / fence. A see-also ENTRY is
-                // a list item, a link-only line (bare/blockquoted `[[x]]`s), OR a prose line that
-                // CARRIES a `[[link]]` ("review [[a]] and [[b]]") — anything navigational. A
-                // link-FREE prose line is a pure LEAD-IN ("Related pages:") allowed before the
-                // entries. Once an entry has appeared, the first non-entry, non-blank line is
-                // TRAILING CONTENT and ends the section (whether or not a blank separates it).
-                // Keying the end only on a STRUCTURED entry let a prose-only see-also run to EOF
-                // and swallow a trailing content citation, falsely flagging grounding/reciprocity.
-                func isEntryLine(_ line: String) -> Bool {
-                    if matches(line, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#) { return true }   // list item
-                    let stripped = matches(line, #"^[ \t]*>"#)
-                        ? line.replacingOccurrences(of: #"^[ \t]*>[ \t]*"#, with: "", options: .regularExpression)
-                        : line
-                    return matches(stripped, #"^[ \t]*(\[\[[^\]]+\]\][ \t]*)+$"#)        // link-only line
-                }
-                func carriesLink(_ line: String) -> Bool { matches(line, #"\[\[[^\]]+\]\]"#) }
-                var sawEntry = false
+            if let hlen = seeAlsoHeadingLen(at: i) {
+                i += hlen   // drop the See Also heading (1 line ATX/bold, 2 lines setext)
+                // Consume the section to the next heading / fence. Every line here is navigation:
+                // a [[link]] on it is a see-also edge, never content. The ONLY thing split out is
+                // a link-FREE trailing prose note after at least one navigational entry (a
+                // closing remark) — it has no links, so it changes only the readable text.
+                var sawNavEntry = false
                 while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
                     let line = lines[i]
                     if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                        // blank line within the section is neutral (separates entries / lead-in)
-                    } else if sawEntry && !isEntryLine(line) {
-                        break                                   // prose after an entry = trailing content
-                    } else if isEntryLine(line) || carriesLink(line) {
-                        // a structured entry OR a prose line bearing a [[link]] closes the lead-in
-                        // window; a link-free prose line falls through as a pure lead-in.
-                        sawEntry = true
+                        // blank line is neutral (separates entries / lead-in)
+                    } else if carriesLink(line) {
+                        sawNavEntry = true                      // a navigational entry (any link-bearing line)
+                    } else if sawNavEntry {
+                        break                                   // link-FREE prose after entries = trailing note
                     }
+                    // a link-free line before any entry is a pure lead-in: falls through, consumed.
                     seeAlso.append(line); i += 1
                 }
                 continue
