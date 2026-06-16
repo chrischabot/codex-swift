@@ -29,7 +29,7 @@ public enum ContextSanitizer {
         "start_header_id", "end_header_id", "bos", "eos",
         // Conversation roles + common envelope / instruction tags.
         "system", "assistant", "user", "developer",
-        "tool", "tool_call", "tool_calls", "tool_result", "function_call",
+        "tool", "tool_call", "tool_calls", "tool_use", "tool_result", "function_call",
         "context", "instruction", "instructions", "prompt",
         "think", "chat_session", "trajectory", "take", "document",
     ]

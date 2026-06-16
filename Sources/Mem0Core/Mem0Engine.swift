@@ -405,7 +405,18 @@ public struct Mem0Engine: Sendable {
         //    regex-indistinguishable from prose without a name list, and the real threat surface
         //    is exactly these known role/tool/chat-template markers.)
         let bareTag = #"<\s*/?\s*[A-Za-z|][A-Za-z0-9|_:-]*\s*/?>"#
-        let markers = "tool_call|tool_response|function_call|im_start|im_end|system|user|assistant|developer|tool|function|prompt|context"
+        // The PASS-2 vocabulary MIRRORS MemoryInfer.ContextSanitizer.breakoutTags (Mem0Core
+        // cannot import MemoryInfer, so it is duplicated here) PLUS function/tool_response.
+        // KEEP IN SYNC: an attributed form of a marker present in breakoutTags but missing
+        // here passes through LIVE — testValuelessAttributeMarkersAreDefanged enumerates the
+        // full contract and fails on drift. Longest alternatives first so `\b` resolves cleanly.
+        let markers = [
+            "im_start", "im_end", "endoftext", "eot_id", "start_header_id", "end_header_id",
+            "bos", "eos", "system", "assistant", "user", "developer",
+            "tool_calls", "tool_call", "tool_use", "tool_response", "tool_result", "tool",
+            "function_call", "function", "context", "instructions", "instruction", "prompt",
+            "think", "chat_session", "trajectory", "take", "document",
+        ].joined(separator: "|")
         let attributedMarker = #"(?i)<\s*/?\s*(?:\|\s*)?(?:\#(markers))\b[^>]*>"#
         for pattern in [bareTag, attributedMarker] {
             guard let re = try? NSRegularExpression(pattern: pattern) else { continue }

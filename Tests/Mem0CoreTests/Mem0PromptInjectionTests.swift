@@ -63,6 +63,39 @@ final class Mem0PromptInjectionTests: XCTestCase {
         XCTAssertEqual(Mem0Engine.sanitizeForPrompt("<im_start system>"), "[im_start system]")
     }
 
+    // FULL CONTRACT — the round-3 review found the PASS-2 vocabulary had drifted from the
+    // codebase's canonical ContextSanitizer.breakoutTags, so ATTRIBUTED forms of the missing
+    // markers (notably <tool_use id=…> / <tool_result …> — the host model family's own tool
+    // markers) passed through LIVE. This enumerates every breakoutTags name (+ tool_use,
+    // tool_response, function) and asserts BOTH a valued and a valueless attributed form
+    // defangs. If breakoutTags grows but the engine vocabulary doesn't, this fails. KEEP IN
+    // SYNC with MemoryInfer.ContextSanitizer.breakoutTags + Mem0Engine.sanitizeForPrompt.
+    func testEveryBreakoutMarkerDefangsAttributedAndValueless() {
+        let markers = [
+            "im_start", "im_end", "endoftext", "eot_id", "start_header_id", "end_header_id",
+            "bos", "eos", "system", "assistant", "user", "developer",
+            "tool", "tool_call", "tool_calls", "tool_use", "tool_response", "tool_result",
+            "function_call", "function", "context", "instruction", "instructions", "prompt",
+            "think", "chat_session", "trajectory", "take", "document",
+        ]
+        for m in markers {
+            // valued attribute
+            let valued = Mem0Engine.sanitizeForPrompt("<\(m) id=\"x\">payload")
+            XCTAssertFalse(valued.contains("<\(m) "), "<\(m) id=…> must be defanged (valued attr)")
+            XCTAssertTrue(valued.hasPrefix("[\(m) id=\"x\"]"), "expected bracket-swap, got: \(valued)")
+            // valueless attribute (the bypass class)
+            let valueless = Mem0Engine.sanitizeForPrompt("<\(m) trusted>payload")
+            XCTAssertFalse(valueless.contains("<\(m) "), "<\(m) trusted> must be defanged (valueless attr)")
+            XCTAssertTrue(valueless.hasPrefix("[\(m) trusted]"), "expected bracket-swap, got: \(valueless)")
+            // bare form (PASS 1)
+            XCTAssertEqual(Mem0Engine.sanitizeForPrompt("<\(m)>"), "[\(m)]")
+        }
+        // The specific Anthropic tool markers the review flagged as leaking.
+        XCTAssertEqual(Mem0Engine.sanitizeForPrompt("<tool_use id=\"abc\">"), "[tool_use id=\"abc\"]")
+        XCTAssertEqual(Mem0Engine.sanitizeForPrompt("<tool_result tool_use_id=\"xyz\">"),
+                       "[tool_result tool_use_id=\"xyz\"]")
+    }
+
     // Prose integrity: multi-word text with `<`/`>` must stay byte-identical whether or NOT it
     // contains `=`. The `=`-gated pattern (round-1) mangled `c = d` prose; the two-pass design
     // (bare-tag pattern has no `=` branch; the attributed pass is vocabulary-scoped) leaves all
