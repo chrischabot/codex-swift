@@ -134,6 +134,44 @@ final class WikiLinkLinterTests: XCTestCase {
                       "a fenced ## See Also creates no real see-also section")
     }
 
+    // A See-Also section may open with a non-list LEAD-IN (prose intro, bare [[link]] lines,
+    // or blockquote entries) before/instead of bullets. The round-3 first-line-must-be-a-list
+    // bound leaked these entirely into content, defeating grounding + reciprocity. They must
+    // be classified as see-also (so a see-also-only page is still ungrounded, and one-way
+    // edges still flag non-reciprocal).
+    func testSeeAlsoWithLeadInOrBareLinksIsStillSeeAlso() {
+        // (a) prose lead-in then bullets → links are see-also, page is ungrounded
+        let leadIn = "# Report\nThis report draws conclusions.\n\n## See Also\nRelated pages:\n- [[nav1]]\n- [[nav2]]\n"
+        XCTAssertEqual(Set(WikiLinkLinter.seeAlsoLinks(in: leadIn)), ["nav1", "nav2"],
+                       "a lead-in line does not stop the see-also list")
+        XCTAssertFalse(WikiLinkLinter.bodyExcludingSeeAlso(leadIn).contains("[[nav1]]"),
+                       "see-also nav links must not leak into content")
+        let li = WikiLinkLinter.lint([WikiLintPage(slug: "rep", body: leadIn, category: "report", claimLinkCount: 0)],
+                                     validSlugs: ["rep", "nav1", "nav2"])
+        XCTAssertTrue(li.contains { $0.kind == .ungrounded }, "see-also-only (with lead-in) page is ungrounded")
+
+        // (b) bare [[link]] lines with no bullets → see-also
+        let bare = "## See Also\n[[nav1]]\n[[nav2]]\n"
+        XCTAssertEqual(Set(WikiLinkLinter.seeAlsoLinks(in: bare)), ["nav1", "nav2"])
+
+        // (c) blockquote entries → see-also
+        let quoted = "## See Also\n> [[nav1]]\n> [[nav2]]\n"
+        XCTAssertEqual(Set(WikiLinkLinter.seeAlsoLinks(in: quoted)), ["nav1", "nav2"])
+
+        // (d) non-reciprocal still flagged when the section uses a lead-in
+        let pages = [
+            WikiLintPage(slug: "x", body: "intro\n\n## See Also\nSee:\n- [[b]]\n", category: "concept"),
+            WikiLintPage(slug: "b", body: "no backlink", category: "concept"),
+        ]
+        let nonRecip = WikiLinkLinter.lint(pages).filter { $0.kind == .nonReciprocalSeeAlso }
+        XCTAssertEqual(nonRecip.map(\.target), ["b"], "a one-way see-also with a lead-in still flags non-reciprocal")
+
+        // (e) trailing prose AFTER the list still falls into content (round-3 win preserved)
+        let trailing = "## See Also\n- [[nav]]\n\nGrounded at [[real]].\n"
+        XCTAssertEqual(WikiLinkLinter.seeAlsoLinks(in: trailing), ["nav"])
+        XCTAssertTrue(WikiLinkLinter.bodyExcludingSeeAlso(trailing).contains("[[real]]"))
+    }
+
     // A See-Also edge is NAVIGATION, not a citation: a grounding-required page whose ONLY
     // [[link]] sits under a "See Also" heading (and 0 claims) cites nothing real → ungrounded.
     // A page with the SAME link as a CONTENT link (body, not see-also) is grounded.

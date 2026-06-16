@@ -107,11 +107,21 @@ public enum WikiLinkLinter {
             }
             if isSeeAlsoHeading(lines[i]) {
                 i += 1   // drop the See Also heading itself
-                // Consume ONLY the following list (list items + interspersed blanks). Trailing
-                // prose, a fence, or the next heading ends the section and falls into content.
-                while i < lines.count && !isFenceMarker(lines[i])
-                      && !startsHeading(at: i) && isListItemOrBlank(lines[i]) {
-                    seeAlso.append(lines[i]); i += 1
+                // Consume the section's body up to the next heading / fence. A non-list,
+                // non-blank line is allowed as a LEAD-IN before the list begins (e.g.
+                // "Related pages:", or bare `[[link]]` / blockquote `> [[x]]` entries that
+                // aren't bullets); it only ENDS the section as trailing prose once a list
+                // item has appeared. (Requiring a bullet at the FIRST body line — the prior
+                // bound — wrongly leaked lead-in/bare-link see-also blocks into content,
+                // defeating grounding + reciprocity.)
+                var sawListItem = false
+                while i < lines.count && !isFenceMarker(lines[i]) && !startsHeading(at: i) {
+                    let line = lines[i]
+                    let isItem = matches(line, #"^[ \t]*([-*+]|\d+[.)])[ \t]"#)
+                    let isBlank = line.trimmingCharacters(in: .whitespaces).isEmpty
+                    if isItem { sawListItem = true }
+                    else if !isBlank && sawListItem { break }   // trailing prose after the list
+                    seeAlso.append(line); i += 1
                 }
                 continue
             }
