@@ -48,6 +48,25 @@ final class RetrieveTests: XCTestCase {
                       "expected the swift-programming chunk among top hits: \(ids)")
     }
 
+    // The query embed-cache must be keyed by the resolved embedding provider id, so a
+    // long-lived retriever cannot serve vectors cached under a different model. Three
+    // construction sites set this; Run.swift was the one missed and silently kept the
+    // "default" key (cross-model isolation inert). Assert the discriminator propagates,
+    // and that the unwired default is the sentinel the bug exposed.
+    func testEmbedCacheDiscriminatorIsTheProviderId() async throws {
+        let path = NSTemporaryDirectory() + "retr-disc-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = try MemoryStore(MemoryStoreConfig(path: path, embeddingDimension: 8))
+        let inference = MockInferenceProvider(embeddingDimension: 8)
+        let wired = MemoryRetriever(store: store, inference: inference,
+                                    embedCacheModelId: "openai:text-embedding-3-small")
+        XCTAssertEqual(wired.embedCacheModelId, "openai:text-embedding-3-small",
+                       "the resolved provider id is the cache discriminator")
+        let unwired = MemoryRetriever(store: store, inference: inference)
+        XCTAssertEqual(unwired.embedCacheModelId, "default",
+                       "omitting the id falls back to the sentinel — the exact bug at the missed site")
+    }
+
     func testHybridSearchClampsHostileTopKForDirectCallers() async throws {
         let path = NSTemporaryDirectory() + "retr-hostile-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

@@ -228,7 +228,12 @@ public enum CodexMemoryRun {
         let archive = MemoryArchive.open(codexHome: codexHome)
         let processor = MemoryProcessor(store: store, inference: inference,
                                         archive: archive)
-        let retriever = MemoryRetriever(store: store, inference: inference)
+        // Pass the resolved provider id (== the store's embedding stamp) as the query
+        // embed-cache discriminator — the third construction site, missed when the other
+        // two were wired. Without it the cache keys on "default" and a future in-place
+        // embedder swap could serve vectors cached under the old model.
+        let retriever = MemoryRetriever(store: store, inference: inference,
+                                        embedCacheModelId: plan.providerID)
         let scorer = Scorer(store: store)
 
         // BrainGate is the explicit spend-gated escalation path. It uses the
