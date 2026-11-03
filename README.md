@@ -118,6 +118,11 @@ www/                                        React web UI
 - **Operations:** [observability](docs/features/observability.md), [usage and cost](docs/features/usage-and-cost.md), [DeepSWE benchmark runner](docs/features/benchmarks.md)
 - **Internals and status:** [architecture](docs/ARCHITECTURE.md), [development](docs/DEVELOPMENT.md), [addon portfolio](ADDONS.md), [status](STATUS.md), [upstream sync log](UPSTREAM_SYNC_LOG.md), [crate dispositions](CRATE_DISPOSITIONS.md)
 
+## Project background
+
+- [codex-swift project overview](https://chabot.dev/projects/#codex-swift) on Chris Chabot’s site.
+- [A hung agent shouldn't freeze the others](https://chabot.dev/blog/coding-agents-as-supervised-local-services/): process isolation, supervision and shared authentication.
+
 ## License and credits
 
 codex-swift is licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
